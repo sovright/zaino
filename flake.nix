@@ -83,6 +83,10 @@
             cargo-deny
             cargo-make
             rust-analyzer
+
+            # Integration tests
+            kind
+            kubectl
           ];
 
           inherit (commonArgs) env;
