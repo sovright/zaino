@@ -103,9 +103,9 @@ mod zebrad {
         };
         let validator = match &vol {
             Some(vol) => env.add_validator(
-                Validator::zebrad("5.2.0").regtest().mine_to(mine_to).persistent_state_in(vol),
+                Validator::zebrad("6.0.0-rc.0").regtest().mine_to(mine_to).persistent_state_in(vol),
             ),
-            None => env.add_validator(Validator::zebrad("5.2.0").regtest().mine_to(mine_to)),
+            None => env.add_validator(Validator::zebrad("6.0.0-rc.0").regtest().mine_to(mine_to)),
         };
         let indexer = match &vol {
             Some(vol) => env.add_indexer(
@@ -354,7 +354,7 @@ mod zebrad {
         Ok(())
     }
 
-    /// Port of `get_address_balance`: `z_getaddressbalance` over the recipient's
+    /// Port of `get_address_balance`: `getaddressbalance` over the recipient's
     /// taddr reports exactly 250_000.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
@@ -366,12 +366,12 @@ mod zebrad {
         let res = indexer
             .json_rpc()
             .await?
-            .call_value("z_getaddressbalance", serde_json::json!([{ "addresses": [taddr] }]))
+            .call_value("getaddressbalance", serde_json::json!([{ "addresses": [taddr] }]))
             .await?;
         assert_eq!(
             res.get("balance").and_then(serde_json::Value::as_u64),
             Some(SEND_AMOUNT),
-            "z_getaddressbalance must report the send amount: {res:?}"
+            "getaddressbalance must report the send amount: {res:?}"
         );
         Ok(())
     }
@@ -683,9 +683,38 @@ mod zebrad {
         // output is uniquely identifiable by its amount.
         const FUNDING_AMOUNT: i64 = 250_000;
 
-        let mut env = TestEnv::builder();
-        let validator = env.add_validator(Validator::zebrad("5.2.0").regtest().mine_to(FUND));
-        let indexer = env.add_indexer(dev!(Indexer::Zainod, "../../Dockerfile").regtest());
+        // State-backend only, mirroring origin/dev: zebra serves no
+        // `getblockdeltas` RPC, so only the state backend — which synthesizes
+        // the deltas from a verbosity-2 block and resolves each spend's prevout
+        // via its `ReadStateService` — can answer it. There is no fetch path and
+        // no fetch-vs-state cross-check. The state zainod opens the validator's
+        // zebra-state DB as a RocksDB secondary over the shared volume, so the
+        // validator is built with `persistent_state_in` on the same `vol`.
+        //
+        // Coinbase mines to Orchard, matching dev's `SHIELDED_FUNDING_POOL`.
+        // Orchard is invalid before NU5 (height 2) and the miner address pins
+        // the pool, so `funded_faucet_with_notes` warms the chain past NU5
+        // before mining the faucet's notes (mirroring upstream's launch
+        // pre-mine). The coinbase is shielded, so the 250_000 transparent send
+        // is the funding block's only transparent output.
+        //
+        // `zebrad("6.0.0-rc.0")` is dev's validator (`.env.testing-artifacts`
+        // `ZEBRA_VERSION`): the wallet and miner produce orchard-0.15 proofs and
+        // only a zebra linking the same orchard 0.15 / zcash_protocol 0.10 verifies
+        // them. (An older `5.2.0` links orchard ~0.13 and rejects the proofs with
+        // "could not validate orchard proof".) zaino parses 6.0.0-rc.0's
+        // getblockchaininfo now that `value_pools` is a `Vec<ChainBalance>`.
+        let mut env = TestEnv::builder().ready_timeout(SYNC_TIMEOUT);
+        let vol = env.shared_volume("zebra-db");
+        let validator = env.add_validator(
+            Validator::zebrad("6.0.0-rc.0")
+                .regtest()
+                .mine_to(Pool::Orchard)
+                .persistent_state_in(&vol),
+        );
+        let indexer = env.add_indexer(
+            dev!(Indexer::Zainod, "../../Dockerfile").regtest_state_in(&vol, &validator),
+        );
         let wallet = env.add_wallet(Wallet::librustzcash());
         env.build().await?;
         let irpc = indexer.json_rpc().await?;
@@ -784,13 +813,33 @@ mod zebrad {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_block_deltas_coinbase_only_block_has_no_inputs() -> Result<()> {
-        let mut env = TestEnv::builder();
-        let validator = env.add_validator(Validator::zebrad("5.2.0").regtest().mine_to(FUND));
-        let indexer = env.add_indexer(dev!(Indexer::Zainod, "../../Dockerfile").regtest());
+        // State-backend only, mirroring origin/dev (cf.
+        // `get_block_deltas_resolves_transparent_spend`): zebra serves no
+        // `getblockdeltas` RPC, so only the synthesizing state backend can
+        // answer it. Coinbase mines to Orchard (dev's `SHIELDED_FUNDING_POOL`)
+        // on `zebrad("6.0.0-rc.0")` (dev's validator; orchard 0.15 /
+        // zcash_protocol 0.10 — see the sibling test for why the orchard version
+        // must match the wallet). This test has no faucet, so it mines the NU5 warmup block itself
+        // (height 1, pre-NU5 fallback coinbase) and inspects the height-2 block
+        // — the first true Orchard coinbase — which carries only its coinbase
+        // tx, so `getblockdeltas` fabricates no transparent inputs.
+        let mut env = TestEnv::builder().ready_timeout(SYNC_TIMEOUT);
+        let vol = env.shared_volume("zebra-db");
+        let validator = env.add_validator(
+            Validator::zebrad("6.0.0-rc.0")
+                .regtest()
+                .mine_to(Pool::Orchard)
+                .persistent_state_in(&vol),
+        );
+        let indexer = env.add_indexer(
+            dev!(Indexer::Zainod, "../../Dockerfile").regtest_state_in(&vol, &validator),
+        );
         env.build().await?;
         let irpc = indexer.json_rpc().await?;
 
-        let tip = validator.generate_blocks(1).await?;
+        // Height 1 warms past NU5; height 2 is the Orchard coinbase-only block
+        // under test.
+        let tip = validator.generate_blocks(2).await?;
         wait_tip(&indexer, tip).await?;
         let block_hash = best_block_hash(&irpc).await?;
 
@@ -829,7 +878,7 @@ mod zebrad {
             let mut env = TestEnv::builder().ready_timeout(READY);
             let vol = env.shared_volume("zebra-db");
             let validator = env.add_validator(
-                Validator::zebrad("5.2.0")
+                Validator::zebrad("6.0.0-rc.0")
                     .regtest()
                     .mine_to(pool)
                     .persistent_state_in(&vol),
@@ -1084,12 +1133,12 @@ mod zebrad {
             let fetch_bal = fetch
                 .json_rpc()
                 .await?
-                .call_value("z_getaddressbalance", params.clone())
+                .call_value("getaddressbalance", params.clone())
                 .await?;
             let state_bal = state
                 .json_rpc()
                 .await?
-                .call_value("z_getaddressbalance", params)
+                .call_value("getaddressbalance", params)
                 .await?;
             assert_eq!(
                 fetch_bal.get("balance").and_then(serde_json::Value::as_u64),

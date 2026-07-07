@@ -43,6 +43,7 @@ async fn json_server_check_info() -> Result<()> {
     Ok(())
 }
 
+// TODO: This module should not be called `zcashd`
 mod zcashd {
     use super::*;
 

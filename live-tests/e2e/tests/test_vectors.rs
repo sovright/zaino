@@ -96,7 +96,7 @@ async fn create_200_block_regtest_chain_vectors() -> Result<()> {
     // zebrad regtest validator with `mine_to(Pool::Transparent)` + a zainod pod.
     let mut env = TestEnv::builder().ready_timeout(SYNC_TIMEOUT);
     let validator =
-        env.add_validator(Validator::zebrad("5.2.0").regtest().mine_to(Pool::Transparent));
+        env.add_validator(Validator::zebrad("6.0.0-rc.0").regtest().mine_to(Pool::Transparent));
     let indexer = env.add_indexer(dev!(Indexer::Zainod, "../../Dockerfile").regtest());
     let wallet = env.add_wallet(Wallet::librustzcash());
     env.build().await?;
@@ -620,8 +620,10 @@ fn read_vectors_from_file<P: AsRef<Path>>(
         }
     }
 
+    // faucet_data.json
     let faucet = serde_json::from_reader(File::open(base.join("faucet_data.json"))?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // recipient_data.json
     let recipient = serde_json::from_reader(File::open(base.join("recipient_data.json"))?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 

@@ -11,7 +11,7 @@ async fn two_pods() -> Result<(TestEnv, ZebraValidator, ZainoIndexer, ZainoIndex
     let mut env = TestEnv::builder().ready_timeout(READY);
     let vol = env.shared_volume("zebra-db");
     let validator = env.add_validator(
-        Validator::zebrad("5.2.0")
+        Validator::zebrad("6.0.0-rc.0")
             .regtest()
             .persistent_state_in(&vol),
     );
@@ -45,9 +45,11 @@ async fn mine_and_sync_both(
 }
 
 mod zebra {
+
     use super::*;
 
     pub(crate) mod check_info {
+
         use super::*;
 
         #[ztest::qos::integration]
@@ -64,7 +66,12 @@ mod zebra {
                 "",
                 &frpc,
                 &srpc,
-                &["valuePools", "verificationprogress", "size_on_disk"],
+                &[
+                    "valuePools",
+                    "chainSupply",
+                    "verificationprogress",
+                    "size_on_disk",
+                ],
             )
             .await?;
             Ok(())
@@ -78,7 +85,10 @@ mod zebra {
                 let tip = mine_and_sync_both(&validator, &fetch, &state, 1).await?;
                 let fetch_hash = fetch.get_block(tip).await?.hash;
                 let state_hash = state.get_block(tip).await?.hash;
-                assert_eq!(fetch_hash, state_hash, "state tip hash must match fetch at {tip}");
+                assert_eq!(
+                    fetch_hash, state_hash,
+                    "state tip hash must match fetch at {tip}"
+                );
             }
             Ok(())
         }
@@ -101,6 +111,7 @@ mod zebra {
     }
 
     pub(crate) mod get {
+
         use super::*;
 
         #[ztest::qos::integration]
@@ -228,9 +239,15 @@ mod zebra {
             let frpc = fetch.json_rpc().await?;
             let srpc = state.json_rpc().await?;
             let block = assert_rpc_parity("getblock", r#"["1", 1]"#, &frpc, &srpc, &[]).await?;
-            let hash = block.get("hash").and_then(Value::as_str).context("getblock.hash")?;
+            let hash = block
+                .get("hash")
+                .and_then(Value::as_str)
+                .context("getblock.hash")?;
             let by_hash = srpc.call_value("getblock", json!([hash, 1])).await?;
-            assert_eq!(by_hash, block, "state getblock by-hash must equal by-height");
+            assert_eq!(
+                by_hash, block,
+                "state getblock by-hash must equal by-height"
+            );
             Ok(())
         }
 
@@ -278,7 +295,7 @@ mod zebra {
             unimplemented!("testnet get_address_deltas parity — requires synced testnet zebrad")
         }
 
-        pub(crate) mod z {
+        mod z {
             use super::*;
 
             #[ztest::qos::integration]
@@ -296,7 +313,9 @@ mod zebra {
             #[ignore = "requires fully synced testnet."]
             #[tokio::test(flavor = "multi_thread")]
             pub(crate) async fn subtrees_by_index_testnet() -> Result<()> {
-                unimplemented!("testnet z_get_subtrees_by_index parity — requires synced testnet zebrad")
+                unimplemented!(
+                    "testnet z_get_subtrees_by_index parity — requires synced testnet zebrad"
+                )
             }
 
             #[ztest::qos::integration]
@@ -361,7 +380,9 @@ mod zebra {
             for i in 0u32..10 {
                 let tip = mine_and_sync_both(&validator, &fetch, &state, 1).await?;
                 let _ = tip;
-                let blk = frpc.call_value("getblock", json!([i.to_string(), 1])).await?;
+                let blk = frpc
+                    .call_value("getblock", json!([i.to_string(), 1]))
+                    .await?;
                 let hash = blk
                     .get("hash")
                     .and_then(Value::as_str)
@@ -392,8 +413,12 @@ mod zebra {
             let (_env, validator, fetch, state) = two_pods().await?;
             mine_and_sync_both(&validator, &fetch, &state, 5).await?;
             assert_eq!(
-                fetch.get_subtree_roots(2, ShieldedProtocol::Sapling, 0).await?,
-                state.get_subtree_roots(2, ShieldedProtocol::Sapling, 0).await?,
+                fetch
+                    .get_subtree_roots(2, ShieldedProtocol::Sapling, 0)
+                    .await?,
+                state
+                    .get_subtree_roots(2, ShieldedProtocol::Sapling, 0)
+                    .await?,
                 "sapling subtree roots must agree"
             );
             Ok(())
@@ -444,8 +469,12 @@ mod zebra {
             let (_env, validator, fetch, state) = two_pods().await?;
             mine_and_sync_both(&validator, &fetch, &state, 6).await?;
             assert_eq!(
-                fetch.get_block_range_nullifiers(BlockHeight::from(2u32), BlockHeight::from(5u32)).await?,
-                state.get_block_range_nullifiers(BlockHeight::from(2u32), BlockHeight::from(5u32)).await?,
+                fetch
+                    .get_block_range_nullifiers(BlockHeight::from(2u32), BlockHeight::from(5u32))
+                    .await?,
+                state
+                    .get_block_range_nullifiers(BlockHeight::from(2u32), BlockHeight::from(5u32))
+                    .await?,
                 "block range nullifiers [2,5] must agree"
             );
             Ok(())

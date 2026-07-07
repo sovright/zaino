@@ -536,74 +536,6 @@ where
     Ok(())
 }
 
-mod zebrad {
-    use super::*;
-
-    mod launch {
-        use super::*;
-
-        #[ztest::qos::integration]
-        #[tokio::test(flavor = "multi_thread")]
-        pub(crate) async fn regtest_no_cache() -> Result<()> {
-            launch_fetch_service(Validator::zebrad("5.2.0")).await
-        }
-
-        #[ztest::qos::integration]
-        #[tokio::test(flavor = "multi_thread")]
-        #[ignore = "We no longer use chain caches. See zebrad::launch::regtest_no_cache."]
-        pub(crate) async fn regtest_with_cache() -> Result<()> {
-            launch_fetch_service(Validator::zebrad("5.2.0")).await
-        }
-    }
-
-    mod validation {
-        use super::*;
-
-        #[ztest::qos::integration]
-        #[tokio::test(flavor = "multi_thread")]
-        pub(crate) async fn validate_address() -> Result<()> {
-            fetch_service_validate_address(Validator::zebrad("5.2.0")).await
-        }
-
-        #[ztest::qos::integration]
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        pub(crate) async fn z_validate_address() -> Result<()> {
-            z_validate(
-                Validator::zebrad("5.2.0"),
-                SaplingSuite::ZebradPassthroughFetchService,
-            )
-            .await
-        }
-    }
-
-    mod get {
-        use super::*;
-
-        zaino_testutils::validator_tests!(
-            Validator::zebrad("5.2.0"),
-            block_raw => fetch_service_get_block_raw,
-            block_object => fetch_service_get_block_object,
-            latest_block => fetch_service_get_latest_block,
-            block => fetch_service_get_block,
-            block_header => fetch_service_get_block_header,
-            difficulty => assert_fetch_service_difficulty_matches_rpc,
-            mining_info => assert_fetch_service_mininginfo_matches_rpc,
-            peer_info => assert_fetch_service_peerinfo_matches_rpc,
-            block_subsidy => fetch_service_get_block_subsidy,
-            best_blockhash => fetch_service_get_best_blockhash,
-            block_count => fetch_service_get_block_count,
-            block_nullifiers => fetch_service_get_block_nullifiers,
-            block_range => fetch_service_get_block_range,
-            block_range_nullifiers => fetch_service_get_block_range_nullifiers,
-            tree_state => fetch_service_get_tree_state,
-            latest_tree_state => fetch_service_get_latest_tree_state,
-            subtree_roots => fetch_service_get_subtree_roots,
-            lightd_info => fetch_service_get_lightd_info,
-            get_network_sol_ps => assert_fetch_service_getnetworksols_matches_rpc,
-        );
-    }
-}
-
 #[cfg(feature = "zcashd_support")]
 async fn assert_fetch_service_gettxoutsetinfo_matches_rpc<B: ValidatorConfig>(
     v: Validator<B>,
@@ -781,6 +713,74 @@ mod zcashd {
             lightd_info => fetch_service_get_lightd_info,
             get_network_sol_ps => assert_fetch_service_getnetworksols_matches_rpc,
             get_tx_out_set_info => assert_fetch_service_gettxoutsetinfo_matches_rpc,
+        );
+    }
+}
+
+mod zebrad {
+    use super::*;
+
+    mod launch {
+        use super::*;
+
+        #[ztest::qos::integration]
+        #[tokio::test(flavor = "multi_thread")]
+        pub(crate) async fn regtest_no_cache() -> Result<()> {
+            launch_fetch_service(Validator::zebrad("6.0.0-rc.0")).await
+        }
+
+        #[ztest::qos::integration]
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "We no longer use chain caches. See zebrad::launch::regtest_no_cache."]
+        pub(crate) async fn regtest_with_cache() -> Result<()> {
+            launch_fetch_service(Validator::zebrad("6.0.0-rc.0")).await
+        }
+    }
+
+    mod validation {
+        use super::*;
+
+        #[ztest::qos::integration]
+        #[tokio::test(flavor = "multi_thread")]
+        pub(crate) async fn validate_address() -> Result<()> {
+            fetch_service_validate_address(Validator::zebrad("6.0.0-rc.0")).await
+        }
+
+        #[ztest::qos::integration]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        pub(crate) async fn z_validate_address() -> Result<()> {
+            z_validate(
+                Validator::zebrad("6.0.0-rc.0"),
+                SaplingSuite::ZebradPassthroughFetchService,
+            )
+            .await
+        }
+    }
+
+    mod get {
+        use super::*;
+
+        zaino_testutils::validator_tests!(
+            Validator::zebrad("6.0.0-rc.0"),
+            block_raw => fetch_service_get_block_raw,
+            block_object => fetch_service_get_block_object,
+            latest_block => fetch_service_get_latest_block,
+            block => fetch_service_get_block,
+            block_header => fetch_service_get_block_header,
+            difficulty => assert_fetch_service_difficulty_matches_rpc,
+            mining_info => assert_fetch_service_mininginfo_matches_rpc,
+            peer_info => assert_fetch_service_peerinfo_matches_rpc,
+            block_subsidy => fetch_service_get_block_subsidy,
+            best_blockhash => fetch_service_get_best_blockhash,
+            block_count => fetch_service_get_block_count,
+            block_nullifiers => fetch_service_get_block_nullifiers,
+            block_range => fetch_service_get_block_range,
+            block_range_nullifiers => fetch_service_get_block_range_nullifiers,
+            tree_state => fetch_service_get_tree_state,
+            latest_tree_state => fetch_service_get_latest_tree_state,
+            subtree_roots => fetch_service_get_subtree_roots,
+            lightd_info => fetch_service_get_lightd_info,
+            get_network_sol_ps => assert_fetch_service_getnetworksols_matches_rpc,
         );
     }
 }

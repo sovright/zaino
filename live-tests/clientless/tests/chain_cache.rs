@@ -89,7 +89,7 @@ mod chain_query_interface {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_block_range_zebrad() -> Result<()> {
-        get_block_range(Validator::zebrad("5.2.0")).await
+        get_block_range(Validator::zebrad("6.0.0-rc.0")).await
     }
 
     #[cfg(feature = "zcashd_support")]
@@ -179,7 +179,7 @@ mod chain_query_interface {
     #[ignore = "prone to timeouts and hangs, to be fixed in chain index integration"]
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_large_chain_zebrad() -> Result<()> {
-        sync_large_chain(Validator::zebrad("5.2.0")).await
+        sync_large_chain(Validator::zebrad("6.0.0-rc.0")).await
     }
 
     #[cfg(feature = "zcashd_support")]
@@ -288,7 +288,7 @@ mod chain_query_interface {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_subtree_roots_zebrad() -> Result<()> {
-        get_subtree_roots(Validator::zebrad("5.2.0")).await
+        get_subtree_roots(Validator::zebrad("6.0.0-rc.0")).await
     }
 
     #[cfg(feature = "zcashd_support")]
@@ -340,7 +340,7 @@ mod chain_query_interface {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_mempool_stream_fresh_snapshot_repeated_zebrad() -> Result<()> {
-        get_mempool_stream_fresh_snapshot_repeated(Validator::zebrad("5.2.0")).await
+        get_mempool_stream_fresh_snapshot_repeated(Validator::zebrad("6.0.0-rc.0")).await
     }
 
     #[cfg(feature = "zcashd_support")]

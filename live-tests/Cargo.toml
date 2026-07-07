@@ -35,3 +35,14 @@ serde_json = "1.0"
 
 # Test parameterization (fetch × state indexer-backend matrix).
 rstest = "0.23"
+
+# ztest's librustzcash wallet backend tracks librustzcash `main` (orchard 0.15,
+# to match the 6.0.0-rc.0 validator), whose `zcash_client_backend` calls
+# shardtree/incrementalmerkletree methods (ensure_retained, retained_checkpoints,
+# remove_retained_checkpoint) not yet in the published shardtree 0.6.2. Cargo
+# honours `[patch.crates-io]` only from the workspace being built, so ztest's own
+# patch is not inherited here — mirror it. Pinned to the same incrementalmerkletree
+# rev librustzcash `main` uses; remove once a shardtree release carries these methods.
+[patch.crates-io]
+shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
