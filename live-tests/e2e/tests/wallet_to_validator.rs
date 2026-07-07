@@ -6,13 +6,18 @@
 //! queried via the ztest `indexer` handle. Test names / structure / invariants
 //! mirror dev 1:1.
 //!
-//! Backend matrix: dev ran each wallet test twice — once against an in-process
-//! `zaino_state::FetchService` (`mod fetch_service`) and once against a
-//! `StateService` (`mod state_service`). Here that `<Service>` axis is expressed
-//! as `#[rstest]` `#[case::fetch]` / `#[case::state]`: `Fetch` is a `zaino-fetch`
-//! pod reading zebrad over RPC, `State` a `zaino-state` pod reading zebrad's DB
-//! as a RocksDB secondary off a shared volume (see [`single_env`]). The
-//! `cross_service` module keeps dev's standalone fetch-vs-state comparisons.
+//! Backend matrix: dev's `<Service>` axis was NOT uniform — dev's
+//! `mod fetch_service` held 25 tests and `mod state_service` only 12. The
+//! send / mining-reward / `get_transaction_mined` / `get_raw_mempool` /
+//! `get_mempool_info` core ran on BOTH backends; the address-query, treestate,
+//! subtree, `get_raw_transaction`, `get_mempool_tx`/`get_mempool_stream` and
+//! `get_transaction_mempool` family ran on the FetchService ONLY. We mirror that
+//! split 1:1: tests dev ran on both carry `#[rstest]` `#[case::fetch]` /
+//! `#[case::state]`; the fetch-only family carries `#[case::fetch]` alone (their
+//! fetch-vs-state agreement is separately covered by the `cross_service` module,
+//! which keeps dev's standalone comparisons). `Fetch` is a `zaino-fetch` pod
+//! reading zebrad over RPC, `State` a `zaino-state` pod reading zebrad's DB as a
+//! RocksDB secondary off a shared volume (see [`single_env`]).
 //!
 //! Funding: dev funds the faucet from `SHIELDED_FUNDING_POOL` (orchard). The
 //! `zfnd/zebra` image can't mine a valid orchard coinbase (block-2+ fails the
@@ -51,6 +56,14 @@ const SHIELDED_POOLS: [i32; 2] = [2, 3];
 async fn best_block_hash(irpc: &JsonRpcClient) -> Result<String> {
     let v = irpc.call_value("getbestblockhash", serde_json::json!([])).await?;
     Ok(v.as_str().expect("getbestblockhash returns a hash string").to_string())
+}
+
+/// The string elements of a JSON array response (e.g. the `getrawmempool`
+/// txid list); non-strings and non-arrays yield an empty vec.
+fn json_string_array(v: serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 /// A `getblockdeltas` delta's `outputs` array (empty if absent).
@@ -305,7 +318,6 @@ mod zebrad {
     /// taddr returns the send's txid.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_address_tx_ids(#[case] backend: Backend) -> Result<()> {
@@ -338,7 +350,6 @@ mod zebrad {
     /// taddr returns a utxo whose txid is the send's.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_address_utxos(#[case] backend: Backend) -> Result<()> {
@@ -358,7 +369,6 @@ mod zebrad {
     /// taddr reports exactly 250_000.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_address_balance(#[case] backend: Backend) -> Result<()> {
@@ -380,7 +390,6 @@ mod zebrad {
     /// taddr reports 250_000.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_taddress_balance(#[case] backend: Backend) -> Result<()> {
@@ -398,7 +407,6 @@ mod zebrad {
     /// recipient's taddr and a range around the send succeeds.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_taddress_txids(#[case] backend: Backend) -> Result<()> {
@@ -413,7 +421,6 @@ mod zebrad {
     /// recipient's taddr succeeds.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_taddress_utxos(#[case] backend: Backend) -> Result<()> {
@@ -428,7 +435,6 @@ mod zebrad {
     /// over the recipient's taddr succeeds.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_taddress_utxos_stream(#[case] backend: Backend) -> Result<()> {
@@ -442,7 +448,6 @@ mod zebrad {
     /// Port of `z_get_treestate` (smoke): tree state at the tip succeeds.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn z_get_treestate(#[case] backend: Backend) -> Result<()> {
@@ -455,7 +460,6 @@ mod zebrad {
     /// Port of `z_get_subtrees_by_index` (smoke): orchard subtree roots succeed.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn z_get_subtrees_by_index(#[case] backend: Backend) -> Result<()> {
@@ -468,7 +472,6 @@ mod zebrad {
     /// send's txid succeeds.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_raw_transaction(#[case] backend: Backend) -> Result<()> {
@@ -498,7 +501,6 @@ mod zebrad {
     /// `get_transaction` for an unmined orchard send from the mempool.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_transaction_mempool(#[case] backend: Backend) -> Result<()> {
@@ -521,14 +523,25 @@ mod zebrad {
     #[tokio::test(flavor = "multi_thread")]
     async fn get_raw_mempool(#[case] backend: Backend) -> Result<()> {
         let (_env, validator, indexer, _t, _u) = fill_mempool(backend).await?;
-        zaino_testutils::assert_rpc_parity(
-            "getrawmempool",
-            "",
-            &validator.json_rpc().await?,
-            &indexer.json_rpc().await?,
-            &[],
-        )
-        .await?;
+        // `getrawmempool` returns the mempool txid set in unspecified order, so
+        // dev sorted both sides before comparing (devtool.rs:
+        // `zaino_mempool.sort(); validator_mempool.sort(); assert_eq!`). The
+        // generic `assert_rpc_parity` compares arrays positionally and so flags
+        // a spurious mismatch when the two sides enumerate the same txids in a
+        // different order; sort both txid lists and compare as sets, matching
+        // dev's normalization.
+        let mut validator_txids = json_string_array(
+            validator.json_rpc().await?.call_value("getrawmempool", serde_json::json!([])).await?,
+        );
+        let mut indexer_txids = json_string_array(
+            indexer.json_rpc().await?.call_value("getrawmempool", serde_json::json!([])).await?,
+        );
+        validator_txids.sort();
+        indexer_txids.sort();
+        assert_eq!(
+            validator_txids, indexer_txids,
+            "getrawmempool txid sets must agree (order-insensitive)"
+        );
         Ok(())
     }
 
@@ -536,7 +549,6 @@ mod zebrad {
     /// transactions, and the exclude-by-txid-suffix filter drops one.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_mempool_tx(#[case] backend: Backend) -> Result<()> {
@@ -563,14 +575,22 @@ mod zebrad {
     /// unmined transactions.
     #[rstest]
     #[case::fetch(Backend::Fetch)]
-    #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_mempool_stream(#[case] backend: Backend) -> Result<()> {
         let (_env, validator, indexer, _t, _u) = fill_mempool(backend).await?;
-        let _ = indexer.get_mempool_stream().await?;
+        // zaino's GetMempoolStream snapshots the current mempool then stays open
+        // until a block is mined, so dev spawned the drain and mined concurrently
+        // (draining before mining hangs). Mirror that: subscribe, mine to close,
+        // then collect.
+        let drain = tokio::spawn({
+            let indexer = indexer.clone();
+            async move { indexer.get_mempool_stream().await }
+        });
         let tip = validator.generate_blocks(1).await?;
         wait_tip(&indexer, tip).await?;
+        let txs = drain.await.expect("mempool-stream drain task joins")?;
+        assert!(!txs.is_empty(), "mempool stream must observe the unmined txs");
         Ok(())
     }
 
@@ -590,18 +610,30 @@ mod zebrad {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_mempool_info(#[case] backend: Backend) -> Result<()> {
-        let (_env, _v, indexer, _t, _u) = fill_mempool(backend).await?;
+        let (_env, validator, indexer, _t, _u) = fill_mempool(backend).await?;
 
-        // The mempool-stream carries each unmined tx's serialized bytes;
-        // recompute the expected size and total byte count from them.
-        let txs = indexer.get_mempool_stream().await?;
-        let expected_bytes: u64 = txs.iter().map(|tx| tx.data.len() as u64).sum();
-
+        // Query getmempoolinfo while the two txs are still unmined (mining below
+        // clears the mempool, so this must come first).
         let info = indexer
             .json_rpc()
             .await?
             .call_value("getmempoolinfo", serde_json::json!([]))
             .await?;
+
+        // The mempool-stream carries each unmined tx's serialized bytes; recompute
+        // the expected byte total from them. zaino's GetMempoolStream snapshots the
+        // current mempool then stays open until a block is mined (mining ends the
+        // subscription), so — like dev — spawn the drain and mine concurrently;
+        // draining before mining hangs (see mempool-stream drain semantics).
+        let drain = tokio::spawn({
+            let indexer = indexer.clone();
+            async move { indexer.get_mempool_stream().await }
+        });
+        let tip = validator.generate_blocks(1).await?;
+        wait_tip(&indexer, tip).await?;
+        let txs = drain.await.expect("mempool-stream drain task joins")?;
+        let expected_bytes: u64 = txs.iter().map(|tx| tx.data.len() as u64).sum();
+
         let size = info.get("size").and_then(serde_json::Value::as_u64);
         let bytes = info.get("bytes").and_then(serde_json::Value::as_u64);
         let usage = info.get("usage").and_then(serde_json::Value::as_u64);
