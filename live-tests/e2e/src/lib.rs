@@ -34,6 +34,7 @@ impl Pool {
     pub fn ztest(self) -> ztest::Pool {
         match self {
             Pool::Orchard => ztest::Pool::Orchard,
+            Pool::Ironwood => ztest::Pool::Ironwood,
             Pool::Sapling => ztest::Pool::Sapling,
             Pool::Transparent => ztest::Pool::Transparent,
         }

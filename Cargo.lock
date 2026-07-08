@@ -3437,7 +3437,6 @@ version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
- "aws-lc-rs",
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
@@ -3827,7 +3826,6 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -5894,6 +5892,7 @@ version = "0.2.0"
 dependencies = [
  "hex",
  "nu-ansi-term",
+ "rustls",
  "serde",
  "thiserror 2.0.18",
  "time",
@@ -5901,7 +5900,6 @@ dependencies = [
  "tracing-subscriber",
  "tracing-tree",
  "zebra-chain",
- "zingo_common_components",
 ]
 
 [[package]]
@@ -5909,7 +5907,6 @@ name = "zaino-fetch"
 version = "0.2.1"
 dependencies = [
  "base64",
- "byteorder",
  "derive_more",
  "hex",
  "http",
@@ -5920,7 +5917,6 @@ dependencies = [
  "reqwest 0.13.1",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
@@ -5959,6 +5955,7 @@ dependencies = [
  "tonic",
  "tower 0.4.13",
  "tracing",
+ "zaino-common",
  "zaino-fetch",
  "zaino-proto",
  "zaino-state",
@@ -6022,7 +6019,7 @@ dependencies = [
 
 [[package]]
 name = "zainod"
-version = "0.4.2"
+version = "0.4.3-ironwood.1"
 dependencies = [
  "clap",
  "config",
@@ -6641,15 +6638,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "zingo_common_components"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3378e81bdef45a9659736a09deaef2b5e5cb3d1556031468debfca3a21d4fa76"
-dependencies = [
- "hex",
 ]
 
 [[package]]

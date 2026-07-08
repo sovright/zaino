@@ -46,16 +46,52 @@ async fn wait_tip(indexer: &(impl IndexerBackend + ?Sized), tip: BlockHeight) ->
     Ok(())
 }
 
-/// Transparent pool-type filters, matching dev's `all_pools_i32()` /
-/// `shielded_pools_i32()`: the lightwalletd wire enum is transparent=1,
-/// sapling=2, orchard=3.
-const ALL_POOLS: [i32; 3] = [1, 2, 3];
-const SHIELDED_POOLS: [i32; 2] = [2, 3];
+/// Pool-type filters for `GetBlockRange`, matching zaino's `PoolType` wire enum:
+/// transparent=1, sapling=2, orchard=3, ironwood=4. Ironwood must be included:
+/// zaino's default (empty `poolTypes`) filter is every shielded pool
+/// (`PoolTypeFilter::default` = sapling+orchard+ironwood), so the explicit
+/// shielded set has to match it or the default-vs-explicit parity checks diverge.
+const ALL_POOLS: [i32; 4] = [1, 2, 3, 4];
+const SHIELDED_POOLS: [i32; 3] = [2, 3, 4];
 
 /// The tip block hash (display order), via the indexer's `getbestblockhash`.
 async fn best_block_hash(irpc: &JsonRpcClient) -> Result<String> {
     let v = irpc.call_value("getbestblockhash", serde_json::json!([])).await?;
     Ok(v.as_str().expect("getbestblockhash returns a hash string").to_string())
+}
+
+/// The e2e validator: zebrad built from **source** at the `v6.0.0-rc.0` tag
+/// (commit `15d5783`), mirroring dev — which resolves `ZEBRA_VERSION=6.0.0-rc.0`
+/// to that git tag and builds it (`get-zebra-git-ref` + source build), not the
+/// released Docker image. The released `zfnd/zebra:6.0.0-rc.0` image predates
+/// NU6.3 and lacks the Ironwood consensus branch id (`0x37a5165b`) the
+/// librustzcash wallet signs with, so it rejects NU6.3 sends with "incorrect
+/// consensus branch id"; the source tag carries NU6.3, matching the wallet and
+/// zaino. `version = "6.0.0-rc.0"` gates NU6.3 config emission
+/// (`zebrad_supports_nu6_3`).
+///
+/// This is a `macro_rules!`, not a `fn`, on purpose: `dev!` injects an
+/// `inventory::submit!` that the preflight image builder collects, and that
+/// registration only links when `dev!` expands at a call site (module/statement
+/// position) — wrapping it in a `fn` silently drops the inventory entry, so the
+/// zebra image never gets built and the validator falls back to the Published
+/// (NU6.3-less) image. Expanding inline at each call site (as the sibling
+/// `dev!(Indexer::Zainod, …)` calls do) keeps the registration.
+macro_rules! dev_zebrad {
+    () => {
+        dev!(
+            Validator::Zebrad,
+            git = "https://github.com/ZcashFoundation/zebra",
+            rev = "15d578362448fb8c4a5d29a00dcfe8adb5184082",
+            dockerfile = "docker/Dockerfile",
+            context = ".",
+            version = "6.0.0-rc.0",
+            // zebra v6.0.0-rc.0 pins Rust 1.91.0 (rust-toolchain.toml / the
+            // Dockerfile's `ARG RUST_VERSION=1.91.0`); pass it as the build-arg so
+            // `FROM rust:${RUST_VERSION}-trixie` resolves during the source build.
+            rust_version = "1.91.0"
+        )
+    };
 }
 
 /// The string elements of a JSON array response (e.g. the `getrawmempool`
@@ -116,9 +152,9 @@ mod zebrad {
         };
         let validator = match &vol {
             Some(vol) => env.add_validator(
-                Validator::zebrad("6.0.0-rc.0").regtest().mine_to(mine_to).persistent_state_in(vol),
+                dev_zebrad!().regtest().mine_to(mine_to).persistent_state_in(vol),
             ),
-            None => env.add_validator(Validator::zebrad("6.0.0-rc.0").regtest().mine_to(mine_to)),
+            None => env.add_validator(dev_zebrad!().regtest().mine_to(mine_to)),
         };
         let indexer = match &vol {
             Some(vol) => env.add_indexer(
@@ -234,7 +270,12 @@ mod zebrad {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn send_to_orchard(#[case] backend: Backend) -> Result<()> {
-        send_to_pool(backend, Pool::Orchard).await
+        // The recipient's unified address exposes an Orchard receiver, but from
+        // NU6.3 librustzcash routes the output value to the Ironwood pool
+        // (Orchard is spend-locked), so the receipt lands in — and is asserted
+        // against — the Ironwood balance. Verified on-chain: the send credits
+        // `ironwood`, not `orchard`.
+        send_to_pool(backend, Pool::Ironwood).await
     }
 
     #[rstest]
@@ -268,7 +309,8 @@ mod zebrad {
         // Three notes — one per send (no chaining of unconfirmed change).
         let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 3).await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
-        for pool in [Pool::Orchard, Pool::Sapling, Pool::Transparent] {
+        // NU6.3: the unified-address (Orchard-receiver) output routes to Ironwood.
+        for pool in [Pool::Ironwood, Pool::Sapling, Pool::Transparent] {
             let addr = recipient.address(pool).await?;
             faucet.send(&addr, SEND_AMOUNT).await?;
         }
@@ -277,7 +319,7 @@ mod zebrad {
         recipient.sync().await?;
 
         let balances = recipient.balances().await?;
-        assert_eq!(balances.get(Pool::Orchard), SEND_AMOUNT);
+        assert_eq!(balances.get(Pool::Ironwood), SEND_AMOUNT);
         assert_eq!(balances.get(Pool::Sapling), SEND_AMOUNT);
         assert_eq!(balances.get(Pool::Transparent), SEND_AMOUNT);
         Ok(())
@@ -307,9 +349,10 @@ mod zebrad {
         wait_tip(&indexer, tip).await?;
         recipient.sync().await?;
         assert_eq!(
-            recipient.balances().await?.get(Pool::Orchard),
+            recipient.balances().await?.get(Pool::Ironwood),
             SEND_AMOUNT - SHIELD_FEE,
-            "shielded orchard balance must be the send net of the ZIP-317 fee"
+            "shielded balance must be the send net of the ZIP-317 fee \
+             (NU6.3 shields transparent funds into the Ironwood pool)"
         );
         Ok(())
     }
@@ -739,7 +782,7 @@ mod zebrad {
         let mut env = TestEnv::builder().ready_timeout(SYNC_TIMEOUT);
         let vol = env.shared_volume("zebra-db");
         let validator = env.add_validator(
-            Validator::zebrad("6.0.0-rc.0")
+            dev_zebrad!()
                 .regtest()
                 .mine_to(Pool::Orchard)
                 .persistent_state_in(&vol),
@@ -858,7 +901,7 @@ mod zebrad {
         let mut env = TestEnv::builder().ready_timeout(SYNC_TIMEOUT);
         let vol = env.shared_volume("zebra-db");
         let validator = env.add_validator(
-            Validator::zebrad("6.0.0-rc.0")
+            dev_zebrad!()
                 .regtest()
                 .mine_to(Pool::Orchard)
                 .persistent_state_in(&vol),
@@ -910,7 +953,7 @@ mod zebrad {
             let mut env = TestEnv::builder().ready_timeout(READY);
             let vol = env.shared_volume("zebra-db");
             let validator = env.add_validator(
-                Validator::zebrad("6.0.0-rc.0")
+                dev_zebrad!()
                     .regtest()
                     .mine_to(pool)
                     .persistent_state_in(&vol),
@@ -1040,7 +1083,9 @@ mod zebrad {
             let faucet = wallet.funded_faucet_with_notes(&validator, &fetch, 3).await?;
             let recipient = wallet.recipient(&validator, &fetch).await?;
             let mut txids = Vec::new();
-            for pool in [Pool::Transparent, Pool::Sapling, Pool::Orchard] {
+            // NU6.3: the unified-address (Orchard-receiver) send emits Ironwood
+            // actions, so the compact block carries them under `ironwood_actions`.
+            for pool in [Pool::Transparent, Pool::Sapling, Pool::Ironwood] {
                 let addr = recipient.address(pool).await?;
                 let txid = faucet.send(&addr, SEND_AMOUNT).await?.into_iter().next().expect("txid");
                 txids.push(txid);
@@ -1063,7 +1108,7 @@ mod zebrad {
 
             e2e::assert_pool_present(compact_block, &txids[0], e2e::Pool::Transparent);
             e2e::assert_pool_present(compact_block, &txids[1], e2e::Pool::Sapling);
-            e2e::assert_pool_present(compact_block, &txids[2], e2e::Pool::Orchard);
+            e2e::assert_pool_present(compact_block, &txids[2], e2e::Pool::Ironwood);
             Ok(())
         }
 
