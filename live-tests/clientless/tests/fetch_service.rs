@@ -142,7 +142,10 @@ where
         .ok()
         .context("block hash must be 32 bytes")?;
     let by_hash = indexer.get_block_by_hash(BlockHash(hash_bytes)).await?;
-    assert_eq!(by_height.height, by_hash.height, "by-hash height round-trip");
+    assert_eq!(
+        by_height.height, by_hash.height,
+        "by-hash height round-trip"
+    );
     assert_eq!(by_height.hash, by_hash.hash, "by-hash hash round-trip");
     Ok(())
 }
@@ -290,7 +293,7 @@ where
 
     let vrpc = validator.json_rpc().await?;
     let irpc = indexer.json_rpc().await?;
-    for height in 0u32..=block_limit {
+    for height in 0u32..block_limit {
         let params = format!("[{height}]");
         assert_rpc_parity("getblocksubsidy", &params, &vrpc, &irpc, &[]).await?;
     }
@@ -414,8 +417,13 @@ where
     let tip = validator.generate_blocks(3).await?;
     sync_to(&indexer, tip).await?;
 
-    let cb = indexer.get_block_nullifiers(BlockHeight::from(1u32)).await?;
-    assert_eq!(cb.height, 1, "GetBlockNullifiers must return the requested height");
+    let cb = indexer
+        .get_block_nullifiers(BlockHeight::from(1u32))
+        .await?;
+    assert_eq!(
+        cb.height, 1,
+        "GetBlockNullifiers must return the requested height"
+    );
     assert_eq!(cb.hash.len(), 32, "block hash must be 32 bytes");
     Ok(())
 }
@@ -443,9 +451,7 @@ where
     Ok(())
 }
 
-async fn fetch_service_get_block_range_nullifiers<B: ValidatorConfig>(
-    v: Validator<B>,
-) -> Result<()>
+async fn fetch_service_get_block_range_nullifiers<B: ValidatorConfig>(v: Validator<B>) -> Result<()>
 where
     Validator<B>: Regtest,
 {
@@ -460,9 +466,17 @@ where
     let blocks = indexer
         .get_block_range_nullifiers(BlockHeight::from(1u32), BlockHeight::from(10u32))
         .await?;
-    assert_eq!(blocks.len(), 10, "stream must yield exactly 10 entries for 1..=10");
+    assert_eq!(
+        blocks.len(),
+        10,
+        "stream must yield exactly 10 entries for 1..=10"
+    );
     for (i, cb) in blocks.iter().enumerate() {
-        assert_eq!(cb.height as usize, i + 1, "heights must be contiguous from 1");
+        assert_eq!(
+            cb.height as usize,
+            i + 1,
+            "heights must be contiguous from 1"
+        );
         assert_eq!(cb.hash.len(), 32, "block hash must be 32 bytes");
     }
     Ok(())
@@ -482,7 +496,11 @@ where
 
     let chain_tip = validator.chain_height().await?;
     let ts = indexer.get_tree_state(chain_tip).await?;
-    assert_eq!(ts.height, u64::from(chain_tip), "tree state height must equal tip");
+    assert_eq!(
+        ts.height,
+        u64::from(chain_tip),
+        "tree state height must equal tip"
+    );
     assert_eq!(ts.hash.len(), 64, "tree state hash must be 64 hex chars");
     assert!(ts.time > 0, "tree state time must be positive");
     Ok(())
@@ -502,7 +520,10 @@ where
 
     let ts = indexer.get_latest_tree_state().await?;
     let tip = u64::from(validator.chain_height().await?);
-    assert_eq!(ts.height, tip, "latest tree state must be at the current tip");
+    assert_eq!(
+        ts.height, tip,
+        "latest tree state must be at the current tip"
+    );
     Ok(())
 }
 
@@ -612,7 +633,11 @@ where
         .get("hash_serialized")
         .and_then(Value::as_str)
         .context("hash_serialized")?;
-    assert_eq!(hash_serialized.len(), 64, "hash_serialized must be 64 hex chars");
+    assert_eq!(
+        hash_serialized.len(),
+        64,
+        "hash_serialized must be 64 hex chars"
+    );
     assert!(
         hash_serialized.chars().all(|c| c.is_ascii_hexdigit()),
         "hash_serialized must be hex: got {hash_serialized}"

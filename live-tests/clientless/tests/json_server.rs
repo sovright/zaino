@@ -19,7 +19,11 @@ async fn dual() -> Result<(TestEnv, ZcashdValidator, ZainoIndexer)> {
     Ok((env, validator, indexer))
 }
 
-async fn mine_sync(validator: &ZcashdValidator, indexer: &ZainoIndexer, n: u32) -> Result<BlockHeight> {
+async fn mine_sync(
+    validator: &ZcashdValidator,
+    indexer: &ZainoIndexer,
+    n: u32,
+) -> Result<BlockHeight> {
     let tip = validator.generate_blocks(n).await?;
     while indexer.latest_block_height().await? != tip {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -32,14 +36,28 @@ async fn json_server_check_info() -> Result<()> {
     let zrpc = validator.json_rpc().await?;
     let irpc = indexer.json_rpc().await?;
     assert_rpc_parity("getinfo", "", &zrpc, &irpc, &["errorstimestamp"]).await?;
-    assert_rpc_parity(
-        "getblockchaininfo",
-        "",
-        &zrpc,
-        &irpc,
-        &["verificationprogress", "size_on_disk"],
-    )
-    .await?;
+    // Parity with dev's `launch_json_server_check_info`: dev did NOT compare the
+    // whole getblockchaininfo object — it asserted exactly this field set
+    // (chain, blocks, bestblockhash, estimatedheight, valuePools, upgrades,
+    // consensus), deliberately omitting volatile/divergent fields such as
+    // chainSupply (see memory note #235). Compare that same set field-by-field.
+    let z = zrpc.call_value("getblockchaininfo", json!([])).await?;
+    let i = irpc.call_value("getblockchaininfo", json!([])).await?;
+    for field in [
+        "chain",
+        "blocks",
+        "bestblockhash",
+        "estimatedheight",
+        "valuePools",
+        "upgrades",
+        "consensus",
+    ] {
+        assert_eq!(
+            z.get(field),
+            i.get(field),
+            "getblockchaininfo.{field} differs from zcashd"
+        );
+    }
     Ok(())
 }
 
@@ -120,8 +138,7 @@ mod zcashd {
                     .context("getbestblockhash non-string")?
                     .to_string();
                 let params = format!(r#"["{hash}"]"#);
-                assert_rpc_parity("getblockdeltas", &params, &zrpc, &irpc, &[])
-                    .await?;
+                assert_rpc_parity("getblockdeltas", &params, &zrpc, &irpc, &[]).await?;
                 mine_sync(&validator, &indexer, 1).await?;
             }
             Ok(())
@@ -158,19 +175,43 @@ mod zcashd {
                 .await?;
 
             for field in ["height", "bestblock", "transactions", "txouts"] {
-                assert_eq!(z.get(field), i.get(field), "gettxoutsetinfo.{field} differs from zcashd");
+                assert_eq!(
+                    z.get(field),
+                    i.get(field),
+                    "gettxoutsetinfo.{field} differs from zcashd"
+                );
             }
-            let z_amt = z.get("total_amount").and_then(Value::as_f64).context("zcashd total_amount")?;
-            let i_amt = i.get("total_amount").and_then(Value::as_f64).context("zaino total_amount")?;
+            let z_amt = z
+                .get("total_amount")
+                .and_then(Value::as_f64)
+                .context("zcashd total_amount")?;
+            let i_amt = i
+                .get("total_amount")
+                .and_then(Value::as_f64)
+                .context("zaino total_amount")?;
             assert!(
                 (z_amt - i_amt).abs() < 1e-8,
                 "gettxoutsetinfo.total_amount differs: zcashd={z_amt} zaino={i_amt}"
             );
             let txouts = i.get("txouts").and_then(Value::as_i64).context("txouts")?;
-            let bytes_serialized = i.get("bytes_serialized").and_then(Value::as_i64).context("bytes_serialized")?;
-            assert_eq!(bytes_serialized, txouts * 65, "bytes_serialized must equal txouts * 65");
-            let hash_serialized = i.get("hash_serialized").and_then(Value::as_str).context("hash_serialized")?;
-            assert_eq!(hash_serialized.len(), 64, "hash_serialized must be 64 hex chars");
+            let bytes_serialized = i
+                .get("bytes_serialized")
+                .and_then(Value::as_i64)
+                .context("bytes_serialized")?;
+            assert_eq!(
+                bytes_serialized,
+                txouts * 65,
+                "bytes_serialized must equal txouts * 65"
+            );
+            let hash_serialized = i
+                .get("hash_serialized")
+                .and_then(Value::as_str)
+                .context("hash_serialized")?;
+            assert_eq!(
+                hash_serialized.len(),
+                64,
+                "hash_serialized must be 64 hex chars"
+            );
             assert!(
                 hash_serialized.chars().all(|c| c.is_ascii_hexdigit()),
                 "hash_serialized must be hex: got {hash_serialized}"
@@ -216,7 +257,10 @@ mod zcashd {
             let (_env, validator, indexer) = dual().await?;
             let zrpc = validator.json_rpc().await?;
             let irpc = indexer.json_rpc().await?;
-            for addr in ["tmHMBeeYRuc2eVicLNfP15YLxbQsooCA6jb", "t3TAfQ9eYmXWGe3oPae1XKhdTxm8JvsnFRL"] {
+            for addr in [
+                "tmHMBeeYRuc2eVicLNfP15YLxbQsooCA6jb",
+                "t3TAfQ9eYmXWGe3oPae1XKhdTxm8JvsnFRL",
+            ] {
                 let params = format!(r#"["{addr}"]"#);
                 assert_rpc_parity("validateaddress", &params, &zrpc, &irpc, &[]).await?;
             }
@@ -242,9 +286,15 @@ mod zcashd {
             let irpc = indexer.json_rpc().await?;
             assert_rpc_parity("getblock", r#"["1", 0]"#, &zrpc, &irpc, &[]).await?;
             let block = assert_rpc_parity("getblock", r#"["1", 1]"#, &zrpc, &irpc, &[]).await?;
-            let hash = block.get("hash").and_then(Value::as_str).context("getblock.hash")?;
+            let hash = block
+                .get("hash")
+                .and_then(Value::as_str)
+                .context("getblock.hash")?;
             let by_hash = irpc.call_value("getblock", json!([hash, 1])).await?;
-            assert_eq!(by_hash, block, "zaino getblock by-hash must equal by-height");
+            assert_eq!(
+                by_hash, block,
+                "zaino getblock by-hash must equal by-height"
+            );
             Ok(())
         }
 
@@ -255,7 +305,9 @@ mod zcashd {
             let zrpc = validator.json_rpc().await?;
             let irpc = indexer.json_rpc().await?;
             for i in 0u32..10 {
-                let blk = zrpc.call_value("getblock", json!([i.to_string(), 1])).await?;
+                let blk = zrpc
+                    .call_value("getblock", json!([i.to_string(), 1]))
+                    .await?;
                 let hash = blk
                     .get("hash")
                     .and_then(Value::as_str)

@@ -118,6 +118,8 @@ mod zebra {
         #[ignore = "requires fully synced testnet."]
         #[tokio::test(flavor = "multi_thread")]
         async fn address_utxos_testnet() -> Result<()> {
+            // dev: z_get_address_utxos for tmAkxrvJCN75Ty9YkiHccqc1hJmGZpggo6i,
+            // fetch/state agreement on cached testnet chain.
             unimplemented!("testnet z_get_address_utxos parity — requires synced testnet zebrad")
         }
 
@@ -125,6 +127,8 @@ mod zebra {
         #[ignore = "requires fully synced testnet."]
         #[tokio::test(flavor = "multi_thread")]
         async fn address_tx_ids_testnet() -> Result<()> {
+            // dev: get_address_tx_ids for tmAkxrvJCN75Ty9YkiHccqc1hJmGZpggo6i over
+            // heights [2_000_000, 3_000_000], fetch/state agreement.
             unimplemented!("testnet get_address_tx_ids parity — requires synced testnet zebrad")
         }
 
@@ -132,6 +136,8 @@ mod zebra {
         #[ignore = "requires fully synced testnet."]
         #[tokio::test(flavor = "multi_thread")]
         async fn raw_transaction_testnet() -> Result<()> {
+            // dev: get_raw_transaction(txid, None) for
+            // abb0399df392130baa45644c421fab553670a2d0d399c4dd776a8f7862ec289d.
             unimplemented!("testnet get_raw_transaction parity — requires synced testnet zebrad")
         }
 
@@ -228,6 +234,7 @@ mod zebra {
         #[ignore = "requires fully synced testnet."]
         #[tokio::test(flavor = "multi_thread")]
         async fn raw_mempool_testnet() -> Result<()> {
+            // dev: get_raw_mempool, sorted, fetch/state agreement.
             unimplemented!("testnet get_raw_mempool parity — requires synced testnet zebrad")
         }
 
@@ -255,6 +262,8 @@ mod zebra {
         #[ignore = "requires fully synced testnet."]
         #[tokio::test(flavor = "multi_thread")]
         async fn block_object_testnet() -> Result<()> {
+            // dev: z_get_block("1000000", verbosity 1), by-height vs by-hash,
+            // fetch/state agreement.
             unimplemented!("testnet getblock(object) parity — requires synced testnet zebrad")
         }
 
@@ -278,6 +287,7 @@ mod zebra {
         #[ignore = "requires fully synced testnet."]
         #[tokio::test(flavor = "multi_thread")]
         async fn block_raw_testnet() -> Result<()> {
+            // dev: z_get_block("1000000", verbosity 0), fetch/state agreement.
             unimplemented!("testnet getblock(raw) parity — requires synced testnet zebrad")
         }
 
@@ -285,6 +295,8 @@ mod zebra {
         #[ignore = "requires fully synced testnet."]
         #[tokio::test(flavor = "multi_thread")]
         async fn address_balance_testnet() -> Result<()> {
+            // dev: z_get_address_balance for tmAkxrvJCN75Ty9YkiHccqc1hJmGZpggo6i,
+            // fetch/state agreement.
             unimplemented!("testnet z_get_address_balance parity — requires synced testnet zebrad")
         }
 
@@ -292,6 +304,8 @@ mod zebra {
         #[ignore = "requires fully synced testnet."]
         #[tokio::test]
         async fn address_deltas_testnet() -> Result<()> {
+            // dev: get_address_deltas for tmAkxrvJCN75Ty9YkiHccqc1hJmGZpggo6i over
+            // [2_000_000, 3_000_000], both chain_info=false and chain_info=true.
             unimplemented!("testnet get_address_deltas parity — requires synced testnet zebrad")
         }
 
@@ -313,6 +327,8 @@ mod zebra {
             #[ignore = "requires fully synced testnet."]
             #[tokio::test(flavor = "multi_thread")]
             pub(crate) async fn subtrees_by_index_testnet() -> Result<()> {
+                // dev: z_get_subtrees_by_index for "sapling" and "orchard",
+                // start_index=0, limit=None, fetch/state agreement.
                 unimplemented!(
                     "testnet z_get_subtrees_by_index parity — requires synced testnet zebrad"
                 )
@@ -322,6 +338,7 @@ mod zebra {
             #[ignore = "requires fully synced testnet."]
             #[tokio::test(flavor = "multi_thread")]
             pub(crate) async fn treestate_testnet() -> Result<()> {
+                // dev: z_get_treestate("3000000"), fetch/state agreement.
                 unimplemented!("testnet z_get_treestate parity — requires synced testnet zebrad")
             }
         }
@@ -442,7 +459,8 @@ mod zebra {
         async fn get_block_range_full() -> Result<()> {
             let (_env, validator, fetch, state) = two_pods().await?;
             mine_and_sync_both(&validator, &fetch, &state, 6).await?;
-            let all_pools = vec![1, 2, 3];
+            // Dev used all_pools_i32() = [Transparent, Sapling, Orchard, Ironwood].
+            let all_pools = vec![1, 2, 3, 4];
             assert_eq!(
                 fetch
                     .get_block_range_with_pools(

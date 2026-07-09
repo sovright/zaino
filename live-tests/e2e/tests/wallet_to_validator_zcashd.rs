@@ -31,7 +31,9 @@ async fn faucet_receives_zcashd_orchard_reward() -> Result<()> {
     let wallet = env.add_wallet(Wallet::librustzcash());
     env.build().await?;
 
-    let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+    let faucet = wallet
+        .funded_faucet_with_notes(&validator, &indexer, 1)
+        .await?;
     assert!(
         faucet.balances().await?.get(Pool::Orchard) > 0,
         "faucet must hold a spendable orchard coinbase note"
@@ -50,7 +52,9 @@ mod wallet_to_validator {
         let indexer = env.add_indexer(dev!(Indexer::Zainod, "../../Dockerfile").regtest());
         let wallet = env.add_wallet(Wallet::librustzcash());
         env.build().await?;
-        let _faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let _faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         recipient.sync().await?;
         assert!(!indexer.indexer_info().await?.chain_name.is_empty());
@@ -64,7 +68,9 @@ mod wallet_to_validator {
         let wallet = env.add_wallet(Wallet::librustzcash());
         env.build().await?;
 
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         let addr = recipient.address(pool).await?;
         faucet.send(&addr, SEND_AMOUNT).await?;
@@ -102,20 +108,28 @@ mod wallet_to_validator {
         let wallet = env.add_wallet(Wallet::librustzcash());
         env.build().await?;
 
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         let taddr = recipient.address(Pool::Transparent).await?;
         faucet.send(&taddr, SEND_AMOUNT).await?;
         let tip = validator.generate_blocks(1).await?;
         wait_tip(&indexer, tip).await?;
         recipient.sync().await?;
-        assert_eq!(recipient.balances().await?.get(Pool::Transparent), SEND_AMOUNT);
+        assert_eq!(
+            recipient.balances().await?.get(Pool::Transparent),
+            SEND_AMOUNT
+        );
 
         recipient.shield().await?;
         let tip = validator.generate_blocks(1).await?;
         wait_tip(&indexer, tip).await?;
         recipient.sync().await?;
-        assert_eq!(recipient.balances().await?.get(Pool::Orchard), SEND_AMOUNT - SHIELD_FEE);
+        assert_eq!(
+            recipient.balances().await?.get(Pool::Orchard),
+            SEND_AMOUNT - SHIELD_FEE
+        );
         Ok(())
     }
 
@@ -145,7 +159,9 @@ mod wallet_to_validator {
         let indexer = env.add_indexer(dev!(Indexer::Zainod, "../../Dockerfile").regtest());
         let wallet = env.add_wallet(Wallet::librustzcash());
         env.build().await?;
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 3).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 3)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         for pool in [Pool::Orchard, Pool::Sapling, Pool::Transparent] {
             let addr = recipient.address(pool).await?;
@@ -220,7 +236,9 @@ mod json_server {
         send: Option<Pool>,
     ) -> Result<(Account<LrzWallet>, String, String, Option<String>)> {
         let notes: u32 = if send.is_some() { 1 } else { 2 };
-        let faucet = wallet.funded_faucet_with_notes(validator, indexer, notes).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(validator, indexer, notes)
+            .await?;
         let recipient = wallet.recipient(validator, indexer).await?;
 
         let recipient_taddr = recipient.address(Pool::Transparent).await?;
@@ -250,7 +268,10 @@ mod json_server {
         let irpc = indexer.json_rpc().await?;
         let params = format!(r#"[{{"addresses": ["{recipient_taddr}"]}}]"#);
         let balance = assert_rpc_parity("getaddressbalance", &params, &zrpc, &irpc, &[]).await?;
-        assert_eq!(balance.get("balance").and_then(Value::as_u64), Some(SEND_AMOUNT));
+        assert_eq!(
+            balance.get("balance").and_then(Value::as_u64),
+            Some(SEND_AMOUNT)
+        );
         Ok(())
     }
 
@@ -376,8 +397,15 @@ mod json_server {
             .as_array()
             .and_then(|a| a.first())
             .context("zcashd getaddressutxos returned no utxos")?;
-        let txid = first.get("txid").and_then(Value::as_str).context("utxo.txid")?.to_string();
-        let output_index = first.get("outputIndex").and_then(Value::as_u64).context("utxo.outputIndex")?;
+        let txid = first
+            .get("txid")
+            .and_then(Value::as_str)
+            .context("utxo.txid")?
+            .to_string();
+        let output_index = first
+            .get("outputIndex")
+            .and_then(Value::as_u64)
+            .context("utxo.outputIndex")?;
 
         let present = format!(r#"["{txid}", {output_index}, true]"#);
         assert_rpc_parity("gettxout", &present, &zrpc, &irpc, &[]).await?;
@@ -404,11 +432,18 @@ mod json_server {
             chain_height - 2,
             chain_height
         );
-        let zcashd_txids = zrpc.call_value("getaddresstxids", serde_json::from_str(&params)?).await?;
-        let zaino_txids = irpc.call_value("getaddresstxids", serde_json::from_str(&params)?).await?;
+        let zcashd_txids = zrpc
+            .call_value("getaddresstxids", serde_json::from_str(&params)?)
+            .await?;
+        let zaino_txids = irpc
+            .call_value("getaddresstxids", serde_json::from_str(&params)?)
+            .await?;
 
         assert_eq!(
-            zcashd_txids.as_array().and_then(|a| a.first()).and_then(Value::as_str),
+            zcashd_txids
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(Value::as_str),
             Some(tx.as_str())
         );
         assert_eq!(zcashd_txids, zaino_txids);

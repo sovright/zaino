@@ -71,9 +71,9 @@ const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// round-trip instead.
 type BlockRow = (
     u32,
-    Vec<u8>,             // raw block bytes (dev: zebra_chain::block::Block)
+    Vec<u8>,                      // raw block bytes (dev: zebra_chain::block::Block)
     (Vec<u8>, u64, Vec<u8>, u64), // (sapling_root, sapling_size, orchard_root, orchard_size) — roots are raw 32B (dev: tree::Root)
-    (Vec<u8>, Vec<u8>),  // (sapling_treestate, orchard_treestate) — same as dev
+    (Vec<u8>, Vec<u8>),           // (sapling_treestate, orchard_treestate) — same as dev
 );
 
 /// Transparent-address vector tuple: `(txids, utxos_as_json, balance)`. dev's
@@ -95,8 +95,11 @@ async fn create_200_block_regtest_chain_vectors() -> Result<()> {
     // `TestManager::launch_mining_to(PoolType::Transparent, ..)`; here that is a
     // zebrad regtest validator with `mine_to(Pool::Transparent)` + a zainod pod.
     let mut env = TestEnv::builder().ready_timeout(SYNC_TIMEOUT);
-    let validator =
-        env.add_validator(Validator::zebrad("6.0.0-rc.0").regtest().mine_to(Pool::Transparent));
+    let validator = env.add_validator(
+        Validator::zebrad("6.0.0-rc.0")
+            .regtest()
+            .mine_to(Pool::Transparent),
+    );
     let indexer = env.add_indexer(dev!(Indexer::Zainod, "../../Dockerfile").regtest());
     let wallet = env.add_wallet(Wallet::librustzcash());
     env.build().await?;
@@ -114,7 +117,9 @@ async fn create_200_block_regtest_chain_vectors() -> Result<()> {
     // maturity window and shields the coinbase into orchard. We ask for a few
     // notes so subsequent rounds have independent spendable notes. This replaces
     // dev's explicit `generate_blocks_and_wait_for_tip(150)` + `shield_faucet()`.
-    let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 3).await?;
+    let faucet = wallet
+        .funded_faucet_with_notes(&validator, &indexer, 3)
+        .await?;
     let recipient = wallet.recipient(&validator, &indexer).await?;
 
     let faucet_taddr = faucet.address(Pool::Transparent).await?;
@@ -314,10 +319,8 @@ async fn create_200_block_regtest_chain_vectors() -> Result<()> {
     let (re_blocks, re_faucet, re_recipient) = read_vectors_from_file(&vec_dir)?;
 
     // Assert the round-trip is byte-identical, exactly as dev did per height.
-    for (
-        (h_orig, block_orig, roots_orig, trees_orig),
-        (h_new, block_new, roots_new, trees_new),
-    ) in block_data.iter().zip(re_blocks.iter())
+    for ((h_orig, block_orig, roots_orig, trees_orig), (h_new, block_new, roots_new, trees_new)) in
+        block_data.iter().zip(re_blocks.iter())
     {
         assert_eq!(h_orig, h_new, "height mismatch at block {h_orig}");
         // dev compared typed `zebra_chain::block::Block`; here we compare the

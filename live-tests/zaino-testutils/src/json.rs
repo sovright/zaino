@@ -40,8 +40,7 @@ fn json_eq_numeric(a: &Value, b: &Value) -> bool {
                     .all(|(k, xv)| y.get(k).is_some_and(|yv| json_eq_numeric(xv, yv)))
         }
         (Value::Array(x), Value::Array(y)) => {
-            x.len() == y.len()
-                && x.iter().zip(y).all(|(xv, yv)| json_eq_numeric(xv, yv))
+            x.len() == y.len() && x.iter().zip(y).all(|(xv, yv)| json_eq_numeric(xv, yv))
         }
         _ => a == b,
     }

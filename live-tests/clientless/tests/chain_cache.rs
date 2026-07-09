@@ -41,9 +41,7 @@ async fn sync_to(indexer: &(impl IndexerBackend + ?Sized), tip: BlockHeight) -> 
     Ok(())
 }
 
-async fn launch<B: ValidatorConfig>(
-    v: Validator<B>,
-) -> Result<(TestEnv, B::Handle, ZainoIndexer)>
+async fn launch<B: ValidatorConfig>(v: Validator<B>) -> Result<(TestEnv, B::Handle, ZainoIndexer)>
 where
     Validator<B>: Regtest,
 {
@@ -319,16 +317,15 @@ mod chain_query_interface {
                 sync_to(&indexer, tip).await
             };
 
-            let (stream_result, mine_result) =
-                tokio::time::timeout(Duration::from_secs(20), async {
-                    tokio::join!(stream, mine)
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "mempool stream did not close after chain tip changed on iteration {iteration}"
-                    )
-                });
+            let joined = tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(stream, mine)
+            })
+            .await;
+            let (stream_result, mine_result) = joined.unwrap_or_else(|_| {
+                panic!(
+                    "mempool stream did not close after chain tip changed on iteration {iteration}"
+                )
+            });
             stream_result.with_context(|| {
                 format!("mempool stream yielded unexpected error on iteration {iteration}")
             })?;

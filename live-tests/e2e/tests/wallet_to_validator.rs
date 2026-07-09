@@ -56,8 +56,12 @@ const SHIELDED_POOLS: [i32; 3] = [2, 3, 4];
 
 /// The tip block hash (display order), via the indexer's `getbestblockhash`.
 async fn best_block_hash(irpc: &JsonRpcClient) -> Result<String> {
-    let v = irpc.call_value("getbestblockhash", serde_json::json!([])).await?;
-    Ok(v.as_str().expect("getbestblockhash returns a hash string").to_string())
+    let v = irpc
+        .call_value("getbestblockhash", serde_json::json!([]))
+        .await?;
+    Ok(v.as_str()
+        .expect("getbestblockhash returns a hash string")
+        .to_string())
 }
 
 /// The e2e validator: zebrad built from **source** at the `v6.0.0-rc.0` tag
@@ -98,7 +102,11 @@ macro_rules! dev_zebrad {
 /// txid list); non-strings and non-arrays yield an empty vec.
 fn json_string_array(v: serde_json::Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -152,7 +160,10 @@ mod zebrad {
         };
         let validator = match &vol {
             Some(vol) => env.add_validator(
-                dev_zebrad!().regtest().mine_to(mine_to).persistent_state_in(vol),
+                dev_zebrad!()
+                    .regtest()
+                    .mine_to(mine_to)
+                    .persistent_state_in(vol),
             ),
             None => env.add_validator(dev_zebrad!().regtest().mine_to(mine_to)),
         };
@@ -174,7 +185,9 @@ mod zebrad {
     async fn send_to_pool(backend: Backend, pool: Pool) -> Result<()> {
         let (_env, validator, indexer, wallet) = single_env(backend, FUND).await?;
 
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         let addr = recipient.address(pool).await?;
         faucet.send(&addr, SEND_AMOUNT).await?;
@@ -199,7 +212,9 @@ mod zebrad {
     ) -> Result<(TestEnv, ZebraValidator, ZainoIndexer, TxId, String)> {
         let (env, validator, indexer, wallet) = single_env(backend, FUND).await?;
 
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         let addr = recipient.address(pool).await?;
         let txid = faucet
@@ -219,12 +234,24 @@ mod zebrad {
         backend: Backend,
     ) -> Result<(TestEnv, ZebraValidator, ZainoIndexer, TxId, TxId)> {
         let (env, validator, indexer, wallet) = single_env(backend, FUND).await?;
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 2).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 2)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         let taddr = recipient.address(Pool::Transparent).await?;
         let ua = recipient.address(Pool::Orchard).await?;
-        let t_txid = faucet.send(&taddr, SEND_AMOUNT).await?.into_iter().next().expect("txid");
-        let u_txid = faucet.send(&ua, SEND_AMOUNT).await?.into_iter().next().expect("txid");
+        let t_txid = faucet
+            .send(&taddr, SEND_AMOUNT)
+            .await?
+            .into_iter()
+            .next()
+            .expect("txid");
+        let u_txid = faucet
+            .send(&ua, SEND_AMOUNT)
+            .await?
+            .into_iter()
+            .next()
+            .expect("txid");
         tokio::time::sleep(Duration::from_secs(1)).await;
         Ok((env, validator, indexer, t_txid, u_txid))
     }
@@ -239,7 +266,9 @@ mod zebrad {
     #[tokio::test(flavor = "multi_thread")]
     async fn receives_mining_reward(#[case] backend: Backend) -> Result<()> {
         let (_env, validator, indexer, wallet) = single_env(backend, FUND).await?;
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let balances = faucet.balances().await?;
         assert!(
             balances.get(FUND) > 0,
@@ -257,7 +286,9 @@ mod zebrad {
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_to_node_get_info(#[case] backend: Backend) -> Result<()> {
         let (_env, validator, indexer, wallet) = single_env(backend, FUND).await?;
-        let _faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let _faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         recipient.sync().await?;
         indexer.indexer_info().await?;
@@ -269,7 +300,7 @@ mod zebrad {
     #[case::state(Backend::State)]
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
-    async fn send_to_orchard(#[case] backend: Backend) -> Result<()> {
+    async fn send_to_ironwood(#[case] backend: Backend) -> Result<()> {
         // The recipient's unified address exposes an Orchard receiver, but from
         // NU6.3 librustzcash routes the output value to the Ironwood pool
         // (Orchard is spend-locked), so the receipt lands in — and is asserted
@@ -307,7 +338,9 @@ mod zebrad {
         let (_env, validator, indexer, wallet) = single_env(backend, FUND).await?;
 
         // Three notes — one per send (no chaining of unconfirmed change).
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 3).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 3)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         // NU6.3: the unified-address (Orchard-receiver) output routes to Ironwood.
         for pool in [Pool::Ironwood, Pool::Sapling, Pool::Transparent] {
@@ -320,6 +353,10 @@ mod zebrad {
 
         let balances = recipient.balances().await?;
         assert_eq!(balances.get(Pool::Ironwood), SEND_AMOUNT);
+        // From NU6.3 the unified-address output routes to Ironwood; the orchard
+        // pool must stay empty (a nonzero orchard here means the receipt was
+        // mislabelled, not merely misrouted).
+        assert_eq!(balances.get(Pool::Orchard), 0);
         assert_eq!(balances.get(Pool::Sapling), SEND_AMOUNT);
         assert_eq!(balances.get(Pool::Transparent), SEND_AMOUNT);
         Ok(())
@@ -335,14 +372,19 @@ mod zebrad {
     async fn shield_for_validator(#[case] backend: Backend) -> Result<()> {
         let (_env, validator, indexer, wallet) = single_env(backend, FUND).await?;
 
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         let taddr = recipient.address(Pool::Transparent).await?;
         faucet.send(&taddr, SEND_AMOUNT).await?;
         let tip = validator.generate_blocks(1).await?;
         wait_tip(&indexer, tip).await?;
         recipient.sync().await?;
-        assert_eq!(recipient.balances().await?.get(Pool::Transparent), SEND_AMOUNT);
+        assert_eq!(
+            recipient.balances().await?.get(Pool::Transparent),
+            SEND_AMOUNT
+        );
 
         recipient.shield().await?;
         let tip = validator.generate_blocks(1).await?;
@@ -415,11 +457,15 @@ mod zebrad {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_address_balance(#[case] backend: Backend) -> Result<()> {
-        let (_env, _v, indexer, _txid, taddr) = fund_and_send_to(backend, Pool::Transparent).await?;
+        let (_env, _v, indexer, _txid, taddr) =
+            fund_and_send_to(backend, Pool::Transparent).await?;
         let res = indexer
             .json_rpc()
             .await?
-            .call_value("getaddressbalance", serde_json::json!([{ "addresses": [taddr] }]))
+            .call_value(
+                "getaddressbalance",
+                serde_json::json!([{ "addresses": [taddr] }]),
+            )
             .await?;
         assert_eq!(
             res.get("balance").and_then(serde_json::Value::as_u64),
@@ -436,7 +482,8 @@ mod zebrad {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_taddress_balance(#[case] backend: Backend) -> Result<()> {
-        let (_env, _v, indexer, _txid, taddr) = fund_and_send_to(backend, Pool::Transparent).await?;
+        let (_env, _v, indexer, _txid, taddr) =
+            fund_and_send_to(backend, Pool::Transparent).await?;
         let bal = indexer.get_taddress_balance(vec![taddr]).await?;
         assert_eq!(
             u64::try_from(i64::from(bal)).unwrap_or(0),
@@ -453,7 +500,8 @@ mod zebrad {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_taddress_txids(#[case] backend: Backend) -> Result<()> {
-        let (_env, _v, indexer, _txid, taddr) = fund_and_send_to(backend, Pool::Transparent).await?;
+        let (_env, _v, indexer, _txid, taddr) =
+            fund_and_send_to(backend, Pool::Transparent).await?;
         let tip = indexer.latest_block_height().await?;
         let start = BlockHeight::from(u32::from(tip).saturating_sub(2));
         let _ = indexer.get_taddress_txids(taddr, start, tip).await?;
@@ -467,7 +515,8 @@ mod zebrad {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_taddress_utxos(#[case] backend: Backend) -> Result<()> {
-        let (_env, _v, indexer, _txid, taddr) = fund_and_send_to(backend, Pool::Transparent).await?;
+        let (_env, _v, indexer, _txid, taddr) =
+            fund_and_send_to(backend, Pool::Transparent).await?;
         let _ = indexer
             .get_address_utxos(vec![taddr], BlockHeight::from(0u32), 0)
             .await?;
@@ -481,7 +530,8 @@ mod zebrad {
     #[ztest::qos::integration]
     #[tokio::test(flavor = "multi_thread")]
     async fn get_taddress_utxos_stream(#[case] backend: Backend) -> Result<()> {
-        let (_env, _v, indexer, _txid, taddr) = fund_and_send_to(backend, Pool::Transparent).await?;
+        let (_env, _v, indexer, _txid, taddr) =
+            fund_and_send_to(backend, Pool::Transparent).await?;
         let _ = indexer
             .get_address_utxos_stream(vec![taddr], BlockHeight::from(0u32), 0)
             .await?;
@@ -507,7 +557,9 @@ mod zebrad {
     #[tokio::test(flavor = "multi_thread")]
     async fn z_get_subtrees_by_index(#[case] backend: Backend) -> Result<()> {
         let (_env, _v, indexer, _txid, _addr) = fund_and_send_to(backend, Pool::Orchard).await?;
-        let _ = indexer.get_subtree_roots(0, ShieldedProtocol::Orchard, 0).await?;
+        let _ = indexer
+            .get_subtree_roots(0, ShieldedProtocol::Orchard, 0)
+            .await?;
         Ok(())
     }
 
@@ -522,7 +574,10 @@ mod zebrad {
         let _ = indexer
             .json_rpc()
             .await?
-            .call_value("getrawtransaction", serde_json::json!([txid.to_string(), 1]))
+            .call_value(
+                "getrawtransaction",
+                serde_json::json!([txid.to_string(), 1]),
+            )
             .await?;
         Ok(())
     }
@@ -548,10 +603,17 @@ mod zebrad {
     #[tokio::test(flavor = "multi_thread")]
     async fn get_transaction_mempool(#[case] backend: Backend) -> Result<()> {
         let (_env, validator, indexer, wallet) = single_env(backend, FUND).await?;
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         let addr = recipient.address(Pool::Orchard).await?;
-        let txid = faucet.send(&addr, SEND_AMOUNT).await?.into_iter().next().expect("txid");
+        let txid = faucet
+            .send(&addr, SEND_AMOUNT)
+            .await?
+            .into_iter()
+            .next()
+            .expect("txid");
         tokio::time::sleep(Duration::from_secs(1)).await;
         let _ = indexer.get_transaction(txid).await?;
         Ok(())
@@ -574,10 +636,18 @@ mod zebrad {
         // different order; sort both txid lists and compare as sets, matching
         // dev's normalization.
         let mut validator_txids = json_string_array(
-            validator.json_rpc().await?.call_value("getrawmempool", serde_json::json!([])).await?,
+            validator
+                .json_rpc()
+                .await?
+                .call_value("getrawmempool", serde_json::json!([]))
+                .await?,
         );
         let mut indexer_txids = json_string_array(
-            indexer.json_rpc().await?.call_value("getrawmempool", serde_json::json!([])).await?,
+            indexer
+                .json_rpc()
+                .await?
+                .call_value("getrawmempool", serde_json::json!([]))
+                .await?,
         );
         validator_txids.sort();
         indexer_txids.sort();
@@ -633,7 +703,10 @@ mod zebrad {
         let tip = validator.generate_blocks(1).await?;
         wait_tip(&indexer, tip).await?;
         let txs = drain.await.expect("mempool-stream drain task joins")?;
-        assert!(!txs.is_empty(), "mempool stream must observe the unmined txs");
+        assert!(
+            !txs.is_empty(),
+            "mempool stream must observe the unmined txs"
+        );
         Ok(())
     }
 
@@ -684,7 +757,11 @@ mod zebrad {
         assert_eq!(size, Some(txs.len() as u64), "size must equal the tx count");
         assert!(size.is_some_and(|s| s >= 1), "size must be at least one");
         assert!(bytes.is_some_and(|b| b > 0), "bytes must be positive");
-        assert_eq!(bytes, Some(expected_bytes), "bytes must equal Σ serialized-tx lengths");
+        assert_eq!(
+            bytes,
+            Some(expected_bytes),
+            "bytes must equal Σ serialized-tx lengths"
+        );
         assert!(
             matches!((usage, bytes), (Some(u), Some(b)) if u >= b),
             "usage must be at least bytes: {info:?}"
@@ -796,7 +873,9 @@ mod zebrad {
 
         // One shielded coinbase note, then fund the recipient's transparent
         // address with a non-coinbase transparent output.
-        let faucet = wallet.funded_faucet_with_notes(&validator, &indexer, 1).await?;
+        let faucet = wallet
+            .funded_faucet_with_notes(&validator, &indexer, 1)
+            .await?;
         let recipient = wallet.recipient(&validator, &indexer).await?;
         let recipient_taddr = recipient.address(Pool::Transparent).await?;
         faucet.send(&recipient_taddr, FUNDING_AMOUNT as u64).await?;
@@ -949,7 +1028,13 @@ mod zebrad {
         /// coinbase on the faucet taddr).
         async fn two_pods_mining_to(
             pool: Pool,
-        ) -> Result<(TestEnv, ZebraValidator, ZainoIndexer, ZainoIndexer, ztest::LrzWallet)> {
+        ) -> Result<(
+            TestEnv,
+            ZebraValidator,
+            ZainoIndexer,
+            ZainoIndexer,
+            ztest::LrzWallet,
+        )> {
             let mut env = TestEnv::builder().ready_timeout(READY);
             let vol = env.shared_volume("zebra-db");
             let validator = env.add_validator(
@@ -989,7 +1074,9 @@ mod zebrad {
 
         /// getrawmempool as a sorted `Vec<String>` for order-independent parity.
         async fn sorted_raw_mempool(irpc: &JsonRpcClient) -> Result<Vec<String>> {
-            let v = irpc.call_value("getrawmempool", serde_json::json!([])).await?;
+            let v = irpc
+                .call_value("getrawmempool", serde_json::json!([]))
+                .await?;
             let mut txids: Vec<String> = v
                 .as_array()
                 .unwrap_or(&Vec::new())
@@ -1031,7 +1118,9 @@ mod zebrad {
 
             // fund_and_send(Orchard): one shielded coinbase note, then send it to
             // the recipient's unified address and mine the send in.
-            let faucet = wallet.funded_faucet_with_notes(&validator, &fetch, 1).await?;
+            let faucet = wallet
+                .funded_faucet_with_notes(&validator, &fetch, 1)
+                .await?;
             let recipient = wallet.recipient(&validator, &fetch).await?;
             let ua = recipient.address(Pool::Orchard).await?;
             faucet.send(&ua, SEND_AMOUNT).await?;
@@ -1080,14 +1169,21 @@ mod zebrad {
 
             // Three shielded coinbase notes (one per send below), then one send to
             // each pool's recipient address, mined into a single block.
-            let faucet = wallet.funded_faucet_with_notes(&validator, &fetch, 3).await?;
+            let faucet = wallet
+                .funded_faucet_with_notes(&validator, &fetch, 3)
+                .await?;
             let recipient = wallet.recipient(&validator, &fetch).await?;
             let mut txids = Vec::new();
             // NU6.3: the unified-address (Orchard-receiver) send emits Ironwood
             // actions, so the compact block carries them under `ironwood_actions`.
             for pool in [Pool::Transparent, Pool::Sapling, Pool::Ironwood] {
                 let addr = recipient.address(pool).await?;
-                let txid = faucet.send(&addr, SEND_AMOUNT).await?.into_iter().next().expect("txid");
+                let txid = faucet
+                    .send(&addr, SEND_AMOUNT)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .expect("txid");
                 txids.push(txid);
             }
             let end = sync_both(&validator, &fetch, &state, 1).await?;
@@ -1109,6 +1205,8 @@ mod zebrad {
             e2e::assert_pool_present(compact_block, &txids[0], e2e::Pool::Transparent);
             e2e::assert_pool_present(compact_block, &txids[1], e2e::Pool::Sapling);
             e2e::assert_pool_present(compact_block, &txids[2], e2e::Pool::Ironwood);
+            // The unified-address send must carry no Orchard actions from NU6.3.
+            e2e::assert_pool_absent(compact_block, &txids[2], e2e::Pool::Orchard);
             Ok(())
         }
 
@@ -1117,12 +1215,26 @@ mod zebrad {
         /// recipient address. The dual-backend analogue of `fund_and_send_to`.
         async fn fund_and_send_dual(
             pool: Pool,
-        ) -> Result<(TestEnv, ZebraValidator, ZainoIndexer, ZainoIndexer, TxId, String)> {
+        ) -> Result<(
+            TestEnv,
+            ZebraValidator,
+            ZainoIndexer,
+            ZainoIndexer,
+            TxId,
+            String,
+        )> {
             let (env, validator, fetch, state, wallet) = two_pods_mining_to(FUND).await?;
-            let faucet = wallet.funded_faucet_with_notes(&validator, &fetch, 1).await?;
+            let faucet = wallet
+                .funded_faucet_with_notes(&validator, &fetch, 1)
+                .await?;
             let recipient = wallet.recipient(&validator, &fetch).await?;
             let addr = recipient.address(pool).await?;
-            let txid = faucet.send(&addr, SEND_AMOUNT).await?.into_iter().next().expect("txid");
+            let txid = faucet
+                .send(&addr, SEND_AMOUNT)
+                .await?
+                .into_iter()
+                .next()
+                .expect("txid");
             sync_both(&validator, &fetch, &state, 1).await?;
             Ok((env, validator, fetch, state, txid, addr))
         }
@@ -1134,7 +1246,10 @@ mod zebrad {
         async fn z_get_treestate_fetch_vs_state() -> Result<()> {
             let (_env, _v, fetch, state, _txid, _addr) = fund_and_send_dual(Pool::Orchard).await?;
             let tip = fetch.latest_block_height().await?;
-            assert_eq!(fetch.get_tree_state(tip).await?, state.get_tree_state(tip).await?);
+            assert_eq!(
+                fetch.get_tree_state(tip).await?,
+                state.get_tree_state(tip).await?
+            );
             Ok(())
         }
 
@@ -1145,8 +1260,12 @@ mod zebrad {
         async fn z_get_subtrees_by_index_fetch_vs_state() -> Result<()> {
             let (_env, _v, fetch, state, _txid, _addr) = fund_and_send_dual(Pool::Orchard).await?;
             assert_eq!(
-                fetch.get_subtree_roots(0, ShieldedProtocol::Orchard, 0).await?,
-                state.get_subtree_roots(0, ShieldedProtocol::Orchard, 0).await?,
+                fetch
+                    .get_subtree_roots(0, ShieldedProtocol::Orchard, 0)
+                    .await?,
+                state
+                    .get_subtree_roots(0, ShieldedProtocol::Orchard, 0)
+                    .await?,
             );
             Ok(())
         }
@@ -1159,8 +1278,16 @@ mod zebrad {
             let (_env, _v, fetch, state, txid, _addr) = fund_and_send_dual(Pool::Orchard).await?;
             let params = serde_json::json!([txid.to_string(), 1]);
             assert_eq!(
-                fetch.json_rpc().await?.call_value("getrawtransaction", params.clone()).await?,
-                state.json_rpc().await?.call_value("getrawtransaction", params).await?,
+                fetch
+                    .json_rpc()
+                    .await?
+                    .call_value("getrawtransaction", params.clone())
+                    .await?,
+                state
+                    .json_rpc()
+                    .await?
+                    .call_value("getrawtransaction", params)
+                    .await?,
             );
             Ok(())
         }
@@ -1227,10 +1354,12 @@ mod zebrad {
 
         /// Broadcast a transparent and a unified send (unmined) so both pods'
         /// mempools hold them. The dual-backend analogue of `fill_mempool`.
-        async fn fill_mempool_dual(
-        ) -> Result<(TestEnv, ZebraValidator, ZainoIndexer, ZainoIndexer)> {
+        async fn fill_mempool_dual() -> Result<(TestEnv, ZebraValidator, ZainoIndexer, ZainoIndexer)>
+        {
             let (env, validator, fetch, state, wallet) = two_pods_mining_to(FUND).await?;
-            let faucet = wallet.funded_faucet_with_notes(&validator, &fetch, 2).await?;
+            let faucet = wallet
+                .funded_faucet_with_notes(&validator, &fetch, 2)
+                .await?;
             let recipient = wallet.recipient(&validator, &fetch).await?;
             let taddr = recipient.address(Pool::Transparent).await?;
             let ua = recipient.address(Pool::Orchard).await?;
@@ -1264,7 +1393,10 @@ mod zebrad {
             let chain_height = fetch.latest_block_height().await?;
             let start = BlockHeight::from(u32::from(chain_height).saturating_sub(2));
             let txids = state.get_taddress_txids(taddr, start, chain_height).await?;
-            assert!(!txids.is_empty(), "at least one tx must touch the recipient taddr");
+            assert!(
+                !txids.is_empty(),
+                "at least one tx must touch the recipient taddr"
+            );
             Ok(())
         }
 
@@ -1283,12 +1415,20 @@ mod zebrad {
             // compact blocks, so this starts at height 1, not 0
             // (zingolabs/zaino#818).
             let range = state
-                .get_block_range_with_pools(BlockHeight::from(1u32), chain_height, ALL_POOLS.to_vec())
+                .get_block_range_with_pools(
+                    BlockHeight::from(1u32),
+                    chain_height,
+                    ALL_POOLS.to_vec(),
+                )
                 .await?;
             for cb in range {
                 for tx in cb.vtx {
                     assert!(
-                        !tx.vout.first().expect("transparent vout present").script_pub_key.is_empty(),
+                        !tx.vout
+                            .first()
+                            .expect("transparent vout present")
+                            .script_pub_key
+                            .is_empty(),
                         "each tx's transparent output must carry a script pub key"
                     );
                 }
@@ -1321,7 +1461,10 @@ mod zebrad {
             let (_env, fetch, state, faucet_taddr) = transparent_faucet_taddr(100).await?;
             let fetch_txids = address_tx_ids(&fetch.json_rpc().await?, &faucet_taddr, 2, 5).await?;
             let state_txids = address_tx_ids(&state.json_rpc().await?, &faucet_taddr, 2, 5).await?;
-            assert!(!fetch_txids.is_empty(), "faucet taddr must hold coinbase txids in range");
+            assert!(
+                !fetch_txids.is_empty(),
+                "faucet taddr must hold coinbase txids in range"
+            );
             assert_eq!(fetch_txids, state_txids);
             Ok(())
         }
@@ -1333,9 +1476,14 @@ mod zebrad {
         #[tokio::test(flavor = "multi_thread")]
         async fn get_taddress_balance_faucet_fetch_vs_state() -> Result<()> {
             let (_env, fetch, state, faucet_taddr) = transparent_faucet_taddr(5).await?;
-            let fetch_bal = fetch.get_taddress_balance(vec![faucet_taddr.clone()]).await?;
+            let fetch_bal = fetch
+                .get_taddress_balance(vec![faucet_taddr.clone()])
+                .await?;
             let state_bal = state.get_taddress_balance(vec![faucet_taddr]).await?;
-            assert!(i64::from(fetch_bal) > 0, "faucet taddr must hold coinbase value");
+            assert!(
+                i64::from(fetch_bal) > 0,
+                "faucet taddr must hold coinbase value"
+            );
             assert_eq!(i64::from(fetch_bal), i64::from(state_bal));
             Ok(())
         }
@@ -1348,9 +1496,16 @@ mod zebrad {
         async fn get_address_utxos_faucet_fetch_vs_state() -> Result<()> {
             let (_env, fetch, state, faucet_taddr) = transparent_faucet_taddr(5).await?;
             let start = BlockHeight::from(2u32);
-            let fetch_utxos = fetch.get_address_utxos(vec![faucet_taddr.clone()], start, 3).await?;
-            let state_utxos = state.get_address_utxos(vec![faucet_taddr], start, 3).await?;
-            assert!(!fetch_utxos.is_empty(), "faucet taddr must hold coinbase utxos");
+            let fetch_utxos = fetch
+                .get_address_utxos(vec![faucet_taddr.clone()], start, 3)
+                .await?;
+            let state_utxos = state
+                .get_address_utxos(vec![faucet_taddr], start, 3)
+                .await?;
+            assert!(
+                !fetch_utxos.is_empty(),
+                "faucet taddr must hold coinbase utxos"
+            );
             assert_eq!(fetch_utxos, state_utxos);
             Ok(())
         }
@@ -1363,17 +1518,22 @@ mod zebrad {
         async fn get_address_utxos_stream_faucet_fetch_vs_state() -> Result<()> {
             let (_env, fetch, state, faucet_taddr) = transparent_faucet_taddr(5).await?;
             let start = BlockHeight::from(2u32);
-            let fetch_utxos =
-                fetch.get_address_utxos_stream(vec![faucet_taddr.clone()], start, 3).await?;
-            let state_utxos = state.get_address_utxos_stream(vec![faucet_taddr], start, 3).await?;
-            assert!(!fetch_utxos.is_empty(), "faucet taddr must hold coinbase utxos");
+            let fetch_utxos = fetch
+                .get_address_utxos_stream(vec![faucet_taddr.clone()], start, 3)
+                .await?;
+            let state_utxos = state
+                .get_address_utxos_stream(vec![faucet_taddr], start, 3)
+                .await?;
+            assert!(
+                !fetch_utxos.is_empty(),
+                "faucet taddr must hold coinbase utxos"
+            );
             assert_eq!(fetch_utxos, state_utxos);
             Ok(())
         }
 
         /// Launch transparent-mining dual pods and mine up to chain height 100.
-        async fn transparent_to_height_100(
-        ) -> Result<(TestEnv, ZainoIndexer, ZainoIndexer)> {
+        async fn transparent_to_height_100() -> Result<(TestEnv, ZainoIndexer, ZainoIndexer)> {
             let (env, validator, fetch, state, _wallet) =
                 two_pods_mining_to(Pool::Transparent).await?;
             let height = u32::from(fetch.latest_block_height().await?);
@@ -1390,10 +1550,12 @@ mod zebrad {
             let (_env, fetch, state) = transparent_to_height_100().await?;
             let (start, end) = (BlockHeight::from(1u32), BlockHeight::from(106u32));
 
-            let (fetch_blocks, fetch_errored) =
-                fetch.drain_block_range(start, end, ALL_POOLS.to_vec()).await?;
-            let (state_blocks, state_errored) =
-                state.drain_block_range(start, end, ALL_POOLS.to_vec()).await?;
+            let (fetch_blocks, fetch_errored) = fetch
+                .drain_block_range(start, end, ALL_POOLS.to_vec())
+                .await?;
+            let (state_blocks, state_errored) = state
+                .drain_block_range(start, end, ALL_POOLS.to_vec())
+                .await?;
 
             assert_eq!(fetch_blocks, state_blocks);
             let compact_block = state_blocks.last().expect("non-empty range");
@@ -1413,10 +1575,12 @@ mod zebrad {
             let (_env, fetch, state) = transparent_to_height_100().await?;
             let (start, end) = (BlockHeight::from(106u32), BlockHeight::from(1u32));
 
-            let (fetch_blocks, fetch_errored) =
-                fetch.drain_block_range(start, end, ALL_POOLS.to_vec()).await?;
-            let (state_blocks, state_errored) =
-                state.drain_block_range(start, end, ALL_POOLS.to_vec()).await?;
+            let (fetch_blocks, fetch_errored) = fetch
+                .drain_block_range(start, end, ALL_POOLS.to_vec())
+                .await?;
+            let (state_blocks, state_errored) = state
+                .drain_block_range(start, end, ALL_POOLS.to_vec())
+                .await?;
 
             assert_eq!(fetch_blocks, state_blocks);
             assert!(fetch_blocks.is_empty());
