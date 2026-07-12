@@ -25,10 +25,12 @@ and this library adheres to Rust's notion of
   the plaintext projection with ordinary-source UTXO results for every standard
   address observed at one identical immutable regtest-vector checkpoint. The
   supporting `zaino-state` surface exists only under `test_dependencies`.
-- `zaino-oram`: the volatile `rostl` experiment now has a bounded,
-  single-owner worker for serialized reads and inserts, FIFO shutdown draining,
-  fail-closed backend faults, and identifier-free aggregate telemetry. It is
-  not connected to the projection or query engine.
+- `zaino-oram`: the exclusive two-table command core now has a bounded,
+  single-owner worker that admits only whole history-read/append commands,
+  drains accepted FIFO work on shutdown, fails not-yet-entered work without
+  touching the executor after a terminal fault, and keeps internal telemetry
+  identifier-free. Export cadence and suppression remain unset. The old raw
+  read/insert worker surface is removed.
 - `zaino-oram`: exact immutable protected-table candidates now encode a
   38-byte directory cell and an 82-byte one-event page with canonical dummies,
   named persistence conversions, and `Pod`/`Cmov` proofs. Table allocation and
@@ -48,8 +50,8 @@ and this library adheres to Rust's notion of
   fake table handles, validates their public capacity shape, performs a full
   directory plus bounded-history successful preflight, derives the next
   ordinal from owned-backend state, and terminal-latches after uncertain or
-  partial writes. This is a portable logical model only; backend non-aliasing,
-  worker, projection, real `rostl`, persistence, crash recovery, and physical
+  partial writes. This is a portable logical model only; projection, real
+  `rostl`, persistence, crash recovery, real-backend non-aliasing, and physical
   trace integration remain follow-up work.
 - `zainod-oram`: a non-published, listener-free one-shot runner that scans one
   fixed mainnet tip using an NFS snapshot and chain-continuity validation into

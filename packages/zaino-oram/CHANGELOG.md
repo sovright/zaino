@@ -20,10 +20,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   interfaces.
 - A Linux-x86_64-only volatile `rostl` experiment pinned at `8c3a12d2`; other
   targets reject construction and no production obliviousness claim is made.
-- A bounded single-owner worker for the volatile candidate, with nonblocking
-  admission, serialized reads and inserts, deterministic shutdown draining,
-  terminal fault latching, dropped-reply/send-failure handling, and
-  aggregate-only lifecycle telemetry.
+- A bounded single-owner worker for the exact two-table command core, with
+  nonblocking admission of whole history-read/append commands, deterministic
+  shutdown draining, terminal fault latching, uniform append-ticket-abandonment
+  fault latching, and identifier-free internal queue/lifecycle/outcome counters
+  with no export-policy claim.
 - Exact immutable 38-byte address-directory and 82-byte one-event page
   candidates with canonical dummy encodings, named persistence conversions,
   standard-address validation, redacted diagnostics, and `Pod`/`Cmov` proofs.
@@ -39,19 +40,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   combined modeled fit flags. Backend expansion and position-map width remain
   uncalibrated research inputs rather than measured RSS evidence.
 - A module-private synchronous two-table command core that owns distinct typed
-  fake backend handles, validates their public capacity shape before use, scans the
-  full directory plus every bounded event ordinal on successful preflights,
+  fake backend handles, validates their public capacity shape before use, scans
+  the full directory plus every bounded event ordinal on successful preflights,
   derives the append ordinal from a contiguous owned-backend history, obtains
   admission counts from those backends, and preflights both immutable inserts
   without executor-command interleaving. Any uncertain or partial mutation
-  terminal-latches the candidate for discard; the core is not yet connected to
-  the worker, projection, or real `rostl` adapter and makes no backend
+  terminal-latches the candidate for discard; the core and worker remain
+  disconnected from the projection and real `rostl` adapter and make no backend
   non-aliasing, crash-atomicity, or physical-obliviousness claim.
 
 ### Changed
 
 - Replace the obsolete occupied-page corpus estimate and version-1 report with
   fixed directory/event allocation inputs and the version-2 aggregate schema.
+- Replace the incompatible raw-key/raw-record `rostl`-adapter worker with a
+  portable business-command worker that consumes the exclusive two-table
+  executor and exposes no storage-operation bypass.
 
 ### Deprecated
 

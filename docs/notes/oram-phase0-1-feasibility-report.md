@@ -1,8 +1,8 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-12
-- Evaluated branch: `feat/oram-atomic-query-store`, stacked on
-  `feat/oram-full-capacity-sizing`
+- Evaluated branch: `feat/oram-exclusive-command-worker`, stacked on
+  `feat/oram-atomic-query-store`
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
 - Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
@@ -51,6 +51,11 @@ The evaluated worktree implements:
   noncontiguous histories, derives the next ordinal from owned-backend
   observations, obtains admission counts from those backends, and preflights
   both insertions before its first write;
+- a portable bounded worker that moves that exact command core onto one thread,
+  admits only whole history-read/append business commands, has no raw key or
+  persistent-record surface, drains accepted FIFO work, and rejects commands
+  that have not yet entered the executor without executor I/O after a terminal
+  fault;
 - compile-time `bytemuck::Pod` and `rostl_primitives::traits::Cmov` checks when
   `rostl-experimental` is enabled;
 - fixed Rust envelope and result-page shapes plus a test-only compiled profile;
@@ -93,12 +98,14 @@ The evaluated worktree implements:
   `IndexedBlock` values without retaining them, and requires every sizing input;
 - a pinned, volatile `rostl` candidate adapter that is compiled only into real
   operations on Linux x86_64 and returns `UnsupportedPlatform` elsewhere;
-- a bounded single-owner candidate worker that serializes reads and inserts,
-  admits at most a fixed public queue depth in the research range 1..=4096
-  without fallback, drains accepted FIFO work before shutdown/join, latches
-  terminal backend faults and full-call panics, counts reply-send failure only
-  after the accepted operation finishes, and exposes only fixed-schema
-  aggregate lifecycle telemetry.
+- a bounded single-owner command worker that admits at most a fixed public queue
+  depth in the research range 1..=4096 without fallback, owns the exclusive
+  two-table executor, drains accepted FIFO work before shutdown/join, latches
+  terminal executor faults and full-call panics, counts every unconsumed reply
+  ticket in one aggregate, and additionally terminal-latches every append-ticket
+  abandonment with the same coarse fault. A command already in flight when a
+  late abandonment latches may finish its backend call, but its reply fails
+  closed and later commands do not enter the executor.
 
 The following statements are **not** established by that evidence:
 
@@ -117,9 +124,9 @@ The following statements are **not** established by that evidence:
   `zainod-oram` currently contains only the offline corpus runner;
 - no durable ORAM/checkpoint implementation, rollback defense, crash recovery,
   measured rebuild path, or recovery-time objective exists;
-- the worker mechanics run locally only against a deterministic fake backend;
-  the real worker path is compile-checked but has not executed on Linux x86_64,
-  and it is not connected to the projection or query engine;
+- the worker mechanics run locally only around the deterministic fake-backed
+  executor; there is no real worker path, and the worker is not connected to the
+  projection, checkpoint publisher, query engine, or `rostl` adapter;
 - worker queue depth is observable load leakage, caught panics still invoke the
   process-wide panic hook (including connector-caught backend panics), so real
   backend panic payloads must be identifier-free and a controlled boundary is
@@ -129,10 +136,11 @@ The following statements are **not** established by that evidence:
   indeterminate, forbids automatic retry, and requires volatile-state discard
   plus reconciliation or rebuild from an authoritative checkpoint;
 - fixed-probe derivation and logical binding now have a portable synchronous
-  connector whose unaliased fake handles prevent executor-command interleaving,
-  but no worker command, proof of real-backend non-aliasing, real composite
-  two-ORAM backend, crash-atomic commit, seed generation/persistence/rotation
-  protocol, or selected production probe/load constants exist;
+  connector plus a business-command worker whose unaliased fake handles prevent
+  executor-command interleaving, but no proof of real-backend non-aliasing, real
+  composite two-ORAM backend, crash-atomic commit, seed
+  generation/persistence/rotation protocol, or selected production probe/load
+  constants exist;
 - full-capacity logical arithmetic now exists, but its flat position-map width
   and backend expansion are uncalibrated operator inputs. It does not model the
   pinned backend's tree blocks, recursive maps, stash, initialization
@@ -174,7 +182,7 @@ The following statements are **not** established by that evidence:
 | Aggregate corpus implementation | Partial | Identifier-free accumulator, mainnet-only one-shot runner, provenance validation, nonempty fixture, same-block spend, standard/nonstandard accounting | Execute the runner and produce a reproducible full-mainnet report |
 | Mainnet counts/distributions and growth | Missing | No mainnet output artifact exists | Measure distinct standard scripts, lifetime events, live/peak UTXOs, hot tails, script classes, record sizes, and selected growth horizon |
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov` compile-time tests | Bind the records to the selected backend and exercise them through actual pinned ORAM operations on Linux x86_64 |
-| Fixed-probe table layout | Partial model | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, and a module-private synchronous two-table connector that derives ordinals after a complete bounded-history preflight | Integrate the exclusive command with the worker and two real typed ORAMs, add authenticated generation ownership and crash-safe commit/rebuild, select measured capacities/probe counts, and trace the native backend |
+| Fixed-probe table layout | Partial model | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, a complete bounded-history preflight, and a bounded worker with no raw storage bypass | Integrate two real typed ORAMs, add authenticated generation ownership and crash-safe commit/rebuild, select measured capacities/probe counts, and trace the native backend |
 | Full-capacity logical sizing | Partial pass | Version-2 reports bind compiled 38/82-byte cells to shared directory/event allocation validation, charge both full table and position-map domains, keep modeled bytes fixed across occupancy/growth, and expose load/admission/hot-address/modeled-memory flags plus explicit negative evidence markers | Calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and runtime working set on target hardware; select an accepted mainnet profile |
 | Compiler pin | Pass | Repository pins Rust 1.96.0 | Pin release flags, LLVM behavior, and reproducible Linux build inputs |
 | CPU/target/TDX pin | Missing | Code gates real adapter operations to Linux x86_64; only macOS aarch64 is installed locally | Select CPU generations, target triple, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
@@ -219,11 +227,11 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
 | Pinned real-ORAM adapter | Partial compile evidence | The volatile `rostl` candidate remains isolated and cross-compiles on Linux x86_64; it is not the projection store and has not run on target hardware |
-| Append-only event-page or audited upsert design | Partial portable connector | Exact immutable directory and one-event cells avoid tail-page/directory upsert; the keyed planner validates full probe sets, and a module-private synchronous connector scans every bounded ordinal, derives a contiguous next ordinal, reads owned-backend admission counts, and preflights a new directory plus event before writing. Tests use typed fakes; real adapter/worker/projection integration, authenticated contents, crash atomicity, and measured whole-history cost remain open |
+| Append-only event-page or audited upsert design | Partial portable connector | Exact immutable directory and one-event cells avoid tail-page/directory upsert; the keyed planner validates full probe sets, and a module-private synchronous connector scans every bounded ordinal, derives a contiguous next ordinal, reads owned-backend admission counts, and preflights a new directory plus event before writing. A bounded worker owns this core and exposes only whole business commands. Tests use typed fakes; real adapter/projection integration, authenticated contents, crash atomicity, and measured whole-history cost remain open |
 | Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state |
 | Staged mutation and fail-closed state | Pass for the in-memory oracle | Whole blocks apply to a cloned candidate; late unknown/double-spend, provenance, and collection-capacity failures leave the current block uncommitted; target failures never publish readiness or expose query results |
 | Checkpoint/replay/rebuild policy | Pass for the in-memory oracle | Opaque cursor candidates prevent forged/stale commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready oracle usable |
-| Single mutation worker and backend telemetry | Partial model | A feature-gated std-thread worker exclusively owns the volatile candidate, serializes reads and inserts, validates a 1..=4096 research queue bound before channel allocation, bounds accepted-not-started work with a `sync_channel`, drains FIFO admissions before shutdown/join, separates lifecycle from terminal fault health, and reports only queue/in-flight/counter/lifecycle aggregates. Deterministic fake-backend tests cover order, exact accounting, queue full, nonterminal rejection, terminal fault/panic latching, dropped reply receivers, shutdown, and drop/join; the real path only cross-compiles, exposes no upstream stash metric, and is not projection-integrated |
+| Single mutation worker and backend telemetry | Partial portable model | A portable std-thread worker exclusively owns the exact two-table executor, validates a 1..=4096 research queue bound before allocation, bounds accepted-not-started whole business commands with a `sync_channel`, drains FIFO admissions before shutdown/join, removes raw read/insert bypasses, and separates lifecycle from terminal fault health. Its identifier-free queue/lifecycle, completion/failure, admission-rejection, and reply-delivery counters are internal and not approved for export. Deterministic fake-backed tests cover order, exact accounting, queue full, nonterminal rejection, terminal executor/panic latching, unconsumed-ticket accounting, uniform append-abandonment latching, retained-ticket progress, shutdown, and drop/join; there is no real backend path, stash metric, projection integration, or fixed-cadence suppression policy |
 | Volatile rebuild path | Partial pass | Fresh rebuild and clone-ready forward replay are deterministic in fixtures; no full-corpus runtime or RTO is measured |
 | Shadow comparison with ordinary Zaino | Pass for one static fixture checkpoint | A default-off test independently obtains ordinary UTXOs from `MockchainSource::get_address_utxos` over Zebra full blocks and projection UTXOs from `IndexedBlock` transparent events; it compares every standard address observed through immutable regtest-vector height 200 plus an absent address, at the same height/hash. Live direct/RPC, finalised-database, mainnet, and reorg shadow modes remain missing |
 | Zero query-derived source calls | Pass for current type boundary | The query engine has no validator/LMDB/raw-transaction dependency; this is not yet an integrated readiness or call-trace result |
@@ -247,14 +255,14 @@ yet stakeholder-approved.
 | Continuation cursor/query digest/nonce | Must hide | Fixed authenticated encryption and no visible remaining count | Fixed 128-byte token and redacted debug exist; protector is only an interface with a test implementation | Open |
 | Hit versus miss | Must hide | Same work, outer status, bytes, frames, and completion | Equal complete offline logical traces are tested | Open: physical, transport, and outer-status equivalence missing |
 | Invalid-domain versus valid query | Must hide after authenticated decode | Full profile work and protected outcome | Mock engine completes the same modeled trace and protects the outcome | Open: decode/token/wire timing not traced |
-| Store failure versus ordinary outcome | Must hide per completed-query policy and fail readiness safely | Uniform outer behavior; detailed fault remains internal | Every mock failure ordinal completes the same modeled trace | Open: real ORAM/readiness/service behavior missing |
+| Store failure versus ordinary outcome | Must hide per completed-query policy and fail readiness safely | Uniform outer behavior; detailed fault remains internal | Every mock failure ordinal completes the same modeled trace. The internal worker reply still distinguishes success, rejection, and failed-closed state and is not service-integrated | Open: real ORAM/readiness/service behavior missing |
 | Exact result count | Must hide | Fixed response slots and encrypted dummy occupancy | Fixed result-page shape exists | Open: no encrypted wire result |
 | Last real page / `has_more` | Must hide | Fixed page and cover-round behavior | Cover-round integer exists only in a test profile | Open |
 | Client continuation count | Permitted only for weak profiles | Strong profile requires fixed cover rounds | No client or service exists | Unset budget |
 | Logical ORAM key | Must hide | No query-derived host address or fallback | Mock receives the key; this is explicitly plaintext test code | Open |
 | Physical ORAM location/path | Must hide | Secret cases must be indistinguishable under accepted trace test | Pinned adapter compiles; no Linux/x86 physical trace was captured | Open |
-| Worker queue depth, in-flight state, and aggregate counters | Permitted operational load only | Fixed public capacity and fixed-schema aggregates; never identifiers, command/result kinds, hit/miss, or per-command timing | Deterministic tests pin queue bounds, exact accepted-command accounting, redacted handles/replies, and aggregate-only snapshot fields | Open: budget and fixed-interval export policy unset; no native-load trace |
-| Address-directory lookup | Must hide | Directory and event-page lookup both protected | A module-private synchronous connector combines exact directory/page encodings, shared full-capacity sizing, and keyed fixed-probe binding to model a complete directory plus bounded-history preflight with no fake-model executor-command interleaving | Open: no worker/real directory-event ORAM integration, content authentication, crash-safe commit, or measured physical trace |
+| Worker queue depth, in-flight state, and aggregate counters | Permitted operational load only | Fixed public capacity and fixed-schema aggregates; never identifiers, command/result kinds, hit/miss, or per-command timing | The internal snapshot separates queue/lifecycle, completion/failure, admission-rejection, and reply-delivery counters. They are identifier-free but are not approved for export; no fixed-cadence aggregation or suppression policy exists | Open: budget and fixed-interval export policy unset; no native-load trace |
+| Address-directory lookup | Must hide | Directory and event-page lookup both protected | A module-private synchronous connector and its bounded business-command worker combine exact directory/page encodings, shared full-capacity sizing, and keyed fixed-probe binding to model a complete preflight with no fake-model executor-command interleaving or raw storage bypass | Open: no real directory-event ORAM integration, content authentication, crash-safe commit, or measured physical trace |
 | Query-derived allocation | Must hide | Fixed allocation/work budget | Offline recorder validates zero explicit modeled query allocations | Open: allocator/page/instruction measurement absent |
 | Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | Engine has no source dependency and validates zero modeled source calls | Open: no integrated source instrumentation or readiness proof |
 | NFS scan work | Must hide | Complete profile-fixed scan on every query | No NFS merge implementation | Open |
@@ -266,7 +274,7 @@ yet stakeholder-approved.
 | Service/schema/profile ID | Permitted | Bound into attestation and publicly versioned | Test label only; no attestation | Open |
 | Coarse network/chain epoch/height/hash/sync lag | Permitted | Public checkpoint and freshness policy | Corpus report plus offline oracle bind network, height/hash, schema, and key epoch with replay/rebuild decisions | Partial; authoritative live feed and serving policy absent |
 | Database capacity and projected growth | Permitted | Aggregate only, never identifier-bearing | Aggregate report types and redacted debug exist | Partial; no mainnet artifact |
-| Aggregate QPS/queue/health | Permitted within allowlist | No outcome/cardinality labels | No metrics implementation | Open |
+| Aggregate QPS/queue/health | Permitted within allowlist | No outcome/cardinality labels | An internal snapshot exists; no service metrics exporter or fixed-cadence aggregation/suppression policy exists | Open |
 | Logs, errors, traces, metric labels | Must exclude private values/outcomes | Allowlisted aggregate/public fields only | New sensitive types use redacted debug; no end-to-end log audit | Open |
 | CPU instructions/branches/timing | Must not distinguish secret cases above accepted threshold | Pinned release build, assembly review, classifier/trace gate | Not measured | Blocker |
 | Page faults, memory addresses, allocations | Must not distinguish secret cases above accepted threshold | Release-binary physical trace gate | Not measured | Blocker |
@@ -329,6 +337,8 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 |---|---|---|
 | `git merge-base HEAD upstream/dev` | `c94ae247de7286fd3337e313559bb3d62bdcbd5d` | Recorded upstream baseline |
 | `rustc --version --verbose` | Rust 1.96.0, LLVM 22.1.2, `aarch64-apple-darwin` | Compiler/host pin confirmed |
+| `rust-analyzer --version` | Rust Analyzer 1.96.0 (`ac68faa2`) | Installed from the pinned toolchain for semantic code intelligence |
+| `cargo nextest --version` | `cargo-nextest 0.9.140` | Repository-native test runner installed for the single workspace |
 | `rustup target list --installed` | Pinned 1.96.0: `aarch64-apple-darwin` | Exact pinned Linux target was not exercised |
 | `rustup +stable target list --installed` | Includes `x86_64-unknown-linux-gnu`; stable is Rust 1.96.1 | Enables a compile-only supported-path check, not execution evidence |
 | `cargo tree -p zaino-oram --features rostl-experimental --edges normal` | Resolved `rostl` alpha9 to pinned commit `8c3a12d2...` | Dependency pin confirmed |
@@ -336,15 +346,16 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
 | `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Trait proof and unsupported-target path compile; real ORAM path not executed |
-| `cargo test -p zaino-oram --all-targets --no-default-features` | 97 passed | Fixed models, token semantics, complete logical traces, exact record encodings, keyed layout vectors, shared allocation validation, full-probe collision/corruption/requested-owner checks, full-capacity arithmetic, and the private two-table command's fixed full-history preflight, authoritative count, gap/orphan, replay, redaction, and uncertain-write tests |
-| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 116 passed | Adds shared canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
-| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 112 passed | Adds directory/page `Pod`/`Cmov` semantics, expected unsupported-host behavior, and deterministic bounded-worker FIFO, capacity-bound, saturation, exact accounting, backend/outer panic, indeterminate active outcome, reply-send failure, telemetry, shutdown, and drop/join coverage; the new two-table command remains fake-backed and the Linux real-backend round trip was cfg-excluded |
-| `cargo test -p zaino-oram --all-targets --all-features` | 132 passed | Combined keyed layout, two-table command, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, bounded-worker model, and unsupported-host adapter suite |
-| `cargo test -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
-| `cargo test -p zaino-proto --test compact_tx_streamer_legacy_golden` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
-| `cargo test -p zainod-oram --all-targets` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
-| `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Pass with Rust 1.96.1 | Linux x86_64 adapter and real-worker path compile strictly; they were not linked or executed and this is not the exact pinned compiler |
-| `cargo test -p zaino-state transparent_events --lib --no-default-features` | 4 passed | Event ordering, coinbase skip, script handling, overflow errors, and redaction |
+| `cargo nextest run -p zaino-oram --no-default-features` | 113 passed | Fixed models, token semantics, complete logical traces, exact records, keyed layout, full-capacity arithmetic, exclusive two-table preflight, and all 16 business-command worker tests pass without optional features |
+| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 132 passed | Adds canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
+| `cargo nextest run -p zaino-oram --features rostl-experimental --status-level fail` | 116 passed | Adds directory/page `Pod`/`Cmov` semantics and the expected unsupported-host adapter path; the portable worker remains fake-backed and separate from the cfg-gated adapter |
+| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 136 passed | Combined keyed layout, two-table command, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, 16-test business-command worker suite, and unsupported-host adapter suite |
+| `cargo nextest run -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint --status-level fail` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
+| `cargo nextest run -p zaino-proto --test compact_tx_streamer_legacy_golden --status-level fail` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
+| `cargo nextest run -p zainod-oram --status-level fail` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
+| `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Pass with Rust 1.96.1 | The Linux x86_64 adapter and portable business-command worker compile strictly; the adapter was not linked or executed and this is not the exact pinned compiler |
+| `cargo nextest run -p zaino-state transparent_events --no-default-features --status-level fail` | 4 passed | Event ordering, coinbase skip, script handling, overflow errors, and redaction |
+| `cargo nextest run -p zaino-state --no-default-features --status-level fail` | 218 passed, 1 skipped | Process isolation avoids the tracing-subscriber collision seen under the legacy in-process runner; the complete no-default unit suite is green |
 | `cargo clippy -p zaino-oram --all-targets --all-features --no-deps -- -D warnings -D clippy::unwrap_used` | Pass | Focused all-feature lint is warning-free and the affected crate has no production/test `unwrap` use |
 | `cargo clippy -p zaino-state --lib --features test_dependencies --no-deps -- -D warnings` | Pass | The feature-gated cross-crate fixture seam is warning-free without widening the normal production feature set |
 | `cargo clippy -p zaino-state --lib --features test_dependencies --no-deps -- -D warnings -D clippy::unwrap_used` | Existing-tree failure | Reports four pre-existing production `unwrap` calls outside this slice (`node_backed_indexer.rs`, `finalised_state/entry.rs`, and `mempool.rs`); the changed production/test-support paths contain none |
@@ -353,19 +364,17 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo check --workspace --all-targets --no-default-features` | Pass | Every workspace member, including the new non-default runner, compiles without default features |
 | `RUSTDOCFLAGS='-D warnings' cargo doc -p zaino-oram --no-deps --all-features` | Pass | The research models, shadow seam, and private worker document cleanly |
 | `cargo fmt --all -- --check` | Pass | Rust formatting is clean |
+| Rust Analyzer semantic searches for `$a.try_read($b)` and `$a.try_insert($b, $c)` | No matches | The deleted raw worker has no remaining read/insert call sites; semantic searches find the new business methods only in their module-local tests |
 | `git diff --check -- docs/notes/oram-phase0-1-feasibility-report.md` | Pass | Report has no whitespace errors |
-| `makers lint-boundary-conversions` | Canonical task unavailable because `makers` is not installed; its four forbidden-pattern classes were scanned directly with `rg` and returned no hits | Re-run the canonical task in CI/tooling-enabled environment |
+| `makers lint-boundary-conversions` | Canonical task unavailable because `makers` is not installed; Rust Analyzer shows no `From`/`TryFrom` implementation in the new worker, and this slice adds no boundary conversion | Re-run the canonical task in CI/tooling-enabled environment |
 
 Two broader `zaino-state` gates remain baseline-blocked outside this slice.
-`cargo test -p zaino-state --lib --no-default-features` reports 134 passes,
-84 failures, and one ignored test because repeated test initializers unwrap a
-second process-global tracing subscriber installation; running serially does
-not change that process-global conflict. The directly affected existing vector
-loader test, existing ordinary `get_address_utxos` test, and new shadow fixture
-test each pass in isolated processes. Warning-denied `zaino-state` rustdoc also
-stops on two private `OPERATIONAL_NFS_DEPTH` links and one stale
-`BlockCacheConfig` link outside the changed paths; warning-denied `zaino-oram`
-rustdoc passes with `shadow-parity` enabled.
+Warning-denied Clippy with `clippy::unwrap_used` reports four existing
+production unwraps in `node_backed_indexer.rs`, `finalised_state/entry.rs`, and
+`mempool.rs`. Warning-denied `zaino-state` rustdoc stops on two private
+`OPERATIONAL_NFS_DEPTH` links and one stale `BlockCacheConfig` link. The
+complete no-default `zaino-state` suite now passes under `cargo nextest`, and
+warning-denied `zaino-oram` rustdoc passes with all features.
 
 These are compile/unit-model results. They are not benchmark, mainnet, TDX,
 network, recovery, or side-channel results.
@@ -422,12 +431,14 @@ No target hardware benchmark has been run. Required evidence still includes:
 7. long-run failure evidence and a documented probability bound rather than an
    assumption.
 
-The current `RostlCandidateStore` and its worker are intentionally unsuitable
-for such a claim. They are volatile, do not implement the engine's
-`ObliviousStore`, expose no upstream stash metric, and have not run on the
-intended target. The worker catches a complete candidate call and latches a
-generic failed-closed state, but Rust's process-wide panic hook still runs and
-this is not recovery. Upstream open work includes Circuit ORAM stash recovery
+The current `RostlCandidateStore` and the separate portable command worker are
+intentionally unsuitable for such a claim. The adapter is volatile, does not
+implement the engine's `ObliviousStore`, exposes no upstream stash metric, and
+has not run on the intended target. The worker owns only a deterministic
+fake-backed two-table executor; it has no `rostl` path. Both the synchronous
+executor and outer worker boundary catch panics and latch a generic
+failed-closed state, but Rust's process-wide panic hook still runs and this is
+not recovery. Upstream open work includes Circuit ORAM stash recovery
 ([#13](https://github.com/obliviouslabs/rostl/issues/13)) and map queue recovery
 ([#32](https://github.com/obliviouslabs/rostl/issues/32)).
 

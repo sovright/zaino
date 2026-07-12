@@ -1,16 +1,17 @@
 //! Exclusive, in-memory two-table execution for one fixed layout generation.
 //!
-//! This module deliberately models only a synchronous owner and a backend
-//! contract. It is not wired to `rostl`, the worker, projection, or query
-//! engine, and it makes no persistence or physical-obliviousness claim.
+//! This module models a synchronous owner and a nested bounded worker that
+//! consumes that complete owner. It is not wired to `rostl`, projection, or
+//! the query engine, and it makes no persistence or physical-obliviousness
+//! claim.
 //! "Exclusive" means one executor command completes its scan and preflight
 //! without another executor command interleaving. A new-address append still
 //! performs two sequential writes; it is not an all-or-nothing transaction,
 //! and a second-write failure leaves an unusable partial candidate.
 //!
 //! Catching a backend panic does not suppress the process-wide panic hook.
-//! Real integration therefore remains blocked on a panic-free or otherwise
-//! controlled backend boundary.
+//! Real backend integration therefore remains blocked on a panic-free or
+//! otherwise controlled backend boundary.
 
 use std::{
     fmt,
@@ -18,6 +19,8 @@ use std::{
 };
 
 use super::*;
+
+mod worker;
 
 /// A sparse fixed-capacity table whose insert never overwrites an existing key.
 ///

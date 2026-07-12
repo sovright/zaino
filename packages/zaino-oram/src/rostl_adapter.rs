@@ -259,6 +259,9 @@ mod tests {
     #[test]
     fn linux_x86_64_candidate_round_trips_and_rejects_duplicates() -> Result<(), RostlAdapterError>
     {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<RostlCandidateStore>();
         let mut store = RostlCandidateStore::new(8)?;
         let event = fixed_event();
 

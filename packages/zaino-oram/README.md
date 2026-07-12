@@ -14,6 +14,9 @@ offline dependency experiment:
   event fake-backend handles, validates their public capacity shape before
   use, and models one full-history append preflight without executor-command
   interleaving;
+- a bounded single-owner worker that moves that exact command core onto one
+  thread and admits only whole `read_history` and `append` business commands,
+  with no raw probe, key, record, read, or insert surface;
 - compiled privacy-profile validation;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
@@ -25,12 +28,9 @@ offline dependency experiment:
 - a fixed continuation-token codec with injected protection/replay interfaces;
 - `rostl-experimental`, pinned to `8c3a12d2`, which compile-checks the fixed
   event as `Pod`/`Cmov` and exposes an offline volatile adapter only on Linux
-  x86_64. A bounded single-owner worker serializes both reads and inserts,
-  rejects queue saturation without fallback, drains accepted work before
-  joining, rejects queue capacities outside the research bound of 1..=4096,
-  and reports identifier-free aggregate lifecycle counters. Other targets fail
-  real-worker construction explicitly while still testing the worker mechanics
-  against a deterministic fake backend.
+  x86_64. The adapter remains separate from the two-table command worker because
+  it has one incompatible 72-byte record type and destructive duplicate-insert
+  behavior.
 
 It does **not** contain production encryption, durable ORAM persistence, TDX
 attestation, protobufs, or a network listener, and it makes no production
@@ -39,15 +39,27 @@ mainnet blocks into the core, but no full-mainnet measurement artifact exists
 yet. Static fixture parity is not live-backend, finalised-database, reorg, or
 mainnet shadow evidence. Upstream `rostl` panic/recovery, persistence,
 side-channel, and licensing gates remain unresolved.
-The worker is not connected to the projection or query engine, and its queue
-metrics expose aggregate load. Panics caught by either the worker or synchronous
-connector still invoke Rust's process-wide panic hook, so future real backend
-panic payloads must be identifier-free and a panic-free or controlled boundary
-remains a production requirement. Candidate records are not zeroized, and
-accepted volatile mutations have no durable acknowledgement or retry guarantee.
-An unexpected worker-loop panic can make the active accepted command's outcome
-indeterminate. Automatic retry is forbidden: discard the volatile candidate and
-reconcile or rebuild it from an authoritative checkpoint first.
+The worker owns the fake-backed command core but is not connected to the
+projection, query engine, checkpoint publication, or real ORAM adapter. Its
+internal snapshot exposes queue/lifecycle plus aggregate completion, rejection,
+and reply-delivery counters; no safe export policy is claimed. Queue saturation
+rejects without fallback, shutdown drains accepted FIFO commands, and cloned
+handles cannot access raw storage operations. Abandoning a read ticket does not
+cancel accepted work and is nonterminal. Abandoning any append ticket latches
+the same terminal fault, independent of whether the command has entered or how
+the executor resolves it. The fault carries no outcome class, and the worker
+returns fixed history rather than an insert/replay disposition. Internal reply
+variants are not yet mapped to a uniform protected service outcome. A command
+already in flight when a late abandonment latches may finish its backend call,
+but its reply fails closed; commands that have not entered the executor do no
+further backend I/O. Retaining a reply ticket does not block worker progress or
+shutdown. Panics caught by either the worker or synchronous connector still
+invoke Rust's process-wide panic hook, so future real backend panic payloads
+must be identifier-free and a panic-free or controlled boundary remains a
+production requirement. Candidate records are not zeroized, and accepted
+volatile mutations have no durable acknowledgement or crash-retry guarantee.
+An unexpected worker-loop panic makes the active accepted command's outcome
+indeterminate and drops the uniquely owned executor.
 The one-event page is the deliberately inefficient append-only compatibility
 baseline: filling a multi-event tail page would require an upsert, while the
 current candidate overwrites before reporting a duplicate. Immutability and
@@ -76,8 +88,8 @@ uncertain mutation terminal-latches the connector as unusable, pending owner
 discard and rebuild. Its unaliased fake handles model no executor-command
 interleaving; they do not prove non-aliasing for a future real backend. This is
 not crash atomicity, persistence, rollback, or a physical obliviousness claim.
-The connector is not wired to the existing worker, projection, query engine,
-or `rostl` adapter.
+The connector is wired only to the module-private business-command worker, not
+to the projection, query engine, checkpoint publisher, or `rostl` adapter.
 
 Cross-table script ownership is checked for the requested event, but an
 unrelated event collision cannot be associated with its directory without more
@@ -88,11 +100,12 @@ seed and keyed-hash state are not zeroized or memory-locked, and no seed
 generation, persistence, or rotation lifecycle exists. Source-level fixed
 scanning is not proof of equal instructions, branches, allocations, memory/page
 accesses, or timing. The pure planner still accepts caller-supplied vacancy and
-occupancy model inputs; the module-private connector closes only
-executor-command TOCTOU in its unaliased fake model. The current `rostl` worker
-still exposes separate raw read and insert commands and is not a safe
-integration surface, so integrating the two requires replacing that raw
-command surface in a later slice.
+occupancy model inputs; the module-private connector and worker close only
+executor-command TOCTOU in their unaliased fake model. The old raw worker surface
+has been removed. Real integration still requires two non-aliased typed ORAMs
+whose unique insert cannot mutate before rejecting a duplicate. Reply
+abandonment relies on the module-private trusted owner dropping tickets normally;
+deliberately leaking a ticket with `mem::forget` is outside this offline model.
 
 The canonical dummy encoding is versioned `[1, 0, ...]`; all-zero `Default` or
 `Zeroable` storage is invalid and may only be an ignored scratch buffer after a
@@ -102,8 +115,9 @@ dummies would turn later real inserts into destructive duplicates. The differing
 record sizes are safe only in distinct typed stores; a future unified padded
 value needs an authenticated kind tag.
 Slots, ordinals, occupancy, and nested event fields remain sensitive and must
-not enter logs, errors, or metrics. No real composite two-ORAM store, worker
-connector, or seed persistence/rotation protocol is implemented. The
+not enter logs, errors, or metrics. No real composite two-ORAM store,
+projection/checkpoint connector, or seed persistence/rotation protocol is
+implemented. The
 logical sizing model charges every allocated 38-byte directory cell, every
 allocated 82-byte event cell, and position-map entries for both full capacity
 domains; occupancy changes admission/load flags but never reduces modeled

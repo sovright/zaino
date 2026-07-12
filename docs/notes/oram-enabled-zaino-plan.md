@@ -13,14 +13,16 @@ scope establishes the ADR, fixed business/persistence/envelope and continuation
 shapes, exact profile coupling, a bounded plaintext test store, logical
 store-call schedule tests, aggregate corpus/full-capacity two-table sizing
 models, a shared transparent event seam, and a pinned volatile `rostl`
-experiment. A later stacked slice adds a module-private synchronous command
-core over two typed table interfaces: it validates the public capacity shape, performs a
-complete directory plus bounded-history preflight, derives the append ordinal
-from owned-backend observations, and terminal-latches a possibly partial
-mutation for discard. Its deterministic fake model prevents executor-command
-interleaving but does not prove real-backend handle non-aliasing. It is not
-connected to the worker, projection, or real adapter, and it does not claim
-crash atomicity. The fork contains no production
+experiment. Later stacked slices add a module-private synchronous command core
+over two typed table interfaces and a bounded worker that owns that exact core.
+The core validates the public capacity shape, performs a complete directory
+plus bounded-history preflight, derives the append ordinal from owned-backend
+observations, and terminal-latches a possibly partial mutation for discard. The
+worker admits only whole history-read/append commands; the former raw-key and
+raw-record worker surface is removed. Their deterministic fake model prevents
+executor-command interleaving but does not prove real-backend handle
+non-aliasing. They are not connected to the projection or real adapter and do
+not claim crash atomicity. The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
 mainnet/RSS, recovery, side-channel, hardware, and licensing gates are open.
@@ -387,6 +389,9 @@ Deliverables:
   interfaces, derives append ordinals after fixed bounded-history scans, and
   terminal-latches the whole candidate for owner discard after an uncertain or
   partial mutation;
+- one bounded worker that owns that command core, exposes no raw storage
+  operations, drains accepted FIFO work, and fails commands that have not yet
+  entered the executor without executor I/O after a terminal fault;
 - deterministic projection from `IndexedBlock` fixtures and finalised snapshots;
 - single-worker mutation queue, capacity/stash/queue telemetry, and fail-closed transitions;
 - research-only volatile rebuild path if durable external memory is not yet available;

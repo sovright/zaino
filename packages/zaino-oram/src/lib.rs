@@ -30,8 +30,6 @@ mod projection;
 mod records;
 #[cfg(feature = "rostl-experimental")]
 mod rostl_adapter;
-#[cfg(feature = "rostl-experimental")]
-mod rostl_worker;
 mod sizing;
 mod store;
 mod trace;
