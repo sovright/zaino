@@ -32,12 +32,17 @@ The evaluated worktree implements:
   default members;
 - fixed transparent UTXO shapes and named persistence-boundary conversions;
 - an exact 72-byte append-only `PersistentUtxoEvent` byte representation with
-  adjacent validation and round-trip tests;
+  named finalized create/spend constructors, storage-boundary state validation,
+  and adjacent round-trip/rejection tests;
 - compile-time `bytemuck::Pod` and `rostl_primitives::traits::Cmov` checks when
   `rostl-experimental` is enabled;
 - fixed Rust envelope and result-page shapes plus a test-only compiled profile;
-- a bounded plaintext mock and equal logical store-read schedules across
-  selected hit, miss, filtered, full, cap-hit, early/late, invalid-domain, and
+- an allocation-free logical trace recorder bound to the only supported
+  read-only unary profile shape: configured sequential reads, zero modeled
+  writes/allocations/source calls, one request/response application envelope,
+  fixed application bytes, and one public completion shape;
+- a bounded plaintext mock and equal complete modeled traces across selected
+  hit, miss, filtered, full, cap-hit, early/late, invalid-domain, and
   injected-store-failure cases;
 - a fixed 128-byte continuation-token format with injected protection and
   replay-guard interfaces, plus tamper, expiry, binding, reserved-byte, replay,
@@ -45,6 +50,8 @@ The evaluated worktree implements:
 - a redacted transparent-event extraction seam from `IndexedBlock`;
 - shared feature-gated address-history write/delete consumers of that seam,
   including legacy nonstandard-key preservation;
+- a legacy `CompactTxStreamer` schema golden pinned to the upstream baseline's
+  service name, ordered RPC signatures, and normalized proto fingerprint;
 - an aggregate-only corpus accumulator and sizing model;
 - a Zaino corpus adapter that validates a nonempty genesis-forward chain,
   contiguous heights, parent hashes, and the network-bound canonical genesis before
@@ -63,8 +70,9 @@ The following statements are **not** established by that evidence:
 - no production privacy profile or accepted profile constants exist;
 - no mainnet corpus report, TDX RSS result, latency result, stash result, queue
   result, assembly result, or physical trace result exists;
-- the logical schedule tests do not prove equal instructions, branches,
-  allocations, memory/page accesses, timing, or packets;
+- the logical trace tests do not measure or prove equal instructions, branches,
+  allocator activity, memory/page accesses, timing, transport frames, or
+  packets;
 - the continuation protector used by tests is not a selected production AEAD;
 - no private protobuf, gRPC adapter, NFS merge, attestation provider, TLS
   identity, readiness path, or private-service lifecycle exists;
@@ -106,18 +114,18 @@ open the server gate.
 
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
-| Business and persistent records | Partial pass | Fixed UTXO and 72-byte event types exist with named conversions and adjacent tests; permitted event kind/mined/spent combinations are not yet enforced, and projection/page/directory/checkpoint types remain incomplete |
+| Business and persistent records | Partial pass | Fixed UTXO and 72-byte event types exist with named conversions and adjacent tests; finalized create/spend state combinations are enforced at construction and persistent decode, while projection/page/directory/checkpoint types remain incomplete |
 | Fixed envelope codec | Partial | Exact Rust byte-array length is tested; there is no encrypted inner codec or protobuf framing |
-| Compiled profile table | Partial | Test profile validates reads, response slots, envelope bytes, and cover rounds; padded inputs, writes, NFS work, timeout, concurrency, and a production profile ID are absent |
+| Compiled profile table | Partial pass | Test profile binds reads, zero logical writes/allocations/source calls, one request/response application frame, fixed bytes, unary completion, response slots, envelope bytes, and cover rounds; padded inner inputs, NFS work, timeout, concurrency, and a production profile ID are absent |
 | Continuation tokens | Partial | Fixed format and semantic rejection tests exist; nonce generation is still caller-supplied, and no reviewed AEAD, key lifecycle, service integration, or fixed-work timing/trace result exists |
 | Deterministic mock store | Pass for logical modeling | Bounded plaintext mock rejects duplicate/out-of-range/capacity errors |
-| Logical store trace | Partial pass | Store-read ordinals/counts match across selected cases; allocations, writes, source calls, NFS work, frames, and bytes are not recorded |
+| Logical store trace | Pass for the offline model | Allocation-free recorder validates sequential reads, zero modeled writes/allocations/source calls, modeled application frames/bytes, and completion across selected secret/error cases; NFS and physical/runtime dimensions remain outside this evidence |
 | Failure completion schedule | Partial pass | Every injected mock read failure still completes all configured logical reads; physical failure behavior is not equivalent or measured |
 | Independent private proto | Missing | No `zainod-oram/proto` or `zaino.private.v1` generation exists |
 | Private service adapter | Missing | No service or outer-status equivalence test exists |
-| Frame/byte/completion equivalence | Missing | Fixed arrays are not network evidence |
-| NFS/source-call equivalence | Missing | No NFS scan implementation or validator/LMDB/raw-transaction source counters exist |
-| Legacy golden/parity tests | Partial | Existing `CompactTxStreamer` has not changed; ordinary address-history write/delete paths now consume the shared seam and retain a nonstandard-key regression test, but no committed `CompactTxStreamer` wire golden proves parity |
+| Frame/byte/completion equivalence | Partial model | Every offline round models one fixed request and response application envelope, equal bytes, and unary completion; this is explicitly not protobuf, HTTP/2, TLS, packet-capture, or outer-status evidence |
+| NFS/source-call equivalence | Partial model | The engine has no source dependency and validates zero query-derived source calls; no NFS scan or integrated validator/LMDB/raw-transaction instrumentation exists |
+| Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior, but complete result-state parity still awaits the offline projection oracle |
 | Token fixed-work equivalence | Missing | Rejection semantics are tested, but instruction/allocation/timing and full query-shape equivalence are not |
 | Test runtime discipline | Pass in this slice | New tests are synchronous `#[test]` cases |
 
@@ -135,20 +143,20 @@ yet stakeholder-approved.
 | Queried address/script | Must hide | Never appears outside the protected workload or in host-keyed storage access | Sensitive Rust `Debug` output is redacted; no private transport or TDX exists | Open |
 | Queried txid/outpoint | Must hide | No logs, errors, source calls, tokens, or physical locations expose it | Event/corpus debug output is redacted; query service is absent | Open |
 | Continuation cursor/query digest/nonce | Must hide | Fixed authenticated encryption and no visible remaining count | Fixed 128-byte token and redacted debug exist; protector is only an interface with a test implementation | Open |
-| Hit versus miss | Must hide | Same work, outer status, bytes, frames, and completion | Equal mock logical reads are tested | Open: physical and network equivalence missing |
-| Invalid-domain versus valid query | Must hide after authenticated decode | Full profile work and protected outcome | Mock engine completes all reads | Open: decode/token/wire timing not traced |
-| Store failure versus ordinary outcome | Must hide per completed-query policy and fail readiness safely | Uniform outer behavior; detailed fault remains internal | Mock read failures complete the logical read budget | Open: real ORAM/service behavior missing |
+| Hit versus miss | Must hide | Same work, outer status, bytes, frames, and completion | Equal complete offline logical traces are tested | Open: physical, transport, and outer-status equivalence missing |
+| Invalid-domain versus valid query | Must hide after authenticated decode | Full profile work and protected outcome | Mock engine completes the same modeled trace and protects the outcome | Open: decode/token/wire timing not traced |
+| Store failure versus ordinary outcome | Must hide per completed-query policy and fail readiness safely | Uniform outer behavior; detailed fault remains internal | Every mock failure ordinal completes the same modeled trace | Open: real ORAM/readiness/service behavior missing |
 | Exact result count | Must hide | Fixed response slots and encrypted dummy occupancy | Fixed result-page shape exists | Open: no encrypted wire result |
 | Last real page / `has_more` | Must hide | Fixed page and cover-round behavior | Cover-round integer exists only in a test profile | Open |
 | Client continuation count | Permitted only for weak profiles | Strong profile requires fixed cover rounds | No client or service exists | Unset budget |
 | Logical ORAM key | Must hide | No query-derived host address or fallback | Mock receives the key; this is explicitly plaintext test code | Open |
 | Physical ORAM location/path | Must hide | Secret cases must be indistinguishable under accepted trace test | Pinned adapter compiles; no Linux/x86 physical trace was captured | Open |
 | Address-directory lookup | Must hide | Directory and event-page lookup both protected | Sizing model counts both logical position-map domains | Open: no implemented directory ORAM |
-| Query-derived allocation | Must hide | Fixed allocation/work budget | Not recorded by the current trace | Open |
-| Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | No integrated source path or source-call counter | Open |
+| Query-derived allocation | Must hide | Fixed allocation/work budget | Offline recorder validates zero explicit modeled query allocations | Open: allocator/page/instruction measurement absent |
+| Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | Engine has no source dependency and validates zero modeled source calls | Open: no integrated source instrumentation or readiness proof |
 | NFS scan work | Must hide | Complete profile-fixed scan on every query | No NFS merge implementation | Open |
-| Request/response application bytes | Fixed public class | Exactly the attested profile size | Fixed Rust envelope length exists | Open: no protobuf/TLS/packet capture |
-| Frame count and completion shape | Fixed public class | Same across protected outcomes | No network service | Open |
+| Request/response application bytes | Fixed public class | Exactly the attested profile size | Offline profile/trace bind equal fixed application-envelope bytes | Open: no inner codec, protobuf/TLS, or packet capture |
+| Frame count and completion shape | Fixed public class | Same across protected outcomes | Offline trace models one request, one response, and unary completion | Open: no network or outer-status evidence |
 | Method class | Permitted only if contract exposes separate methods | Preferred single `QueryPage` hides it | No proto exists | Decision retained, unimplemented |
 | Request arrival and connection duration | Permitted | Declared traffic-analysis leakage | No service exists | Not applicable yet |
 | Client IP/network metadata | Permitted | Outside initial claim | No service exists | Not applicable yet |
@@ -224,16 +232,19 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo check -p zaino-oram --all-targets --no-default-features` | Pass | Portable research model compiles |
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Trait proof and unsupported-target path compile; real ORAM path not executed |
-| `cargo test -p zaino-oram --all-targets --no-default-features` | 46 passed | Fixed models, token semantics, logical schedules, records, sizing, and aggregate core |
-| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 53 passed | Adds canonical/nonempty Zaino fixture, network/genesis binding, incremental scanning, poisoning, and provenance coverage |
-| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 48 passed | Adds `Pod`/`Cmov` proof and expected `UnsupportedPlatform`; Linux round-trip test was cfg-excluded |
-| `cargo test -p zaino-oram --all-targets --all-features` | 55 passed | Combined model, token, corpus/provenance, and unsupported-host adapter suite |
+| `cargo test -p zaino-oram --all-targets --no-default-features` | 53 passed | Fixed models, token semantics, complete logical traces, event-state validation, records, sizing, and aggregate core |
+| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 60 passed | Adds canonical/nonempty Zaino fixture, network/genesis binding, incremental scanning, poisoning, and provenance coverage |
+| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 55 passed | Adds `Pod`/`Cmov` proof and expected `UnsupportedPlatform`; Linux round-trip test was cfg-excluded |
+| `cargo test -p zaino-oram --all-targets --all-features` | 62 passed | Combined trace, record, token, corpus/provenance, and unsupported-host adapter suite |
+| `cargo test -p zaino-proto --test compact_tx_streamer_legacy_golden` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
 | `cargo test -p zainod-oram --all-targets` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
 | `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu -- -D warnings` | Pass with Rust 1.96.1 | Linux x86_64 adapter code compiles strictly; it was not linked or executed and is not the exact pinned compiler |
 | `cargo test -p zaino-state transparent_events --lib --no-default-features` | 4 passed | Event ordering, coinbase skip, script handling, overflow errors, and redaction |
 | `cargo clippy -p zaino-oram --all-targets --all-features -- -D warnings` | Pass | Focused all-feature lint is clean on the local host |
+| `cargo clippy -p zaino-proto --test compact_tx_streamer_legacy_golden -- -D warnings` | Pass | Legacy schema golden is warning-free |
 | `cargo clippy -p zainod-oram --all-targets -- -D warnings` | Pass | Listener-free runner lint is clean |
 | `cargo check --workspace --all-targets --no-default-features` | Pass | Every workspace member, including the new non-default runner, compiles without default features |
+| `RUSTDOCFLAGS='-D warnings' cargo doc -p zaino-oram --no-deps --all-features` | Pass | New private trace and record APIs document cleanly |
 | `cargo fmt --all -- --check` | Pass | Rust formatting is clean |
 | `git diff --check -- docs/notes/oram-phase0-1-feasibility-report.md` | Pass | Report has no whitespace errors |
 | `makers lint-boundary-conversions` | Canonical task unavailable because `makers` is not installed; its four forbidden-pattern classes were scanned directly with `rg` and returned no hits | Re-run the canonical task in CI/tooling-enabled environment |
@@ -345,13 +356,13 @@ exposing a private server:
    there without calling that a privacy qualification;
 4. select target CPU/TDX instances and measure random full-map performance,
    stash/queue behavior, RSS, swapping, and rebuild time;
-5. implement an access-trace harness for source calls, allocations, physical
-   storage, instructions/memory/pages, and eventual frames/bytes;
+5. extend the logical trace into release-binary source, allocator, physical
+   storage, instruction/memory/page, and real transport-frame instrumentation;
 6. design or obtain typed upstream failure/recovery behavior and an
    authenticated persistence/checkpoint protocol;
 7. resolve git-dependency and TDX/verifier licensing with an exact SBOM;
-8. complete the Phase 1 inner codec/profile/token model and legacy golden
-   parity without opening a network listener;
+8. complete the Phase 1 inner codec and fixed-work token/runtime parity without
+   opening a network listener; retain the new legacy schema golden;
 9. obtain independent security review of the evidence and then revisit this
    decision.
 

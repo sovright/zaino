@@ -224,20 +224,17 @@ impl std::error::Error for RostlAdapterError {
 mod tests {
     use super::*;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    use crate::records::{UtxoEvent, UtxoEventKind, UtxoScriptClass, TXID_BYTES};
+    use crate::records::{UtxoEvent, UtxoScriptClass, TXID_BYTES};
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn fixed_event() -> PersistentUtxoEvent {
-        PersistentUtxoEvent::from_business(&UtxoEvent::new(
-            UtxoEventKind::Created,
+        PersistentUtxoEvent::from_business(&UtxoEvent::created(
             [0x51; TXID_BYTES],
             2,
             30_000,
             100,
             UtxoScriptClass::PayToScriptHash,
             [0x61; 20],
-            true,
-            false,
         ))
     }
 

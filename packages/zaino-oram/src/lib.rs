@@ -26,6 +26,7 @@ mod records;
 mod rostl_adapter;
 mod sizing;
 mod store;
+mod trace;
 #[cfg(feature = "corpus-zaino")]
 mod zaino_corpus;
 

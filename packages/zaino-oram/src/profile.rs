@@ -1,6 +1,6 @@
 use std::{fmt, marker::PhantomData};
 
-use crate::envelope::FixedEnvelope;
+use crate::{envelope::FixedEnvelope, trace::QueryAccessBudget};
 
 /// A compiled privacy budget for one fixed query class.
 ///
@@ -10,9 +10,8 @@ use crate::envelope::FixedEnvelope;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PrivacyProfile {
     label: &'static str,
-    store_reads: usize,
+    access_budget: QueryAccessBudget,
     response_slots: usize,
-    envelope_bytes: usize,
     cover_rounds: usize,
 }
 
@@ -42,9 +41,11 @@ impl PrivacyProfile {
         }
         Ok(Self {
             label,
-            store_reads,
+            access_budget: QueryAccessBudget::read_only_unary_fixed_envelope(
+                store_reads,
+                envelope_bytes,
+            ),
             response_slots,
-            envelope_bytes,
             cover_rounds,
         })
     }
@@ -56,7 +57,12 @@ impl PrivacyProfile {
 
     /// Returns the logical store calls performed by every query.
     pub(super) const fn store_reads(&self) -> usize {
-        self.store_reads
+        self.access_budget.store_reads()
+    }
+
+    /// Returns the complete modeled logical-access budget.
+    pub(super) const fn access_budget(&self) -> QueryAccessBudget {
+        self.access_budget
     }
 
     /// Returns the exact number of fixed response slots.
@@ -66,7 +72,7 @@ impl PrivacyProfile {
 
     /// Returns the exact protected-envelope byte length.
     const fn envelope_bytes(&self) -> usize {
-        self.envelope_bytes
+        self.access_budget.request_bytes()
     }
 
     /// Returns the required query/cover round count.
@@ -85,9 +91,9 @@ impl PrivacyProfile {
     }
 
     const fn validate_envelope_bytes<const N: usize>(&self) -> Result<(), PrivacyProfileError> {
-        if self.envelope_bytes != N {
+        if self.envelope_bytes() != N {
             return Err(PrivacyProfileError::EnvelopeShapeMismatch {
-                required: self.envelope_bytes,
+                required: self.envelope_bytes(),
                 available: N,
             });
         }
@@ -202,12 +208,12 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::CompletionShape;
 
     const PROFILE: PrivacyProfile = PrivacyProfile {
         label: "test-v1",
-        store_reads: 4,
+        access_budget: QueryAccessBudget::read_only_unary_fixed_envelope(4, 128),
         response_slots: 2,
-        envelope_bytes: 128,
         cover_rounds: 3,
     };
 
@@ -215,6 +221,17 @@ mod tests {
     fn profile_exposes_complete_compiled_budget() {
         assert_eq!(PROFILE.label(), "test-v1");
         assert_eq!(PROFILE.store_reads(), 4);
+        assert_eq!(PROFILE.access_budget().store_writes(), 0);
+        assert_eq!(PROFILE.access_budget().allocations(), 0);
+        assert_eq!(PROFILE.access_budget().source_calls(), 0);
+        assert_eq!(PROFILE.access_budget().request_frames(), 1);
+        assert_eq!(PROFILE.access_budget().response_frames(), 1);
+        assert_eq!(PROFILE.access_budget().request_bytes(), 128);
+        assert_eq!(PROFILE.access_budget().response_bytes(), 128);
+        assert_eq!(
+            PROFILE.access_budget().completion(),
+            CompletionShape::UnaryFixedEnvelope
+        );
         assert_eq!(PROFILE.response_slots(), 2);
         assert_eq!(PROFILE.envelope_bytes(), 128);
         assert_eq!(PROFILE.cover_rounds(), 3);

@@ -221,11 +221,47 @@ pub(super) struct UtxoEvent {
 }
 
 impl UtxoEvent {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the constructor names every fixed field in the candidate record"
-    )]
-    pub(super) const fn new(
+    /// Builds a finalized output-creation event.
+    pub(super) const fn created(
+        txid: [u8; TXID_BYTES],
+        output_index: u32,
+        value_zat: u64,
+        height: u32,
+        script_class: UtxoScriptClass,
+        script_hash: [u8; 20],
+    ) -> Self {
+        Self::with_kind(
+            UtxoEventKind::Created,
+            txid,
+            output_index,
+            value_zat,
+            height,
+            script_class,
+            script_hash,
+        )
+    }
+
+    /// Builds a finalized output-spend event.
+    pub(super) const fn spent(
+        txid: [u8; TXID_BYTES],
+        output_index: u32,
+        value_zat: u64,
+        height: u32,
+        script_class: UtxoScriptClass,
+        script_hash: [u8; 20],
+    ) -> Self {
+        Self::with_kind(
+            UtxoEventKind::Spent,
+            txid,
+            output_index,
+            value_zat,
+            height,
+            script_class,
+            script_hash,
+        )
+    }
+
+    const fn with_kind(
         kind: UtxoEventKind,
         txid: [u8; TXID_BYTES],
         output_index: u32,
@@ -233,8 +269,6 @@ impl UtxoEvent {
         height: u32,
         script_class: UtxoScriptClass,
         script_hash: [u8; 20],
-        mined: bool,
-        spent: bool,
     ) -> Self {
         Self {
             kind,
@@ -244,9 +278,37 @@ impl UtxoEvent {
             height,
             script_class,
             script_hash,
-            mined,
-            spent,
+            mined: true,
+            spent: matches!(kind, UtxoEventKind::Spent),
         }
+    }
+
+    const fn kind(&self) -> UtxoEventKind {
+        self.kind
+    }
+
+    const fn txid(&self) -> &[u8; TXID_BYTES] {
+        &self.txid
+    }
+
+    const fn output_index(&self) -> u32 {
+        self.output_index
+    }
+
+    const fn value_zat(&self) -> u64 {
+        self.value_zat
+    }
+
+    const fn height(&self) -> u32 {
+        self.height
+    }
+
+    const fn script_class(&self) -> UtxoScriptClass {
+        self.script_class
+    }
+
+    const fn script_hash(&self) -> &[u8; 20] {
+        &self.script_hash
     }
 }
 
@@ -296,34 +358,57 @@ impl PersistentUtxoEvent {
         if flags & !UTXO_EVENT_KNOWN_FLAGS != 0 {
             return Err(PersistentUtxoEventError::InvalidFlags { actual: flags });
         }
+        let kind = UtxoEventKind::try_from_byte(self.0[1])?;
+        let mined = flags & UTXO_EVENT_FLAG_MINED != 0;
+        let spent = flags & UTXO_EVENT_FLAG_SPENT != 0;
+        match (kind, mined, spent) {
+            (UtxoEventKind::Created, true, false) | (UtxoEventKind::Spent, true, true) => {}
+            (UtxoEventKind::Created, mined, spent) => {
+                return Err(PersistentUtxoEventError::InvalidCreatedState { mined, spent });
+            }
+            (UtxoEventKind::Spent, mined, spent) => {
+                return Err(PersistentUtxoEventError::InvalidSpentState { mined, spent });
+            }
+        }
 
         let mut txid = [0; TXID_BYTES];
         txid.copy_from_slice(&self.0[4..36]);
         let mut script_hash = [0; 20];
         script_hash.copy_from_slice(&self.0[52..72]);
-        Ok(UtxoEvent::new(
-            UtxoEventKind::try_from_byte(self.0[1])?,
-            txid,
-            u32::from_le_bytes(
-                self.0[36..40]
-                    .try_into()
-                    .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
+        let output_index = u32::from_le_bytes(
+            self.0[36..40]
+                .try_into()
+                .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
+        );
+        let value_zat = u64::from_le_bytes(
+            self.0[40..48]
+                .try_into()
+                .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
+        );
+        let height = u32::from_le_bytes(
+            self.0[48..52]
+                .try_into()
+                .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
+        );
+        let script_class = UtxoScriptClass::try_from_byte(self.0[2])?;
+        Ok(match kind {
+            UtxoEventKind::Created => UtxoEvent::created(
+                txid,
+                output_index,
+                value_zat,
+                height,
+                script_class,
+                script_hash,
             ),
-            u64::from_le_bytes(
-                self.0[40..48]
-                    .try_into()
-                    .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
+            UtxoEventKind::Spent => UtxoEvent::spent(
+                txid,
+                output_index,
+                value_zat,
+                height,
+                script_class,
+                script_hash,
             ),
-            u32::from_le_bytes(
-                self.0[48..52]
-                    .try_into()
-                    .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
-            ),
-            UtxoScriptClass::try_from_byte(self.0[2])?,
-            script_hash,
-            flags & UTXO_EVENT_FLAG_MINED != 0,
-            flags & UTXO_EVENT_FLAG_SPENT != 0,
-        ))
+        })
     }
 
     #[cfg(all(
@@ -370,6 +455,8 @@ pub(super) enum PersistentUtxoEventError {
     InvalidEventKind { actual: u8 },
     InvalidScriptClass { actual: u8 },
     InvalidFlags { actual: u8 },
+    InvalidCreatedState { mined: bool, spent: bool },
+    InvalidSpentState { mined: bool, spent: bool },
     InvalidFixedLayout,
 }
 
@@ -388,6 +475,14 @@ impl fmt::Display for PersistentUtxoEventError {
             Self::InvalidFlags { actual } => {
                 write!(f, "invalid persistent UTXO event flags {actual}")
             }
+            Self::InvalidCreatedState { mined, spent } => write!(
+                f,
+                "persistent created UTXO event has invalid state mined={mined}, spent={spent}"
+            ),
+            Self::InvalidSpentState { mined, spent } => write!(
+                f,
+                "persistent spent UTXO event has invalid state mined={mined}, spent={spent}"
+            ),
             Self::InvalidFixedLayout => {
                 f.write_str("persistent UTXO event has an invalid fixed layout")
             }
@@ -624,17 +719,25 @@ mod tests {
             .expect("sample transparent script fits the fixed record")
     }
 
-    fn sample_event() -> UtxoEvent {
-        UtxoEvent::new(
-            UtxoEventKind::Created,
+    fn sample_created_event() -> UtxoEvent {
+        UtxoEvent::created(
             [0x31; TXID_BYTES],
             7,
             42_000,
             123,
             UtxoScriptClass::PayToPublicKeyHash,
             [0x41; 20],
-            true,
-            false,
+        )
+    }
+
+    fn sample_spent_event() -> UtxoEvent {
+        UtxoEvent::spent(
+            [0x32; TXID_BYTES],
+            8,
+            43_000,
+            124,
+            UtxoScriptClass::PayToScriptHash,
+            [0x42; 20],
         )
     }
 
@@ -681,20 +784,43 @@ mod tests {
     #[test]
     fn fixed_event_round_trips_through_exact_persistent_bytes(
     ) -> Result<(), PersistentUtxoEventError> {
-        let business = sample_event();
-        let persistent = PersistentUtxoEvent::from_business(&business);
+        for business in [sample_created_event(), sample_spent_event()] {
+            let persistent = PersistentUtxoEvent::from_business(&business);
 
-        assert_eq!(
-            std::mem::size_of_val(&persistent),
-            PERSISTENT_UTXO_EVENT_BYTES
-        );
-        assert_eq!(persistent.into_business()?, business);
+            assert_eq!(
+                std::mem::size_of_val(&persistent),
+                PERSISTENT_UTXO_EVENT_BYTES
+            );
+            assert_eq!(persistent.into_business()?, business);
+        }
         Ok(())
     }
 
     #[test]
+    fn named_event_constructors_set_the_only_permitted_finalized_states() {
+        let created = sample_created_event();
+        let spent = sample_spent_event();
+
+        assert!(created.kind() == UtxoEventKind::Created);
+        assert_eq!(created.txid(), &[0x31; TXID_BYTES]);
+        assert_eq!(created.output_index(), 7);
+        assert_eq!(created.value_zat(), 42_000);
+        assert_eq!(created.height(), 123);
+        assert!(created.script_class() == UtxoScriptClass::PayToPublicKeyHash);
+        assert_eq!(created.script_hash(), &[0x41; 20]);
+        assert_eq!(
+            PersistentUtxoEvent::from_business(&created).0[3],
+            UTXO_EVENT_FLAG_MINED
+        );
+        assert_eq!(
+            PersistentUtxoEvent::from_business(&spent).0[3],
+            UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT
+        );
+    }
+
+    #[test]
     fn fixed_event_revalidates_every_tag_and_flag() {
-        let valid = PersistentUtxoEvent::from_business(&sample_event());
+        let valid = PersistentUtxoEvent::from_business(&sample_created_event());
         for (index, actual, expected) in [
             (
                 0,
@@ -720,8 +846,68 @@ mod tests {
     }
 
     #[test]
+    fn fixed_event_rejects_every_illegal_known_kind_and_state_combination() {
+        let valid = PersistentUtxoEvent::from_business(&sample_created_event());
+        for (kind, flags, expected) in [
+            (
+                UtxoEventKind::Created.to_byte(),
+                0,
+                PersistentUtxoEventError::InvalidCreatedState {
+                    mined: false,
+                    spent: false,
+                },
+            ),
+            (
+                UtxoEventKind::Created.to_byte(),
+                UTXO_EVENT_FLAG_SPENT,
+                PersistentUtxoEventError::InvalidCreatedState {
+                    mined: false,
+                    spent: true,
+                },
+            ),
+            (
+                UtxoEventKind::Created.to_byte(),
+                UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT,
+                PersistentUtxoEventError::InvalidCreatedState {
+                    mined: true,
+                    spent: true,
+                },
+            ),
+            (
+                UtxoEventKind::Spent.to_byte(),
+                0,
+                PersistentUtxoEventError::InvalidSpentState {
+                    mined: false,
+                    spent: false,
+                },
+            ),
+            (
+                UtxoEventKind::Spent.to_byte(),
+                UTXO_EVENT_FLAG_MINED,
+                PersistentUtxoEventError::InvalidSpentState {
+                    mined: true,
+                    spent: false,
+                },
+            ),
+            (
+                UtxoEventKind::Spent.to_byte(),
+                UTXO_EVENT_FLAG_SPENT,
+                PersistentUtxoEventError::InvalidSpentState {
+                    mined: false,
+                    spent: true,
+                },
+            ),
+        ] {
+            let mut bytes = valid.0;
+            bytes[1] = kind;
+            bytes[3] = flags;
+            assert_eq!(PersistentUtxoEvent(bytes).into_business(), Err(expected));
+        }
+    }
+
+    #[test]
     fn fixed_event_debug_output_is_redacted() {
-        let business = sample_event();
+        let business = sample_created_event();
         let persistent = PersistentUtxoEvent::from_business(&business);
 
         assert_eq!(format!("{business:?}"), "UtxoEvent { ..REDACTED.. }");
