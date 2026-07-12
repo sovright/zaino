@@ -38,6 +38,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and reports independent directory, event, hot-address, modeled-memory, and
   combined modeled fit flags. Backend expansion and position-map width remain
   uncalibrated research inputs rather than measured RSS evidence.
+- A module-private synchronous two-table command core that owns distinct typed
+  fake backend handles, validates their public capacity shape before use, scans the
+  full directory plus every bounded event ordinal on successful preflights,
+  derives the append ordinal from a contiguous owned-backend history, obtains
+  admission counts from those backends, and preflights both immutable inserts
+  without executor-command interleaving. Any uncertain or partial mutation
+  terminal-latches the candidate for discard; the core is not yet connected to
+  the worker, projection, or real `rostl` adapter and makes no backend
+  non-aliasing, crash-atomicity, or physical-obliviousness claim.
 
 ### Changed
 

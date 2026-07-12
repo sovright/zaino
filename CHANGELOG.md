@@ -44,6 +44,13 @@ and this library adheres to Rust's notion of
   hot-address, modeled-memory, and combined modeled fit with explicit negative
   evidence markers; backend expansion remains an uncalibrated research
   assumption rather than measured RSS evidence.
+- `zaino-oram`: a module-private synchronous command core now owns two typed
+  fake table handles, validates their public capacity shape, performs a full
+  directory plus bounded-history successful preflight, derives the next
+  ordinal from owned-backend state, and terminal-latches after uncertain or
+  partial writes. This is a portable logical model only; backend non-aliasing,
+  worker, projection, real `rostl`, persistence, crash recovery, and physical
+  trace integration remain follow-up work.
 - `zainod-oram`: a non-published, listener-free one-shot runner that scans one
   fixed mainnet tip using an NFS snapshot and chain-continuity validation into
   identifier-free corpus aggregates.

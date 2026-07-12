@@ -1,12 +1,14 @@
-//! Pure fixed-probe planning and record-binding model.
+//! Fixed-probe planning, record binding, and exclusive-command model.
 //!
-//! This module performs no backend I/O. It models two separate sparse tables,
+//! The parent module is a pure planner: it models two separate sparse tables,
 //! validates every fixed probe observation before producing a match or an
 //! insertion capability, and keeps layout identity separate from persistent
-//! record encoding. Vacancies and occupancy counts are caller-supplied model
-//! inputs, not authenticated current backend state. This module does not
-//! authenticate record contents, persist the secret seed, make
-//! scan-then-insert atomic, or establish a physical obliviousness claim.
+//! record encoding. Its vacancies and occupancy counts remain caller-supplied
+//! model inputs. The private child command core joins that planner to two typed
+//! backend interfaces under one synchronous owner and terminal-latches an
+//! uncertain generation. Neither layer authenticates record contents, persists
+//! the secret seed, proves crash atomicity, or establishes physical
+//! obliviousness.
 
 use std::{fmt, num::NonZeroU64};
 
@@ -19,6 +21,8 @@ use crate::records::{
     AddressDirectory, AddressEventPage, AddressKey, PersistentAddressDirectory,
     PersistentAddressEventPage, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
 };
+
+mod atomic_store;
 
 const LAYOUT_FORMAT_VERSION: u8 = 1;
 const ADDRESS_KEY_DOMAIN: &[u8] = b"zaino-oram-address-key-v1";
@@ -461,6 +465,7 @@ fn validate_max_events_per_address(
 enum LayoutPlanError {
     EventOrdinalOutOfRange,
     DirectoryProfileMismatch,
+    ProbePlanProfileMismatch,
     BackendIndexOutsideHostDomain,
 }
 
@@ -471,7 +476,10 @@ impl fmt::Display for LayoutPlanError {
                 f.write_str("event ordinal is outside the compiled layout profile")
             }
             Self::DirectoryProfileMismatch => {
-                f.write_str("bound directory belongs to a different layout profile")
+                f.write_str("directory witness belongs to a different layout profile")
+            }
+            Self::ProbePlanProfileMismatch => {
+                f.write_str("probe plan belongs to a different layout profile")
             }
             Self::BackendIndexOutsideHostDomain => {
                 f.write_str("logical table slot is outside the host index domain")
@@ -672,6 +680,20 @@ impl fmt::Debug for BoundDirectory {
     }
 }
 
+/// A clean directory vacancy retained only while one append is preflighted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProspectiveDirectory {
+    profile_binding: [u8; 32],
+    slot: DirectorySlot,
+    address_key: AddressKey,
+}
+
+impl fmt::Debug for ProspectiveDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProspectiveDirectory { ..REDACTED.. }")
+    }
+}
+
 /// Fixed event probe plan for one bound directory and append ordinal.
 struct EventProbePlan<const PROBES: usize> {
     profile_binding: [u8; 32],
@@ -857,6 +879,20 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
         }
     }
 
+    fn directory_backend_indices(
+        &self,
+        plan: &DirectoryProbePlan<DIRECTORY_PROBES>,
+    ) -> Result<[usize; DIRECTORY_PROBES], LayoutPlanError> {
+        if !fixed_bytes_equal(&plan.profile_binding, &self.profile_binding) {
+            return Err(LayoutPlanError::ProbePlanProfileMismatch);
+        }
+        let mut indices = [0; DIRECTORY_PROBES];
+        for (destination, slot) in indices.iter_mut().zip(plan.slots) {
+            *destination = slot.backend_index()?;
+        }
+        Ok(indices)
+    }
+
     fn event_plan(
         &self,
         directory: &BoundDirectory,
@@ -865,33 +901,89 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
         if !fixed_bytes_equal(&directory.profile_binding, &self.profile_binding) {
             return Err(LayoutPlanError::DirectoryProfileMismatch);
         }
-        let ordinal = self.event_ordinal(ordinal)?;
-        let directory_identity = directory.slot.0;
-        Ok(EventProbePlan {
-            profile_binding: directory.profile_binding,
-            directory_identity,
+        self.event_plan_for_identity(
+            directory.profile_binding,
+            directory.slot,
+            directory.address_key,
             ordinal,
-            expected_address_key: directory.address_key,
-            accept_match: true,
-            slots: self
-                .event_probe_slots(directory_identity, ordinal)
-                .map(EventTableSlot),
+            true,
+        )
+    }
+
+    fn prospective_directory(
+        &self,
+        vacancy: &DirectoryVacancy,
+    ) -> Result<ProspectiveDirectory, LayoutPlanError> {
+        if !fixed_bytes_equal(&vacancy.profile_binding, &self.profile_binding) {
+            return Err(LayoutPlanError::DirectoryProfileMismatch);
+        }
+        Ok(ProspectiveDirectory {
+            profile_binding: vacancy.profile_binding,
+            slot: vacancy.slot,
+            address_key: vacancy.address_key,
         })
+    }
+
+    fn prospective_event_plan(
+        &self,
+        directory: &ProspectiveDirectory,
+        ordinal: u64,
+    ) -> Result<EventProbePlan<EVENT_PROBES>, LayoutPlanError> {
+        if !fixed_bytes_equal(&directory.profile_binding, &self.profile_binding) {
+            return Err(LayoutPlanError::DirectoryProfileMismatch);
+        }
+        self.event_plan_for_identity(
+            directory.profile_binding,
+            directory.slot,
+            directory.address_key,
+            ordinal,
+            true,
+        )
     }
 
     fn cover_event_plan(
         &self,
         ordinal: u64,
     ) -> Result<EventProbePlan<EVENT_PROBES>, LayoutPlanError> {
+        self.event_plan_for_identity(
+            self.profile_binding,
+            DirectorySlot(self.directory.0.capacity),
+            self.synthetic_address_key(),
+            ordinal,
+            false,
+        )
+    }
+
+    fn event_backend_indices(
+        &self,
+        plan: &EventProbePlan<EVENT_PROBES>,
+    ) -> Result<[usize; EVENT_PROBES], LayoutPlanError> {
+        if !fixed_bytes_equal(&plan.profile_binding, &self.profile_binding) {
+            return Err(LayoutPlanError::ProbePlanProfileMismatch);
+        }
+        let mut indices = [0; EVENT_PROBES];
+        for (destination, slot) in indices.iter_mut().zip(plan.slots) {
+            *destination = slot.backend_index()?;
+        }
+        Ok(indices)
+    }
+
+    fn event_plan_for_identity(
+        &self,
+        profile_binding: [u8; 32],
+        directory_slot: DirectorySlot,
+        expected_address_key: AddressKey,
+        ordinal: u64,
+        accept_match: bool,
+    ) -> Result<EventProbePlan<EVENT_PROBES>, LayoutPlanError> {
         let ordinal = self.event_ordinal(ordinal)?;
-        let directory_identity = self.directory.0.capacity;
-        let synthetic = self.synthetic_address_key();
+        let directory_identity = directory_slot.0;
         Ok(EventProbePlan {
-            profile_binding: self.profile_binding,
+            profile_binding,
             directory_identity,
             ordinal,
-            expected_address_key: synthetic,
-            accept_match: false,
+            expected_address_key,
+            accept_match,
             slots: self
                 .event_probe_slots(directory_identity, ordinal)
                 .map(EventTableSlot),
@@ -1881,11 +1973,26 @@ mod tests {
         let replacement = layout_with(LayoutNetwork::Mainnet, 1, 7, 12, [0x5a; 32], 8, 6, 16, 12)?;
         let plan = original.directory_plan(p2pkh(0x1b));
         assert!(matches!(
+            replacement.directory_backend_indices(&plan),
+            Err(LayoutPlanError::ProbePlanProfileMismatch)
+        ));
+        assert!(matches!(
             replacement.scan_directory(&plan, [ProbeRead::Miss; DIRECTORY_PROBES]),
             Err(LayoutCorruption::ProbePlanProfileMismatch)
         ));
 
         let vacancy = original.scan_directory(&plan, [ProbeRead::Miss; DIRECTORY_PROBES])?;
+        let prospective = match &vacancy {
+            DirectoryScan::Vacant(vacancy) => original.prospective_directory(vacancy)?,
+            DirectoryScan::Found(_) | DirectoryScan::Full => {
+                panic!("all-miss directory scan must produce a vacancy")
+            }
+        };
+        let event_plan = original.prospective_event_plan(&prospective, 0)?;
+        assert!(matches!(
+            replacement.event_backend_indices(&event_plan),
+            Err(LayoutPlanError::ProbePlanProfileMismatch)
+        ));
         assert!(matches!(
             replacement.prepare_directory_insert(vacancy, 0),
             Err(MutationPlanError::VacancyProfileMismatch {

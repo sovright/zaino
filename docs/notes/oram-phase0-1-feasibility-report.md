@@ -1,9 +1,10 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-12
-- Branch: `feat/oram-private-foundation`
+- Evaluated branch: `feat/oram-atomic-query-store`, stacked on
+  `feat/oram-full-capacity-sizing`
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
-- Foundation commit: `6bf50bdaada0491b423d999b4911cd5900c28d9a`
+- Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
 - Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
 - Delivery plan: [ORAM-enabled Zaino plan](oram-enabled-zaino-plan.md)
 - Design seed: [TEE-backed Zaino/lightwalletd sketch](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3)
@@ -44,6 +45,12 @@ The evaluated worktree implements:
   over power-of-two capacities, scans complete const-generic observation
   arrays, validates collision placement and requested event ownership, and
   prepares opaque immutable inserts only after a clean full scan;
+- a module-private synchronous two-table command core that validates the owned
+  fake backends' public capacity shape before use, completes the directory plus
+  every bounded event-ordinal scan on successful preflights, rejects
+  noncontiguous histories, derives the next ordinal from owned-backend
+  observations, obtains admission counts from those backends, and preflights
+  both insertions before its first write;
 - compile-time `bytemuck::Pod` and `rostl_primitives::traits::Cmov` checks when
   `rostl-experimental` is enabled;
 - fixed Rust envelope and result-page shapes plus a test-only compiled profile;
@@ -114,22 +121,26 @@ The following statements are **not** established by that evidence:
   the real worker path is compile-checked but has not executed on Linux x86_64,
   and it is not connected to the projection or query engine;
 - worker queue depth is observable load leakage, caught panics still invoke the
-  process-wide panic hook, candidate records are not zeroized, and a volatile
-  mutation that fails before acknowledgement has no exactly-once retry claim;
+  process-wide panic hook (including connector-caught backend panics), so real
+  backend panic payloads must be identifier-free and a controlled boundary is
+  still missing. Candidate records are not zeroized, and a volatile mutation
+  that fails before acknowledgement has no exactly-once retry claim;
   an unexpected outer worker-loop panic reports the active accepted command as
   indeterminate, forbids automatic retry, and requires volatile-state discard
   plus reconciliation or rebuild from an authoritative checkpoint;
-- fixed-probe derivation and logical binding now exist only as a pure model; no
-  protected backend-connected allocator, atomic scan-and-insert worker command,
-  seed generation/persistence/rotation protocol, composite two-ORAM backend,
-  or selected production probe/load constants exist;
+- fixed-probe derivation and logical binding now have a portable synchronous
+  connector whose unaliased fake handles prevent executor-command interleaving,
+  but no worker command, proof of real-backend non-aliasing, real composite
+  two-ORAM backend, crash-atomic commit, seed generation/persistence/rotation
+  protocol, or selected production probe/load constants exist;
 - full-capacity logical arithmetic now exists, but its flat position-map width
   and backend expansion are uncalibrated operator inputs. It does not model the
   pinned backend's tree blocks, recursive maps, stash, initialization
   temporaries, allocator/runtime working set, or measured RSS;
-- the pure vacancy witness and occupied-record admission input are supplied by
-  the caller, not authenticated current backend state; the injected probe seed
-  and keyed-hash state are not zeroized or memory-locked;
+- the pure planner's vacancy witness and admission input remain caller-supplied
+  model values; the connector obtains counts from its owned fake-backed table
+  interfaces, but has no authenticated real-backend state. The injected probe
+  seed and keyed-hash state are not zeroized or memory-locked;
 - the pure model validates a requested directory key/physical slot and a
   requested event tuple/script owner, but the 38/82-byte records contain no MAC,
   generation tag, rollback defense, or full-content authentication. An unrelated
@@ -163,7 +174,7 @@ The following statements are **not** established by that evidence:
 | Aggregate corpus implementation | Partial | Identifier-free accumulator, mainnet-only one-shot runner, provenance validation, nonempty fixture, same-block spend, standard/nonstandard accounting | Execute the runner and produce a reproducible full-mainnet report |
 | Mainnet counts/distributions and growth | Missing | No mainnet output artifact exists | Measure distinct standard scripts, lifetime events, live/peak UTXOs, hot tails, script classes, record sizes, and selected growth horizon |
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov` compile-time tests | Bind the records to the selected backend and exercise them through actual pinned ORAM operations on Linux x86_64 |
-| Fixed-probe table layout | Partial model | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, and opaque insert preparation | Select measured capacities/probe counts, make scan-and-insert atomic in one worker command, add authenticated generation ownership, and trace the native backend |
+| Fixed-probe table layout | Partial model | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, and a module-private synchronous two-table connector that derives ordinals after a complete bounded-history preflight | Integrate the exclusive command with the worker and two real typed ORAMs, add authenticated generation ownership and crash-safe commit/rebuild, select measured capacities/probe counts, and trace the native backend |
 | Full-capacity logical sizing | Partial pass | Version-2 reports bind compiled 38/82-byte cells to shared directory/event allocation validation, charge both full table and position-map domains, keep modeled bytes fixed across occupancy/growth, and expose load/admission/hot-address/modeled-memory flags plus explicit negative evidence markers | Calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and runtime working set on target hardware; select an accepted mainnet profile |
 | Compiler pin | Pass | Repository pins Rust 1.96.0 | Pin release flags, LLVM behavior, and reproducible Linux build inputs |
 | CPU/target/TDX pin | Missing | Code gates real adapter operations to Linux x86_64; only macOS aarch64 is installed locally | Select CPU generations, target triple, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
@@ -208,7 +219,7 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
 | Pinned real-ORAM adapter | Partial compile evidence | The volatile `rostl` candidate remains isolated and cross-compiles on Linux x86_64; it is not the projection store and has not run on target hardware |
-| Append-only event-page or audited upsert design | Partial layout model | Exact immutable directory and one-event cells avoid tail-page/directory upsert; a pure keyed two-table planner validates full fixed probe sets, legitimate collisions, duplicates, dummies, placement, and requested event ownership. Backend-connected allocation, atomic mutation, whole-history fold cost, and adapter integration remain unselected |
+| Append-only event-page or audited upsert design | Partial portable connector | Exact immutable directory and one-event cells avoid tail-page/directory upsert; the keyed planner validates full probe sets, and a module-private synchronous connector scans every bounded ordinal, derives a contiguous next ordinal, reads owned-backend admission counts, and preflights a new directory plus event before writing. Tests use typed fakes; real adapter/worker/projection integration, authenticated contents, crash atomicity, and measured whole-history cost remain open |
 | Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state |
 | Staged mutation and fail-closed state | Pass for the in-memory oracle | Whole blocks apply to a cloned candidate; late unknown/double-spend, provenance, and collection-capacity failures leave the current block uncommitted; target failures never publish readiness or expose query results |
 | Checkpoint/replay/rebuild policy | Pass for the in-memory oracle | Opaque cursor candidates prevent forged/stale commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready oracle usable |
@@ -243,7 +254,7 @@ yet stakeholder-approved.
 | Logical ORAM key | Must hide | No query-derived host address or fallback | Mock receives the key; this is explicitly plaintext test code | Open |
 | Physical ORAM location/path | Must hide | Secret cases must be indistinguishable under accepted trace test | Pinned adapter compiles; no Linux/x86 physical trace was captured | Open |
 | Worker queue depth, in-flight state, and aggregate counters | Permitted operational load only | Fixed public capacity and fixed-schema aggregates; never identifiers, command/result kinds, hit/miss, or per-command timing | Deterministic tests pin queue bounds, exact accepted-command accounting, redacted handles/replies, and aggregate-only snapshot fields | Open: budget and fixed-interval export policy unset; no native-load trace |
-| Address-directory lookup | Must hide | Directory and event-page lookup both protected | Exact directory/page encodings, shared full-capacity sizing, and a pure keyed fixed-probe/binding model exist; complete const-generic scans have equal modeled observation/validation counts | Open: no atomic allocator, directory/event ORAM integration, content authentication, or measured physical trace |
+| Address-directory lookup | Must hide | Directory and event-page lookup both protected | A module-private synchronous connector combines exact directory/page encodings, shared full-capacity sizing, and keyed fixed-probe binding to model a complete directory plus bounded-history preflight with no fake-model executor-command interleaving | Open: no worker/real directory-event ORAM integration, content authentication, crash-safe commit, or measured physical trace |
 | Query-derived allocation | Must hide | Fixed allocation/work budget | Offline recorder validates zero explicit modeled query allocations | Open: allocator/page/instruction measurement absent |
 | Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | Engine has no source dependency and validates zero modeled source calls | Open: no integrated source instrumentation or readiness proof |
 | NFS scan work | Must hide | Complete profile-fixed scan on every query | No NFS merge implementation | Open |
@@ -325,10 +336,10 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
 | `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Trait proof and unsupported-target path compile; real ORAM path not executed |
-| `cargo test -p zaino-oram --all-targets --no-default-features` | 82 passed | Fixed models, token semantics, complete logical traces, exact record encodings, keyed layout vectors, shared allocation validation, full-probe collision/corruption/requested-owner checks, full-capacity arithmetic, admission/load/hot-address boundaries, fixed-growth bytes, sizing overflow, and aggregate core |
-| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 101 passed | Adds shared canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
-| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 97 passed | Adds directory/page `Pod`/`Cmov` semantics, expected unsupported-host behavior, and deterministic bounded-worker FIFO, capacity-bound, saturation, exact accounting, backend/outer panic, indeterminate active outcome, reply-send failure, telemetry, shutdown, and drop/join coverage; the Linux real-backend round trip was cfg-excluded |
-| `cargo test -p zaino-oram --all-targets --all-features` | 117 passed | Combined keyed layout, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, bounded-worker model, and unsupported-host adapter suite |
+| `cargo test -p zaino-oram --all-targets --no-default-features` | 97 passed | Fixed models, token semantics, complete logical traces, exact record encodings, keyed layout vectors, shared allocation validation, full-probe collision/corruption/requested-owner checks, full-capacity arithmetic, and the private two-table command's fixed full-history preflight, authoritative count, gap/orphan, replay, redaction, and uncertain-write tests |
+| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 116 passed | Adds shared canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
+| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 112 passed | Adds directory/page `Pod`/`Cmov` semantics, expected unsupported-host behavior, and deterministic bounded-worker FIFO, capacity-bound, saturation, exact accounting, backend/outer panic, indeterminate active outcome, reply-send failure, telemetry, shutdown, and drop/join coverage; the new two-table command remains fake-backed and the Linux real-backend round trip was cfg-excluded |
+| `cargo test -p zaino-oram --all-targets --all-features` | 132 passed | Combined keyed layout, two-table command, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, bounded-worker model, and unsupported-host adapter suite |
 | `cargo test -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
 | `cargo test -p zaino-proto --test compact_tx_streamer_legacy_golden` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
 | `cargo test -p zainod-oram --all-targets` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |

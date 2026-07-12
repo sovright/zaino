@@ -10,6 +10,10 @@ offline dependency experiment:
 - immutable 38-byte protected-directory and 82-byte one-event page candidates;
 - a private, pure two-table planner with network/schema-separated address keys,
   keyed fixed probes, fixed-array scan validation, and opaque insertion plans;
+- a module-private synchronous command core that owns distinct directory and
+  event fake-backend handles, validates their public capacity shape before
+  use, and models one full-history append preflight without executor-command
+  interleaving;
 - compiled privacy-profile validation;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
@@ -36,12 +40,14 @@ yet. Static fixture parity is not live-backend, finalised-database, reorg, or
 mainnet shadow evidence. Upstream `rostl` panic/recovery, persistence,
 side-channel, and licensing gates remain unresolved.
 The worker is not connected to the projection or query engine, and its queue
-metrics expose aggregate load. Caught panics still invoke Rust's process-wide
-panic hook; candidate records are not zeroized, and accepted volatile mutations
-have no durable acknowledgement or retry guarantee. An unexpected worker-loop
-panic can make the active accepted command's outcome indeterminate. Automatic
-retry is forbidden: discard the volatile candidate and reconcile or rebuild it
-from an authoritative checkpoint first.
+metrics expose aggregate load. Panics caught by either the worker or synchronous
+connector still invoke Rust's process-wide panic hook, so future real backend
+panic payloads must be identifier-free and a panic-free or controlled boundary
+remains a production requirement. Candidate records are not zeroized, and
+accepted volatile mutations have no durable acknowledgement or retry guarantee.
+An unexpected worker-loop panic can make the active accepted command's outcome
+indeterminate. Automatic retry is forbidden: discard the volatile candidate and
+reconcile or rebuild it from an authoritative checkpoint first.
 The one-event page is the deliberately inefficient append-only compatibility
 baseline: filling a multi-event tail page would require an upsert, while the
 current candidate overwrites before reporting a duplicate. Immutability and
@@ -61,19 +67,32 @@ when its stored identity owns that physical probe. Exact directory matches bind
 their full key and physical slot. Exact event matches bind directory slot plus
 ordinal and must derive the same address key from the event script.
 
-This is still a logical planner, not a backend or authenticator. Cross-table
-script ownership is checked for the requested event, but an unrelated event
-collision cannot be associated with its directory without more protected reads
-or a wider authenticated record. The 38/82-byte formats contain no MAC,
+This remains a logical model, not a real ORAM backend or authenticator.
+The module-private synchronous connector obtains occupancy from its owned typed
+fake backends, scans the directory and every bounded event ordinal on successful
+preflights, validates a contiguous history, derives the next ordinal, and
+preflights both insertions before its first write. A possible partial or
+uncertain mutation terminal-latches the connector as unusable, pending owner
+discard and rebuild. Its unaliased fake handles model no executor-command
+interleaving; they do not prove non-aliasing for a future real backend. This is
+not crash atomicity, persistence, rollback, or a physical obliviousness claim.
+The connector is not wired to the existing worker, projection, query engine,
+or `rostl` adapter.
+
+Cross-table script ownership is checked for the requested event, but an
+unrelated event collision cannot be associated with its directory without more
+protected reads or a wider authenticated record. The 38/82-byte formats
+contain no MAC,
 generation tag, content authentication, or rollback protection. The injected
 seed and keyed-hash state are not zeroized or memory-locked, and no seed
 generation, persistence, or rotation lifecycle exists. Source-level fixed
 scanning is not proof of equal instructions, branches, allocations, memory/page
-accesses, or timing. A vacancy witness and admission count are caller-supplied
-model inputs, not authenticated current backend state. The current worker also
-exposes separate read and insert commands, so a scan-derived vacancy is not
-atomic or safe to execute until a later single-owner command performs the whole
-scan-and-insert sequence.
+accesses, or timing. The pure planner still accepts caller-supplied vacancy and
+occupancy model inputs; the module-private connector closes only
+executor-command TOCTOU in its unaliased fake model. The current `rostl` worker
+still exposes separate raw read and insert commands and is not a safe
+integration surface, so integrating the two requires replacing that raw
+command surface in a later slice.
 
 The canonical dummy encoding is versioned `[1, 0, ...]`; all-zero `Default` or
 `Zeroable` storage is invalid and may only be an ignored scratch buffer after a
@@ -83,8 +102,8 @@ dummies would turn later real inserts into destructive duplicates. The differing
 record sizes are safe only in distinct typed stores; a future unified padded
 value needs an authenticated kind tag.
 Slots, ordinals, occupancy, and nested event fields remain sensitive and must
-not enter logs, errors, or metrics. No backend-connected allocator, composite
-two-ORAM store, or seed persistence/rotation protocol is implemented. The
+not enter logs, errors, or metrics. No real composite two-ORAM store, worker
+connector, or seed persistence/rotation protocol is implemented. The
 logical sizing model charges every allocated 38-byte directory cell, every
 allocated 82-byte event cell, and position-map entries for both full capacity
 domains; occupancy changes admission/load flags but never reduces modeled
