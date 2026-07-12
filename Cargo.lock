@@ -140,6 +140,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02882884d3e1bc524fb12c79f107f6ad0e1cfd498c536ffb494301740995dfe"
 
 [[package]]
+name = "assume"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d6f9ca11400f14ef046700eb6401c706c587871303453a5e7586efb82340c3d"
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -502,6 +508,26 @@ name = "byte-slice-cast"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
+
+[[package]]
+name = "bytemuck"
+version = "1.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6aedf8ae72766347502cf3cb4f41cf5e9cc37d28bee90f1fdaaae15f9cf9424"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f65693059b6b9c588b9f62fed1cedbf0a8b805631457ea162d68f0de186f3de5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
 
 [[package]]
 name = "byteorder"
@@ -3945,6 +3971,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "rostl-oram"
+version = "0.1.0-alpha9"
+source = "git+https://github.com/obliviouslabs/rostl?rev=8c3a12d2febf17b024f2e949428b3bc526d74172#8c3a12d2febf17b024f2e949428b3bc526d74172"
+dependencies = [
+ "bytemuck",
+ "rand 0.9.4",
+ "rostl-primitives",
+ "rostl-sort",
+ "static_assertions",
+]
+
+[[package]]
+name = "rostl-primitives"
+version = "0.1.0-alpha9"
+source = "git+https://github.com/obliviouslabs/rostl?rev=8c3a12d2febf17b024f2e949428b3bc526d74172#8c3a12d2febf17b024f2e949428b3bc526d74172"
+dependencies = [
+ "assume",
+ "bytemuck",
+ "static_assertions",
+]
+
+[[package]]
+name = "rostl-sort"
+version = "0.1.0-alpha9"
+source = "git+https://github.com/obliviouslabs/rostl?rev=8c3a12d2febf17b024f2e949428b3bc526d74172#8c3a12d2febf17b024f2e949428b3bc526d74172"
+dependencies = [
+ "assume",
+ "bytemuck",
+ "rand 0.9.4",
+ "rostl-primitives",
+ "static_assertions",
+]
+
+[[package]]
 name = "route-recognizer"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5980,6 +6040,13 @@ dependencies = [
 [[package]]
 name = "zaino-oram"
 version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "rand 0.9.4",
+ "rostl-oram",
+ "rostl-primitives",
+ "zaino-state",
+]
 
 [[package]]
 name = "zaino-proto"
@@ -6116,6 +6183,18 @@ dependencies = [
  "zcash_protocol",
  "zebra-chain",
  "zebra-state",
+]
+
+[[package]]
+name = "zainod-oram"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "tokio",
+ "zaino-common",
+ "zaino-oram",
+ "zaino-state",
+ "zainod",
 ]
 
 [[package]]

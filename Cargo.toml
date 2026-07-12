@@ -8,6 +8,7 @@ members = [
     "packages/zaino-state",
     "packages/zaino-fetch",
     "packages/zaino-proto",
+    "packages/zainod-oram",
     # Live-test suite (docs/adr/0002, docs/adr/0003, docs/adr/0004).
     # zaino-testutils first: the e2e/clientless partitions depend on it.
     "live-tests/zaino-testutils",

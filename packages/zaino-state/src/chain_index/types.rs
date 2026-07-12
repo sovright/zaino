@@ -36,6 +36,7 @@ pub mod block_context;
 pub mod db;
 pub mod helpers;
 pub mod primitives;
+mod transparent_events;
 pub mod wire;
 
 // Re-export database types for backward compatibility
@@ -46,6 +47,9 @@ pub use db::{CommitmentTreeData, CommitmentTreeRoots, CommitmentTreeSizes};
 pub use block_context::BlockContext;
 pub use primitives::{
     BlockIndex, ChainWork, ChainWorkError, CompactDifficulty, CompactDifficultyError,
+};
+pub use transparent_events::{
+    extract_transparent_events, TransparentBlockEvent, TransparentEventError,
 };
 
 // Re-export helper types

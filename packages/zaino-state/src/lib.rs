@@ -76,13 +76,14 @@ pub use chain_index::non_finalised_state::{
 };
 // NOTE: Should these be pub at all?
 pub use chain_index::types::{
-    AddrHistRecord, AddrScript, BlockContext, BlockData, BlockHash, BlockHeaderData, BlockMetadata,
-    BlockWithMetadata, ChainWork, ChainWorkError, CommitmentTreeData, CommitmentTreeRoots,
-    CommitmentTreeSizes, CompactDifficulty, CompactDifficultyError, CompactOrchardAction,
-    CompactSaplingOutput, CompactSaplingSpend, CompactTxData, Height, IndexedBlock,
-    OrchardCompactTx, OrchardTxList, Outpoint, SaplingCompactTx, SaplingTxList, ScriptType,
-    ShardIndex, ShardRoot, TransactionHash, TransparentCompactTx, TransparentTxList, TreeRootData,
-    TxInCompact, TxLocation, TxOutCompact, TxidList,
+    extract_transparent_events, AddrHistRecord, AddrScript, BlockContext, BlockData, BlockHash,
+    BlockHeaderData, BlockMetadata, BlockWithMetadata, ChainWork, ChainWorkError,
+    CommitmentTreeData, CommitmentTreeRoots, CommitmentTreeSizes, CompactDifficulty,
+    CompactDifficultyError, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
+    CompactTxData, Height, IndexedBlock, OrchardCompactTx, OrchardTxList, Outpoint,
+    SaplingCompactTx, SaplingTxList, ScriptType, ShardIndex, ShardRoot, TransactionHash,
+    TransparentBlockEvent, TransparentCompactTx, TransparentEventError, TransparentTxList,
+    TreeRootData, TxInCompact, TxLocation, TxOutCompact, TxidList,
 };
 
 pub use chain_index::mempool::{MempoolKey, MempoolValue};

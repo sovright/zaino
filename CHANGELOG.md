@@ -14,6 +14,15 @@ and this library adheres to Rust's notion of
   equal logical store-call schedules. This slice does not claim equal physical
   work. ADR-0007 defines the privacy boundary and keeps the experimental runtime
   outside the publishable Zaino dependency graph.
+- `zaino-oram`: aggregate corpus/sizing models, a fixed continuation-token
+  contract, an exact 72-byte append-only event candidate, and a pinned volatile
+  `rostl` feasibility adapter. These remain offline research components and do
+  not establish a production host-obliviousness claim.
+- `zaino-state`: a reusable transparent create/spend event-extraction seam for
+  ORAM-agnostic projection consumers.
+- `zainod-oram`: a non-published, listener-free one-shot runner that scans one
+  fixed mainnet tip using an NFS snapshot and chain-continuity validation into
+  identifier-free corpus aggregates.
 
 ### Changed
 - `zaino-state`: `FetchService` and `StateService` are merged into a single

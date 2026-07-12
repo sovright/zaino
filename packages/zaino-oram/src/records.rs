@@ -13,6 +13,15 @@ pub(super) const TXID_BYTES: usize = 32;
 /// closed instead of entering a variable-length fallback.
 const TRANSPARENT_SCRIPT_CAPACITY: usize = 34;
 
+/// Exact byte width of the append-only event candidate exercised by the
+/// experimental ORAM adapter.
+pub(super) const PERSISTENT_UTXO_EVENT_BYTES: usize = 72;
+
+const UTXO_EVENT_FORMAT_VERSION: u8 = 1;
+const UTXO_EVENT_FLAG_MINED: u8 = 1 << 0;
+const UTXO_EVENT_FLAG_SPENT: u8 = 1 << 1;
+const UTXO_EVENT_KNOWN_FLAGS: u8 = UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT;
+
 /// A domain-separated digest of a canonical transparent locking script.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct AddressKey([u8; ADDRESS_KEY_BYTES]);
@@ -145,6 +154,248 @@ impl fmt::Display for UtxoRecordError {
 }
 
 impl std::error::Error for UtxoRecordError {}
+
+/// Append-only operation represented by one fixed event record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum UtxoEventKind {
+    Created,
+    Spent,
+}
+
+impl UtxoEventKind {
+    const fn to_byte(self) -> u8 {
+        match self {
+            Self::Created => 1,
+            Self::Spent => 2,
+        }
+    }
+
+    const fn try_from_byte(value: u8) -> Result<Self, PersistentUtxoEventError> {
+        match value {
+            1 => Ok(Self::Created),
+            2 => Ok(Self::Spent),
+            actual => Err(PersistentUtxoEventError::InvalidEventKind { actual }),
+        }
+    }
+}
+
+/// Fixed script classification retained by an append-only event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum UtxoScriptClass {
+    PayToPublicKeyHash,
+    PayToScriptHash,
+    NonStandard,
+}
+
+impl UtxoScriptClass {
+    const fn to_byte(self) -> u8 {
+        match self {
+            Self::PayToPublicKeyHash => 0,
+            Self::PayToScriptHash => 1,
+            Self::NonStandard => 2,
+        }
+    }
+
+    const fn try_from_byte(value: u8) -> Result<Self, PersistentUtxoEventError> {
+        match value {
+            0 => Ok(Self::PayToPublicKeyHash),
+            1 => Ok(Self::PayToScriptHash),
+            2 => Ok(Self::NonStandard),
+            actual => Err(PersistentUtxoEventError::InvalidScriptClass { actual }),
+        }
+    }
+}
+
+/// Business-layer event folded into a private transparent UTXO result.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct UtxoEvent {
+    kind: UtxoEventKind,
+    txid: [u8; TXID_BYTES],
+    output_index: u32,
+    value_zat: u64,
+    height: u32,
+    script_class: UtxoScriptClass,
+    script_hash: [u8; 20],
+    mined: bool,
+    spent: bool,
+}
+
+impl UtxoEvent {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the constructor names every fixed field in the candidate record"
+    )]
+    pub(super) const fn new(
+        kind: UtxoEventKind,
+        txid: [u8; TXID_BYTES],
+        output_index: u32,
+        value_zat: u64,
+        height: u32,
+        script_class: UtxoScriptClass,
+        script_hash: [u8; 20],
+        mined: bool,
+        spent: bool,
+    ) -> Self {
+        Self {
+            kind,
+            txid,
+            output_index,
+            value_zat,
+            height,
+            script_class,
+            script_hash,
+            mined,
+            spent,
+        }
+    }
+}
+
+impl fmt::Debug for UtxoEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UtxoEvent { ..REDACTED.. }")
+    }
+}
+
+/// Exact, padding-free storage representation of [`UtxoEvent`].
+///
+/// The byte-array representation makes its width and initialization explicit.
+/// With `rostl-experimental`, the derive verifies the exact candidate satisfies
+/// `rostl`'s `Pod` requirement; trace-oblivious execution remains limited to
+/// the separately gated Linux x86_64 adapter.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rostl-experimental",
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub(super) struct PersistentUtxoEvent([u8; PERSISTENT_UTXO_EVENT_BYTES]);
+
+const _: [(); PERSISTENT_UTXO_EVENT_BYTES] = [(); std::mem::size_of::<PersistentUtxoEvent>()];
+
+impl PersistentUtxoEvent {
+    pub(super) fn from_business(src: &UtxoEvent) -> Self {
+        let mut bytes = [0; PERSISTENT_UTXO_EVENT_BYTES];
+        bytes[0] = UTXO_EVENT_FORMAT_VERSION;
+        bytes[1] = src.kind.to_byte();
+        bytes[2] = src.script_class.to_byte();
+        bytes[3] = (u8::from(src.mined) * UTXO_EVENT_FLAG_MINED)
+            | (u8::from(src.spent) * UTXO_EVENT_FLAG_SPENT);
+        bytes[4..36].copy_from_slice(&src.txid);
+        bytes[36..40].copy_from_slice(&src.output_index.to_le_bytes());
+        bytes[40..48].copy_from_slice(&src.value_zat.to_le_bytes());
+        bytes[48..52].copy_from_slice(&src.height.to_le_bytes());
+        bytes[52..72].copy_from_slice(&src.script_hash);
+        Self(bytes)
+    }
+
+    pub(super) fn into_business(self) -> Result<UtxoEvent, PersistentUtxoEventError> {
+        if self.0[0] != UTXO_EVENT_FORMAT_VERSION {
+            return Err(PersistentUtxoEventError::UnsupportedVersion { actual: self.0[0] });
+        }
+        let flags = self.0[3];
+        if flags & !UTXO_EVENT_KNOWN_FLAGS != 0 {
+            return Err(PersistentUtxoEventError::InvalidFlags { actual: flags });
+        }
+
+        let mut txid = [0; TXID_BYTES];
+        txid.copy_from_slice(&self.0[4..36]);
+        let mut script_hash = [0; 20];
+        script_hash.copy_from_slice(&self.0[52..72]);
+        Ok(UtxoEvent::new(
+            UtxoEventKind::try_from_byte(self.0[1])?,
+            txid,
+            u32::from_le_bytes(
+                self.0[36..40]
+                    .try_into()
+                    .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
+            ),
+            u64::from_le_bytes(
+                self.0[40..48]
+                    .try_into()
+                    .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
+            ),
+            u32::from_le_bytes(
+                self.0[48..52]
+                    .try_into()
+                    .map_err(|_| PersistentUtxoEventError::InvalidFixedLayout)?,
+            ),
+            UtxoScriptClass::try_from_byte(self.0[2])?,
+            script_hash,
+            flags & UTXO_EVENT_FLAG_MINED != 0,
+            flags & UTXO_EVENT_FLAG_SPENT != 0,
+        ))
+    }
+
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    pub(super) const fn zeroed() -> Self {
+        Self([0; PERSISTENT_UTXO_EVENT_BYTES])
+    }
+}
+
+impl Default for PersistentUtxoEvent {
+    fn default() -> Self {
+        Self([0; PERSISTENT_UTXO_EVENT_BYTES])
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl rostl_primitives::traits::Cmov for PersistentUtxoEvent {
+    fn cmov(&mut self, other: &Self, choice: bool) {
+        for (destination, source) in self.0.iter_mut().zip(other.0.iter()) {
+            rostl_primitives::traits::Cmov::cmov(destination, source, choice);
+        }
+    }
+
+    fn cxchg(&mut self, other: &mut Self, choice: bool) {
+        for (left, right) in self.0.iter_mut().zip(other.0.iter_mut()) {
+            rostl_primitives::traits::Cmov::cxchg(left, right, choice);
+        }
+    }
+}
+
+impl fmt::Debug for PersistentUtxoEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PersistentUtxoEvent([REDACTED])")
+    }
+}
+
+/// Fixed event bytes rejected during storage-boundary validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PersistentUtxoEventError {
+    UnsupportedVersion { actual: u8 },
+    InvalidEventKind { actual: u8 },
+    InvalidScriptClass { actual: u8 },
+    InvalidFlags { actual: u8 },
+    InvalidFixedLayout,
+}
+
+impl fmt::Display for PersistentUtxoEventError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedVersion { actual } => {
+                write!(f, "unsupported persistent UTXO event version {actual}")
+            }
+            Self::InvalidEventKind { actual } => {
+                write!(f, "invalid persistent UTXO event kind {actual}")
+            }
+            Self::InvalidScriptClass { actual } => {
+                write!(f, "invalid persistent UTXO script class {actual}")
+            }
+            Self::InvalidFlags { actual } => {
+                write!(f, "invalid persistent UTXO event flags {actual}")
+            }
+            Self::InvalidFixedLayout => {
+                f.write_str("persistent UTXO event has an invalid fixed layout")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PersistentUtxoEventError {}
 
 /// A private transparent-UTXO query prepared for profile-bounded execution.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -373,6 +624,20 @@ mod tests {
             .expect("sample transparent script fits the fixed record")
     }
 
+    fn sample_event() -> UtxoEvent {
+        UtxoEvent::new(
+            UtxoEventKind::Created,
+            [0x31; TXID_BYTES],
+            7,
+            42_000,
+            123,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0x41; 20],
+            true,
+            false,
+        )
+    }
+
     #[test]
     fn address_key_round_trips_through_persistent_boundary() {
         let business = AddressKey::new([0x22; ADDRESS_KEY_BYTES]);
@@ -411,6 +676,56 @@ mod tests {
                 capacity: TRANSPARENT_SCRIPT_CAPACITY,
             })
         );
+    }
+
+    #[test]
+    fn fixed_event_round_trips_through_exact_persistent_bytes(
+    ) -> Result<(), PersistentUtxoEventError> {
+        let business = sample_event();
+        let persistent = PersistentUtxoEvent::from_business(&business);
+
+        assert_eq!(
+            std::mem::size_of_val(&persistent),
+            PERSISTENT_UTXO_EVENT_BYTES
+        );
+        assert_eq!(persistent.into_business()?, business);
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_event_revalidates_every_tag_and_flag() {
+        let valid = PersistentUtxoEvent::from_business(&sample_event());
+        for (index, actual, expected) in [
+            (
+                0,
+                2,
+                PersistentUtxoEventError::UnsupportedVersion { actual: 2 },
+            ),
+            (
+                1,
+                3,
+                PersistentUtxoEventError::InvalidEventKind { actual: 3 },
+            ),
+            (
+                2,
+                3,
+                PersistentUtxoEventError::InvalidScriptClass { actual: 3 },
+            ),
+            (3, 4, PersistentUtxoEventError::InvalidFlags { actual: 4 }),
+        ] {
+            let mut bytes = valid.0;
+            bytes[index] = actual;
+            assert_eq!(PersistentUtxoEvent(bytes).into_business(), Err(expected));
+        }
+    }
+
+    #[test]
+    fn fixed_event_debug_output_is_redacted() {
+        let business = sample_event();
+        let persistent = PersistentUtxoEvent::from_business(&business);
+
+        assert_eq!(format!("{business:?}"), "UtxoEvent { ..REDACTED.. }");
+        assert_eq!(format!("{persistent:?}"), "PersistentUtxoEvent([REDACTED])");
     }
 
     #[test]

@@ -1010,7 +1010,10 @@ pub trait IndexedBlockExt: Send + Sync {
 /// Range semantics:
 /// - Methods that accept `start_height` and `end_height` interpret the range as inclusive:
 ///   `[start_height, end_height]`
-pub trait TransparentHistExt: Send + Sync {
+#[cfg(feature = "transparent_address_history_experimental")]
+type TransparentUtxo = (TxLocation, u16, u64);
+
+pub(crate) trait TransparentHistExt: Send + Sync {
     /// Fetch all address history records for a given transparent address.
     ///
     /// Returns:
@@ -1066,7 +1069,7 @@ pub trait TransparentHistExt: Send + Sync {
         addr_script: AddrScript,
         start_height: Height,
         end_height: Height,
-    ) -> impl SendFut<Result<Option<Vec<(TxLocation, u16, u64)>>, FinalisedStateError>>;
+    ) -> impl SendFut<Result<Option<Vec<TransparentUtxo>>, FinalisedStateError>>;
 
     /// Computes the transparent balance change for `addr_script` over the
     /// height range `[start_height, end_height]` (inclusive).

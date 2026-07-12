@@ -1,17 +1,21 @@
 # ORAM-enabled Zaino fork: architecture and delivery plan
 
-- Status: proposed research fork, not production-ready.
+- Status: Phase 0/1 research foundation implemented; current gate is **NO-GO
+  for server integration** pending the measured blockers in
+  [the feasibility report](oram-phase0-1-feasibility-report.md).
 - Prepared: 2026-07-12.
 - Target fork point: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d), the live `origin/dev` head inspected for this plan.
 - Design seed: [TEE-backed lightwalletd / Zaino with `rostl` and `oblivious_node`](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3).
 
 Implementation began on `feat/oram-private-foundation` after fast-forwarding the
 local `dev` branch to the recorded target fork point. The initial implemented
-scope is deliberately narrower than Phase 1: it establishes the ADR, fixed
-business/persistence/envelope shapes, exact profile coupling, a bounded
-plaintext test store, and logical store-call schedule tests. It contains no
-real ORAM, encryption, network service, attestation, or production privacy
-claim.
+scope establishes the ADR, fixed business/persistence/envelope and continuation
+shapes, exact profile coupling, a bounded plaintext test store, logical
+store-call schedule tests, aggregate corpus/sizing models, a shared transparent
+event seam, and a pinned volatile `rostl` experiment. It contains no production
+encryption, durable ORAM, network service, attestation, or production privacy
+claim. Per the Phase 0 stop rule, private-server work remains closed while the
+mainnet/RSS, recovery, side-channel, hardware, and licensing gates are open.
 
 ## Executive decision
 

@@ -8,6 +8,10 @@ and this library adheres to Rust's notion of
 ## [Unreleased]
 
 ### Added
+- A pure `extract_transparent_events` business-layer seam for deterministic,
+  checked transparent create/spend extraction from `IndexedBlock`, used by the
+  ORAM research projection without adding an internal-runtime dependency to
+  this publishable crate.
 - The chain index tracks Ironwood (NU6.3) note-commitment treestate roots,
   storing `None` while the pool has no treestate rather than fabricating a
   root.
