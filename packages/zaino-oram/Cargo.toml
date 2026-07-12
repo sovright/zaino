@@ -1,0 +1,15 @@
+[package]
+name = "zaino-oram"
+description = "Research models for Zaino's proposed oblivious private-query projection."
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+version = "0.1.0"
+publish = false
+
+[features]
+default = []
+
+[dependencies]

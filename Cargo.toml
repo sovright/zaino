@@ -2,6 +2,7 @@
 [workspace]
 members = [
     "packages/zaino-common",
+    "packages/zaino-oram",
     "packages/zainod",
     "packages/zaino-serve",
     "packages/zaino-state",

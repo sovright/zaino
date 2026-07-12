@@ -221,6 +221,7 @@ jobs:
           # decision tracked in https://github.com/zingolabs/zaino/issues/1308.
           # When added, regenerate this matrix with `makers update-test-targets`.
           - "zainod"
+          - "zaino-oram"
           - "zaino-state"
           - "zaino-testutils"
     steps:

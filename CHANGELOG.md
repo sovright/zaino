@@ -7,6 +7,14 @@ and this library adheres to Rust's notion of
 
 ## Unreleased
 
+### Added
+- `zaino-oram`: a non-published, dependency-free research foundation for
+  private transparent-UTXO queries, including fixed records and envelopes,
+  exact compiled profile shapes, a bounded plaintext mock store, and tests for
+  equal logical store-call schedules. This slice does not claim equal physical
+  work. ADR-0007 defines the privacy boundary and keeps the experimental runtime
+  outside the publishable Zaino dependency graph.
+
 ### Changed
 - `zaino-state`: `FetchService` and `StateService` are merged into a single
   generic `NodeBackedIndexerService<Source>` (module
