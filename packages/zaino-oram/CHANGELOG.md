@@ -22,8 +22,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   targets reject construction and no production obliviousness claim is made.
 - A bounded single-owner worker for the volatile candidate, with nonblocking
   admission, serialized reads and inserts, deterministic shutdown draining,
-  terminal fault latching, dropped-reply/send-failure handling, and aggregate-only
-  lifecycle telemetry.
+  terminal fault latching, dropped-reply/send-failure handling, and
+  aggregate-only lifecycle telemetry.
+- Exact immutable 38-byte address-directory and 82-byte one-event page
+  candidates with canonical dummy encodings, named persistence conversions,
+  standard-address validation, redacted diagnostics, and `Pod`/`Cmov` proofs.
 
 ### Changed
 

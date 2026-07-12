@@ -7,6 +7,7 @@ The current research foundation contains deterministic models plus an optional
 offline dependency experiment:
 
 - fixed transparent-UTXO, 72-byte append-only event, and envelope shapes;
+- immutable 38-byte protected-directory and 82-byte one-event page candidates;
 - compiled privacy-profile validation;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
@@ -39,6 +40,28 @@ have no durable acknowledgement or retry guarantee. An unexpected worker-loop
 panic can make the active accepted command's outcome indeterminate. Automatic
 retry is forbidden: discard the volatile candidate and reconcile or rebuild it
 from an authoritative checkpoint first.
+The one-event page is the deliberately inefficient append-only compatibility
+baseline: filling a multi-event tail page would require an upsert, while the
+current candidate overwrites before reporting a duplicate. Immutability and
+unique-key allocation are therefore preconditions, not properties enforced by
+the adapter: duplicate insertion is destructive, is not an idempotency probe,
+and requires discarding the entire candidate store. An indeterminate write has
+the same discard-and-reconcile requirement.
+
+These are self-described record shapes, not an authenticated layout. The future
+layout must validate a directory cell's stored slot and address key against its
+logical read key, validate an event cell's stored directory slot and ordinal,
+and prove that the event script class/hash belongs to the referenced address.
+The canonical dummy encoding is versioned `[1, 0, ...]`; all-zero `Default` or
+`Zeroable` storage is invalid and may only be an ignored scratch buffer after a
+definitive backend miss. In a sparse table, only a backend miss is free: finding
+a canonical dummy is corruption, not reusable capacity, and pre-inserting
+dummies would turn later real inserts into destructive duplicates. The differing
+record sizes are safe only in distinct typed stores; a future unified padded
+value needs an authenticated kind tag.
+Slots, ordinals, occupancy, and nested event fields remain sensitive and must
+not enter logs, errors, or metrics. No protected table allocator, fixed-probe
+lookup, composite backend, or page-capacity sizing claim is implemented yet.
 The schedule model does not establish equal instruction, memory, allocation,
 page, timing, or packet behavior.
 Those components remain gated by ADR-0007 and the feasibility criteria in
