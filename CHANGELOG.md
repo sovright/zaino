@@ -24,6 +24,10 @@ and this library adheres to Rust's notion of
   the plaintext projection with ordinary-source UTXO results for every standard
   address observed at one identical immutable regtest-vector checkpoint. The
   supporting `zaino-state` surface exists only under `test_dependencies`.
+- `zaino-oram`: the volatile `rostl` experiment now has a bounded,
+  single-owner worker for serialized reads and inserts, FIFO shutdown draining,
+  fail-closed backend faults, and identifier-free aggregate telemetry. It is
+  not connected to the projection or query engine.
 - `zainod-oram`: a non-published, listener-free one-shot runner that scans one
   fixed mainnet tip using an NFS snapshot and chain-continuity validation into
   identifier-free corpus aggregates.

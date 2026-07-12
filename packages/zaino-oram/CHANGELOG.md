@@ -20,6 +20,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   interfaces.
 - A Linux-x86_64-only volatile `rostl` experiment pinned at `8c3a12d2`; other
   targets reject construction and no production obliviousness claim is made.
+- A bounded single-owner worker for the volatile candidate, with nonblocking
+  admission, serialized reads and inserts, deterministic shutdown draining,
+  terminal fault latching, dropped-reply/send-failure handling, and aggregate-only
+  lifecycle telemetry.
 
 ### Changed
 

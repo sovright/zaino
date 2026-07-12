@@ -40,12 +40,13 @@ impl RostlCandidateStore {
             if !(2..=u32::MAX as usize).contains(&capacity) {
                 return Err(RostlAdapterError::InvalidCapacity { capacity });
             }
-            Ok(Self {
+            catch_upstream(|| Self {
                 oram: CircuitORAM::new(capacity),
                 position_map: RecursivePositionMap::new(capacity),
                 capacity,
                 failed_closed: false,
             })
+            .map_err(|()| RostlAdapterError::UpstreamPanic)
         }
 
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -191,7 +192,7 @@ impl fmt::Display for RostlAdapterError {
             }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Self::UpstreamPanic => {
-                f.write_str("rostl experiment panicked and entered failed-closed state")
+                f.write_str("rostl experiment panicked; candidate state must be discarded")
             }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Self::FailedClosed => f.write_str("rostl experiment is failed closed"),

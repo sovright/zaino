@@ -71,7 +71,13 @@ The evaluated worktree implements:
   scanner to canonical mainnet genesis, captures a fixed public tip, streams
   `IndexedBlock` values without retaining them, and requires every sizing input;
 - a pinned, volatile `rostl` candidate adapter that is compiled only into real
-  operations on Linux x86_64 and returns `UnsupportedPlatform` elsewhere.
+  operations on Linux x86_64 and returns `UnsupportedPlatform` elsewhere;
+- a bounded single-owner candidate worker that serializes reads and inserts,
+  admits at most a fixed public queue depth in the research range 1..=4096
+  without fallback, drains accepted FIFO work before shutdown/join, latches
+  terminal backend faults and full-call panics, counts reply-send failure only
+  after the accepted operation finishes, and exposes only fixed-schema
+  aggregate lifecycle telemetry.
 
 The following statements are **not** established by that evidence:
 
@@ -90,6 +96,15 @@ The following statements are **not** established by that evidence:
   `zainod-oram` currently contains only the offline corpus runner;
 - no durable ORAM/checkpoint implementation, rollback defense, crash recovery,
   measured rebuild path, or recovery-time objective exists;
+- the worker mechanics run locally only against a deterministic fake backend;
+  the real worker path is compile-checked but has not executed on Linux x86_64,
+  and it is not connected to the projection or query engine;
+- worker queue depth is observable load leakage, caught panics still invoke the
+  process-wide panic hook, candidate records are not zeroized, and a volatile
+  mutation that fails before acknowledgement has no exactly-once retry claim;
+  an unexpected outer worker-loop panic reports the active accepted command as
+  indeterminate, forbids automatic retry, and requires volatile-state discard
+  plus reconciliation or rebuild from an authoritative checkpoint;
 - the offline projection uses ordinary cloned Rust maps/vectors: it is not an
   ORAM, authenticated root, durable transaction, or allocator-failure boundary;
 - static fixture parity is not live-backend shadow parity, finalised-database
@@ -117,7 +132,7 @@ The following statements are **not** established by that evidence:
 | Latency/stash/queue gate | Missing | No target-hardware measurements | Record latency distribution, sustained QPS, stash pressure, queue depth, update contention, and failure behavior |
 | Assembly/compiler-preservation experiment | Missing | No release assembly or instruction trace | Resolve the concern tracked by [`rostl` issue #8](https://github.com/obliviouslabs/rostl/issues/8) for the pinned binary/toolchain |
 | Failure probability | Missing | No long-run or analytical bound | Address [`rostl` issue #24](https://github.com/obliviouslabs/rostl/issues/24) and document node-year risk |
-| Typed capacity/stash/queue failure | Partial | Local validation is typed; upstream panics are caught by the research adapter and latch a failed-closed state | Replace panic-based upstream boundaries, type stash/queue exhaustion, and prove no leaky fallback |
+| Typed capacity/stash/queue failure | Partial | Local validation is typed; the research worker has nonblocking bounded admission, a typed identifier-free `QueueFull`, no fallback, and terminal backend/panic latching | Replace panic-based upstream boundaries, type stash exhaustion, and prove behavior under native target load |
 | Persistence/recovery/RTO | Blocked | Candidate adapter is deliberately volatile and is not an `ObliviousStore` backend | Design authenticated atomic persistence or measure a cold rebuild and publish an RTO |
 | Go/no-go stakeholder acceptance | Missing | No accepted numeric profile or client contract | Security, operator, and client teams approve the exact leakage budget |
 
@@ -155,14 +170,15 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state |
 | Staged mutation and fail-closed state | Pass for the in-memory oracle | Whole blocks apply to a cloned candidate; late unknown/double-spend, provenance, and collection-capacity failures leave the current block uncommitted; target failures never publish readiness or expose query results |
 | Checkpoint/replay/rebuild policy | Pass for the in-memory oracle | Opaque cursor candidates prevent forged/stale commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready oracle usable |
-| Single mutation worker and backend telemetry | Missing | No queue, concurrency boundary, stash/queue/capacity metrics, or real backend mutation worker exists |
+| Single mutation worker and backend telemetry | Partial model | A feature-gated std-thread worker exclusively owns the volatile candidate, serializes reads and inserts, validates a 1..=4096 research queue bound before channel allocation, bounds accepted-not-started work with a `sync_channel`, drains FIFO admissions before shutdown/join, separates lifecycle from terminal fault health, and reports only queue/in-flight/counter/lifecycle aggregates. Deterministic fake-backend tests cover order, exact accounting, queue full, nonterminal rejection, terminal fault/panic latching, dropped reply receivers, shutdown, and drop/join; the real path only cross-compiles, exposes no upstream stash metric, and is not projection-integrated |
 | Volatile rebuild path | Partial pass | Fresh rebuild and clone-ready forward replay are deterministic in fixtures; no full-corpus runtime or RTO is measured |
 | Shadow comparison with ordinary Zaino | Pass for one static fixture checkpoint | A default-off test independently obtains ordinary UTXOs from `MockchainSource::get_address_utxos` over Zebra full blocks and projection UTXOs from `IndexedBlock` transparent events; it compares every standard address observed through immutable regtest-vector height 200 plus an absent address, at the same height/hash. Live direct/RPC, finalised-database, mainnet, and reorg shadow modes remain missing |
 | Zero query-derived source calls | Pass for current type boundary | The query engine has no validator/LMDB/raw-transaction dependency; this is not yet an integrated readiness or call-trace result |
 | Long-run failure bound | Missing | No target-load mixed-operation soak or node-year analysis exists |
 
-Phase 2 now has a deterministic plaintext oracle and one static ordinary-source
-parity result, not an ORAM-backed projection or live shadow mode.
+Phase 2 now has a deterministic plaintext oracle, one static ordinary-source
+parity result, and a bounded volatile-worker model, not an ORAM-backed
+projection or live shadow mode.
 
 ## Leakage matrix
 
@@ -184,6 +200,7 @@ yet stakeholder-approved.
 | Client continuation count | Permitted only for weak profiles | Strong profile requires fixed cover rounds | No client or service exists | Unset budget |
 | Logical ORAM key | Must hide | No query-derived host address or fallback | Mock receives the key; this is explicitly plaintext test code | Open |
 | Physical ORAM location/path | Must hide | Secret cases must be indistinguishable under accepted trace test | Pinned adapter compiles; no Linux/x86 physical trace was captured | Open |
+| Worker queue depth, in-flight state, and aggregate counters | Permitted operational load only | Fixed public capacity and fixed-schema aggregates; never identifiers, command/result kinds, hit/miss, or per-command timing | Deterministic tests pin queue bounds, exact accepted-command accounting, redacted handles/replies, and aggregate-only snapshot fields | Open: budget and fixed-interval export policy unset; no native-load trace |
 | Address-directory lookup | Must hide | Directory and event-page lookup both protected | Sizing model counts both logical position-map domains | Open: no implemented directory ORAM |
 | Query-derived allocation | Must hide | Fixed allocation/work budget | Offline recorder validates zero explicit modeled query allocations | Open: allocator/page/instruction measurement absent |
 | Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | Engine has no source dependency and validates zero modeled source calls | Open: no integrated source instrumentation or readiness proof |
@@ -268,20 +285,20 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Trait proof and unsupported-target path compile; real ORAM path not executed |
 | `cargo test -p zaino-oram --all-targets --no-default-features` | 53 passed | Fixed models, token semantics, complete logical traces, event-state validation, records, sizing, and aggregate core |
 | `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 72 passed | Adds shared canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
-| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 55 passed | Adds `Pod`/`Cmov` proof and expected `UnsupportedPlatform`; Linux round-trip test was cfg-excluded |
-| `cargo test -p zaino-oram --all-targets --all-features` | 75 passed | Combined trace, record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, and unsupported-host adapter suite |
+| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 67 passed | Adds `Pod`/`Cmov`, expected unsupported-host behavior, and deterministic bounded-worker FIFO, capacity-bound, saturation, exact accounting, backend/outer panic, indeterminate active outcome, reply-send failure, telemetry, shutdown, and drop/join coverage; the Linux real-backend round trip was cfg-excluded |
+| `cargo test -p zaino-oram --all-targets --all-features` | 87 passed | Combined trace, record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, bounded-worker model, and unsupported-host adapter suite |
 | `cargo test -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
 | `cargo test -p zaino-proto --test compact_tx_streamer_legacy_golden` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
 | `cargo test -p zainod-oram --all-targets` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
-| `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu -- -D warnings` | Pass with Rust 1.96.1 | Linux x86_64 adapter code compiles strictly; it was not linked or executed and is not the exact pinned compiler |
+| `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Pass with Rust 1.96.1 | Linux x86_64 adapter and real-worker path compile strictly; they were not linked or executed and this is not the exact pinned compiler |
 | `cargo test -p zaino-state transparent_events --lib --no-default-features` | 4 passed | Event ordering, coinbase skip, script handling, overflow errors, and redaction |
-| `cargo clippy -p zaino-oram --all-targets --all-features -- -D warnings` | Pass | Focused all-feature lint is clean on the local host |
+| `cargo clippy -p zaino-oram --all-targets --all-features --no-deps -- -D warnings -D clippy::unwrap_used` | Pass | Focused all-feature lint is warning-free and the affected crate has no production/test `unwrap` use |
 | `cargo clippy -p zaino-state --lib --features test_dependencies --no-deps -- -D warnings` | Pass | The feature-gated cross-crate fixture seam is warning-free without widening the normal production feature set |
 | `cargo clippy -p zaino-state --lib --features test_dependencies --no-deps -- -D warnings -D clippy::unwrap_used` | Existing-tree failure | Reports four pre-existing production `unwrap` calls outside this slice (`node_backed_indexer.rs`, `finalised_state/entry.rs`, and `mempool.rs`); the changed production/test-support paths contain none |
 | `cargo clippy -p zaino-proto --test compact_tx_streamer_legacy_golden -- -D warnings` | Pass | Legacy schema golden is warning-free |
 | `cargo clippy -p zainod-oram --all-targets -- -D warnings` | Pass | Listener-free runner lint is clean |
 | `cargo check --workspace --all-targets --no-default-features` | Pass | Every workspace member, including the new non-default runner, compiles without default features |
-| `RUSTDOCFLAGS='-D warnings' cargo doc -p zaino-oram --no-deps --all-features` | Pass | New private trace and record APIs document cleanly |
+| `RUSTDOCFLAGS='-D warnings' cargo doc -p zaino-oram --no-deps --all-features` | Pass | The research models, shadow seam, and private worker document cleanly |
 | `cargo fmt --all -- --check` | Pass | Rust formatting is clean |
 | `git diff --check -- docs/notes/oram-phase0-1-feasibility-report.md` | Pass | Report has no whitespace errors |
 | `makers lint-boundary-conversions` | Canonical task unavailable because `makers` is not installed; its four forbidden-pattern classes were scanned directly with `rg` and returned no hits | Re-run the canonical task in CI/tooling-enabled environment |
@@ -343,10 +360,12 @@ No target hardware benchmark has been run. Required evidence still includes:
 7. long-run failure evidence and a documented probability bound rather than an
    assumption.
 
-The current `RostlCandidateStore` is intentionally unsuitable for such a
-claim. It is volatile, does not implement the engine's `ObliviousStore`, catches
-upstream panics only to latch a local failed-closed state, and has not run on
-the intended target. Upstream open work includes Circuit ORAM stash recovery
+The current `RostlCandidateStore` and its worker are intentionally unsuitable
+for such a claim. They are volatile, do not implement the engine's
+`ObliviousStore`, expose no upstream stash metric, and have not run on the
+intended target. The worker catches a complete candidate call and latches a
+generic failed-closed state, but Rust's process-wide panic hook still runs and
+this is not recovery. Upstream open work includes Circuit ORAM stash recovery
 ([#13](https://github.com/obliviouslabs/rostl/issues/13)) and map queue recovery
 ([#32](https://github.com/obliviouslabs/rostl/issues/32)).
 

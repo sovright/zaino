@@ -18,7 +18,12 @@ offline dependency experiment:
 - a fixed continuation-token codec with injected protection/replay interfaces;
 - `rostl-experimental`, pinned to `8c3a12d2`, which compile-checks the fixed
   event as `Pod`/`Cmov` and exposes an offline volatile adapter only on Linux
-  x86_64. Other targets fail adapter construction explicitly.
+  x86_64. A bounded single-owner worker serializes both reads and inserts,
+  rejects queue saturation without fallback, drains accepted work before
+  joining, rejects queue capacities outside the research bound of 1..=4096,
+  and reports identifier-free aggregate lifecycle counters. Other targets fail
+  real-worker construction explicitly while still testing the worker mechanics
+  against a deterministic fake backend.
 
 It does **not** contain production encryption, durable ORAM persistence, TDX
 attestation, protobufs, or a network listener, and it makes no production
@@ -27,6 +32,13 @@ mainnet blocks into the core, but no full-mainnet measurement artifact exists
 yet. Static fixture parity is not live-backend, finalised-database, reorg, or
 mainnet shadow evidence. Upstream `rostl` panic/recovery, persistence,
 side-channel, and licensing gates remain unresolved.
+The worker is not connected to the projection or query engine, and its queue
+metrics expose aggregate load. Caught panics still invoke Rust's process-wide
+panic hook; candidate records are not zeroized, and accepted volatile mutations
+have no durable acknowledgement or retry guarantee. An unexpected worker-loop
+panic can make the active accepted command's outcome indeterminate. Automatic
+retry is forbidden: discard the volatile candidate and reconcile or rebuild it
+from an authoritative checkpoint first.
 The schedule model does not establish equal instruction, memory, allocation,
 page, timing, or packet behavior.
 Those components remain gated by ADR-0007 and the feasibility criteria in
