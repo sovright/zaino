@@ -152,7 +152,7 @@ impl fmt::Debug for LayoutIdentity {
 
 /// Protected table kind. This is public profile information, not an identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TableKind {
+pub(super) enum TableKind {
     Directory,
     Event,
 }
@@ -163,6 +163,129 @@ impl TableKind {
             Self::Directory => 1,
             Self::Event => 2,
         }
+    }
+}
+
+/// Validated fixed allocation and admission boundary shared with sizing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct TableAllocation {
+    capacity: u32,
+    admission_limit: u32,
+}
+
+impl TableAllocation {
+    fn new(
+        kind: TableKind,
+        capacity: u64,
+        admission_limit: u64,
+    ) -> Result<Self, LayoutConfigError> {
+        let capacity = validate_table_capacity(kind, capacity)?;
+        let admission_limit = validate_admission_limit(kind, capacity, admission_limit)?;
+        Ok(Self {
+            capacity,
+            admission_limit,
+        })
+    }
+
+    pub(super) const fn capacity(self) -> u32 {
+        self.capacity
+    }
+
+    pub(super) const fn admission_limit(self) -> u32 {
+        self.admission_limit
+    }
+}
+
+fn validate_table_capacity(kind: TableKind, capacity: u64) -> Result<u32, LayoutConfigError> {
+    if capacity < MINIMUM_TABLE_CAPACITY {
+        return Err(LayoutConfigError::CapacityBelowMinimum { table: kind });
+    }
+    if capacity > MAXIMUM_TABLE_CAPACITY {
+        return Err(LayoutConfigError::CapacityOutsideSlotDomain { table: kind });
+    }
+    if !capacity.is_power_of_two() {
+        return Err(LayoutConfigError::CapacityNotPowerOfTwo { table: kind });
+    }
+    u32::try_from(capacity)
+        .map_err(|_| LayoutConfigError::CapacityOutsideSlotDomain { table: kind })
+}
+
+fn validate_admission_limit(
+    kind: TableKind,
+    capacity: u32,
+    admission_limit: u64,
+) -> Result<u32, LayoutConfigError> {
+    if admission_limit == 0 {
+        return Err(LayoutConfigError::ZeroAdmissionLimit { table: kind });
+    }
+    if admission_limit >= u64::from(capacity) {
+        return Err(LayoutConfigError::AdmissionLimitOutsideTable { table: kind });
+    }
+    u32::try_from(admission_limit)
+        .map_err(|_| LayoutConfigError::AdmissionLimitOutsideTable { table: kind })
+}
+
+impl fmt::Debug for TableAllocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TableAllocation { public_shape: true, .. }")
+    }
+}
+
+/// Validated allocation shared by the pure planner and capacity model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct FixedLayoutAllocation {
+    directory: TableAllocation,
+    event: TableAllocation,
+    max_events_per_address: u32,
+}
+
+impl FixedLayoutAllocation {
+    pub(super) fn new(
+        directory_capacity: u64,
+        directory_admission_limit: u64,
+        event_capacity: u64,
+        event_admission_limit: u64,
+        max_events_per_address: u64,
+    ) -> Result<Self, LayoutConfigError> {
+        let directory = TableAllocation::new(
+            TableKind::Directory,
+            directory_capacity,
+            directory_admission_limit,
+        )?;
+        let event = TableAllocation::new(TableKind::Event, event_capacity, event_admission_limit)?;
+        Self::from_allocations(directory, event, max_events_per_address)
+    }
+
+    fn from_allocations(
+        directory: TableAllocation,
+        event: TableAllocation,
+        max_events_per_address: u64,
+    ) -> Result<Self, LayoutConfigError> {
+        let max_events_per_address =
+            validate_max_events_per_address(event.admission_limit(), max_events_per_address)?;
+        Ok(Self {
+            directory,
+            event,
+            max_events_per_address,
+        })
+    }
+
+    pub(super) const fn directory(self) -> TableAllocation {
+        self.directory
+    }
+
+    pub(super) const fn event(self) -> TableAllocation {
+        self.event
+    }
+
+    pub(super) const fn max_events_per_address(self) -> u32 {
+        self.max_events_per_address
+    }
+}
+
+impl fmt::Debug for FixedLayoutAllocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FixedLayoutAllocation { public_shape: true, .. }")
     }
 }
 
@@ -187,28 +310,11 @@ impl TableShape {
         if probe_count > MAXIMUM_PROBE_COUNT {
             return Err(LayoutConfigError::ProbeCountAboveResearchLimit { table: kind });
         }
-        if capacity < MINIMUM_TABLE_CAPACITY {
-            return Err(LayoutConfigError::CapacityBelowMinimum { table: kind });
-        }
-        if capacity > MAXIMUM_TABLE_CAPACITY {
-            return Err(LayoutConfigError::CapacityOutsideSlotDomain { table: kind });
-        }
-        if !capacity.is_power_of_two() {
-            return Err(LayoutConfigError::CapacityNotPowerOfTwo { table: kind });
-        }
-        if u64::try_from(probe_count).map_or(true, |count| count > capacity) {
+        let capacity = validate_table_capacity(kind, capacity)?;
+        if u64::try_from(probe_count).map_or(true, |count| count > u64::from(capacity)) {
             return Err(LayoutConfigError::ProbeCountExceedsCapacity { table: kind });
         }
-        if admission_limit == 0 {
-            return Err(LayoutConfigError::ZeroAdmissionLimit { table: kind });
-        }
-        if admission_limit >= capacity {
-            return Err(LayoutConfigError::AdmissionLimitOutsideTable { table: kind });
-        }
-        let capacity = u32::try_from(capacity)
-            .map_err(|_| LayoutConfigError::CapacityOutsideSlotDomain { table: kind })?;
-        let admission_limit = u32::try_from(admission_limit)
-            .map_err(|_| LayoutConfigError::AdmissionLimitOutsideTable { table: kind })?;
+        let admission_limit = validate_admission_limit(kind, capacity, admission_limit)?;
         let probe_count = u32::try_from(probe_count)
             .map_err(|_| LayoutConfigError::ProbeCountAboveResearchLimit { table: kind })?;
         Ok(Self {
@@ -220,6 +326,13 @@ impl TableShape {
 
     const fn mask(self) -> u32 {
         self.capacity - 1
+    }
+
+    const fn allocation(self) -> TableAllocation {
+        TableAllocation {
+            capacity: self.capacity,
+            admission_limit: self.admission_limit,
+        }
     }
 }
 
@@ -263,7 +376,7 @@ impl<const PROBES: usize> fmt::Debug for EventTableConfiguration<PROBES> {
 
 /// Invalid public layout configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayoutConfigError {
+pub(super) enum LayoutConfigError {
     ZeroSchemaVersion,
     ZeroKeyEpoch,
     ZeroLayoutGeneration,
@@ -327,6 +440,21 @@ impl fmt::Display for LayoutConfigError {
 }
 
 impl std::error::Error for LayoutConfigError {}
+
+fn validate_max_events_per_address(
+    event_admission_limit: u32,
+    max_events_per_address: u64,
+) -> Result<u32, LayoutConfigError> {
+    if max_events_per_address == 0 {
+        return Err(LayoutConfigError::ZeroEventsPerAddress);
+    }
+    let max_events_per_address = u32::try_from(max_events_per_address)
+        .map_err(|_| LayoutConfigError::EventsPerAddressOutsideDomain)?;
+    if max_events_per_address > event_admission_limit {
+        return Err(LayoutConfigError::EventsPerAddressExceedsAdmission);
+    }
+    Ok(max_events_per_address)
+}
 
 /// Identifier-free failure to prepare a logical probe plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -686,14 +814,12 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
         event: EventTableConfiguration<EVENT_PROBES>,
         max_events_per_address: u64,
     ) -> Result<Self, LayoutConfigError> {
-        if max_events_per_address == 0 {
-            return Err(LayoutConfigError::ZeroEventsPerAddress);
-        }
-        let max_events_per_address = u32::try_from(max_events_per_address)
-            .map_err(|_| LayoutConfigError::EventsPerAddressOutsideDomain)?;
-        if max_events_per_address > event.0.admission_limit {
-            return Err(LayoutConfigError::EventsPerAddressExceedsAdmission);
-        }
+        let allocation = FixedLayoutAllocation::from_allocations(
+            directory.0.allocation(),
+            event.0.allocation(),
+            max_events_per_address,
+        )?;
+        let max_events_per_address = allocation.max_events_per_address();
         let mut layout = Self {
             identity,
             directory,
@@ -1291,6 +1417,18 @@ mod tests {
             EventTableConfiguration::<EVENT_PROBES>::new(event_capacity, event_admission)?,
             8,
         )
+    }
+
+    #[test]
+    fn planner_and_sizing_share_one_validated_allocation_shape() -> Result<(), LayoutConfigError> {
+        let allocation = FixedLayoutAllocation::new(8, 6, 16, 12, 8)?;
+        let layout = layout()?;
+
+        assert_eq!(allocation.directory(), layout.directory.0.allocation());
+        assert_eq!(allocation.event(), layout.event.0.allocation());
+        assert_eq!(allocation.max_events_per_address(), 8);
+        assert_eq!(layout.max_events_per_address, 8);
+        Ok(())
     }
 
     const fn p2pkh(byte: u8) -> StandardAddress {

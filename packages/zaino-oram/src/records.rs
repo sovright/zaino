@@ -15,7 +15,7 @@ const TRANSPARENT_SCRIPT_CAPACITY: usize = 34;
 
 /// Exact byte width of the append-only event candidate exercised by the
 /// experimental ORAM adapter.
-pub(super) const PERSISTENT_UTXO_EVENT_BYTES: usize = 72;
+const PERSISTENT_UTXO_EVENT_BYTES: usize = 72;
 
 /// Exact byte width of one immutable protected-directory cell.
 const PERSISTENT_ADDRESS_DIRECTORY_BYTES: usize = 38;

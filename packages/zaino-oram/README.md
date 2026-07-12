@@ -13,8 +13,8 @@ offline dependency experiment:
 - compiled privacy-profile validation;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
-- an aggregate-only corpus accumulator, checked memory-sizing model, and
-  optional adapter for canonical `zaino-state::IndexedBlock` streams;
+- an aggregate-only corpus accumulator, checked full-capacity two-table sizing
+  model, and optional adapter for canonical `zaino-state::IndexedBlock` streams;
 - a bounded plaintext finalized-projection oracle plus a default-off
   `shadow-parity` fixture that compares every observed standard address with
   ordinary-source results at one identical immutable vector checkpoint;
@@ -84,9 +84,18 @@ record sizes are safe only in distinct typed stores; a future unified padded
 value needs an authenticated kind tag.
 Slots, ordinals, occupancy, and nested event fields remain sensitive and must
 not enter logs, errors, or metrics. No backend-connected allocator, composite
-two-ORAM store, seed persistence/rotation protocol, or full-allocated-capacity
-sizing claim is implemented yet. The existing estimator remains invalid for
-this two-table layout until the next sizing slice replaces occupied-page math.
+two-ORAM store, or seed persistence/rotation protocol is implemented. The
+logical sizing model charges every allocated 38-byte directory cell, every
+allocated 82-byte event cell, and position-map entries for both full capacity
+domains; occupancy changes admission/load flags but never reduces modeled
+bytes. Its flat position-map width and backend expansion remain uncalibrated
+operator assumptions. They do not model the pinned backend's tree blocks,
+recursive maps, stash, initialization temporaries, allocator/runtime working
+set, or measured RSS. `fits_modeled_constraints` therefore combines only
+configured count limits with the uncalibrated memory model; it is not proof of
+insertion success, collision probability, TDX fit, or 30% RSS headroom. The
+version-2 report carries `insertion_bound=false`, `backend_calibrated=false`,
+and `rss_measured=false` alongside those booleans.
 The schedule model does not establish equal instruction, memory, allocation,
 page, timing, or packet behavior.
 Those components remain gated by ADR-0007 and the feasibility criteria in

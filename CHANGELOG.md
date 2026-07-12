@@ -14,10 +14,11 @@ and this library adheres to Rust's notion of
   equal logical store-call schedules. This slice does not claim equal physical
   work. ADR-0007 defines the privacy boundary and keeps the experimental runtime
   outside the publishable Zaino dependency graph.
-- `zaino-oram`: aggregate corpus/sizing models, a fixed continuation-token
-  contract, an exact 72-byte append-only event candidate, and a pinned volatile
-  `rostl` feasibility adapter. These remain offline research components and do
-  not establish a production host-obliviousness claim.
+- `zaino-oram`: initial aggregate corpus/page-capacity models, a fixed
+  continuation-token contract, an exact 72-byte append-only event candidate,
+  and a pinned volatile `rostl` feasibility adapter. These remain offline
+  research components and do not establish a production host-obliviousness
+  claim.
 - `zaino-state`: a reusable transparent create/spend event-extraction seam for
   ORAM-agnostic projection consumers.
 - `zaino-oram` / `zaino-state`: a default-off offline shadow fixture compares
@@ -36,7 +37,13 @@ and this library adheres to Rust's notion of
   network/schema-separated address keys, generates distinct keyed fixed probes,
   validates complete directory/event probe arrays, and prepares opaque
   immutable inserts only after a clean scan. It is not backend-integrated or a
-  content-authentication, sizing, or physical-obliviousness claim.
+  content-authentication or physical-obliviousness claim.
+- `zaino-oram` / `zainod-oram`: the aggregate capacity model and corpus CLI now
+  charge full allocated 38-byte directory and 82-byte event tables plus both
+  complete position-map domains. Version-2 reports separate admission,
+  hot-address, modeled-memory, and combined modeled fit with explicit negative
+  evidence markers; backend expansion remains an uncalibrated research
+  assumption rather than measured RSS evidence.
 - `zainod-oram`: a non-published, listener-free one-shot runner that scans one
   fixed mainnet tip using an NFS snapshot and chain-continuity validation into
   identifier-free corpus aggregates.

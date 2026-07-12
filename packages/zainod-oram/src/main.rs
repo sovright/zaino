@@ -51,19 +51,27 @@ struct CorpusArgs {
     #[arg(long)]
     annual_growth_bps: u64,
 
-    /// Fixed event slots reserved in every logical address page.
+    /// Full allocated address-directory table capacity (power of two).
     #[arg(long)]
-    events_per_page: u64,
+    directory_capacity: u64,
 
-    /// Fixed metadata overhead reserved per logical address page.
+    /// Maximum occupied directory records admitted below table capacity.
     #[arg(long)]
-    page_overhead_bytes: u64,
+    directory_admission_limit: u64,
 
-    /// Fixed logical address-directory entry width.
+    /// Full allocated one-event table capacity (power of two).
     #[arg(long)]
-    directory_entry_bytes: u64,
+    event_capacity: u64,
 
-    /// Fixed logical position-map entry width.
+    /// Maximum occupied event records admitted below table capacity.
+    #[arg(long)]
+    event_admission_limit: u64,
+
+    /// Maximum events admitted for any one standard address.
+    #[arg(long)]
+    max_events_per_address: u64,
+
+    /// Uncalibrated flat position-map entry width used only by the model.
     #[arg(long)]
     position_map_entry_bytes: u64,
 
@@ -101,9 +109,11 @@ async fn run_corpus(args: CorpusArgs) -> RunnerResult<()> {
     let model = MainnetCorpusModel::new(
         args.growth_horizon_years,
         args.annual_growth_bps,
-        args.events_per_page,
-        args.page_overhead_bytes,
-        args.directory_entry_bytes,
+        args.directory_capacity,
+        args.directory_admission_limit,
+        args.event_capacity,
+        args.event_admission_limit,
+        args.max_events_per_address,
         args.position_map_entry_bytes,
         args.backend_expansion_bps,
         args.tdx_memory_bytes,
@@ -197,7 +207,7 @@ impl Error for RunnerError {}
 mod tests {
     use super::*;
 
-    fn valid_args() -> [&'static str; 22] {
+    fn valid_args() -> [&'static str; 26] {
         [
             "zainod-oram",
             "corpus",
@@ -207,11 +217,15 @@ mod tests {
             "5",
             "--annual-growth-bps",
             "500",
-            "--events-per-page",
-            "64",
-            "--page-overhead-bytes",
-            "32",
-            "--directory-entry-bytes",
+            "--directory-capacity",
+            "256",
+            "--directory-admission-limit",
+            "190",
+            "--event-capacity",
+            "1024",
+            "--event-admission-limit",
+            "900",
+            "--max-events-per-address",
             "64",
             "--position-map-entry-bytes",
             "8",
@@ -230,6 +244,9 @@ mod tests {
         let Command::Corpus(args) = cli.command;
 
         assert_eq!(args.growth_horizon_years, 5);
+        assert_eq!(args.directory_capacity, 256);
+        assert_eq!(args.event_capacity, 1_024);
+        assert_eq!(args.max_events_per_address, 64);
         assert_eq!(args.required_headroom_bps, 3_000);
         assert_eq!(args.progress_interval.get(), 10_000);
         Ok(())

@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    records::{AddressKey, PersistentTransparentUtxo, TransparentUtxo},
+    records::{AddressKey, PersistentTransparentUtxo, PersistentUtxoEvent, TransparentUtxo},
     sizing::{SizingError, SizingParameters, StorageEstimate},
     store::StoreSlot,
 };
@@ -346,7 +346,10 @@ impl CorpusAccumulator {
             live_distribution,
             peak_live_distribution,
             hottest_event_counts,
-            record_sizes: CandidateRecordSizes::compiled(sizing.event_record_bytes()),
+            record_sizes: CandidateRecordSizes::compiled(
+                sizing.directory_record_bytes(),
+                sizing.event_record_bytes(),
+            ),
             growth,
             sizing,
             projections,
@@ -401,24 +404,28 @@ impl DistributionSummary {
     }
 }
 
-/// Compiled and configured record widths included in every corpus report.
+/// Compiled record widths included in every corpus report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CandidateRecordSizes {
     address_key_bytes: u64,
     business_utxo_bytes: u64,
     persistent_utxo_bytes: u64,
+    persistent_event_bytes: u64,
     logical_store_slot_bytes: u64,
-    configured_event_record_bytes: u64,
+    directory_cell_bytes: u64,
+    event_cell_bytes: u64,
 }
 
 impl CandidateRecordSizes {
-    fn compiled(configured_event_record_bytes: u64) -> Self {
+    fn compiled(directory_cell_bytes: u64, event_cell_bytes: u64) -> Self {
         Self {
             address_key_bytes: size_of::<AddressKey>() as u64,
             business_utxo_bytes: size_of::<TransparentUtxo>() as u64,
             persistent_utxo_bytes: size_of::<PersistentTransparentUtxo>() as u64,
+            persistent_event_bytes: size_of::<PersistentUtxoEvent>() as u64,
             logical_store_slot_bytes: size_of::<StoreSlot>() as u64,
-            configured_event_record_bytes,
+            directory_cell_bytes,
+            event_cell_bytes,
         }
     }
 }
@@ -499,7 +506,7 @@ impl fmt::Display for CorpusReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "schema=oram-corpus-v1\naggregate_only=true\nblocks={}\ntransactions={}\noutputs={}\nspends={}\ndistinct_standard_addresses={}\nlive_standard_utxos={}\nlive_nonstandard_utxos={}\n",
+            "schema=oram-corpus-v2\naggregate_only=true\nblocks={}\ntransactions={}\noutputs={}\nspends={}\ndistinct_standard_addresses={}\nlive_standard_utxos={}\nlive_nonstandard_utxos={}\n",
             self.blocks,
             self.transactions,
             self.outputs,
@@ -522,12 +529,14 @@ impl fmt::Display for CorpusReport {
         write_array(f, "hottest_event_counts", &self.hottest_event_counts)?;
         writeln!(
             f,
-            "record_sizes=address_key:{},business_utxo:{},persistent_utxo:{},logical_store_slot:{},configured_event:{}",
+            "record_sizes=address_key:{},business_utxo:{},persistent_utxo:{},persistent_event:{},logical_store_slot:{},directory_cell:{},event_cell:{}",
             self.record_sizes.address_key_bytes,
             self.record_sizes.business_utxo_bytes,
             self.record_sizes.persistent_utxo_bytes,
+            self.record_sizes.persistent_event_bytes,
             self.record_sizes.logical_store_slot_bytes,
-            self.record_sizes.configured_event_record_bytes,
+            self.record_sizes.directory_cell_bytes,
+            self.record_sizes.event_cell_bytes,
         )?;
         writeln!(
             f,
@@ -538,14 +547,26 @@ impl fmt::Display for CorpusReport {
         for projection in &self.projections {
             writeln!(
                 f,
-                "projection=year:{},standard_addresses:{},events:{},pages:{},modeled_bytes:{},usable_memory_bytes:{},fits_memory:{}",
+                "projection=year:{},standard_addresses:{},events:{},max_events_per_address:{},directory_load_bps:{},event_load_bps:{},allocated_directory_bytes:{},allocated_event_bytes:{},allocated_table_bytes:{},logical_position_map_bytes:{},logical_total_bytes:{},backend_expanded_bytes:{},usable_memory_bytes:{},fits_directory_admission:{},fits_event_admission:{},fits_address_event_limit:{},fits_configured_limits:{},fits_modeled_memory:{},fits_modeled_constraints:{}",
                 projection.year,
                 projection.standard_addresses,
                 projection.estimate.event_count(),
-                projection.estimate.page_count(),
+                projection.estimate.maximum_events_per_address(),
+                projection.estimate.directory_load_bps(),
+                projection.estimate.event_load_bps(),
+                projection.estimate.allocated_directory_bytes(),
+                projection.estimate.allocated_event_bytes(),
+                projection.estimate.allocated_table_bytes(),
+                projection.estimate.logical_position_map_bytes(),
+                projection.estimate.logical_total_bytes(),
                 projection.estimate.backend_expanded_bytes(),
                 projection.estimate.usable_memory_bytes(),
-                projection.estimate.fits_memory(),
+                projection.estimate.fits_directory_admission(),
+                projection.estimate.fits_event_admission(),
+                projection.estimate.fits_address_event_limit(),
+                projection.estimate.fits_configured_limits(),
+                projection.estimate.fits_modeled_memory(),
+                projection.estimate.fits_modeled_constraints(),
             )?;
         }
         Ok(())
@@ -805,11 +826,39 @@ mod tests {
     }
 
     fn sizing() -> Result<SizingParameters, SizingError> {
-        SizingParameters::new(2, 16, 32, 4, 20_000, 1_000_000, 3_000)
+        SizingParameters::new(8, 6, 16, 12, 8, 4, 20_000, 1_000_000, 3_000)
     }
 
     fn growth() -> Result<GrowthAssumption, CorpusError> {
         GrowthAssumption::new(2, 1_000)
+    }
+
+    #[test]
+    fn growth_keeps_fixed_allocation_and_exposes_admission_crossings() -> Result<(), CorpusError> {
+        let sizing = SizingParameters::new(8, 5, 16, 10, 3, 4, 10_000, 10_000, 0)
+            .map_err(CorpusError::Sizing)?;
+        let projections = build_projections(
+            &BTreeMap::from([(1, 3)]),
+            GrowthAssumption::new(2, 10_000)?,
+            sizing,
+            3,
+        )?;
+
+        assert_eq!(projections.len(), 3);
+        assert!(projections[0].estimate.fits_modeled_constraints());
+        assert!(!projections[1].estimate.fits_directory_admission());
+        assert!(projections[1].estimate.fits_event_admission());
+        assert!(!projections[2].estimate.fits_event_admission());
+        assert_eq!(projections[0].estimate.maximum_events_per_address(), 1);
+        assert_eq!(projections[2].estimate.maximum_events_per_address(), 1);
+        assert!(projections.windows(2).all(|pair| {
+            pair[0].estimate.allocated_table_bytes() == pair[1].estimate.allocated_table_bytes()
+                && pair[0].estimate.logical_position_map_bytes()
+                    == pair[1].estimate.logical_position_map_bytes()
+                && pair[0].estimate.backend_expanded_bytes()
+                    == pair[1].estimate.backend_expanded_bytes()
+        }));
+        Ok(())
     }
 
     #[test]
@@ -847,11 +896,37 @@ mod tests {
         assert_eq!(report.projections().len(), 3);
 
         let output = report.to_string();
-        assert!(output.contains("aggregate_only=true"));
-        assert!(output.contains("hottest_event_counts=2,1"));
-        assert!(output.contains(
-            "sizing_parameters=events_per_page:2,event_record_bytes:72,page_overhead_bytes:16,directory_entry_bytes:32,position_map_entry_bytes:4,backend_expansion_bps:20000,tdx_memory_bytes:1000000,required_headroom_bps:3000"
-        ));
+        assert_eq!(
+            output,
+            concat!(
+                "schema=oram-corpus-v2\n",
+                "aggregate_only=true\n",
+                "blocks=1\n",
+                "transactions=2\n",
+                "outputs=2\n",
+                "spends=1\n",
+                "distinct_standard_addresses=2\n",
+                "live_standard_utxos=1\n",
+                "live_nonstandard_utxos=0\n",
+                "script_class=p2pkh,outputs:1,spends:1,live_utxos:0\n",
+                "script_class=p2sh,outputs:1,spends:0,live_utxos:1\n",
+                "script_class=nonstandard,outputs:0,spends:0,live_utxos:0\n",
+                "events_per_address=1:1,2:1\n",
+                "live_utxos_per_address=0:1,1:1\n",
+                "peak_live_utxos_per_address=1:2\n",
+                "event_distribution=p50:1,p90:2,p99:2,p999:2,max:2\n",
+                "live_distribution=p50:0,p90:1,p99:1,p999:1,max:1\n",
+                "peak_live_distribution=p50:1,p90:1,p99:1,p999:1,max:1\n",
+                "hottest_event_counts=2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n",
+                "record_sizes=address_key:32,business_utxo:88,persistent_utxo:88,persistent_event:72,logical_store_slot:96,directory_cell:38,event_cell:82\n",
+                "growth_assumption=horizon_years:2,annual_growth_bps:1000\n",
+                "sizing_parameters=directory_capacity:8,directory_admission_limit:6,directory_admission_bps:7500,directory_record_bytes:38,event_capacity:16,event_admission_limit:12,event_admission_bps:7500,event_record_bytes:82,max_events_per_address:8,position_map_entry_bytes:4,backend_expansion_bps:20000,tdx_memory_bytes:1000000,required_headroom_bps:3000\n",
+                "sizing_evidence=insertion_bound:false,backend_calibrated:false,rss_measured:false,load_bps_rounding:floor,load_bps_capped:false\n",
+                "projection=year:0,standard_addresses:2,events:3,max_events_per_address:2,directory_load_bps:2500,event_load_bps:1875,allocated_directory_bytes:304,allocated_event_bytes:1312,allocated_table_bytes:1616,logical_position_map_bytes:96,logical_total_bytes:1712,backend_expanded_bytes:3424,usable_memory_bytes:700000,fits_directory_admission:true,fits_event_admission:true,fits_address_event_limit:true,fits_configured_limits:true,fits_modeled_memory:true,fits_modeled_constraints:true\n",
+                "projection=year:1,standard_addresses:4,events:6,max_events_per_address:2,directory_load_bps:5000,event_load_bps:3750,allocated_directory_bytes:304,allocated_event_bytes:1312,allocated_table_bytes:1616,logical_position_map_bytes:96,logical_total_bytes:1712,backend_expanded_bytes:3424,usable_memory_bytes:700000,fits_directory_admission:true,fits_event_admission:true,fits_address_event_limit:true,fits_configured_limits:true,fits_modeled_memory:true,fits_modeled_constraints:true\n",
+                "projection=year:2,standard_addresses:6,events:9,max_events_per_address:2,directory_load_bps:7500,event_load_bps:5625,allocated_directory_bytes:304,allocated_event_bytes:1312,allocated_table_bytes:1616,logical_position_map_bytes:96,logical_total_bytes:1712,backend_expanded_bytes:3424,usable_memory_bytes:700000,fits_directory_admission:true,fits_event_admission:true,fits_address_event_limit:true,fits_configured_limits:true,fits_modeled_memory:true,fits_modeled_constraints:true\n",
+            )
+        );
         assert!(!output.contains("11111111"));
         assert!(!output.contains("22222222"));
         assert!(!output.contains("aaaaaaaa"));

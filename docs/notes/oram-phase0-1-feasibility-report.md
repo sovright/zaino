@@ -62,7 +62,11 @@ The evaluated worktree implements:
   including legacy nonstandard-key preservation;
 - a legacy `CompactTxStreamer` schema golden pinned to the upstream baseline's
   service name, ordered RPC signatures, and normalized proto fingerprint;
-- an aggregate-only corpus accumulator and sizing model;
+- an aggregate-only corpus accumulator and version-2 two-table sizing model
+  that shares layout capacity/admission validation, charges every allocated
+  38/82-byte cell and both complete position-map domains, and reports separate
+  directory, event, hot-address, modeled-memory, and combined modeled fit
+  flags;
 - a Zaino corpus adapter that validates a nonempty genesis-forward chain,
   contiguous heights, parent hashes, and the network-bound canonical genesis before
   emitting a public final checkpoint;
@@ -118,8 +122,11 @@ The following statements are **not** established by that evidence:
 - fixed-probe derivation and logical binding now exist only as a pure model; no
   protected backend-connected allocator, atomic scan-and-insert worker command,
   seed generation/persistence/rotation protocol, composite two-ORAM backend,
-  or full-allocated-capacity sizing exists, and no probe/load constants are
-  selected for production;
+  or selected production probe/load constants exist;
+- full-capacity logical arithmetic now exists, but its flat position-map width
+  and backend expansion are uncalibrated operator inputs. It does not model the
+  pinned backend's tree blocks, recursive maps, stash, initialization
+  temporaries, allocator/runtime working set, or measured RSS;
 - the pure vacancy witness and occupied-record admission input are supplied by
   the caller, not authenticated current backend state; the injected probe seed
   and keyed-hash state are not zeroized or memory-locked;
@@ -156,7 +163,8 @@ The following statements are **not** established by that evidence:
 | Aggregate corpus implementation | Partial | Identifier-free accumulator, mainnet-only one-shot runner, provenance validation, nonempty fixture, same-block spend, standard/nonstandard accounting | Execute the runner and produce a reproducible full-mainnet report |
 | Mainnet counts/distributions and growth | Missing | No mainnet output artifact exists | Measure distinct standard scripts, lifetime events, live/peak UTXOs, hot tails, script classes, record sizes, and selected growth horizon |
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov` compile-time tests | Bind the records to the selected backend and exercise them through actual pinned ORAM operations on Linux x86_64 |
-| Fixed-probe table layout | Partial model | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, and opaque insert preparation | Select measured capacities/probe counts, correct full-capacity sizing, make scan-and-insert atomic in one worker command, add authenticated generation ownership, and trace the native backend |
+| Fixed-probe table layout | Partial model | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, and opaque insert preparation | Select measured capacities/probe counts, make scan-and-insert atomic in one worker command, add authenticated generation ownership, and trace the native backend |
+| Full-capacity logical sizing | Partial pass | Version-2 reports bind compiled 38/82-byte cells to shared directory/event allocation validation, charge both full table and position-map domains, keep modeled bytes fixed across occupancy/growth, and expose load/admission/hot-address/modeled-memory flags plus explicit negative evidence markers | Calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and runtime working set on target hardware; select an accepted mainnet profile |
 | Compiler pin | Pass | Repository pins Rust 1.96.0 | Pin release flags, LLVM behavior, and reproducible Linux build inputs |
 | CPU/target/TDX pin | Missing | Code gates real adapter operations to Linux x86_64; only macOS aarch64 is installed locally | Select CPU generations, target triple, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
 | Pinned ORAM dependency | Partial | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock` | Resolve API/failure/recovery concerns and decide upstream, fork, or replacement |
@@ -200,7 +208,7 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
 | Pinned real-ORAM adapter | Partial compile evidence | The volatile `rostl` candidate remains isolated and cross-compiles on Linux x86_64; it is not the projection store and has not run on target hardware |
-| Append-only event-page or audited upsert design | Partial layout model | Exact immutable directory and one-event cells avoid tail-page/directory upsert; a pure keyed two-table planner validates full fixed probe sets, legitimate collisions, duplicates, dummies, placement, and requested event ownership. Backend-connected allocation, atomic mutation, whole-history fold cost, full-capacity sizing, and adapter integration remain unselected |
+| Append-only event-page or audited upsert design | Partial layout model | Exact immutable directory and one-event cells avoid tail-page/directory upsert; a pure keyed two-table planner validates full fixed probe sets, legitimate collisions, duplicates, dummies, placement, and requested event ownership. Backend-connected allocation, atomic mutation, whole-history fold cost, and adapter integration remain unselected |
 | Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state |
 | Staged mutation and fail-closed state | Pass for the in-memory oracle | Whole blocks apply to a cloned candidate; late unknown/double-spend, provenance, and collection-capacity failures leave the current block uncommitted; target failures never publish readiness or expose query results |
 | Checkpoint/replay/rebuild policy | Pass for the in-memory oracle | Opaque cursor candidates prevent forged/stale commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready oracle usable |
@@ -235,7 +243,7 @@ yet stakeholder-approved.
 | Logical ORAM key | Must hide | No query-derived host address or fallback | Mock receives the key; this is explicitly plaintext test code | Open |
 | Physical ORAM location/path | Must hide | Secret cases must be indistinguishable under accepted trace test | Pinned adapter compiles; no Linux/x86 physical trace was captured | Open |
 | Worker queue depth, in-flight state, and aggregate counters | Permitted operational load only | Fixed public capacity and fixed-schema aggregates; never identifiers, command/result kinds, hit/miss, or per-command timing | Deterministic tests pin queue bounds, exact accepted-command accounting, redacted handles/replies, and aggregate-only snapshot fields | Open: budget and fixed-interval export policy unset; no native-load trace |
-| Address-directory lookup | Must hide | Directory and event-page lookup both protected | Exact directory/page encodings and a pure keyed fixed-probe/binding model exist; complete const-generic scans have equal modeled observation/validation counts | Open: no atomic allocator, directory/event ORAM integration, corrected full-capacity sizing, content authentication, or measured physical trace |
+| Address-directory lookup | Must hide | Directory and event-page lookup both protected | Exact directory/page encodings, shared full-capacity sizing, and a pure keyed fixed-probe/binding model exist; complete const-generic scans have equal modeled observation/validation counts | Open: no atomic allocator, directory/event ORAM integration, content authentication, or measured physical trace |
 | Query-derived allocation | Must hide | Fixed allocation/work budget | Offline recorder validates zero explicit modeled query allocations | Open: allocator/page/instruction measurement absent |
 | Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | Engine has no source dependency and validates zero modeled source calls | Open: no integrated source instrumentation or readiness proof |
 | NFS scan work | Must hide | Complete profile-fixed scan on every query | No NFS merge implementation | Open |
@@ -317,10 +325,10 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
 | `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Trait proof and unsupported-target path compile; real ORAM path not executed |
-| `cargo test -p zaino-oram --all-targets --no-default-features` | 78 passed | Fixed models, token semantics, complete logical traces, exact record encodings, keyed layout vectors, full-probe collision/corruption/requested-owner/admission/capability validation, minimum/maximum supported table shapes, sizing, and aggregate core |
-| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 97 passed | Adds shared canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
-| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 93 passed | Adds directory/page `Pod`/`Cmov` semantics, expected unsupported-host behavior, and deterministic bounded-worker FIFO, capacity-bound, saturation, exact accounting, backend/outer panic, indeterminate active outcome, reply-send failure, telemetry, shutdown, and drop/join coverage; the Linux real-backend round trip was cfg-excluded |
-| `cargo test -p zaino-oram --all-targets --all-features` | 113 passed | Combined keyed layout, trace, exact record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, bounded-worker model, and unsupported-host adapter suite |
+| `cargo test -p zaino-oram --all-targets --no-default-features` | 82 passed | Fixed models, token semantics, complete logical traces, exact record encodings, keyed layout vectors, shared allocation validation, full-probe collision/corruption/requested-owner checks, full-capacity arithmetic, admission/load/hot-address boundaries, fixed-growth bytes, sizing overflow, and aggregate core |
+| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 101 passed | Adds shared canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
+| `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 97 passed | Adds directory/page `Pod`/`Cmov` semantics, expected unsupported-host behavior, and deterministic bounded-worker FIFO, capacity-bound, saturation, exact accounting, backend/outer panic, indeterminate active outcome, reply-send failure, telemetry, shutdown, and drop/join coverage; the Linux real-backend round trip was cfg-excluded |
+| `cargo test -p zaino-oram --all-targets --all-features` | 117 passed | Combined keyed layout, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, bounded-worker model, and unsupported-host adapter suite |
 | `cargo test -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
 | `cargo test -p zaino-proto --test compact_tx_streamer_legacy_golden` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
 | `cargo test -p zainod-oram --all-targets` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
@@ -370,18 +378,23 @@ It is not yet a mainnet measurement:
 - exact identities are available only for standard P2PKH/P2SH scripts;
   nonstandard compact outputs are counted by class without inventing a false
   address identity;
-- the sizing model reserves fixed page slots and accounts for both directory
-  and page position-map entries, but its backend expansion, directory/page
-  constants, ORAM tree load, stash, recursive maps, allocator overhead, and
-  runtime working set are not calibrated to a real backend;
-- the estimator still accepts caller-supplied page/directory widths and charges
-  occupied modeled pages, not full allocated fixed-probe table capacities; it
-  is not yet bound to the new 38/82-byte cell candidates and would not be valid
-  evidence for a two-table layout;
+- the version-2 sizing model charges every compiled 38-byte directory and
+  82-byte event cell across the full configured table capacities plus both full
+  position-map domains; projected occupancy affects only explicit
+  load/admission/hot-address flags, never allocated bytes;
+- the position-map entry width and backend expansion remain uncalibrated
+  operator assumptions. The model does not calculate the pinned backend's
+  actual tree blocks, recursive map levels, stash, initialization temporaries,
+  allocator overhead, or runtime working set, and admission fit is not a bound
+  on fixed-probe insertion success or collision probability;
+- proportional growth currently multiplies address counts within existing
+  histogram buckets; it does not forecast a worsening hot-address tail;
 - no growth horizon or target TDX memory size has been approved.
 
-Therefore `fits_memory` is a model result only. It must not be used as the
-30%-RSS go/no-go result.
+Therefore `fits_modeled_memory` and `fits_modeled_constraints` are model results
+only. Neither may be used as the 30%-RSS go/no-go result. Version-2 output
+states `insertion_bound=false`, `backend_calibrated=false`, and
+`rss_measured=false` in the same machine-readable report.
 
 ## RSS, benchmark, stash, and queue blockers
 

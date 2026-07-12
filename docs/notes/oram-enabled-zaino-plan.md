@@ -11,8 +11,9 @@ Implementation began on `feat/oram-private-foundation` after fast-forwarding the
 local `dev` branch to the recorded target fork point. The initial implemented
 scope establishes the ADR, fixed business/persistence/envelope and continuation
 shapes, exact profile coupling, a bounded plaintext test store, logical
-store-call schedule tests, aggregate corpus/sizing models, a shared transparent
-event seam, and a pinned volatile `rostl` experiment. It contains no production
+store-call schedule tests, aggregate corpus/full-capacity two-table sizing
+models, a shared transparent event seam, and a pinned volatile `rostl`
+experiment. It contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
 mainnet/RSS, recovery, side-channel, hardware, and licensing gates are open.
@@ -191,8 +192,10 @@ The first supported business operation is transparent-address UTXO lookup. The e
 Candidate fixed records are:
 
 - `AddressKey`: network/domain-separated digest of a canonical transparent locking script;
-- `AddressDirectory`: fixed metadata for a bounded number of page slots;
-- `AddressEventPage`: fixed array of output/spend events plus explicit occupancy/dummy bits;
+- `AddressDirectory`: fixed address key plus its self-described directory slot;
+- `AddressEventPage`: fixed one-event compatibility cell with explicit
+  occupancy/dummy state; a future multi-event format requires a separately
+  audited upsert design;
 - `UtxoEvent`: txid, output index, value, height, script kind/hash, and mined/spent flags;
 - `ProjectionCheckpoint`: public chain watermark plus schema/key epoch and authenticated root;
 - `ContinuationState`: cursor/profile/query digest/epoch/expiry/nonce, encoded as a fixed-length AEAD token.
@@ -294,7 +297,11 @@ public_listen_address = "127.0.0.1:9137"
 max_sync_lag = 2
 
 [privacy.oram]
-capacity = 0
+directory_capacity = 0
+directory_admission_limit = 0
+event_capacity = 0
+event_admission_limit = 0
+max_events_per_address = 0
 storage_path = ""
 key_epoch = 0
 

@@ -60,9 +60,11 @@ impl MainnetCorpusModel {
     pub fn new(
         growth_horizon_years: u16,
         annual_growth_bps: u64,
-        events_per_page: u64,
-        page_overhead_bytes: u64,
-        directory_entry_bytes: u64,
+        directory_capacity: u64,
+        directory_admission_limit: u64,
+        event_capacity: u64,
+        event_admission_limit: u64,
+        max_events_per_address: u64,
         position_map_entry_bytes: u64,
         backend_expansion_bps: u64,
         tdx_memory_bytes: u64,
@@ -71,9 +73,11 @@ impl MainnetCorpusModel {
         let growth = GrowthAssumption::new(growth_horizon_years, annual_growth_bps)
             .map_err(ZainoCorpusError::Aggregate)?;
         let sizing = SizingParameters::new(
-            events_per_page,
-            page_overhead_bytes,
-            directory_entry_bytes,
+            directory_capacity,
+            directory_admission_limit,
+            event_capacity,
+            event_admission_limit,
+            max_events_per_address,
             position_map_entry_bytes,
             backend_expansion_bps,
             tdx_memory_bytes,
@@ -364,7 +368,7 @@ mod tests {
     use crate::zaino_fixtures::{indexed_block, output, transaction};
 
     fn sizing() -> Result<SizingParameters, crate::sizing::SizingError> {
-        SizingParameters::new(2, 16, 32, 4, 20_000, 1_000_000, 3_000)
+        SizingParameters::new(8, 6, 16, 12, 8, 4, 20_000, 1_000_000, 3_000)
     }
 
     fn fixture_genesis() -> Result<IndexedBlock, Box<dyn std::error::Error>> {

@@ -12,8 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   fixed envelopes, exact compiled privacy-profile shapes, a bounded plaintext
   mock store, modeled logical store-call schedules, and equivalence tests. No
   equal-physical-work claim is made.
-- Aggregate-only corpus accumulation and checked capacity sizing tied to an
-  exact 72-byte append-only persistent event record.
+- Initial aggregate-only corpus accumulation and page-oriented capacity model
+  tied to an exact 72-byte append-only persistent event record.
 - An optional canonical `IndexedBlock` adapter with genesis/continuity/checkpoint
   validation and identifier-free reports.
 - A fixed continuation-token codec with injected protection and atomic replay
@@ -31,10 +31,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   derivation, secret-seeded keyed probes, power-of-two capacity/admission
   validation, complete fixed-array collision/corruption scans, requested-event
   owner binding, and opaque immutable insertion plans. Backend integration,
-  atomic mutation, content authentication, full-capacity sizing, and physical
-  trace claims remain out of scope.
+  atomic mutation, content authentication, and physical trace claims remain out
+  of scope.
+- A checked two-table capacity model that shares layout allocation validation,
+  charges every allocated 38/82-byte cell and both full position-map domains,
+  and reports independent directory, event, hot-address, modeled-memory, and
+  combined modeled fit flags. Backend expansion and position-map width remain
+  uncalibrated research inputs rather than measured RSS evidence.
 
 ### Changed
+
+- Replace the obsolete occupied-page corpus estimate and version-1 report with
+  fixed directory/event allocation inputs and the version-2 aggregate schema.
 
 ### Deprecated
 
