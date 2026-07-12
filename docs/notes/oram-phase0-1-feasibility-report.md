@@ -1,4 +1,4 @@
-# ORAM Phase 0/1 feasibility report
+# ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-12
 - Branch: `feat/oram-private-foundation`
@@ -56,6 +56,13 @@ The evaluated worktree implements:
 - a Zaino corpus adapter that validates a nonempty genesis-forward chain,
   contiguous heights, parent hashes, and the network-bound canonical genesis before
   emitting a public final checkpoint;
+- one shared, staged canonical-chain cursor used by both corpus scanning and a
+  plaintext offline finalized-projection oracle;
+- a bounded fixture oracle that tracks every seen/live outpoint (including
+  nonstandard outputs), appends standard-address create/spend events,
+  reconstructs exact standard UTXOs, stages whole blocks before checkpoint
+  publication, latches identifier-free failed-closed faults, and models fresh
+  rebuild, forward replay, and network/schema/key/checkpoint reconciliation;
 - a non-published, listener-free `zainod-oram corpus` runner that binds the
   scanner to canonical mainnet genesis, captures a fixed public tip, streams
   `IndexedBlock` values without retaining them, and requires every sizing input;
@@ -79,6 +86,9 @@ The following statements are **not** established by that evidence:
   `zainod-oram` currently contains only the offline corpus runner;
 - no durable ORAM/checkpoint implementation, rollback defense, crash recovery,
   measured rebuild path, or recovery-time objective exists;
+- the offline projection uses ordinary cloned Rust maps/vectors: it is not an
+  ORAM, authenticated root, durable transaction, allocator-failure boundary, or
+  ordinary-Zaino shadow-parity result;
 - dependency licensing is not cleared for the intended distribution.
 
 ## Gate scorecard
@@ -114,7 +124,7 @@ open the server gate.
 
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
-| Business and persistent records | Partial pass | Fixed UTXO and 72-byte event types exist with named conversions and adjacent tests; finalized create/spend state combinations are enforced at construction and persistent decode, while projection/page/directory/checkpoint types remain incomplete |
+| Business and persistent records | Partial pass | Fixed UTXO and 72-byte event types exist with named conversions and adjacent tests; finalized create/spend states are enforced, and an in-memory offline checkpoint/projection model exists; persistent page/directory/checkpoint representations remain incomplete |
 | Fixed envelope codec | Partial | Exact Rust byte-array length is tested; there is no encrypted inner codec or protobuf framing |
 | Compiled profile table | Partial pass | Test profile binds reads, zero logical writes/allocations/source calls, one request/response application frame, fixed bytes, unary completion, response slots, envelope bytes, and cover rounds; padded inner inputs, NFS work, timeout, concurrency, and a production profile ID are absent |
 | Continuation tokens | Partial | Fixed format and semantic rejection tests exist; nonce generation is still caller-supplied, and no reviewed AEAD, key lifecycle, service integration, or fixed-work timing/trace result exists |
@@ -125,11 +135,29 @@ open the server gate.
 | Private service adapter | Missing | No service or outer-status equivalence test exists |
 | Frame/byte/completion equivalence | Partial model | Every offline round models one fixed request and response application envelope, equal bytes, and unary completion; this is explicitly not protobuf, HTTP/2, TLS, packet-capture, or outer-status evidence |
 | NFS/source-call equivalence | Partial model | The engine has no source dependency and validates zero query-derived source calls; no NFS scan or integrated validator/LMDB/raw-transaction instrumentation exists |
-| Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior, but complete result-state parity still awaits the offline projection oracle |
+| Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior, but ordinary-index versus offline-oracle result parity remains uncommitted |
 | Token fixed-work equivalence | Missing | Rejection semantics are tested, but instruction/allocation/timing and full query-shape equivalence are not |
 | Test runtime discipline | Pass in this slice | New tests are synchronous `#[test]` cases |
 
 Phase 1 is a useful skeleton, not an accepted private contract.
+
+### Phase 2 — offline projection and shadow-parity preparation
+
+| Deliverable or acceptance condition | State | Evidence or gap |
+|---|---|---|
+| Pinned real-ORAM adapter | Partial compile evidence | The volatile `rostl` candidate remains isolated and cross-compiles on Linux x86_64; it is not the projection store and has not run on target hardware |
+| Append-only event-page or audited upsert design | Partial model | The plaintext oracle appends exact standard-address events and maintains a derived live map under explicit logical capacities; no ORAM page/directory layout or fold-cost profile is selected |
+| Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state |
+| Staged mutation and fail-closed state | Pass for the in-memory oracle | Whole blocks apply to a cloned candidate; late unknown/double-spend, provenance, and collection-capacity failures leave the current block uncommitted; target failures never publish readiness or expose query results |
+| Checkpoint/replay/rebuild policy | Pass for the in-memory oracle | Opaque cursor candidates prevent forged/stale commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready oracle usable |
+| Single mutation worker and backend telemetry | Missing | No queue, concurrency boundary, stash/queue/capacity metrics, or real backend mutation worker exists |
+| Volatile rebuild path | Partial pass | Fresh rebuild and clone-ready forward replay are deterministic in fixtures; no full-corpus runtime or RTO is measured |
+| Shadow comparison with ordinary Zaino | Missing | Fixture expectations are exact but no committed comparison against `addr_utxos_by_range` at the same finalized checkpoint exists |
+| Zero query-derived source calls | Pass for current type boundary | The query engine has no validator/LMDB/raw-transaction dependency; this is not yet an integrated readiness or call-trace result |
+| Long-run failure bound | Missing | No target-load mixed-operation soak or node-year analysis exists |
+
+Phase 2 has a deterministic plaintext oracle, not an ORAM-backed projection or
+shadow-parity result.
 
 ## Leakage matrix
 
@@ -161,7 +189,7 @@ yet stakeholder-approved.
 | Request arrival and connection duration | Permitted | Declared traffic-analysis leakage | No service exists | Not applicable yet |
 | Client IP/network metadata | Permitted | Outside initial claim | No service exists | Not applicable yet |
 | Service/schema/profile ID | Permitted | Bound into attestation and publicly versioned | Test label only; no attestation | Open |
-| Coarse network/chain epoch/height/hash/sync lag | Permitted | Public checkpoint and freshness policy | Corpus report records network and final height/hash | Partial; serving policy absent |
+| Coarse network/chain epoch/height/hash/sync lag | Permitted | Public checkpoint and freshness policy | Corpus report plus offline oracle bind network, height/hash, schema, and key epoch with replay/rebuild decisions | Partial; authoritative live feed and serving policy absent |
 | Database capacity and projected growth | Permitted | Aggregate only, never identifier-bearing | Aggregate report types and redacted debug exist | Partial; no mainnet artifact |
 | Aggregate QPS/queue/health | Permitted within allowlist | No outcome/cardinality labels | No metrics implementation | Open |
 | Logs, errors, traces, metric labels | Must exclude private values/outcomes | Allowlisted aggregate/public fields only | New sensitive types use redacted debug; no end-to-end log audit | Open |
@@ -233,9 +261,9 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Trait proof and unsupported-target path compile; real ORAM path not executed |
 | `cargo test -p zaino-oram --all-targets --no-default-features` | 53 passed | Fixed models, token semantics, complete logical traces, event-state validation, records, sizing, and aggregate core |
-| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 60 passed | Adds canonical/nonempty Zaino fixture, network/genesis binding, incremental scanning, poisoning, and provenance coverage |
+| `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 72 passed | Adds shared canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
 | `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 55 passed | Adds `Pod`/`Cmov` proof and expected `UnsupportedPlatform`; Linux round-trip test was cfg-excluded |
-| `cargo test -p zaino-oram --all-targets --all-features` | 62 passed | Combined trace, record, token, corpus/provenance, and unsupported-host adapter suite |
+| `cargo test -p zaino-oram --all-targets --all-features` | 74 passed | Combined trace, record, token, corpus/provenance, offline projection, and unsupported-host adapter suite |
 | `cargo test -p zaino-proto --test compact_tx_streamer_legacy_golden` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
 | `cargo test -p zainod-oram --all-targets` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
 | `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu -- -D warnings` | Pass with Rust 1.96.1 | Linux x86_64 adapter code compiles strictly; it was not linked or executed and is not the exact pinned compiler |

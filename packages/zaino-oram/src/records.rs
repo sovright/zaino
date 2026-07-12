@@ -295,7 +295,7 @@ impl UtxoEvent {
         self.output_index
     }
 
-    const fn value_zat(&self) -> u64 {
+    pub(super) const fn value_zat(&self) -> u64 {
         self.value_zat
     }
 
@@ -303,11 +303,11 @@ impl UtxoEvent {
         self.height
     }
 
-    const fn script_class(&self) -> UtxoScriptClass {
+    pub(super) const fn script_class(&self) -> UtxoScriptClass {
         self.script_class
     }
 
-    const fn script_hash(&self) -> &[u8; 20] {
+    pub(super) const fn script_hash(&self) -> &[u8; 20] {
         &self.script_hash
     }
 }

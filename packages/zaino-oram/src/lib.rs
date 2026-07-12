@@ -16,11 +16,15 @@
     )
 )]
 
+#[cfg(feature = "corpus-zaino")]
+mod canonical_chain;
 mod continuation_token;
 mod corpus;
 mod engine;
 mod envelope;
 mod profile;
+#[cfg(feature = "corpus-zaino")]
+mod projection;
 mod records;
 #[cfg(feature = "rostl-experimental")]
 mod rostl_adapter;
@@ -29,6 +33,8 @@ mod store;
 mod trace;
 #[cfg(feature = "corpus-zaino")]
 mod zaino_corpus;
+#[cfg(all(test, feature = "corpus-zaino"))]
+mod zaino_fixtures;
 
 #[cfg(feature = "corpus-zaino")]
 pub use zaino_corpus::{
