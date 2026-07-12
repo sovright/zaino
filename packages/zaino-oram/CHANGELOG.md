@@ -27,6 +27,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Exact immutable 38-byte address-directory and 82-byte one-event page
   candidates with canonical dummy encodings, named persistence conversions,
   standard-address validation, redacted diagnostics, and `Pod`/`Cmov` proofs.
+- A pure const-generic two-table layout model with canonical address-key
+  derivation, secret-seeded keyed probes, power-of-two capacity/admission
+  validation, complete fixed-array collision/corruption scans, requested-event
+  owner binding, and opaque immutable insertion plans. Backend integration,
+  atomic mutation, content authentication, full-capacity sizing, and physical
+  trace claims remain out of scope.
 
 ### Changed
 

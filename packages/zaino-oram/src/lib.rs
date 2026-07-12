@@ -22,6 +22,7 @@ mod continuation_token;
 mod corpus;
 mod engine;
 mod envelope;
+mod layout;
 mod profile;
 #[cfg(feature = "corpus-zaino")]
 mod projection;

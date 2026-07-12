@@ -32,6 +32,11 @@ and this library adheres to Rust's notion of
   38-byte directory cell and an 82-byte one-event page with canonical dummies,
   named persistence conversions, and `Pod`/`Cmov` proofs. Table allocation and
   adapter integration remain separate work.
+- `zaino-oram`: a pure two-table layout model now derives canonical
+  network/schema-separated address keys, generates distinct keyed fixed probes,
+  validates complete directory/event probe arrays, and prepares opaque
+  immutable inserts only after a clean scan. It is not backend-integrated or a
+  content-authentication, sizing, or physical-obliviousness claim.
 - `zainod-oram`: a non-published, listener-free one-shot runner that scans one
   fixed mainnet tip using an NFS snapshot and chain-continuity validation into
   identifier-free corpus aggregates.

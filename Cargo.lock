@@ -6041,6 +6041,7 @@ dependencies = [
 name = "zaino-oram"
 version = "0.1.0"
 dependencies = [
+ "blake2",
  "bytemuck",
  "rand 0.9.4",
  "rostl-oram",

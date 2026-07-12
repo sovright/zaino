@@ -41,7 +41,7 @@ impl AddressKey {
     }
 
     /// Returns the fixed digest bytes.
-    const fn as_bytes(&self) -> &[u8; ADDRESS_KEY_BYTES] {
+    pub(super) const fn as_bytes(&self) -> &[u8; ADDRESS_KEY_BYTES] {
         &self.0
     }
 }
@@ -531,7 +531,7 @@ pub(super) struct AddressDirectory {
 }
 
 impl AddressDirectory {
-    const fn dummy() -> Self {
+    pub(super) const fn dummy() -> Self {
         Self {
             occupied: false,
             directory_slot: 0,
@@ -539,7 +539,7 @@ impl AddressDirectory {
         }
     }
 
-    const fn real(directory_slot: u32, address_key: AddressKey) -> Self {
+    pub(super) const fn real(directory_slot: u32, address_key: AddressKey) -> Self {
         Self {
             occupied: true,
             directory_slot,
@@ -547,15 +547,15 @@ impl AddressDirectory {
         }
     }
 
-    const fn is_occupied(&self) -> bool {
+    pub(super) const fn is_occupied(&self) -> bool {
         self.occupied
     }
 
-    const fn directory_slot(&self) -> u32 {
+    pub(super) const fn directory_slot(&self) -> u32 {
         self.directory_slot
     }
 
-    const fn address_key(&self) -> &AddressKey {
+    pub(super) const fn address_key(&self) -> &AddressKey {
         &self.address_key
     }
 }
@@ -582,7 +582,7 @@ pub(super) struct AddressEventPage {
 }
 
 impl AddressEventPage {
-    const fn dummy() -> Self {
+    pub(super) const fn dummy() -> Self {
         Self {
             event: None,
             directory_slot: 0,
@@ -590,7 +590,7 @@ impl AddressEventPage {
         }
     }
 
-    fn real(
+    pub(super) fn real(
         directory_slot: u32,
         event_ordinal: u32,
         event: UtxoEvent,
@@ -605,19 +605,19 @@ impl AddressEventPage {
         })
     }
 
-    const fn is_occupied(&self) -> bool {
+    pub(super) const fn is_occupied(&self) -> bool {
         self.event.is_some()
     }
 
-    const fn directory_slot(&self) -> u32 {
+    pub(super) const fn directory_slot(&self) -> u32 {
         self.directory_slot
     }
 
-    const fn event_ordinal(&self) -> u32 {
+    pub(super) const fn event_ordinal(&self) -> u32 {
         self.event_ordinal
     }
 
-    const fn event(&self) -> Option<&UtxoEvent> {
+    pub(super) const fn event(&self) -> Option<&UtxoEvent> {
         self.event.as_ref()
     }
 }
@@ -637,7 +637,7 @@ fn is_standard_address_event(event: &UtxoEvent) -> bool {
 
 /// A business event cannot enter the private address-event table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddressEventPageError {
+pub(super) enum AddressEventPageError {
     NonStandardEvent,
 }
 
