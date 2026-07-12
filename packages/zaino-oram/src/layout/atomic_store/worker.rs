@@ -2,8 +2,9 @@
 //!
 //! The worker consumes the complete executor, so no raw table handle, slot,
 //! read, or insert operation crosses the command boundary. It remains a
-//! volatile, module-private research model and is not connected to `rostl`,
-//! projection, or the query engine.
+//! volatile, module-private research model. Its feature-gated child can build
+//! the exact typed `rostl` executor on Linux x86_64 for offline evidence, but
+//! no projection, query-engine, or service owner calls that constructor.
 //! Append reply tickets fail the worker closed when dropped unconsumed, while
 //! merely retaining a ticket never stalls later work or shutdown. Deliberately
 //! leaking a ticket with `mem::forget` is outside this trusted module-private
@@ -21,6 +22,9 @@ use std::{
 };
 
 use super::*;
+
+#[cfg(feature = "rostl-experimental")]
+mod rostl;
 
 const REPLY_CHANNEL_CAPACITY: usize = 1;
 // Allocation guard for the offline experiment, not an approved service profile.

@@ -20,6 +20,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   interfaces.
 - A Linux-x86_64-only volatile `rostl` experiment pinned at `8c3a12d2`; other
   targets reject construction and no production obliviousness claim is made.
+- Separate typed `rostl` stores for the exact 38-byte directory and 82-byte
+  event-page records, plus a private Linux-only offline constructor that places
+  both stores behind the exclusive business-command worker for native proof;
+  no projection/service owner calls it yet. Healthy misses and
+  duplicates share one read/remap plus one write-or-insert/remap schedule;
+  `Cmov` selection preserves the prior logical bytes on duplicate, and
+  uncertain upstream outcomes fail the store closed. Native Linux execution,
+  authentication, persistence, recovery, and physical-trace claims remain out
+  of scope.
 - A bounded single-owner worker for the exact two-table command core, with
   nonblocking admission of whole history-read/append commands, deterministic
   shutdown draining, terminal fault latching, uniform append-ticket-abandonment

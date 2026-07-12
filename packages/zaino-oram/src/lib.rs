@@ -28,8 +28,6 @@ mod profile;
 #[cfg(feature = "corpus-zaino")]
 mod projection;
 mod records;
-#[cfg(feature = "rostl-experimental")]
-mod rostl_adapter;
 mod sizing;
 mod store;
 mod trace;

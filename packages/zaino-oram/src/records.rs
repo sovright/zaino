@@ -418,15 +418,6 @@ impl PersistentUtxoEvent {
             ),
         })
     }
-
-    #[cfg(all(
-        feature = "rostl-experimental",
-        target_os = "linux",
-        target_arch = "x86_64"
-    ))]
-    pub(super) const fn zeroed() -> Self {
-        Self([0; PERSISTENT_UTXO_EVENT_BYTES])
-    }
 }
 
 impl Default for PersistentUtxoEvent {
