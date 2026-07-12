@@ -63,6 +63,10 @@ The evaluated worktree implements:
   reconstructs exact standard UTXOs, stages whole blocks before checkpoint
   publication, latches identifier-free failed-closed faults, and models fresh
   rebuild, forward replay, and network/schema/key/checkpoint reconciliation;
+- a default-off static shadow fixture that compares that oracle with ordinary
+  Zaino `BlockchainSource::get_address_utxos` results for every standard
+  address observed through the same immutable regtest-vector tip, plus an
+  absent address, with both sides bound to the identical height and hash;
 - a non-published, listener-free `zainod-oram corpus` runner that binds the
   scanner to canonical mainnet genesis, captures a fixed public tip, streams
   `IndexedBlock` values without retaining them, and requires every sizing input;
@@ -87,8 +91,9 @@ The following statements are **not** established by that evidence:
 - no durable ORAM/checkpoint implementation, rollback defense, crash recovery,
   measured rebuild path, or recovery-time objective exists;
 - the offline projection uses ordinary cloned Rust maps/vectors: it is not an
-  ORAM, authenticated root, durable transaction, allocator-failure boundary, or
-  ordinary-Zaino shadow-parity result;
+  ORAM, authenticated root, durable transaction, or allocator-failure boundary;
+- static fixture parity is not live-backend shadow parity, finalised-database
+  parity, reorg/seam coverage, a source-call trace, or mainnet evidence;
 - dependency licensing is not cleared for the intended distribution.
 
 ## Gate scorecard
@@ -135,13 +140,13 @@ open the server gate.
 | Private service adapter | Missing | No service or outer-status equivalence test exists |
 | Frame/byte/completion equivalence | Partial model | Every offline round models one fixed request and response application envelope, equal bytes, and unary completion; this is explicitly not protobuf, HTTP/2, TLS, packet-capture, or outer-status evidence |
 | NFS/source-call equivalence | Partial model | The engine has no source dependency and validates zero query-derived source calls; no NFS scan or integrated validator/LMDB/raw-transaction instrumentation exists |
-| Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior, but ordinary-index versus offline-oracle result parity remains uncommitted |
+| Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior; static ordinary-source versus offline-oracle UTXO parity is committed, while live direct/RPC and finalised-database parity remain open |
 | Token fixed-work equivalence | Missing | Rejection semantics are tested, but instruction/allocation/timing and full query-shape equivalence are not |
-| Test runtime discipline | Pass in this slice | New tests are synchronous `#[test]` cases |
+| Test runtime discipline | Pass in this slice | Synchronous cases use `#[test]`; the shadow fixture's two tests alone use current-thread `#[tokio::test]` because they await the ordinary `BlockchainSource` query |
 
 Phase 1 is a useful skeleton, not an accepted private contract.
 
-### Phase 2 — offline projection and shadow-parity preparation
+### Phase 2 — offline projection and static shadow parity
 
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
@@ -152,12 +157,12 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Checkpoint/replay/rebuild policy | Pass for the in-memory oracle | Opaque cursor candidates prevent forged/stale commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready oracle usable |
 | Single mutation worker and backend telemetry | Missing | No queue, concurrency boundary, stash/queue/capacity metrics, or real backend mutation worker exists |
 | Volatile rebuild path | Partial pass | Fresh rebuild and clone-ready forward replay are deterministic in fixtures; no full-corpus runtime or RTO is measured |
-| Shadow comparison with ordinary Zaino | Missing | Fixture expectations are exact but no committed comparison against `addr_utxos_by_range` at the same finalized checkpoint exists |
+| Shadow comparison with ordinary Zaino | Pass for one static fixture checkpoint | A default-off test independently obtains ordinary UTXOs from `MockchainSource::get_address_utxos` over Zebra full blocks and projection UTXOs from `IndexedBlock` transparent events; it compares every standard address observed through immutable regtest-vector height 200 plus an absent address, at the same height/hash. Live direct/RPC, finalised-database, mainnet, and reorg shadow modes remain missing |
 | Zero query-derived source calls | Pass for current type boundary | The query engine has no validator/LMDB/raw-transaction dependency; this is not yet an integrated readiness or call-trace result |
 | Long-run failure bound | Missing | No target-load mixed-operation soak or node-year analysis exists |
 
-Phase 2 has a deterministic plaintext oracle, not an ORAM-backed projection or
-shadow-parity result.
+Phase 2 now has a deterministic plaintext oracle and one static ordinary-source
+parity result, not an ORAM-backed projection or live shadow mode.
 
 ## Leakage matrix
 
@@ -259,16 +264,20 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo tree -p zaino-oram --features rostl-experimental --edges normal` | Resolved `rostl` alpha9 to pinned commit `8c3a12d2...` | Dependency pin confirmed |
 | `cargo check -p zaino-oram --all-targets --no-default-features` | Pass | Portable research model compiles |
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
+| `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Trait proof and unsupported-target path compile; real ORAM path not executed |
 | `cargo test -p zaino-oram --all-targets --no-default-features` | 53 passed | Fixed models, token semantics, complete logical traces, event-state validation, records, sizing, and aggregate core |
 | `cargo test -p zaino-oram --all-targets --features corpus-zaino` | 72 passed | Adds shared canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
 | `cargo test -p zaino-oram --all-targets --features rostl-experimental` | 55 passed | Adds `Pod`/`Cmov` proof and expected `UnsupportedPlatform`; Linux round-trip test was cfg-excluded |
-| `cargo test -p zaino-oram --all-targets --all-features` | 74 passed | Combined trace, record, token, corpus/provenance, offline projection, and unsupported-host adapter suite |
+| `cargo test -p zaino-oram --all-targets --all-features` | 75 passed | Combined trace, record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, and unsupported-host adapter suite |
+| `cargo test -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
 | `cargo test -p zaino-proto --test compact_tx_streamer_legacy_golden` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
 | `cargo test -p zainod-oram --all-targets` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
 | `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu -- -D warnings` | Pass with Rust 1.96.1 | Linux x86_64 adapter code compiles strictly; it was not linked or executed and is not the exact pinned compiler |
 | `cargo test -p zaino-state transparent_events --lib --no-default-features` | 4 passed | Event ordering, coinbase skip, script handling, overflow errors, and redaction |
 | `cargo clippy -p zaino-oram --all-targets --all-features -- -D warnings` | Pass | Focused all-feature lint is clean on the local host |
+| `cargo clippy -p zaino-state --lib --features test_dependencies --no-deps -- -D warnings` | Pass | The feature-gated cross-crate fixture seam is warning-free without widening the normal production feature set |
+| `cargo clippy -p zaino-state --lib --features test_dependencies --no-deps -- -D warnings -D clippy::unwrap_used` | Existing-tree failure | Reports four pre-existing production `unwrap` calls outside this slice (`node_backed_indexer.rs`, `finalised_state/entry.rs`, and `mempool.rs`); the changed production/test-support paths contain none |
 | `cargo clippy -p zaino-proto --test compact_tx_streamer_legacy_golden -- -D warnings` | Pass | Legacy schema golden is warning-free |
 | `cargo clippy -p zainod-oram --all-targets -- -D warnings` | Pass | Listener-free runner lint is clean |
 | `cargo check --workspace --all-targets --no-default-features` | Pass | Every workspace member, including the new non-default runner, compiles without default features |
@@ -276,6 +285,17 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo fmt --all -- --check` | Pass | Rust formatting is clean |
 | `git diff --check -- docs/notes/oram-phase0-1-feasibility-report.md` | Pass | Report has no whitespace errors |
 | `makers lint-boundary-conversions` | Canonical task unavailable because `makers` is not installed; its four forbidden-pattern classes were scanned directly with `rg` and returned no hits | Re-run the canonical task in CI/tooling-enabled environment |
+
+Two broader `zaino-state` gates remain baseline-blocked outside this slice.
+`cargo test -p zaino-state --lib --no-default-features` reports 134 passes,
+84 failures, and one ignored test because repeated test initializers unwrap a
+second process-global tracing subscriber installation; running serially does
+not change that process-global conflict. The directly affected existing vector
+loader test, existing ordinary `get_address_utxos` test, and new shadow fixture
+test each pass in isolated processes. Warning-denied `zaino-state` rustdoc also
+stops on two private `OPERATIONAL_NFS_DEPTH` links and one stale
+`BlockCacheConfig` link outside the changed paths; warning-denied `zaino-oram`
+rustdoc passes with `shadow-parity` enabled.
 
 These are compile/unit-model results. They are not benchmark, mainnet, TDX,
 network, recovery, or side-channel results.

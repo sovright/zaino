@@ -20,6 +20,10 @@ and this library adheres to Rust's notion of
   not establish a production host-obliviousness claim.
 - `zaino-state`: a reusable transparent create/spend event-extraction seam for
   ORAM-agnostic projection consumers.
+- `zaino-oram` / `zaino-state`: a default-off offline shadow fixture compares
+  the plaintext projection with ordinary-source UTXO results for every standard
+  address observed at one identical immutable regtest-vector checkpoint. The
+  supporting `zaino-state` surface exists only under `test_dependencies`.
 - `zainod-oram`: a non-published, listener-free one-shot runner that scans one
   fixed mainnet tip using an NFS snapshot and chain-continuity validation into
   identifier-free corpus aggregates.

@@ -1,7 +1,9 @@
 //! Test vector creation and validity tests, MockchainSource creation.
 
 use corez::io::{self, Read};
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
 use std::io::BufReader;
 use std::path::Path;
@@ -12,9 +14,11 @@ use zebra_chain::serialization::ZcashDeserialize as _;
 use zebra_rpc::methods::GetAddressUtxos;
 
 use crate::chain_index::source::mockchain_source::MockchainSource;
+#[cfg(test)]
+use crate::CompactTxData;
 use crate::{
     read_u32_le, read_u64_le, BlockHash, BlockMetadata, BlockWithMetadata, ChainWork, CompactSize,
-    CompactTxData, IndexedBlock,
+    IndexedBlock,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +47,7 @@ pub struct TestVectorClientData {
     pub balance: u64,
 }
 
+#[cfg(test)]
 pub async fn sync_db_with_blockdata(
     db: &impl crate::chain_index::finalised_state::capability::DbWrite,
     vector_data: Vec<TestVectorBlockData>,
@@ -54,13 +59,16 @@ pub async fn sync_db_with_blockdata(
                 break;
             }
         }
-        db.write_block(chain_block).await.unwrap();
+        db.write_block(chain_block)
+            .await
+            .expect("checked-in test vector block must write to the fixture database");
     }
 }
 
 /// Recursively copies `src` into `dst`, creating `dst` if it does not exist.
 /// Used by tests to seed a fresh tempdir from a pre-built fixture DB so each
 /// test gets an isolated, writable copy without paying for a fresh ingest.
+#[cfg(test)]
 pub(in crate::chain_index::tests) fn copy_dir_recursive(
     src: &Path,
     dst: &Path,
@@ -87,9 +95,20 @@ pub(in crate::chain_index::tests) fn copy_dir_recursive(
 /// each call site picks its own consumption strategy (by-value iteration,
 /// collection, accumulator updates, etc.) without duplicating the metadata
 /// boilerplate.
+#[cfg(test)]
 pub(crate) fn indexed_block_chain(
     blocks: &[TestVectorBlockData],
 ) -> impl Iterator<Item = IndexedBlock> + '_ {
+    try_indexed_block_chain(blocks).map(|result| {
+        result.expect("test vector block must convert to the compact indexed representation")
+    })
+}
+
+/// Fallibly materialises the regtest `IndexedBlock` chain while threading
+/// cumulative chainwork between successive blocks.
+pub(crate) fn try_indexed_block_chain(
+    blocks: &[TestVectorBlockData],
+) -> impl Iterator<Item = io::Result<IndexedBlock>> + '_ {
     let mut parent_chain_work: Option<ChainWork> = None;
     blocks.iter().map(move |vector| {
         let metadata = BlockMetadata::new(
@@ -119,9 +138,10 @@ pub(crate) fn indexed_block_chain(
             ),
         );
         let chain_block =
-            IndexedBlock::try_from(BlockWithMetadata::new(&vector.zebra_block, metadata)).unwrap();
+            IndexedBlock::try_from(BlockWithMetadata::new(&vector.zebra_block, metadata))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         parent_chain_work = Some(chain_block.context.chainwork);
-        chain_block
+        Ok(chain_block)
     })
 }
 
@@ -129,6 +149,7 @@ pub(crate) fn indexed_block_chain(
 /// `(block_height, tx_index) → CompactTxData` lookup, so a spender-symmetry
 /// test can walk the chain once for its outpoint scan and then resolve
 /// `(height, tx_index)` spender references in O(1).
+#[cfg(test)]
 pub(in crate::chain_index::tests) fn index_test_vector_blocks(
     blocks: &[TestVectorBlockData],
 ) -> (Vec<IndexedBlock>, HashMap<(u32, u64), CompactTxData>) {
@@ -293,6 +314,7 @@ pub(crate) fn load_test_vectors() -> io::Result<TestVectorData> {
 }
 
 #[allow(clippy::type_complexity)]
+#[cfg(test)]
 pub(crate) fn build_mockchain_source(
     // the input data for this function could be reduced for wider use
     // but is more simple to pass all test block data here.
@@ -361,13 +383,14 @@ pub(crate) fn build_active_mockchain_source(
 
 // ***** Tests *****
 
-#[tokio::test(flavor = "multi_thread")]
-async fn vectors_can_be_loaded_and_deserialised() {
+#[cfg(test)]
+#[test]
+fn vectors_can_be_loaded_and_deserialised() {
     let TestVectorData {
         blocks,
         faucet,
         recipient,
-    } = load_test_vectors().unwrap();
+    } = load_test_vectors().expect("checked-in test vectors must load");
 
     // Chech block data..
     assert!(

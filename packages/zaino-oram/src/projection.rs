@@ -1691,4 +1691,78 @@ mod tests {
         );
         Ok(())
     }
+
+    #[cfg(feature = "shadow-parity")]
+    #[tokio::test]
+    async fn offline_projection_matches_ordinary_source_at_static_checkpoint() -> FixtureResult<()>
+    {
+        let fixture = zaino_state::test_dependencies::load_ordinary_utxo_shadow_fixture().await?;
+        assert_eq!(
+            fixture.indexed_blocks().len(),
+            fixture.checkpoint_height() as usize + 1,
+            "fixture must contain one genesis-forward block per checkpoint height"
+        );
+
+        let capacities = ProjectionCapacities::new(100_000, 100_000, 10_000, 200_000, 10_000)?;
+        let config = ProjectionConfig::new(
+            CanonicalNetwork::Regtest,
+            SCHEMA_VERSION,
+            KEY_EPOCH,
+            capacities,
+        )?;
+        let target = OfflineProjectionCheckpoint::new(
+            PublicChainCheckpoint::new(
+                CanonicalNetwork::Regtest,
+                fixture.checkpoint_height(),
+                *fixture.checkpoint_hash(),
+            ),
+            SCHEMA_VERSION,
+            KEY_EPOCH,
+        );
+        let projection =
+            OfflineFinalizedProjection::build(config, target, fixture.indexed_blocks().iter())?;
+        assert_eq!(projection.ready_checkpoint()?, target);
+
+        assert!(fixture.cases().len() > 1);
+        let mut nonempty_case_count = 0;
+        let mut largest_case = 0;
+        for case in fixture.cases() {
+            let projected = projection.fixture_live_utxos(case.address_script())?;
+            let mut ordinary_source = case.ordinary_utxos().iter().collect::<Vec<_>>();
+            ordinary_source.sort_by_key(|utxo| (*utxo.txid(), utxo.output_index()));
+            let ordinary = ordinary_source
+                .into_iter()
+                .map(|utxo| {
+                    TransparentUtxo::new(
+                        *utxo.txid(),
+                        utxo.output_index(),
+                        utxo.value_zat(),
+                        utxo.height(),
+                        utxo.script(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if case.must_be_empty() {
+                assert!(
+                    ordinary.is_empty(),
+                    "{} must be the empty case",
+                    case.name()
+                );
+            } else {
+                nonempty_case_count += usize::from(!ordinary.is_empty());
+            }
+            largest_case = largest_case.max(ordinary.len());
+            assert_eq!(projected, ordinary, "{} result differs", case.name());
+        }
+        assert!(
+            nonempty_case_count > 0,
+            "shadow parity must exercise a nonempty ordinary result"
+        );
+        assert!(
+            largest_case > 1,
+            "shadow parity must exercise multiple live UTXOs for one address"
+        );
+        Ok(())
+    }
 }

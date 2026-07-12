@@ -89,6 +89,9 @@ pub use chain_index::types::{
 pub use chain_index::mempool::{MempoolKey, MempoolValue};
 
 #[cfg(feature = "test_dependencies")]
+mod shadow_parity;
+
+#[cfg(feature = "test_dependencies")]
 /// allow public access to additional APIs, for testing
 pub mod test_dependencies {
     /// Testing export of chain_index
@@ -96,6 +99,10 @@ pub mod test_dependencies {
         pub use crate::chain_index::*;
     }
 
+    pub use crate::shadow_parity::{
+        load_ordinary_utxo_shadow_fixture, OrdinaryTransparentUtxo, OrdinaryUtxoShadowCase,
+        OrdinaryUtxoShadowError, OrdinaryUtxoShadowFixture,
+    };
     pub use crate::ChainIndexConfig;
 }
 

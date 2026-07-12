@@ -12,6 +12,9 @@ and this library adheres to Rust's notion of
   checked transparent create/spend extraction from `IndexedBlock`, used by the
   ORAM research projection without adding an internal-runtime dependency to
   this publishable crate.
+- A `test_dependencies`-only ordinary-UTXO fixture binds full Zebra block data
+  and `IndexedBlock` materialization to one immutable checkpoint for cross-crate
+  ORAM shadow-parity tests; it does not alter the shipped query surface.
 - The chain index tracks Ironwood (NU6.3) note-commitment treestate roots,
   storing `None` while the pool has no treestate rather than fabricating a
   root.
