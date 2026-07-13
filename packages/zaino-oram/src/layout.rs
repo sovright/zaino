@@ -27,8 +27,8 @@ mod atomic_store;
 #[cfg(feature = "corpus-zaino")]
 pub(super) use atomic_store::{
     shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
-    AtomicQualificationAppendResult, AtomicQualificationSnapshot, AtomicQueueCapacity,
-    AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+    AtomicQualificationAppendResult, AtomicQualificationCommandError, AtomicQualificationSnapshot,
+    AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
 #[cfg(all(test, feature = "corpus-zaino"))]
 pub(super) use atomic_store::{spawn_atomic_worker_for_tests, BackendFailure, UniqueTable};

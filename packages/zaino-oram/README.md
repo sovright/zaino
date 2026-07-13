@@ -17,6 +17,16 @@ offline dependency experiment:
 - a bounded single-owner worker that moves that exact command core onto one
   thread and admits only whole `read_history` and `append` business commands,
   with no raw probe, key, record, read, or insert surface;
+- fixed listener-free typed-worker correctness and `SmokeV1` stress
+  qualifications. The latter performs a deterministic 64-step mixed workload
+  with reference-model verification, checks a healthy command rejection, and
+  exercises a separate terminal event-limit fault. Its report contains fixed
+  public scenario/profile/backend/shape metadata plus aggregate counts, digests,
+  flags, and worker snapshots, with no raw modeled identifiers, seed, or
+  per-operation results. A portable in-memory run executes both exact worker
+  scenarios and rejects fixed-seed probe-set exhaustion before native CI. It is
+  CI-smoke correctness evidence, not target-load, benchmark, billion-operation,
+  physical-trace, recovery, TDX, or mainnet evidence;
 - compiled privacy-profile validation;
 - a crate-internal versioned request/response codec that seals one
   complete-budget-derived profile ID, fixed checkpoint, prepared query,
@@ -181,12 +191,17 @@ executor-command TOCTOU, and the Linux-only offline constructor creates two
 non-aliased ORAM/map pairs. The old raw worker surface has been removed. The
 portable schedule tests exercise the same insertion helper used by the real
 stores. The actual Linux backend and worker run in the inherited generic native
-CI lane. Capture-head native run `29223983432` passed strict all-target,
+CI lane. Final capture-head native run `29224873175` passed strict all-target,
 all-feature Clippy and all 161 tests while executing the complete typed
-store/coordinator/owner lifecycle. The current runtime-adapter branch passes 190
-all-feature tests on this macOS host; exact-head native evidence remains
-pending. Generic hosted-Linux evidence is not target-CPU, TDX, load, benchmark,
-or physical-trace qualification. Reply abandonment
+store/coordinator/owner lifecycle. Typed-qualification head `d65a999f` passed
+strict all-target, all-feature Clippy plus the 194-test `zaino-oram` and
+29-test `zainod-oram` suites in native run `29244273040` (job `86797325618`);
+their Linux-only qualification tests exercised the real typed backend. The
+current stress worktree passes 201 `zaino-oram` and 39 `zainod-oram`
+all-feature tests locally; this macOS host executes the
+typed-backend-unavailable branch, so exact-head native `SmokeV1` execution
+evidence is pending. Generic hosted-Linux evidence is not target-CPU, TDX,
+load, benchmark, or physical-trace qualification. Reply abandonment
 relies on the module-private trusted owner dropping tickets normally;
 deliberately leaking a ticket with `mem::forget` is outside this offline model.
 

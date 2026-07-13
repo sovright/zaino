@@ -19,3 +19,12 @@
   runtime-service hook, latency/RSS measurement, or physical-trace claim. The
   unsigned self-reported bundle explicitly carries no source, lockfile,
   toolchain, binary, CI-run, or execution-attestation binding.
+- Add `qualification stress --profile smoke-v1 --output-dir <NEW_DIR>` under
+  the same default-off feature. The command offers no numeric workload or
+  backend tuning knobs and publishes a distinct, aggregate-only,
+  read-back-verified stress report, text rendering, and unsigned self-reported
+  provenance bundle. `SmokeV1` is a deterministic CI correctness/fail-closed
+  exercise, not a benchmark, target-load run, billion-operation soak,
+  latency/RSS/stash/queue-load or physical-trace measurement,
+  persistence/recovery or hardware qualification, node-year failure bound, or
+  mainnet gate.

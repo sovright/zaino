@@ -25,8 +25,8 @@ mod worker;
 #[cfg(feature = "corpus-zaino")]
 pub(crate) use worker::{
     shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
-    AtomicQualificationAppendResult, AtomicQualificationSnapshot, AtomicQueueCapacity,
-    AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+    AtomicQualificationAppendResult, AtomicQualificationCommandError, AtomicQualificationSnapshot,
+    AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
 
 /// A sparse fixed-capacity table whose insert never overwrites an existing key.

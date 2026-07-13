@@ -45,6 +45,52 @@ latency, RSS, stash, physical access trace, persistence, TDX, mainnet-capacity,
 or runtime-service result. Unsupported hosts fail before creating the output
 directory.
 
+## Typed-worker stress smoke qualification
+
+The same default-off feature exposes a separate fixed mixed-workload smoke
+profile:
+
+```console
+cargo run -p zainod-oram --features typed-qualification -- \
+  qualification stress --profile smoke-v1 --output-dir <NEW_DIR>
+```
+
+`SmokeV1` is named and immutable at the command boundary: the CLI accepts no
+operation count, seed, capacity, admission, queue, or backend configuration.
+It runs 64 deterministically derived read, unique-append, and exact-replay
+steps across four modeled addresses on one healthy worker, verifies results
+against a bounded reference model after every command and at a fixed cadence,
+then checks every modeled address plus two absent addresses. It also checks
+that a cross-address append is rejected without faulting the healthy worker.
+A separate deliberately constrained worker checks that an accepted second
+unique append exceeds the public per-address event limit, returns
+`FailedClosed`, and latches terminal state. One later read and append are
+rejected at admission, and shutdown returns the expected stopped, faulted
+aggregate snapshot.
+
+Publication uses the same bounded, no-follow, synchronized sibling-staging and
+atomic no-replace path as the correctness qualification, but writes distinct
+`stress-qualification.json`, `stress-qualification.txt`, and `provenance.json`
+files. The JSON schema is
+`zaino-oram-typed-worker-stress-qualification-v1`; provenance uses
+`zaino-oram-typed-worker-stress-qualification-provenance-v1` and binds the
+compact typed report digest. The artifact contains fixed public
+schema/profile/backend/shape metadata, aggregate counts, schedule and
+final-state digests, correctness/fault summaries, evidence flags, and
+identifier-free worker snapshots; provenance adds unsigned runner-version and
+OS/architecture labels plus the report digest. It contains no raw modeled
+address/event/seed fields or per-operation results. The digests deliberately
+commit to the deterministic synthetic schedule and final state.
+
+A successful run yields generic Linux x86_64 CI-smoke evidence only. Exact-head
+native `SmokeV1` execution evidence is pending. The report records no latency,
+throughput, RSS, allocator/page-fault behavior, stash pressure, queue behavior
+under load, physical access trace, persistence/recovery result, target CPU/TDX
+result, or billion-operation reliability result. It is not
+source/lockfile/toolchain/binary-bound or execution-attested and supplies no
+node-year failure bound or mainnet-gate result. Unsupported hosts fail before
+creating the output directory.
+
 ## Corpus capture
 
 `corpus capture` produces an identifier-free measurement of the transparent

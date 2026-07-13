@@ -66,14 +66,34 @@ shutdown, then emits only correctness totals and identifier-free aggregate
 worker counters. The default-off `typed-qualification` feature exposes
 `zainod-oram qualification run`, which publishes that report as an atomic,
 read-back-verified three-file JSON, text, and digest-bound provenance artifact.
-The native Linux lane is extended to compile, lint, and test both
-research crates, but exact-head native qualification evidence remains pending.
+The native Linux lane compiles, lints, and tests both research crates. At
+typed-qualification head `d65a999f`, native run `29244273040` (job
+`86797325618`) passed strict all-target/all-feature Clippy plus the 194-test
+`zaino-oram` and 29-test `zainod-oram` suites; their Linux-only qualification
+tests exercised the real typed backend.
 The artifact digest binds the compact typed JSON report into provenance only;
 staged read-back separately checks the text rendering. The bundle is unsigned,
 self-reported, and explicitly unbound from source, lockfile, toolchain, binary,
 CI-run identity, or execution attestation.
 This slice is not a benchmark and supplies no latency, RSS, stash, physical
 access-trace, persistence, TDX, mainnet-capacity, or runtime-service evidence.
+The next isolated offline slice adds a separate named `SmokeV1` stress
+qualification. It executes a fixed 64-step mix of reads, unique appends, and
+exact replays across four modeled addresses, checks a bounded reference model
+after each command and in periodic/final sweeps, and checks that a cross-address
+command rejection leaves the worker healthy. A separate constrained worker
+checks that an accepted second unique append exceeds the event limit, returns
+`FailedClosed`, and latches terminal state; one later read and append are
+rejected at admission, and shutdown returns the expected stopped, faulted
+snapshot. Its CLI exposes no numeric or backend tuning knobs. The artifact
+contains fixed public schema/profile/backend/shape metadata, aggregate
+counters/digests/flags/snapshots, and unsigned target-label provenance; it
+contains no raw modeled address/event/seed fields or per-operation results.
+This closes a CI-smoke correctness gap only: target-load and adversarial
+full-map experiments, a `10^9`-operation soak, latency/RSS/stash/queue-load
+measurement, physical trace, persistence and recovery, target CPU/TDX, signed
+provenance, full-mainnet sizing, and the mainnet gate all remain separate
+required work. Exact-head native `SmokeV1` execution evidence is pending.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the

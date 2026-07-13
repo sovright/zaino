@@ -64,6 +64,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   stash behavior, physical access traces, persistence, TDX behavior, mainnet
   capacity, or any runtime-service property, and its report marks source,
   lockfile, toolchain, binary, and execution-attestation binding as absent.
+- A separate fixed `SmokeV1` typed-worker stress qualification with 64
+  deterministic mixed read, unique-append, and exact-replay operations across
+  four modeled addresses, periodic and final reference-model verification, a
+  nonterminal cross-address rejection probe, and a second worker that checks an
+  accepted limit-exceeding append returns `FailedClosed`, latches terminal
+  state, and rejects later commands at admission. Its report exposes no raw
+  modeled address, event, seed, or per-operation result and explicitly records
+  that CI smoke correctness is not target-load, billion-operation,
+  latency/RSS/stash/queue-load, physical-trace, persistence/recovery, TDX, or
+  mainnet-gate evidence; it has no node-year failure bound and is not
+  source/lockfile/toolchain/binary-bound or execution-attested. A portable
+  in-memory execution of both exact worker scenarios pins the fixed layout seed
+  to a probe-set-viable choice before native CI.
 - A private generic finalized-event/checkpoint coordinator that fully stages
   canonical validation, transparent event extraction, spend-owner resolution,
   capacity checks, and an ordered standard-event batch before its first sink

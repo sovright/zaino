@@ -97,12 +97,21 @@ impl AtomicWorker {
         &self,
         address: StandardAddress,
     ) -> Result<Vec<Option<UtxoEvent>>, ()> {
+        self.qualification_read_history_typed(address)
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_read_history_typed(
+        &self,
+        address: StandardAddress,
+    ) -> Result<Vec<Option<UtxoEvent>>, AtomicQualificationCommandError> {
         self.handle
             .try_read_history(address)
-            .map_err(|_| ())?
+            .map_err(AtomicQualificationCommandError::from_worker)?
             .wait()
             .map(|history| history.slots)
-            .map_err(|_| ())
+            .map_err(AtomicQualificationCommandError::from_worker)
     }
 
     #[cfg(feature = "corpus-zaino")]
@@ -111,9 +120,19 @@ impl AtomicWorker {
         address: StandardAddress,
         event: UtxoEvent,
     ) -> Result<AtomicQualificationAppendResult, ()> {
+        self.qualification_append_typed(address, event)
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_append_typed(
+        &self,
+        address: StandardAddress,
+        event: UtxoEvent,
+    ) -> Result<AtomicQualificationAppendResult, AtomicQualificationCommandError> {
         self.handle
             .try_append(address, event)
-            .map_err(|_| ())?
+            .map_err(AtomicQualificationCommandError::from_worker)?
             .wait()
             .map(|result| AtomicQualificationAppendResult {
                 disposition: match result.disposition {
@@ -124,7 +143,7 @@ impl AtomicWorker {
                 },
                 history: result.history.slots,
             })
-            .map_err(|_| ())
+            .map_err(AtomicQualificationCommandError::from_worker)
     }
 
     #[cfg(feature = "corpus-zaino")]
@@ -871,6 +890,47 @@ impl fmt::Display for AtomicWorkerBuildError {
 #[cfg(feature = "corpus-zaino")]
 impl std::error::Error for AtomicWorkerBuildError {}
 
+/// Coarse identifier-free outcome from one typed qualification command.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicQualificationCommandError {
+    QueueFull,
+    NotRunning,
+    CommandRejected,
+    FailedClosed,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl AtomicQualificationCommandError {
+    fn from_worker(error: AtomicWorkerError) -> Self {
+        match error {
+            AtomicWorkerError::QueueFull => Self::QueueFull,
+            AtomicWorkerError::NotRunning => Self::NotRunning,
+            AtomicWorkerError::CommandRejected => Self::CommandRejected,
+            AtomicWorkerError::ThreadSpawn(_)
+            | AtomicWorkerError::WorkerDisconnected
+            | AtomicWorkerError::AcceptedOutcomeIndeterminate
+            | AtomicWorkerError::FailedClosed
+            | AtomicWorkerError::WorkerPanicked => Self::FailedClosed,
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl fmt::Display for AtomicQualificationCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueFull => f.write_str("typed qualification worker queue is full"),
+            Self::NotRunning => f.write_str("typed qualification worker is not running"),
+            Self::CommandRejected => f.write_str("typed qualification command was rejected"),
+            Self::FailedClosed => f.write_str("typed qualification worker is failed closed"),
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::error::Error for AtomicQualificationCommandError {}
+
 /// Identifier-free failure from worker startup, admission, execution, or join.
 #[derive(Debug)]
 enum AtomicWorkerError {
@@ -1152,6 +1212,14 @@ mod tests {
         directory_control: Option<ReadControl>,
         event_write_control: Option<WriteControl>,
     ) -> TestResult<(TestExecutor, ObservationLog)> {
+        executor_with_max_events(directory_control, event_write_control, MAX_EVENTS)
+    }
+
+    fn executor_with_max_events(
+        directory_control: Option<ReadControl>,
+        event_write_control: Option<WriteControl>,
+        max_events_per_address: u64,
+    ) -> TestResult<(TestExecutor, ObservationLog)> {
         let observation = Arc::new(Mutex::new(Vec::new()));
         let directory = TestTable::new(
             TableKind::Directory,
@@ -1171,10 +1239,21 @@ mod tests {
             LayoutIdentity::new(LayoutNetwork::Mainnet, 1, 7, 11, [0x5a; 32])?,
             DirectoryTableConfiguration::new(8, 6)?,
             EventTableConfiguration::new(16, 12)?,
-            MAX_EVENTS,
+            max_events_per_address,
         )?;
         Ok((
             ExclusiveTwoTableExecutor::new(layout, directory, events)?,
+            observation,
+        ))
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn worker_with_max_events(
+        max_events_per_address: u64,
+    ) -> TestResult<(AtomicWorker, ObservationLog)> {
+        let (executor, observation) = executor_with_max_events(None, None, max_events_per_address)?;
+        Ok((
+            AtomicWorker::spawn(executor, queue_capacity(1))?,
             observation,
         ))
     }
@@ -1501,6 +1580,76 @@ mod tests {
         assert_eq!(snapshot.completed, 1);
         assert_eq!(snapshot.failed, 1);
         assert_accounting(snapshot);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn typed_qualification_rejection_keeps_worker_usable() -> TestResult<()> {
+        let (worker, _) = worker(1, None)?;
+        let requested = address(0x53);
+        let actual_owner = address(0x54);
+
+        assert!(matches!(
+            worker.qualification_append_typed(requested, event(actual_owner, 0x73)),
+            Err(AtomicQualificationCommandError::CommandRejected)
+        ));
+        let history = worker.qualification_read_history_typed(requested)?;
+        assert_eq!(history.len(), usize::try_from(MAX_EVENTS)?);
+        assert!(history.iter().all(Option::is_none));
+
+        let snapshot = worker.shutdown()?;
+        assert_eq!(snapshot.lifecycle, WorkerLifecycle::Stopped);
+        assert_eq!(snapshot.fault, None);
+        assert_eq!(snapshot.accepted, 2);
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(snapshot.not_running_rejected, 0);
+        assert_accounting(snapshot);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn typed_qualification_capacity_failure_stays_failed_closed_without_more_io() -> TestResult<()>
+    {
+        let (worker, observation) = worker_with_max_events(1)?;
+        let owner = address(0x55);
+
+        let first = worker.qualification_append_typed(owner, event(owner, 0x75))?;
+        assert_eq!(
+            first.disposition,
+            AtomicQualificationAppendDisposition::Inserted
+        );
+        assert!(matches!(
+            worker.qualification_append_typed(owner, event(owner, 0x76)),
+            Err(AtomicQualificationCommandError::FailedClosed)
+        ));
+        let executor_calls_after_failure = lock_test(&observation).len();
+
+        assert!(matches!(
+            worker.qualification_read_history_typed(owner),
+            Err(AtomicQualificationCommandError::FailedClosed)
+        ));
+        assert!(matches!(
+            worker.qualification_append_typed(owner, event(owner, 0x77)),
+            Err(AtomicQualificationCommandError::FailedClosed)
+        ));
+        assert_eq!(lock_test(&observation).len(), executor_calls_after_failure);
+
+        let snapshot = worker
+            .qualification_shutdown()
+            .expect("faulted qualification worker must shut down cleanly");
+        assert!(snapshot.stopped);
+        assert!(snapshot.faulted);
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.in_flight, 0);
+        assert_eq!(snapshot.accepted, 2);
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(snapshot.not_running_rejected, 2);
+        assert_eq!(snapshot.full_rejected, 0);
+        assert_eq!(snapshot.reply_delivery_failed, 0);
         Ok(())
     }
 

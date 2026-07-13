@@ -5,10 +5,14 @@
 
 use std::{error::Error, fmt, num::NonZeroU32, path::PathBuf, process::ExitCode};
 
+#[cfg(feature = "typed-qualification")]
+use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
 use zaino_common::Network;
 #[cfg(feature = "typed-qualification")]
-use zaino_oram::run_typed_worker_qualification;
+use zaino_oram::{
+    run_typed_worker_qualification, run_typed_worker_stress_qualification, TypedWorkerStressProfile,
+};
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_state::{
     chain_index::NonFinalizedSnapshot, ChainIndex, ChainIndexSnapshot, Height,
@@ -25,10 +29,14 @@ use crate::corpus_artifact::{
 };
 #[cfg(feature = "typed-qualification")]
 use crate::qualification_artifact::publish_qualification;
+#[cfg(feature = "typed-qualification")]
+use crate::stress_qualification_artifact::publish_stress_qualification;
 
 mod corpus_artifact;
 #[cfg(feature = "typed-qualification")]
 mod qualification_artifact;
+#[cfg(feature = "typed-qualification")]
+mod stress_qualification_artifact;
 
 type RunnerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -64,6 +72,8 @@ struct QualificationCommand {
 enum QualificationSubcommand {
     /// Run the fixed correctness scenario and publish aggregate evidence.
     Run(QualificationRunArgs),
+    /// Run a fixed stress profile and publish aggregate evidence.
+    Stress(QualificationStressArgs),
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -72,6 +82,35 @@ struct QualificationRunArgs {
     /// New directory that will receive the complete verified evidence artifact.
     #[arg(long, value_name = "DIR")]
     output_dir: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationStressArgs {
+    /// Versioned fixed stress profile to execute.
+    #[arg(long, value_enum)]
+    profile: StressQualificationProfileArg,
+
+    /// New directory that will receive the complete verified evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StressQualificationProfileArg {
+    /// Fixed smoke-level stress qualification profile.
+    #[value(name = "smoke-v1")]
+    SmokeV1,
+}
+
+#[cfg(feature = "typed-qualification")]
+impl StressQualificationProfileArg {
+    fn core_profile(self) -> TypedWorkerStressProfile {
+        match self {
+            Self::SmokeV1 => TypedWorkerStressProfile::SmokeV1,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -204,6 +243,7 @@ async fn run(cli: Cli) -> RunnerResult<()> {
         #[cfg(feature = "typed-qualification")]
         Command::Qualification(command) => match command.command {
             QualificationSubcommand::Run(args) => run_qualification(args),
+            QualificationSubcommand::Stress(args) => run_stress_qualification(args),
         },
     }
 }
@@ -213,6 +253,17 @@ fn run_qualification(args: QualificationRunArgs) -> RunnerResult<()> {
     let qualification = run_typed_worker_qualification()?;
     publish_qualification(&args.output_dir, &qualification, env!("CARGO_PKG_VERSION"))?;
     println!("qualification_artifact={}", args.output_dir.display());
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_stress_qualification(args: QualificationStressArgs) -> RunnerResult<()> {
+    let qualification = run_typed_worker_stress_qualification(args.profile.core_profile())?;
+    publish_stress_qualification(&args.output_dir, &qualification, env!("CARGO_PKG_VERSION"))?;
+    println!(
+        "stress_qualification_artifact={}",
+        args.output_dir.display()
+    );
     Ok(())
 }
 
@@ -507,6 +558,19 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_stress_qualification_args() -> [&'static str; 7] {
+        [
+            "zainod-oram",
+            "qualification",
+            "stress",
+            "--profile",
+            "smoke-v1",
+            "--output-dir",
+            "/tmp/oram-stress-qualification",
+        ]
+    }
+
     fn parsed_corpus(cli: Cli) -> CorpusCommand {
         match cli.command {
             Command::Corpus(command) => command,
@@ -522,6 +586,9 @@ mod tests {
         let args = match cli.command {
             Command::Qualification(command) => match command.command {
                 QualificationSubcommand::Run(args) => args,
+                QualificationSubcommand::Stress(_) => {
+                    panic!("stress arguments parsed as fixed qualification")
+                }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
         };
@@ -532,6 +599,66 @@ mod tests {
             args.extend([rejected, "8"]);
             assert!(Cli::try_parse_from(args).is_err());
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn stress_qualification_cli_exposes_only_a_named_profile_and_output() -> Result<(), clap::Error>
+    {
+        let cli = Cli::try_parse_from(valid_stress_qualification_args())?;
+        let args = match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::Stress(args) => args,
+                QualificationSubcommand::Run(_) => {
+                    panic!("fixed qualification arguments parsed as stress")
+                }
+            },
+            Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
+        };
+        assert_eq!(args.profile, StressQualificationProfileArg::SmokeV1);
+        assert!(matches!(
+            args.profile.core_profile(),
+            TypedWorkerStressProfile::SmokeV1
+        ));
+        assert_eq!(
+            args.output_dir,
+            PathBuf::from("/tmp/oram-stress-qualification")
+        );
+
+        for (rejected, value) in [
+            ("--operations", "10"),
+            ("--command-count", "10"),
+            ("--iterations", "10"),
+            ("--concurrency", "2"),
+            ("--seed", "1"),
+            ("--directory-capacity", "8"),
+            ("--directory-admission-limit", "6"),
+            ("--event-capacity", "16"),
+            ("--event-admission-limit", "12"),
+            ("--max-events-per-address", "8"),
+            ("--queue-capacity", "1"),
+            ("--target-height", "1"),
+            ("--target-hash", "11"),
+            ("--config", "/tmp/zainod.toml"),
+        ] {
+            let mut command = valid_stress_qualification_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+
+        let missing_profile = [
+            "zainod-oram",
+            "qualification",
+            "stress",
+            "--output-dir",
+            "/tmp/oram-stress-qualification",
+        ];
+        assert!(Cli::try_parse_from(missing_profile).is_err());
+
+        let mut unknown_profile = valid_stress_qualification_args();
+        unknown_profile[4] = "custom";
+        assert!(Cli::try_parse_from(unknown_profile).is_err());
         Ok(())
     }
 
@@ -581,6 +708,31 @@ mod tests {
         let result = run(Cli {
             command: Command::Qualification(QualificationCommand {
                 command: QualificationSubcommand::Run(QualificationRunArgs {
+                    output_dir: output_dir.clone(),
+                }),
+            }),
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(!output_dir.exists());
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        not(all(target_os = "linux", target_arch = "x86_64"))
+    ))]
+    #[tokio::test]
+    async fn stress_qualification_dispatch_fails_without_publishing_on_unsupported_hosts(
+    ) -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let output_dir = parent.path().join("stress-qualification");
+
+        let result = run(Cli {
+            command: Command::Qualification(QualificationCommand {
+                command: QualificationSubcommand::Stress(QualificationStressArgs {
+                    profile: StressQualificationProfileArg::SmokeV1,
                     output_dir: output_dir.clone(),
                 }),
             }),
