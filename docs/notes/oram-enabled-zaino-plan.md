@@ -27,8 +27,11 @@ two non-aliased ORAM/map pairs and places them behind the same worker; no
 projection/service owner calls it yet. Its healthy
 miss/duplicate insertion path always performs read/remap followed by
 write-or-insert/remap, selecting the prior bytes on duplicate. This path has
-only cross-compile evidence on the current macOS host. It is not connected to
-the projection and does not claim crash atomicity. A later portable slice adds
+generic native Ubuntu 24.04 x86_64 capacity-8 execution evidence in a dedicated
+pinned CI lane, in addition to the current macOS host's portable and
+cross-compile checks. It is not connected to the projection and does not claim
+target-capacity behavior, physical obliviousness, TDX qualification, or crash
+atomicity. A later portable slice adds
 a private generic finalized-event coordinator: it stages a whole block through
 the existing plaintext spend-owner resolver, completes every synchronous event
 sink call, and commits the in-memory checkpoint last. The owning atomic worker

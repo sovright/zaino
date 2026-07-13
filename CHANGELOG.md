@@ -33,13 +33,19 @@ and this library adheres to Rust's notion of
   read/insert worker surface is removed.
 - `zaino-oram`: exact immutable protected-table candidates now encode a
   38-byte directory cell and an 82-byte one-event page with canonical dummies,
-  named persistence conversions, and `Pod`/`Cmov` proofs. Table allocation and
-  adapter integration remain separate work.
+  named persistence conversions, and `Pod`/`Cmov` proofs. Linux-only table
+  allocation and an offline worker constructor now bind separate exact typed
+  `rostl` stores; projection/service ownership remains separate work.
+- CI: a path-scoped, pinned Ubuntu 24.04 x86_64 lane runs locked strict Clippy
+  and the complete all-feature `zaino-oram` suite against the native volatile
+  `rostl` backend. This is generic functional validation, not target-capacity,
+  physical-obliviousness, persistence, performance, or TDX evidence.
 - `zaino-oram`: a pure two-table layout model now derives canonical
   network/schema-separated address keys, generates distinct keyed fixed probes,
   validates complete directory/event probe arrays, and prepares opaque
-  immutable inserts only after a clean scan. It is not backend-integrated or a
-  content-authentication or physical-obliviousness claim.
+  immutable inserts only after a clean scan. A private command worker now binds
+  the plan to exact typed stores offline; it is not a projection-owner,
+  content-authentication, or physical-obliviousness claim.
 - `zaino-oram` / `zainod-oram`: the aggregate capacity model and corpus CLI now
   charge full allocated 38-byte directory and 82-byte event tables plus both
   complete position-map domains. Version-2 reports separate admission,
@@ -50,9 +56,10 @@ and this library adheres to Rust's notion of
   fake table handles, validates their public capacity shape, performs a full
   directory plus bounded-history successful preflight, derives the next
   ordinal from owned-backend state, and terminal-latches after uncertain or
-  partial writes. This is a portable logical model only; projection, real
-  `rostl`, persistence, crash recovery, real-backend non-aliasing, and physical
-  trace integration remain follow-up work.
+  partial writes. Generic native CI exercises the corresponding exact typed
+  `rostl` executor behind the business worker; projection ownership,
+  persistence, crash recovery, target load, and physical-trace integration
+  remain follow-up work.
 - `zainod-oram`: a non-published, listener-free one-shot runner that scans one
   fixed mainnet tip using an NFS snapshot and chain-continuity validation into
   identifier-free corpus aggregates.
