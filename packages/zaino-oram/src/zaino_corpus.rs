@@ -1,5 +1,6 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use zaino_state::{
     extract_transparent_events, IndexedBlock, ScriptType, TransparentBlockEvent,
     TransparentEventError,
@@ -10,25 +11,25 @@ use crate::{
         CanonicalBlockCursor, CanonicalChainError, CanonicalNetwork, PublicChainCheckpoint,
     },
     corpus::{
-        CorpusAccumulator, CorpusAddress, CorpusError, CorpusEvent, CorpusOutpoint, CorpusReport,
-        CorpusScriptClass, GrowthAssumption,
+        CorpusAccumulator, CorpusAddress, CorpusError, CorpusEvent, CorpusMeasurement,
+        CorpusOutpoint, CorpusScriptClass, CorpusSizingQualification, GrowthAssumption,
     },
     sizing::SizingParameters,
 };
 
-/// Aggregate report paired with its public canonical-chain checkpoint.
-pub(super) struct ZainoCorpusReport {
+/// Aggregate measurement paired with its public canonical-chain checkpoint.
+pub(super) struct ZainoCorpusMeasurement {
     checkpoint: PublicChainCheckpoint,
-    aggregate: CorpusReport,
+    aggregate: CorpusMeasurement,
 }
 
-impl fmt::Debug for ZainoCorpusReport {
+impl fmt::Debug for ZainoCorpusMeasurement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ZainoCorpusReport { public_checkpoint: true, aggregates_only: true, .. }")
+        f.write_str("ZainoCorpusMeasurement { public_checkpoint: true, aggregates_only: true, .. }")
     }
 }
 
-impl fmt::Display for ZainoCorpusReport {
+impl fmt::Display for ZainoCorpusMeasurement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "network={}", self.checkpoint.network())?;
         writeln!(f, "final_height={}", self.checkpoint.height())?;
@@ -41,21 +42,47 @@ impl fmt::Display for ZainoCorpusReport {
     }
 }
 
-/// Validated growth and sizing inputs for a one-shot mainnet corpus scan.
+pub(super) struct ZainoSizingQualification {
+    checkpoint: PublicChainCheckpoint,
+    aggregate: CorpusSizingQualification,
+}
+
+impl fmt::Debug for ZainoSizingQualification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "ZainoSizingQualification { public_checkpoint: true, aggregates_only: true, .. }",
+        )
+    }
+}
+
+impl fmt::Display for ZainoSizingQualification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "network={}", self.checkpoint.network())?;
+        writeln!(f, "final_height={}", self.checkpoint.height())?;
+        writeln!(
+            f,
+            "final_hash={}",
+            self.checkpoint.block_hash().to_rpc_hex()
+        )?;
+        write!(f, "{}", self.aggregate)
+    }
+}
+
+/// Validated growth and sizing inputs applied to a captured mainnet measurement.
 ///
 /// Every value is supplied explicitly by the operator. This research API does
 /// not guess privacy-profile or target-TDX constants.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct MainnetCorpusModel {
+pub struct MainnetSizingModel {
     growth: GrowthAssumption,
     sizing: SizingParameters,
 }
 
-impl MainnetCorpusModel {
+impl MainnetSizingModel {
     /// Validates the complete aggregate growth and logical-storage model.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the one-shot model validates every operator-selected capacity dimension together"
+        reason = "the sizing model validates every operator-selected capacity dimension together"
     )]
     pub fn new(
         growth_horizon_years: u16,
@@ -89,9 +116,9 @@ impl MainnetCorpusModel {
     }
 }
 
-impl fmt::Debug for MainnetCorpusModel {
+impl fmt::Debug for MainnetSizingModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("MainnetCorpusModel { aggregate_parameters: true, .. }")
+        f.write_str("MainnetSizingModel { aggregate_parameters: true, .. }")
     }
 }
 
@@ -100,16 +127,16 @@ impl fmt::Debug for MainnetCorpusModel {
 ///
 /// The scanner does not retain blocks. It necessarily retains public-chain
 /// address and outpoint identities while resolving spends, then consumes that
-/// state into an identifier-free [`MainnetCorpusReport`].
+/// state into an identifier-free [`MainnetCorpusMeasurement`].
 pub struct MainnetCorpusScanner {
     inner: ZainoCorpusScanner,
 }
 
 impl MainnetCorpusScanner {
     /// Starts an empty scanner bound to the canonical mainnet genesis hash.
-    pub fn new(model: MainnetCorpusModel) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: ZainoCorpusScanner::new(CanonicalNetwork::Mainnet, model.growth, model.sizing),
+            inner: ZainoCorpusScanner::new(CanonicalNetwork::Mainnet),
         }
     }
 
@@ -119,10 +146,10 @@ impl MainnetCorpusScanner {
     }
 
     /// Consumes all identifier-bearing scan state and returns aggregates only.
-    pub fn finish(self) -> Result<MainnetCorpusReport, MainnetCorpusError> {
+    pub fn finish(self) -> Result<MainnetCorpusMeasurement, MainnetCorpusError> {
         self.inner
             .finish()
-            .map(|inner| MainnetCorpusReport { inner })
+            .map(MainnetCorpusMeasurement::from_zaino)
             .map_err(Into::into)
     }
 }
@@ -133,20 +160,197 @@ impl fmt::Debug for MainnetCorpusScanner {
     }
 }
 
-/// Identifier-free aggregate output bound to a public mainnet checkpoint.
-pub struct MainnetCorpusReport {
-    inner: ZainoCorpusReport,
-}
-
-impl fmt::Debug for MainnetCorpusReport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("MainnetCorpusReport { public_checkpoint: true, aggregates_only: true, .. }")
+impl Default for MainnetCorpusScanner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl fmt::Display for MainnetCorpusReport {
+/// Primitive public checkpoint stored with every mainnet corpus measurement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainnetCorpusCheckpoint {
+    network: String,
+    height: u32,
+    hash: String,
+}
+
+impl MainnetCorpusCheckpoint {
+    fn from_public(checkpoint: PublicChainCheckpoint) -> Self {
+        Self {
+            network: checkpoint.network().to_string(),
+            height: checkpoint.height(),
+            hash: checkpoint.block_hash().to_rpc_hex(),
+        }
+    }
+
+    /// Returns the fixed public mainnet height.
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Returns the lowercase RPC-order block hash.
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    fn is_valid(&self) -> bool {
+        self.network == "mainnet"
+            && self.hash.len() == 64
+            && self
+                .hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+/// Identifier-free measured aggregates bound to a public mainnet checkpoint.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct MainnetCorpusMeasurement {
+    checkpoint: MainnetCorpusCheckpoint,
+    aggregate: CorpusMeasurement,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainnetCorpusMeasurementDto {
+    checkpoint: MainnetCorpusCheckpoint,
+    aggregate: CorpusMeasurement,
+}
+
+impl<'de> Deserialize<'de> for MainnetCorpusMeasurement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let dto = MainnetCorpusMeasurementDto::deserialize(deserializer)?;
+        let measurement = Self {
+            checkpoint: dto.checkpoint,
+            aggregate: dto.aggregate,
+        };
+        measurement.validate().map_err(serde::de::Error::custom)?;
+        Ok(measurement)
+    }
+}
+
+impl MainnetCorpusMeasurement {
+    fn from_zaino(inner: ZainoCorpusMeasurement) -> Self {
+        Self {
+            checkpoint: MainnetCorpusCheckpoint::from_public(inner.checkpoint),
+            aggregate: inner.aggregate,
+        }
+    }
+
+    /// Returns the verified public checkpoint for this measurement.
+    pub const fn checkpoint(&self) -> &MainnetCorpusCheckpoint {
+        &self.checkpoint
+    }
+
+    /// Revalidates every redundant aggregate field after deserialization.
+    pub fn validate(&self) -> Result<(), MainnetCorpusError> {
+        let expected_blocks = u64::from(self.checkpoint.height) + 1;
+        let genesis_hash_is_valid = self.checkpoint.height != 0
+            || self.checkpoint.hash == CanonicalNetwork::Mainnet.genesis_hash().to_rpc_hex();
+        if !self.checkpoint.is_valid()
+            || !genesis_hash_is_valid
+            || self.aggregate.block_count() != expected_blocks
+        {
+            return Err(ZainoCorpusError::InvalidMainnetMeasurement.into());
+        }
+        self.aggregate
+            .validate()
+            .map_err(ZainoCorpusError::Aggregate)
+            .map_err(Into::into)
+    }
+
+    /// Applies explicit operator sizing assumptions without rescanning the chain.
+    pub fn apply_model(
+        &self,
+        model: &MainnetSizingModel,
+    ) -> Result<MainnetSizingQualification, MainnetCorpusError> {
+        self.validate()?;
+        let aggregate = self
+            .aggregate
+            .qualify(model.growth, model.sizing)
+            .map_err(ZainoCorpusError::Aggregate)?;
+        Ok(MainnetSizingQualification {
+            checkpoint: self.checkpoint.clone(),
+            inner: ZainoSizingQualification {
+                checkpoint: PublicChainCheckpoint::new(
+                    CanonicalNetwork::Mainnet,
+                    self.checkpoint.height,
+                    zaino_state::BlockHash::from_bytes_in_display_order(&decode_checkpoint_hash(
+                        &self.checkpoint.hash,
+                    )?),
+                ),
+                aggregate,
+            },
+        })
+    }
+}
+
+impl fmt::Debug for MainnetCorpusMeasurement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "MainnetCorpusMeasurement { public_checkpoint: true, aggregates_only: true, .. }",
+        )
+    }
+}
+
+impl fmt::Display for MainnetCorpusMeasurement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "network={}", self.checkpoint.network)?;
+        writeln!(f, "final_height={}", self.checkpoint.height)?;
+        writeln!(f, "final_hash={}", self.checkpoint.hash)?;
+        self.aggregate.fmt(f)
+    }
+}
+
+/// Identifier-free sizing qualification derived from a measured mainnet corpus.
+pub struct MainnetSizingQualification {
+    checkpoint: MainnetCorpusCheckpoint,
+    inner: ZainoSizingQualification,
+}
+
+impl MainnetSizingQualification {
+    /// Returns the measured checkpoint used for this sizing qualification.
+    pub const fn checkpoint(&self) -> &MainnetCorpusCheckpoint {
+        &self.checkpoint
+    }
+}
+
+impl fmt::Debug for MainnetSizingQualification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "MainnetSizingQualification { public_checkpoint: true, aggregates_only: true, .. }",
+        )
+    }
+}
+
+impl fmt::Display for MainnetSizingQualification {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
+    }
+}
+
+fn decode_checkpoint_hash(hash: &str) -> Result<[u8; 32], MainnetCorpusError> {
+    if hash.len() != 64 {
+        return Err(ZainoCorpusError::InvalidMainnetMeasurement.into());
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in hash.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_hex_nibble(pair[0])?;
+        let low = decode_hex_nibble(pair[1])?;
+        bytes[index] = (high << 4) | low;
+    }
+    Ok(bytes)
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, MainnetCorpusError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(ZainoCorpusError::InvalidMainnetMeasurement.into()),
     }
 }
 
@@ -177,16 +381,14 @@ impl std::error::Error for MainnetCorpusError {
 /// Scans canonical indexed blocks from genesis and emits only aggregate data.
 ///
 /// The in-memory accumulator necessarily holds public-chain identifiers while
-/// resolving spends. Its returned report owns no address, transaction, or
+/// resolving spends. Its returned measurement owns no address, transaction, or
 /// outpoint identity. A scan that starts after genesis fails on the first
 /// unresolved previous outpoint unless a future complete seed API is used.
 pub(super) fn scan_indexed_blocks<'a>(
     blocks: impl IntoIterator<Item = &'a IndexedBlock>,
     network: CanonicalNetwork,
-    growth: GrowthAssumption,
-    sizing: SizingParameters,
-) -> Result<ZainoCorpusReport, ZainoCorpusError> {
-    let mut scanner = ZainoCorpusScanner::new(network, growth, sizing);
+) -> Result<ZainoCorpusMeasurement, ZainoCorpusError> {
+    let mut scanner = ZainoCorpusScanner::new(network);
     for block in blocks {
         scanner.push(block)?;
     }
@@ -197,21 +399,17 @@ pub(super) fn scan_indexed_blocks<'a>(
 ///
 /// The adapter never retains an [`IndexedBlock`]. It retains only the previous
 /// public checkpoint plus the identifier-bearing maps required to resolve
-/// transparent spends. Those maps are consumed into an aggregate-only report
+/// transparent spends. Those maps are consumed into an aggregate-only measurement
 /// by [`Self::finish`].
 struct ZainoCorpusScanner {
     cursor: CanonicalBlockCursor,
-    growth: GrowthAssumption,
-    sizing: SizingParameters,
     accumulator: Option<CorpusAccumulator>,
 }
 
 impl ZainoCorpusScanner {
-    fn new(network: CanonicalNetwork, growth: GrowthAssumption, sizing: SizingParameters) -> Self {
+    fn new(network: CanonicalNetwork) -> Self {
         Self {
             cursor: CanonicalBlockCursor::new(network),
-            growth,
-            sizing,
             accumulator: Some(CorpusAccumulator::from_genesis()),
         }
     }
@@ -256,16 +454,14 @@ impl ZainoCorpusScanner {
         Ok(())
     }
 
-    fn finish(self) -> Result<ZainoCorpusReport, ZainoCorpusError> {
+    fn finish(self) -> Result<ZainoCorpusMeasurement, ZainoCorpusError> {
         let accumulator = self.accumulator.ok_or(ZainoCorpusError::ScannerPoisoned)?;
         let checkpoint = self
             .cursor
             .checkpoint()
             .ok_or(ZainoCorpusError::EmptyChain)?;
-        let aggregate = accumulator
-            .finish(self.growth, self.sizing)
-            .map_err(ZainoCorpusError::Aggregate)?;
-        Ok(ZainoCorpusReport {
+        let aggregate = accumulator.finish().map_err(ZainoCorpusError::Aggregate)?;
+        Ok(ZainoCorpusMeasurement {
             checkpoint,
             aggregate,
         })
@@ -312,6 +508,7 @@ pub(super) enum ZainoCorpusError {
     EmptyChain,
     /// Aggregate mutation failed and the partial scanner state was discarded.
     ScannerPoisoned,
+    InvalidMainnetMeasurement,
     CanonicalChain(CanonicalChainError),
     /// One block contains more transactions than an aggregate `u64` can count.
     TransactionCountOverflow {
@@ -333,6 +530,9 @@ impl fmt::Display for ZainoCorpusError {
             Self::ScannerPoisoned => {
                 f.write_str("corpus scanner cannot continue after an aggregate mutation failure")
             }
+            Self::InvalidMainnetMeasurement => {
+                f.write_str("mainnet corpus measurement failed semantic validation")
+            }
             Self::CanonicalChain(error) => {
                 write!(f, "corpus canonical-chain validation failed: {error}")
             }
@@ -352,9 +552,10 @@ impl std::error::Error for ZainoCorpusError {
             Self::CanonicalChain(error) => Some(error),
             Self::Extraction(error) => Some(error),
             Self::Aggregate(error) => Some(error),
-            Self::EmptyChain | Self::ScannerPoisoned | Self::TransactionCountOverflow { .. } => {
-                None
-            }
+            Self::EmptyChain
+            | Self::ScannerPoisoned
+            | Self::InvalidMainnetMeasurement
+            | Self::TransactionCountOverflow { .. } => None,
         }
     }
 }
@@ -367,8 +568,38 @@ mod tests {
 
     use crate::zaino_fixtures::{indexed_block, output, transaction};
 
-    fn sizing() -> Result<SizingParameters, crate::sizing::SizingError> {
-        SizingParameters::new(8, 6, 16, 12, 8, 4, 20_000, 1_000_000, 3_000)
+    fn model(annual_growth_bps: u64) -> Result<MainnetSizingModel, MainnetCorpusError> {
+        MainnetSizingModel::new(
+            2,
+            annual_growth_bps,
+            8,
+            6,
+            16,
+            12,
+            8,
+            4,
+            20_000,
+            1_000_000,
+            3_000,
+        )
+    }
+
+    fn mainnet_measurement() -> Result<MainnetCorpusMeasurement, Box<dyn std::error::Error>> {
+        let mut accumulator = CorpusAccumulator::from_genesis();
+        accumulator.record_block(1)?;
+        accumulator.apply(CorpusEvent::Created {
+            outpoint: CorpusOutpoint::new([0x44; 32], 0),
+            address: CorpusAddress::new([0x55; 20], CorpusScriptClass::PayToPublicKeyHash),
+            script_class: CorpusScriptClass::PayToPublicKeyHash,
+        })?;
+        Ok(MainnetCorpusMeasurement {
+            checkpoint: MainnetCorpusCheckpoint {
+                network: "mainnet".to_owned(),
+                height: 0,
+                hash: CanonicalNetwork::Mainnet.genesis_hash().to_rpc_hex(),
+            },
+            aggregate: accumulator.finish()?,
+        })
     }
 
     fn fixture_genesis() -> Result<IndexedBlock, Box<dyn std::error::Error>> {
@@ -432,8 +663,6 @@ mod tests {
         let result = scan_indexed_blocks(
             std::iter::empty::<&IndexedBlock>(),
             CanonicalNetwork::Mainnet,
-            GrowthAssumption::new(0, 0)?,
-            sizing()?,
         );
 
         assert!(matches!(result, Err(ZainoCorpusError::EmptyChain)));
@@ -444,12 +673,7 @@ mod tests {
     fn nonempty_canonical_fixture_runs_extraction_adapter_and_aggregate_report(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let genesis = fixture_genesis()?;
-        let report = scan_indexed_blocks(
-            [&genesis],
-            CanonicalNetwork::Regtest,
-            GrowthAssumption::new(0, 0)?,
-            sizing()?,
-        )?;
+        let report = scan_indexed_blocks([&genesis], CanonicalNetwork::Regtest)?;
         let output = report.to_string();
 
         assert!(output.contains("network=regtest"));
@@ -474,17 +698,12 @@ mod tests {
         let genesis = fixture_genesis()?;
         let second = fixture_second_block()?;
         let network = CanonicalNetwork::Regtest;
-        let mut scanner = ZainoCorpusScanner::new(network, GrowthAssumption::new(0, 0)?, sizing()?);
+        let mut scanner = ZainoCorpusScanner::new(network);
 
         scanner.push(&genesis)?;
         scanner.push(&second)?;
         let incremental = scanner.finish()?;
-        let iterator = scan_indexed_blocks(
-            [&genesis, &second],
-            network,
-            GrowthAssumption::new(0, 0)?,
-            sizing()?,
-        )?;
+        let iterator = scan_indexed_blocks([&genesis, &second], network)?;
 
         assert_eq!(incremental.to_string(), iterator.to_string());
         assert!(incremental.to_string().contains("final_height=1"));
@@ -506,11 +725,7 @@ mod tests {
             [0; 32],
             vec![unknown_spend],
         )?;
-        let mut scanner = ZainoCorpusScanner::new(
-            CanonicalNetwork::Regtest,
-            GrowthAssumption::new(0, 0)?,
-            sizing()?,
-        );
+        let mut scanner = ZainoCorpusScanner::new(CanonicalNetwork::Regtest);
 
         assert!(matches!(
             scanner.push(&invalid_genesis),
@@ -533,12 +748,7 @@ mod tests {
     fn chain_provenance_rejects_wrong_genesis_and_noncontiguous_parent(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let genesis = fixture_genesis()?;
-        let wrong_genesis = scan_indexed_blocks(
-            [&genesis],
-            CanonicalNetwork::Mainnet,
-            GrowthAssumption::new(0, 0)?,
-            sizing()?,
-        );
+        let wrong_genesis = scan_indexed_blocks([&genesis], CanonicalNetwork::Mainnet);
         assert!(matches!(
             wrong_genesis,
             Err(ZainoCorpusError::CanonicalChain(
@@ -547,12 +757,8 @@ mod tests {
         ));
 
         let wrong_parent = indexed_block(1, [0x92; 32], [0xee; 32], Vec::new())?;
-        let discontinuous = scan_indexed_blocks(
-            [&genesis, &wrong_parent],
-            CanonicalNetwork::Regtest,
-            GrowthAssumption::new(0, 0)?,
-            sizing()?,
-        );
+        let discontinuous =
+            scan_indexed_blocks([&genesis, &wrong_parent], CanonicalNetwork::Regtest);
         assert!(matches!(
             discontinuous,
             Err(ZainoCorpusError::CanonicalChain(
@@ -567,11 +773,7 @@ mod tests {
     {
         let wrong_genesis = indexed_block(0, [0xee; 32], [0; 32], Vec::new())?;
         let genesis = fixture_genesis()?;
-        let mut scanner = ZainoCorpusScanner::new(
-            CanonicalNetwork::Regtest,
-            GrowthAssumption::new(0, 0)?,
-            sizing()?,
-        );
+        let mut scanner = ZainoCorpusScanner::new(CanonicalNetwork::Regtest);
 
         assert!(matches!(
             scanner.push(&wrong_genesis),
@@ -621,11 +823,55 @@ mod tests {
             },
         )?;
 
-        let report = accumulator.finish(GrowthAssumption::new(0, 0)?, sizing()?)?;
+        let report = accumulator.finish()?;
         assert_eq!(report.distinct_standard_addresses(), 1);
         assert_eq!(report.live_standard_utxos(), 0);
         assert_eq!(report.live_nonstandard_utxos(), 1);
         assert_eq!(report.events_per_address(), &BTreeMap::from([(2, 1)]));
+        Ok(())
+    }
+
+    #[test]
+    fn public_measurement_round_trips_and_rejects_checkpoint_mismatches(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let measurement = mainnet_measurement()?;
+        measurement.validate()?;
+
+        let json = serde_json::to_vec(&measurement)?;
+        let decoded: MainnetCorpusMeasurement = serde_json::from_slice(&json)?;
+        decoded.validate()?;
+        assert_eq!(decoded, measurement);
+
+        let mut wrong_height = measurement.clone();
+        wrong_height.checkpoint.height = 1;
+        assert!(wrong_height.validate().is_err());
+        assert!(
+            serde_json::from_slice::<MainnetCorpusMeasurement>(&serde_json::to_vec(&wrong_height)?)
+                .is_err()
+        );
+
+        let mut wrong_genesis = measurement;
+        wrong_genesis.checkpoint.hash = "11".repeat(32);
+        assert!(wrong_genesis.validate().is_err());
+        assert!(
+            serde_json::from_slice::<MainnetCorpusMeasurement>(&serde_json::to_vec(
+                &wrong_genesis
+            )?)
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn one_measurement_supports_multiple_offline_sizing_models(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let measurement = mainnet_measurement()?;
+        let baseline = measurement.apply_model(&model(0)?)?;
+        let growth = measurement.apply_model(&model(1_000)?)?;
+
+        assert_eq!(baseline.checkpoint(), measurement.checkpoint());
+        assert_eq!(growth.checkpoint(), measurement.checkpoint());
+        assert_ne!(baseline.to_string(), growth.to_string());
         Ok(())
     }
 }

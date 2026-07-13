@@ -40,5 +40,6 @@ mod zaino_fixtures;
 
 #[cfg(feature = "corpus-zaino")]
 pub use zaino_corpus::{
-    MainnetCorpusError, MainnetCorpusModel, MainnetCorpusReport, MainnetCorpusScanner,
+    MainnetCorpusCheckpoint, MainnetCorpusError, MainnetCorpusMeasurement, MainnetCorpusScanner,
+    MainnetSizingModel, MainnetSizingQualification,
 };

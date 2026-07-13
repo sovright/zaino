@@ -2,6 +2,9 @@
 
 ## Unreleased
 
-- Add a listener-free, fixed-snapshot mainnet aggregate corpus runner.
-- Replace page-oriented sizing flags with explicit fixed directory/event
-  capacity, admission, and hot-address inputs for the version-2 report.
+- Add listener-free `corpus capture` over one indexed non-finalized mainnet
+  snapshot, with optional explicit height/hash selection and atomic,
+  read-back-verified measurement artifacts.
+- Separate observed corpus measurements from growth, capacity, backend, memory,
+  and TDX sizing assumptions so one capture can be qualified offline under
+  multiple models.

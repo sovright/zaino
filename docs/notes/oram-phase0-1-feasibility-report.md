@@ -75,11 +75,12 @@ The evaluated worktree implements:
   including legacy nonstandard-key preservation;
 - a legacy `CompactTxStreamer` schema golden pinned to the upstream baseline's
   service name, ordered RPC signatures, and normalized proto fingerprint;
-- an aggregate-only corpus accumulator and version-2 two-table sizing model
-  that shares layout capacity/admission validation, charges every allocated
+- an aggregate-only corpus measurement whose joint event/live/peak address-state
+  histogram, derived marginals, and compiled record widths are independent of
+  the separately applied two-table sizing model. The model shares layout
+  capacity/admission validation, charges every allocated
   38/82-byte cell and both complete position-map domains, and reports separate
-  directory, event, hot-address, modeled-memory, and combined modeled fit
-  flags;
+  directory, event, hot-address, modeled-memory, and combined modeled fit flags;
 - a Zaino corpus adapter that validates a nonempty genesis-forward chain,
   contiguous heights, parent hashes, and the network-bound canonical genesis before
   emitting a public final checkpoint;
@@ -109,9 +110,12 @@ The evaluated worktree implements:
   Zaino `BlockchainSource::get_address_utxos` results for every standard
   address observed through the same immutable regtest-vector tip, plus an
   absent address, with both sides bound to the identical height and hash;
-- a non-published, listener-free `zainod-oram corpus` runner that binds the
-  scanner to canonical mainnet genesis, captures a fixed public tip, streams
-  `IndexedBlock` values without retaining them, and requires every sizing input;
+- a non-published, listener-free `zainod-oram corpus capture` runner that binds
+  the scanner to canonical mainnet genesis, uses one indexed non-finalized
+  snapshot, optionally verifies an explicit public height/hash checkpoint,
+  streams `IndexedBlock` values without retaining them, accepts no sizing
+  input, and atomically publishes revalidated JSON, text, and minimal-provenance
+  files into a new directory;
 - separate pinned, volatile `rostl` tables for the exact 38-byte directory and
   82-byte event-page records. Their private offline Linux-x86_64 constructor
   creates distinct `CircuitORAM` and recursive-position-map instances and
@@ -151,7 +155,7 @@ The following statements are **not** established by that evidence:
 - the continuation protector used by tests is not a selected production AEAD;
 - no private protobuf, gRPC adapter, NFS merge, attestation provider, TLS
   identity, readiness path, or private-service lifecycle exists;
-  `zainod-oram` currently contains only the offline corpus runner;
+  `zainod-oram` currently contains only offline corpus capture tooling;
 - no durable ORAM/checkpoint implementation, rollback defense, crash recovery,
   measured rebuild path, or recovery-time objective exists;
 - the finalized-event coordinator's private sink seam is implemented by the
@@ -234,7 +238,7 @@ The following statements are **not** established by that evidence:
 | Recorded fork baseline | Pass | Branch merge-base is `c94ae247`; fork remote is `sovright/zaino` | Keep the baseline/current rebases recorded |
 | Threat model and architecture ADR | Pass for research | ADR-0007 is accepted for the research fork | Security and client teams must still accept final constants and claim |
 | Explicit leakage matrix | Draft in this report | Categories are enumerated below | Assign fixed budgets, owners, tests, and formal acceptance |
-| Aggregate corpus implementation | Partial | Identifier-free accumulator, mainnet-only one-shot runner, provenance validation, nonempty fixture, same-block spend, standard/nonstandard accounting | Execute the runner and produce a reproducible full-mainnet report |
+| Aggregate corpus implementation | Partial | Identifier-free measurement, mainnet-only capture runner, fixed indexed snapshot, explicit checkpoint verification, semantic and digest read-back validation, atomic three-file publication, nonempty fixture, same-block spend, standard/nonstandard accounting | Execute the runner and produce a reproducible full-mainnet artifact |
 | Mainnet counts/distributions and growth | Missing | No mainnet output artifact exists | Measure distinct standard scripts, lifetime events, live/peak UTXOs, hot tails, script classes, record sizes, and selected growth horizon |
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov`; generic native Linux CI constructs separate real 38/82-byte backend monomorphizations and exercises both | Measure the target-capacity profile on the selected CPU/TDX platform |
 | Fixed-probe table layout | Partial real integration | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, a complete bounded-history preflight, and a bounded worker with no raw storage bypass. A private offline owner validates exact projection/layout identity and admission limits before composing the coordinator and worker; generic native Linux CI runs 8/16-entry typed stores and the worker-owned exact executor | Add authenticated generation ownership and crash-safe commit/rebuild; select measured capacities/probe counts and trace the backend on target hardware |
@@ -371,7 +375,7 @@ behavior, target CPU features, or TDX isolation.
 |---|---|---|---|---|
 | Zaino baseline | `c94ae247de7286fd3337e313559bb3d62bdcbd5d` | Authoritative fork base | Root Apache-2.0 license file | Recorded |
 | `zaino-oram` | Local `0.1.0`, `publish = false` | Research model and candidate adapter | Workspace Apache-2.0 | Research only |
-| `zainod-oram` | Local `0.1.0`, `publish = false` | Listener-free one-shot mainnet corpus runner | Workspace Apache-2.0 | Offline research only |
+| `zainod-oram` | Local `0.1.0`, `publish = false` | Listener-free one-shot mainnet corpus capture and atomic artifact publication | Workspace Apache-2.0 | Offline research only |
 | `zaino-state` | Local/version `0.3.1`, optional, no default features | Indexed-block corpus adapter | Workspace Apache-2.0 | Enabled only by `corpus-zaino` |
 | `bytemuck` | `1.25.1`, derive/min-const-generics | Exact `Pod` record proof | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
 | `bytemuck_derive` | `1.11.0` | Derive transitive | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
@@ -411,12 +415,12 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Exact record constraints, portable production insertion helper, and unsupported-target path compile; this local command does not execute the real ORAM path |
 | `cargo nextest run -p zaino-oram --no-default-features` | 113 passed | Fixed models, token semantics, complete logical traces, exact records, keyed layout, full-capacity arithmetic, exclusive two-table preflight, and all 16 business-command worker tests pass without optional features |
-| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 147 passed | Adds canonical-cursor hardening, corpus provenance/retry, deterministic projection/coordinator/owner coverage, exact seven-event sink ordering, failure/panic containment, four projection-to-worker adapter tests, and five owner lifecycle/configuration/fail-closed cases |
+| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 151 passed | Adds canonical-cursor hardening, measured/sizing separation, deterministic measurement JSON and semantic rejection, corpus provenance/retry, deterministic projection/coordinator/owner coverage, exact seven-event sink ordering, failure/panic containment, four projection-to-worker adapter tests, and five owner lifecycle/configuration/fail-closed cases |
 | `cargo nextest run -p zaino-oram --features rostl-experimental --status-level fail` | 119 passed | Adds directory/page `Pod`/`Cmov` semantics, power-of-two capacity rejection, equal healthy miss/duplicate two-access schedules against the production helper, found-parity/occupancy rejection, and exact typed unsupported-host construction rejection |
-| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 154 passed locally on macOS aarch64 | Combined keyed layout, two-table command, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection/coordinator/owner, static ordinary-source shadow parity, business-command worker suite, and portable typed-`rostl` suite. Five owner cases cover six-dimension pre-allocation rejection, happy lifecycle, mutate-then-fail terminal behavior, unsupported backend, and coarse diagnostics |
+| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 158 passed locally on macOS aarch64 | Combined keyed layout, two-table command, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection/coordinator/owner, static ordinary-source shadow parity, business-command worker suite, and portable typed-`rostl` suite. Five owner cases cover six-dimension pre-allocation rejection, happy lifecycle, mutate-then-fail terminal behavior, unsupported backend, and coarse diagnostics |
 | `cargo nextest run -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint --status-level fail` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
 | `cargo nextest run -p zaino-proto --test compact_tx_streamer_legacy_golden --status-level fail` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
-| `cargo nextest run -p zainod-oram --status-level fail` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
+| `cargo nextest run -p zainod-oram --status-level fail` | 13 passed | Nested capture CLI, paired checkpoint and snapshot selection, canonical digest/provenance, exact three-file publication, atomic concurrent-output refusal, typed tamper rejection, read-back validation, and staging cleanup |
 | `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Pass with local Rust 1.96.1 | Compile-only precursor for the exact directory/event stores, fixed two-access insertion path, and private offline worker constructor; the exact pinned native CI run above supersedes its execution limitation |
 | `cargo +stable check -p zaino-oram --all-targets --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu` | Environment-blocked before local Linux test checking | The macOS host lacks `x86_64-linux-gnu-gcc`/`g++`, required by transitive native dev dependencies including `aws-lc-sys`, `lmdb-sys`, and `libzcash_script`; the pinned native CI run now covers this host limitation |
 | `cargo +stable clippy -p zaino-oram --lib --all-features --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Environment-blocked in local transitive native builds | Combined Linux `corpus-zaino` plus `rostl-experimental` checking requires the missing cross C/C++ toolchain for `aws-lc-sys`, `ring`, `lz4-sys`, `lmdb-sys`, and `libzcash_script`; pinned native CI now passes the stricter all-target equivalent |
@@ -426,14 +430,14 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `cargo clippy -p zaino-state --lib --features test_dependencies --no-deps -- -D warnings` | Pass | The feature-gated cross-crate fixture seam is warning-free without widening the normal production feature set |
 | `cargo clippy -p zaino-state --lib --features test_dependencies --no-deps -- -D warnings -D clippy::unwrap_used` | Existing-tree failure | Reports four pre-existing production `unwrap` calls outside this slice (`node_backed_indexer.rs`, `finalised_state/entry.rs`, and `mempool.rs`); the changed production/test-support paths contain none |
 | `cargo clippy -p zaino-proto --test compact_tx_streamer_legacy_golden -- -D warnings` | Pass | Legacy schema golden is warning-free |
-| `cargo clippy -p zainod-oram --all-targets -- -D warnings` | Pass | Listener-free runner lint is clean |
+| `cargo clippy -p zainod-oram --all-targets --no-deps -- -D warnings -D clippy::unwrap_used` | Pass | Capture runner and artifact publisher are warning-free and contain no production unwraps; unrelated workspace dependencies are excluded from this package-local lint |
 | `cargo check --workspace --all-targets --no-default-features` | Pass | Every workspace member, including the new non-default runner, compiles without default features |
 | `RUSTDOCFLAGS='-D warnings' cargo doc -p zaino-oram --no-deps --all-features` | Pass | The research models, shadow seam, and private worker document cleanly |
 | `cargo fmt --all -- --check` | Pass | Rust formatting is clean |
 | Rust Analyzer semantic search of the concrete typed backend | Two `access_position`, one `read`, and one `write_or_insert` call site | The implementation has one independently remapped read path and one independently remapped write-or-insert path; the production helper invokes both for healthy miss and duplicate cases |
 | Rust Analyzer references for projection `stage_block`, `commit_staged`, and sink `append_and_wait` | Stage and commit each have the plaintext-oracle and coordinator call sites; sink append-and-wait has one production coordinator call and a private `AtomicWorker` implementation | The coordinator reuses the existing staging/commit implementation, and the owning worker provides the only production sink adapter without exposing a raw handle |
 | `git diff --check -- docs/notes/oram-phase0-1-feasibility-report.md` | Pass | Report has no whitespace errors |
-| `makers lint-boundary-conversions` | Canonical task unavailable because `makers` is not installed; Rust Analyzer shows no `From`/`TryFrom` implementation in the new worker, and this slice adds no boundary conversion | Re-run the canonical task in CI/tooling-enabled environment |
+| Exact `lint-boundary-conversions` task body from `tools/makefiles/lints.toml` | Pass; the `makers` wrapper is not installed locally | No forbidden persistence- or wire-boundary `From`/`TryFrom` implementation exists; CI should still run the canonical wrapper |
 
 The five Linux-x86_64-only `#[test]` functions included in the 157-test
 owner-head native run are
@@ -459,23 +463,27 @@ network, recovery, or side-channel results.
 ## Mainnet corpus and capacity blocker
 
 The scanner core now has useful safety properties: it requires a nonempty
-height-zero start, validates the network-bound canonical genesis hash and null genesis
-parent, checks contiguous heights and parent hashes, resolves spends from a
-genesis-forward live-output map, and returns an aggregate report bound to a
-public network/final height/hash checkpoint. Its returned report retains no
-address, transaction, or outpoint identifiers.
+height-zero start, validates the network-bound canonical genesis hash and null
+genesis parent, checks contiguous heights and parent hashes, resolves spends
+from a genesis-forward live-output map, and returns an aggregate measurement
+bound to a public network/final height/hash checkpoint. Its returned measurement
+retains no address, transaction, or outpoint identifiers. Growth, table,
+backend-expansion, and memory assumptions are applied only after measurement and
+can be changed without rescanning.
 
 It is not yet a mainnet measurement:
 
 - the public `ChainIndex::get_indexed_block_by_height` point source and
-  `zainod-oram corpus` runner are implemented, but the runner has not been
-  executed against a full mainnet checkpoint and no output artifact exists;
+  `zainod-oram corpus capture` runner are implemented, including fixed-snapshot
+  checkpoint verification and atomic read-back-verified publication, but the
+  runner has not been executed against a full mainnet checkpoint and no output
+  artifact exists;
 - no mainnet checkpoint, counts, histogram, hot-address tail, or growth output
   is checked in or otherwise attached to this branch;
 - exact identities are available only for standard P2PKH/P2SH scripts;
   nonstandard compact outputs are counted by class without inventing a false
   address identity;
-- the version-2 sizing model charges every compiled 38-byte directory and
+- the separate sizing model charges every compiled 38-byte directory and
   82-byte event cell across the full configured table capacities plus both full
   position-map domains; projected occupancy affects only explicit
   load/admission/hot-address flags, never allocated bytes;
@@ -489,9 +497,9 @@ It is not yet a mainnet measurement:
 - no growth horizon or target TDX memory size has been approved.
 
 Therefore `fits_modeled_memory` and `fits_modeled_constraints` are model results
-only. Neither may be used as the 30%-RSS go/no-go result. Version-2 output
-states `insertion_bound=false`, `backend_calibrated=false`, and
-`rss_measured=false` in the same machine-readable report.
+only. Neither may be used as the 30%-RSS go/no-go result. Those projections are
+not part of the captured measurement artifact; the next offline sizing command
+must recompute them from explicit assumptions.
 
 ## RSS, benchmark, stash, and queue blockers
 
@@ -568,8 +576,8 @@ prototype.
 The following work remains in scope because it reduces uncertainty without
 exposing a private server:
 
-1. execute the non-published aggregate corpus runner at a public mainnet
-   checkpoint and publish only its identifier-free output;
+1. execute `zainod-oram corpus capture` at an explicit public mainnet checkpoint
+   and publish only its identifier-free, digest-bound artifact;
 2. produce and review the full-mainnet distribution and calibrated sizing
    artifact;
 3. extend the pinned generic Linux x86_64 CI gate into a reproducible release

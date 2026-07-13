@@ -20,8 +20,10 @@ offline dependency experiment:
 - compiled privacy-profile validation;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
-- an aggregate-only corpus accumulator, checked full-capacity two-table sizing
-  model, and optional adapter for canonical `zaino-state::IndexedBlock` streams;
+- an aggregate-only corpus measurement with an exact joint event/live/peak
+  state histogram, a separately applied checked full-capacity two-table sizing
+  model, and an optional adapter for canonical `zaino-state::IndexedBlock`
+  streams;
 - a bounded plaintext finalized-projection oracle plus a default-off
   `shadow-parity` fixture that compares every observed standard address with
   ordinary-source results at one identical immutable vector checkpoint;
@@ -46,10 +48,11 @@ offline dependency experiment:
 
 It does **not** contain production encryption, durable ORAM persistence, TDX
 attestation, protobufs, or a network listener, and it makes no production
-privacy claim. The listener-free `zainod-oram corpus` runner can feed canonical
-mainnet blocks into the core, but no full-mainnet measurement artifact exists
-yet. Static fixture parity is not live-backend, finalised-database, reorg, or
-mainnet shadow evidence. Upstream `rostl` panic/recovery, persistence,
+privacy claim. The listener-free `zainod-oram corpus capture` runner can feed
+canonical mainnet blocks into the core and atomically publish a revalidated
+measurement artifact without sizing assumptions, but no full-mainnet artifact
+exists yet. Static fixture parity is not live-backend, finalised-database,
+reorg, or mainnet shadow evidence. Upstream `rostl` panic/recovery, persistence,
 side-channel, and licensing gates remain unresolved.
 The event coordinator is a portable sink/checkpoint ordering model. A private
 offline owner composes it with the business-command worker and, on supported
@@ -147,10 +150,10 @@ non-aliased ORAM/map pairs. The old raw worker surface has been removed. The
 portable schedule tests exercise the same insertion helper used by the real
 stores. The actual Linux backend and worker ran in the inherited generic native
 CI lane, and owner-head native run `29219929129` executes the complete typed
-store/coordinator/owner lifecycle. The native suite passes 157 tests while 154
-portable all-feature tests pass on this macOS host. Reply abandonment relies on
-the module-private trusted owner
-dropping tickets normally;
+store/coordinator/owner lifecycle. That native owner-head run passed 157 tests;
+after the capture split, 158 portable all-feature tests pass on this macOS host
+and the updated native head still requires CI execution. Reply abandonment
+relies on the module-private trusted owner dropping tickets normally;
 deliberately leaking a ticket with `mem::forget` is outside this offline model.
 
 The canonical dummy encoding is versioned `[1, 0, ...]`; all-zero `Default` or
@@ -173,8 +176,9 @@ recursive maps, stash, initialization temporaries, allocator/runtime working
 set, or measured RSS. `fits_modeled_constraints` therefore combines only
 configured count limits with the uncalibrated memory model; it is not proof of
 insertion success, collision probability, TDX fit, or 30% RSS headroom. The
-version-2 report carries `insertion_bound=false`, `backend_calibrated=false`,
-and `rss_measured=false` alongside those booleans.
+sizing qualification carries `insertion_bound=false`,
+`backend_calibrated=false`, and `rss_measured=false` alongside those booleans;
+none of these assumptions or projections is part of a corpus measurement.
 The schedule model does not establish equal instruction, memory, allocation,
 page, timing, or packet behavior.
 Those components remain gated by ADR-0007 and the feasibility criteria in

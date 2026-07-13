@@ -11,9 +11,9 @@ Implementation began on `feat/oram-private-foundation` after fast-forwarding the
 local `dev` branch to the recorded target fork point. The initial implemented
 scope establishes the ADR, fixed business/persistence/envelope and continuation
 shapes, exact profile coupling, a bounded plaintext test store, logical
-store-call schedule tests, aggregate corpus/full-capacity two-table sizing
-models, a shared transparent event seam, and a pinned volatile `rostl`
-experiment. Later stacked slices add a module-private synchronous command core
+store-call schedule tests, a mainnet corpus measurement separated from the
+full-capacity two-table sizing model, a shared transparent event seam, and a
+pinned volatile `rostl` experiment. Later stacked slices add a module-private synchronous command core
 over two typed table interfaces, a bounded worker that owns that exact core,
 and separate volatile `rostl` stores for the exact 38-byte directory and
 82-byte event-page records.
@@ -366,7 +366,10 @@ Deliverables:
 - branch from `origin/dev@c94ae247` or a fresher explicitly recorded commit;
 - ADR `docs/adr/0007-private-query-service-and-leakage-model.md`;
 - a public leakage matrix and privacy-profile schema;
-- a corpus scanner that reports only aggregate mainnet counts/distributions: distinct address scripts, events per address, live UTXOs per address, script classes, hottest-address tails, record sizes, and projected growth;
+- a corpus capture that reports only aggregate mainnet counts/distributions:
+  distinct address scripts, events per address, live UTXOs per address, script
+  classes, hottest-address tails, and record sizes; plus a separate offline
+  sizing step for projected growth and capacity assumptions;
 - pinned `rostl`, compiler, target CPU, TDX platform, and dependency/license inventory;
 - an exact candidate fixed record compiled with Zaino's Rust 1.96 toolchain and `rostl` constraints;
 - baseline memory/latency/stash/queue experiments on random full-map workloads, not repeated key-zero microbenchmarks;
@@ -591,7 +594,7 @@ The first mergeable slice should stop before real wallet serving:
 
 1. ADR and leakage table.
 2. `zaino-oram` crate with fixed UTXO event/page business and persistent types.
-3. Aggregate corpus scanner and memory model.
+3. Aggregate corpus capture and separately applied memory model.
 4. Mock logical-schedule engine plus fixed envelope/token codec.
 5. Pinned `rostl` volatile adapter exercised only by offline fixtures.
 6. Shadow parity at one finalized snapshot.

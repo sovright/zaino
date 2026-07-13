@@ -6046,6 +6046,8 @@ dependencies = [
  "rand 0.9.4",
  "rostl-oram",
  "rostl-primitives",
+ "serde",
+ "serde_json",
  "tokio",
  "zaino-state",
 ]
@@ -6191,7 +6193,13 @@ dependencies = [
 name = "zainod-oram"
 version = "0.1.0"
 dependencies = [
+ "blake2",
  "clap",
+ "hex",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "zaino-common",
  "zaino-oram",
