@@ -1,9 +1,9 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-13
-- Evaluated branch: `feat/oram-projection-owner`, stacked on
-  `ci/oram-native-linux`; owner integration code head `d71a4031` has native
-  evidence in run `29219929129`
+- Evaluated branch: `feat/oram-corpus-capture`, stacked on
+  `feat/oram-projection-owner`; capture code head `592d1206` has native
+  evidence in run `29223983432`
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
 - Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
@@ -404,9 +404,10 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `rustc --version --verbose` | Rust 1.96.0, LLVM 22.1.2, `aarch64-apple-darwin` | Compiler/host pin confirmed |
 | `rust-analyzer --version` | Rust Analyzer 1.96.0 (`ac68faa2`) | Installed from the pinned toolchain for semantic code intelligence |
 | `cargo nextest --version` | `cargo-nextest 0.9.140` | Repository-native test runner installed for the single workspace |
-| [`ORAM - Native Linux` run 29219929129](https://github.com/sovright/zaino/actions/runs/29219929129) environment | Ubuntu 24.04 x86_64, Rust 1.96.0, cargo-nextest 0.9.140; pass in 20m31s for owner integration code head `d71a4031` | Immutable action pins, locked dependency resolution, and exact tool versions establish a repeatable generic native CI gate; the hosted image is not a reproducible release or TDX build |
-| `cargo clippy -p zaino-oram --all-features --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` | Pass in owner-head native Linux CI; 6m57s cold dev-profile build | The complete owner all-feature/all-target ORAM graph is warning-free on the supported OS/architecture with the pinned compiler |
-| `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 157 passed, 0 skipped in 1.207s after a cold 13m17s test-profile build at owner code head `d71a4031` | Executes the complete generic Linux x86_64 suite, including the real typed-store projection-owner lifecycle; this is functional small-table evidence, not a benchmark |
+| [`ORAM - Native Linux` run 29223983432, job 86734395199](https://github.com/sovright/zaino/actions/runs/29223983432/job/86734395199) environment | Ubuntu 24.04 x86_64, Rust 1.96.0, cargo-nextest 0.9.140; pass in 18m40s for capture code head `592d1206` | Immutable action pins, locked dependency resolution, and exact tool versions establish a repeatable generic native CI gate; the hosted image is not a reproducible release, target-CPU, or TDX build |
+| `cargo clippy -p zaino-oram --all-features --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` | Pass in capture-head native Linux CI | The complete capture-head all-feature/all-target ORAM graph is warning-free on the supported OS/architecture with the pinned compiler |
+| `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 161 passed, 0 skipped at capture code head `592d1206` | Executes the complete generic Linux x86_64 suite, including the real typed-store projection-owner lifecycle and capture measurement model; this is functional small-table evidence, not a benchmark or hardware qualification |
+| [`ORAM - Native Linux` run 29219929129](https://github.com/sovright/zaino/actions/runs/29219929129) | Historical parent evidence: 157 passed, 0 skipped at owner code head `d71a4031` | Records the first complete native projection-owner lifecycle before the capture slice |
 | `rustup target list --installed` | Local pinned 1.96.0: `aarch64-apple-darwin` | Local target inventory only; the native CI evidence is recorded above |
 | `rustup +stable target list --installed` | Includes `x86_64-unknown-linux-gnu`; stable is Rust 1.96.1 | Enables a compile-only supported-path check, not execution evidence |
 | `cargo tree -p zaino-oram --features rostl-experimental --edges normal` | Resolved `rostl` alpha9 to pinned commit `8c3a12d2...` | Dependency pin confirmed |
@@ -439,15 +440,15 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `git diff --check -- docs/notes/oram-phase0-1-feasibility-report.md` | Pass | Report has no whitespace errors |
 | Exact `lint-boundary-conversions` task body from `tools/makefiles/lints.toml` | Pass; the `makers` wrapper is not installed locally | No forbidden persistence- or wire-boundary `From`/`TryFrom` implementation exists; CI should still run the canonical wrapper |
 
-The five Linux-x86_64-only `#[test]` functions included in the 157-test
-owner-head native run are
+The five Linux-x86_64-only `#[test]` functions included in the 161-test
+capture-head native run are
 `exact_typed_stores_preserve_duplicate_values_and_do_not_alias`,
 `full_store_duplicate_still_completes_both_accesses`,
 `exact_typed_executor_runs_behind_the_business_worker`, and
 `synthetic_caught_panic_latches_and_blocks_later_access`, and
-`linux_rostl_owner_builds_finishes_and_shuts_down`. The unsupported-host
-constructor rejection that runs on macOS is excluded on Linux, so the native
-total is three higher than the 154-test macOS all-feature total.
+`linux_rostl_owner_builds_finishes_and_shuts_down`. The two unsupported-host
+constructor rejections that run on macOS are excluded on Linux, so the native
+total is three higher than the 158-test macOS all-feature total.
 
 Two broader `zaino-state` gates remain baseline-blocked outside this slice.
 Warning-denied Clippy with `clippy::unwrap_used` reports four existing

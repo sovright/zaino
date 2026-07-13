@@ -148,11 +148,12 @@ occupancy model inputs; the module-private connector and worker close
 executor-command TOCTOU, and the Linux-only offline constructor creates two
 non-aliased ORAM/map pairs. The old raw worker surface has been removed. The
 portable schedule tests exercise the same insertion helper used by the real
-stores. The actual Linux backend and worker ran in the inherited generic native
-CI lane, and owner-head native run `29219929129` executes the complete typed
-store/coordinator/owner lifecycle. That native owner-head run passed 157 tests;
-after the capture split, 158 portable all-feature tests pass on this macOS host
-and the updated native head still requires CI execution. Reply abandonment
+stores. The actual Linux backend and worker run in the inherited generic native
+CI lane. Capture-head native run `29223983432` passed strict all-target,
+all-feature Clippy and all 161 tests while executing the complete typed
+store/coordinator/owner lifecycle; 158 portable all-feature tests pass on this
+macOS host. This generic hosted-Linux evidence is not target-CPU, TDX, load,
+benchmark, or physical-trace qualification. Reply abandonment
 relies on the module-private trusted owner dropping tickets normally;
 deliberately leaking a ticket with `mem::forget` is outside this offline model.
 
