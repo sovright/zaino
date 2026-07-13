@@ -26,7 +26,8 @@ mod atomic_store;
 
 #[cfg(feature = "corpus-zaino")]
 pub(super) use atomic_store::{
-    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQueueCapacity,
+    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
+    AtomicQualificationAppendResult, AtomicQualificationSnapshot, AtomicQueueCapacity,
     AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
 #[cfg(all(test, feature = "corpus-zaino"))]
@@ -60,13 +61,13 @@ impl LayoutNetwork {
 
 /// Standard transparent address identity before canonical key derivation.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct StandardAddress {
+pub(super) struct StandardAddress {
     kind: StandardScriptKind,
     hash: [u8; 20],
 }
 
 impl StandardAddress {
-    const fn new(kind: StandardScriptKind, hash: [u8; 20]) -> Self {
+    pub(super) const fn new(kind: StandardScriptKind, hash: [u8; 20]) -> Self {
         Self { kind, hash }
     }
 
@@ -88,7 +89,7 @@ impl fmt::Debug for StandardAddress {
 
 /// Supported standard transparent locking-script class.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum StandardScriptKind {
+pub(super) enum StandardScriptKind {
     PayToPublicKeyHash,
     PayToScriptHash,
 }

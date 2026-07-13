@@ -1,4 +1,4 @@
-//! Atomic, self-validating artifacts for one fixed mainnet corpus capture.
+//! Atomic, self-validating artifacts for offline ORAM research evidence.
 
 use std::{
     collections::BTreeSet,
@@ -41,12 +41,12 @@ const MAX_STAGE_ATTEMPTS: u64 = 128;
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-struct ArtifactDirectory {
+pub(super) struct ArtifactDirectory {
     fd: OwnedFd,
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-struct ArtifactDirectory;
+pub(super) struct ArtifactDirectory;
 
 struct ArtifactOutput {
     parent: ArtifactDirectory,
@@ -376,13 +376,13 @@ pub(super) fn publish_capture(
     })
 }
 
-struct ArtifactFile {
+pub(super) struct ArtifactFile {
     name: &'static str,
     bytes: Vec<u8>,
 }
 
 impl ArtifactFile {
-    fn new(name: &'static str, bytes: Vec<u8>) -> Self {
+    pub(super) fn new(name: &'static str, bytes: Vec<u8>) -> Self {
         Self { name, bytes }
     }
 }
@@ -409,6 +409,16 @@ fn publish_verified_directory(
 ) -> Result<(), ArtifactError> {
     let output = open_artifact_output(output_dir)?;
     publish_verified_output(&output, files, failpoint, validate)
+}
+
+/// Publishes a read-back-validated artifact through the shared no-clobber path.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn publish_verified_artifact(
+    output_dir: &Path,
+    files: &[ArtifactFile],
+    validate: impl FnOnce(&ArtifactDirectory) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    publish_verified_directory(output_dir, files, PublishFailpoint::None, validate)
 }
 
 fn publish_verified_output(
@@ -1128,6 +1138,16 @@ fn read_file(
     Err(ArtifactError::UnsupportedPlatform)
 }
 
+/// Reads one regular artifact file without following links and with a byte cap.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn read_artifact_file(
+    directory: &ArtifactDirectory,
+    name: &'static str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, ArtifactError> {
+    read_file(directory, name, maximum_bytes)
+}
+
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn sync_directory(
     directory: &ArtifactDirectory,
@@ -1207,6 +1227,12 @@ fn cleanup_stage(
 
 fn blake2s256_hex(bytes: &[u8]) -> String {
     hex::encode(Blake2s256::digest(bytes))
+}
+
+/// Returns the canonical artifact digest encoding shared by sibling formats.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn artifact_blake2s256_hex(bytes: &[u8]) -> String {
+    blake2s256_hex(bytes)
 }
 
 /// Artifact construction or atomic-publication failure.

@@ -3,6 +3,48 @@
 `zainod-oram` is a non-published application package for Zaino ORAM research.
 It is not part of the workspace's default members.
 
+## Typed-worker correctness qualification
+
+The default-off `typed-qualification` feature exposes one fixed, listener-free
+correctness exercise for the real volatile typed `rostl` worker. It is
+available only on Linux x86_64:
+
+```console
+cargo run -p zainod-oram --features typed-qualification -- \
+  qualification run --output-dir <NEW_DIR>
+```
+
+The command accepts no node configuration or workload knobs. It executes nine
+synchronous business commands against fixed 8-slot directory and 16-slot event
+tables: empty reads, three inserted events across two addresses, one observed
+exact replay, one two-event history, independent histories, and a final empty
+read. It then requires clean worker shutdown with nine accepted/completed
+commands, no failures or rejections, and queue high-water one. No address,
+transaction, event, or probe seed is emitted.
+
+The output uses the same synchronized sibling staging and atomic no-replace
+publication path as corpus artifacts. Staged files are bounded, opened without
+following links, parsed, semantically revalidated, and compared with the
+in-memory report before publication. The directory contains:
+
+- `qualification.json`: the
+  `zaino-oram-typed-worker-qualification-v1` typed report wrapper.
+- `qualification.txt`: the exact identifier-free text rendering.
+- `provenance.json`: the
+  `zaino-oram-typed-worker-qualification-provenance-v1` runner version,
+  Linux/x86_64 target labels, and lowercase BLAKE2s-256 digest of the compact
+  typed qualification wrapper.
+
+The provenance digest binds the compact typed JSON wrapper. Publication also
+checks the text rendering against that report, but neither mechanism is a
+signature or execution attestation. The report explicitly records that it is
+not bound to a source revision, lockfile digest, toolchain, binary identity, CI
+run, or attestation. Trusted CI logs or later signed provenance must establish
+who ran which binary. The command is also not a benchmark: it records no
+latency, RSS, stash, physical access trace, persistence, TDX, mainnet-capacity,
+or runtime-service result. Unsupported hosts fail before creating the output
+directory.
+
 ## Corpus capture
 
 `corpus capture` produces an identifier-free measurement of the transparent

@@ -57,6 +57,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   shutdown draining, terminal fault latching, uniform append-ticket-abandonment
   fault latching, and identifier-free internal queue/lifecycle/outcome counters
   with no export-policy claim.
+- A listener-free typed-worker qualification entry point that drives one fixed
+  nine-command read/append/replay scenario through the real Linux x86_64
+  `rostl` worker and returns only deterministic correctness totals plus
+  identifier-free aggregate worker counters. It does not measure latency, RSS,
+  stash behavior, physical access traces, persistence, TDX behavior, mainnet
+  capacity, or any runtime-service property, and its report marks source,
+  lockfile, toolchain, binary, and execution-attestation binding as absent.
 - A private generic finalized-event/checkpoint coordinator that fully stages
   canonical validation, transparent event extraction, spend-owner resolution,
   capacity checks, and an ordered standard-event batch before its first sink

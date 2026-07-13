@@ -7,6 +7,8 @@ use std::{error::Error, fmt, num::NonZeroU32, path::PathBuf, process::ExitCode};
 
 use clap::{Args, Parser, Subcommand};
 use zaino_common::Network;
+#[cfg(feature = "typed-qualification")]
+use zaino_oram::run_typed_worker_qualification;
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_state::{
     chain_index::NonFinalizedSnapshot, ChainIndex, ChainIndexSnapshot, Height,
@@ -21,8 +23,12 @@ use crate::corpus_artifact::{
     load_capture, publish_capture, publish_sizing, BackendKind, CaptureProvenance, SelectionMode,
     SnapshotMode,
 };
+#[cfg(feature = "typed-qualification")]
+use crate::qualification_artifact::publish_qualification;
 
 mod corpus_artifact;
+#[cfg(feature = "typed-qualification")]
+mod qualification_artifact;
 
 type RunnerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -41,6 +47,31 @@ struct Cli {
 enum Command {
     /// Capture or inspect ORAM corpus evidence.
     Corpus(CorpusCommand),
+    /// Exercise the fixed typed-worker correctness scenario without a listener.
+    #[cfg(feature = "typed-qualification")]
+    Qualification(QualificationCommand),
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationCommand {
+    #[command(subcommand)]
+    command: QualificationSubcommand,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Subcommand)]
+enum QualificationSubcommand {
+    /// Run the fixed correctness scenario and publish aggregate evidence.
+    Run(QualificationRunArgs),
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationRunArgs {
+    /// New directory that will receive the complete verified evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -158,7 +189,7 @@ async fn main() -> ExitCode {
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("ORAM corpus runner failed: {error}");
+            eprintln!("ORAM research runner failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -170,7 +201,19 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             CorpusSubcommand::Capture(args) => run_corpus_capture(args).await,
             CorpusSubcommand::Size(args) => run_corpus_size(args),
         },
+        #[cfg(feature = "typed-qualification")]
+        Command::Qualification(command) => match command.command {
+            QualificationSubcommand::Run(args) => run_qualification(args),
+        },
     }
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_qualification(args: QualificationRunArgs) -> RunnerResult<()> {
+    let qualification = run_typed_worker_qualification()?;
+    publish_qualification(&args.output_dir, &qualification, env!("CARGO_PKG_VERSION"))?;
+    println!("qualification_artifact={}", args.output_dir.display());
+    Ok(())
 }
 
 fn run_corpus_size(args: CorpusSizeArgs) -> RunnerResult<()> {
@@ -453,10 +496,106 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_qualification_args() -> [&'static str; 5] {
+        [
+            "zainod-oram",
+            "qualification",
+            "run",
+            "--output-dir",
+            "/tmp/oram-qualification",
+        ]
+    }
+
+    fn parsed_corpus(cli: Cli) -> CorpusCommand {
+        match cli.command {
+            Command::Corpus(command) => command,
+            #[cfg(feature = "typed-qualification")]
+            Command::Qualification(_) => panic!("qualification arguments parsed as corpus"),
+        }
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn qualification_cli_exposes_only_the_fixed_scenario_output() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_qualification_args())?;
+        let args = match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::Run(args) => args,
+            },
+            Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
+        };
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-qualification"));
+
+        for rejected in ["--config", "--directory-capacity", "--target-height"] {
+            let mut args = valid_qualification_args().to_vec();
+            args.extend([rejected, "8"]);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[tokio::test]
+    async fn qualification_dispatch_publishes_exactly_three_files() -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let output_dir = parent.path().join("qualification");
+
+        run(Cli {
+            command: Command::Qualification(QualificationCommand {
+                command: QualificationSubcommand::Run(QualificationRunArgs {
+                    output_dir: output_dir.clone(),
+                }),
+            }),
+        })
+        .await?;
+
+        let names = fs::read_dir(output_dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                OsString::from("provenance.json"),
+                OsString::from("qualification.json"),
+                OsString::from("qualification.txt"),
+            ])
+        );
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        not(all(target_os = "linux", target_arch = "x86_64"))
+    ))]
+    #[tokio::test]
+    async fn qualification_dispatch_fails_without_publishing_on_unsupported_hosts(
+    ) -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let output_dir = parent.path().join("qualification");
+
+        let result = run(Cli {
+            command: Command::Qualification(QualificationCommand {
+                command: QualificationSubcommand::Run(QualificationRunArgs {
+                    output_dir: output_dir.clone(),
+                }),
+            }),
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(!output_dir.exists());
+        Ok(())
+    }
+
     #[test]
     fn corpus_capture_cli_has_no_sizing_parameters() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(valid_args())?;
-        let Command::Corpus(command) = cli.command;
+        let command = parsed_corpus(cli);
         let args = match command.command {
             CorpusSubcommand::Capture(args) => args,
             CorpusSubcommand::Size(_) => panic!("capture arguments parsed as sizing arguments"),
@@ -473,7 +612,7 @@ mod tests {
     fn corpus_size_cli_is_offline_and_requires_every_explicit_model_input(
     ) -> Result<(), Box<dyn Error>> {
         let cli = Cli::try_parse_from(valid_sizing_args())?;
-        let Command::Corpus(command) = cli.command;
+        let command = parsed_corpus(cli);
         let args = match command.command {
             CorpusSubcommand::Size(args) => args,
             CorpusSubcommand::Capture(_) => {

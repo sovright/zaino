@@ -92,6 +92,48 @@ impl AtomicWorker {
         self.handle.snapshot()
     }
 
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_read_history(
+        &self,
+        address: StandardAddress,
+    ) -> Result<Vec<Option<UtxoEvent>>, ()> {
+        self.handle
+            .try_read_history(address)
+            .map_err(|_| ())?
+            .wait()
+            .map(|history| history.slots)
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_append(
+        &self,
+        address: StandardAddress,
+        event: UtxoEvent,
+    ) -> Result<AtomicQualificationAppendResult, ()> {
+        self.handle
+            .try_append(address, event)
+            .map_err(|_| ())?
+            .wait()
+            .map(|result| AtomicQualificationAppendResult {
+                disposition: match result.disposition {
+                    AppendDisposition::Inserted => AtomicQualificationAppendDisposition::Inserted,
+                    AppendDisposition::ExactReplay => {
+                        AtomicQualificationAppendDisposition::ExactReplay
+                    }
+                },
+                history: result.history.slots,
+            })
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_shutdown(self) -> Result<AtomicQualificationSnapshot, ()> {
+        self.shutdown()
+            .map(AtomicQualificationSnapshot::from_snapshot)
+            .map_err(|_| ())
+    }
+
     fn shutdown(mut self) -> Result<AtomicWorkerSnapshot, AtomicWorkerError> {
         let signal_result = self.signal_shutdown();
         let join_result = self.join_worker();
@@ -252,7 +294,7 @@ impl AtomicWorkerHandle {
         &self,
         address: StandardAddress,
         event: UtxoEvent,
-    ) -> Result<AtomicWorkerReply<FixedEventHistory>, AtomicWorkerError> {
+    ) -> Result<AtomicWorkerReply<AppendResult>, AtomicWorkerError> {
         let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
         self.admit(WorkerCommand::Append {
             address,
@@ -391,6 +433,59 @@ struct AtomicWorkerSnapshot {
     fault: Option<WorkerFault>,
 }
 
+/// Aggregate append disposition retained only for the qualification facade.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicQualificationAppendDisposition {
+    Inserted,
+    ExactReplay,
+}
+
+/// Identifier-free append outcome retained only for the qualification facade.
+#[cfg(feature = "corpus-zaino")]
+pub(crate) struct AtomicQualificationAppendResult {
+    pub(crate) disposition: AtomicQualificationAppendDisposition,
+    pub(crate) history: Vec<Option<UtxoEvent>>,
+}
+
+/// Aggregate stopped-worker state exposed only to the qualification facade.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomicQualificationSnapshot {
+    pub(crate) queue_capacity: usize,
+    pub(crate) queued: usize,
+    pub(crate) in_flight: usize,
+    pub(crate) queue_high_water: usize,
+    pub(crate) accepted: u64,
+    pub(crate) completed: u64,
+    pub(crate) failed: u64,
+    pub(crate) full_rejected: u64,
+    pub(crate) not_running_rejected: u64,
+    pub(crate) reply_delivery_failed: u64,
+    pub(crate) stopped: bool,
+    pub(crate) faulted: bool,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl AtomicQualificationSnapshot {
+    const fn from_snapshot(snapshot: AtomicWorkerSnapshot) -> Self {
+        Self {
+            queue_capacity: snapshot.queue_capacity,
+            queued: snapshot.queued,
+            in_flight: snapshot.in_flight,
+            queue_high_water: snapshot.queue_high_water,
+            accepted: snapshot.accepted,
+            completed: snapshot.completed,
+            failed: snapshot.failed,
+            full_rejected: snapshot.full_rejected,
+            not_running_rejected: snapshot.not_running_rejected,
+            reply_delivery_failed: snapshot.reply_delivery_failed,
+            stopped: matches!(snapshot.lifecycle, WorkerLifecycle::Stopped),
+            faulted: snapshot.fault.is_some(),
+        }
+    }
+}
+
 impl AtomicWorkerSnapshot {
     const fn from_state(state: &WorkerState) -> Self {
         Self {
@@ -491,7 +586,7 @@ enum WorkerCommand {
     Append {
         address: StandardAddress,
         event: UtxoEvent,
-        reply: SyncSender<Result<FixedEventHistory, AtomicWorkerError>>,
+        reply: SyncSender<Result<AppendResult, AtomicWorkerError>>,
     },
     Shutdown {
         reply: SyncSender<()>,
@@ -564,9 +659,8 @@ where
                 reply,
             } => {
                 mark_dequeued(shared);
-                let result = execute_command(executor, shared, |executor| {
-                    executor.append(address, event).map(|result| result.history)
-                });
+                let result =
+                    execute_command(executor, shared, |executor| executor.append(address, event));
                 send_reply(reply, result);
             }
             WorkerCommand::Shutdown { reply } => {

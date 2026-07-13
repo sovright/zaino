@@ -24,7 +24,8 @@ mod worker;
 
 #[cfg(feature = "corpus-zaino")]
 pub(crate) use worker::{
-    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQueueCapacity,
+    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
+    AtomicQualificationAppendResult, AtomicQualificationSnapshot, AtomicQueueCapacity,
     AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
 
@@ -86,6 +87,13 @@ enum AppendDisposition {
 struct AppendResult {
     disposition: AppendDisposition,
     history: FixedEventHistory,
+}
+
+impl AppendResult {
+    #[cfg(test)]
+    fn events(&self) -> &[Option<UtxoEvent>] {
+        self.history.events()
+    }
 }
 
 impl fmt::Debug for AppendResult {

@@ -30,6 +30,8 @@ mod profile;
 mod projection;
 #[cfg(feature = "corpus-zaino")]
 mod projection_owner;
+#[cfg(feature = "corpus-zaino")]
+mod qualification;
 mod records;
 mod sizing;
 mod store;
@@ -39,6 +41,10 @@ mod zaino_corpus;
 #[cfg(all(test, feature = "corpus-zaino"))]
 mod zaino_fixtures;
 
+#[cfg(feature = "corpus-zaino")]
+pub use qualification::{
+    run_typed_worker_qualification, TypedWorkerQualificationError, TypedWorkerQualificationReport,
+};
 #[cfg(feature = "corpus-zaino")]
 pub use zaino_corpus::{
     MainnetCorpusCheckpoint, MainnetCorpusError, MainnetCorpusMeasurement, MainnetCorpusScanner,

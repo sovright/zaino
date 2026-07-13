@@ -9,6 +9,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+typed-qualification = ["zaino-oram/rostl-experimental"]
+
 [dependencies]
 blake2.workspace = true
 clap = { workspace = true, features = ["derive"] }

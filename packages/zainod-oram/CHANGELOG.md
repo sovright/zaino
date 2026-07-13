@@ -12,3 +12,10 @@
   capture consumption, deterministic typed qualification/provenance digests,
   source-bound qualification recomputation, bounded no-follow artifact reads,
   and dirfd-relative crash-durable no-clobber three-file publication.
+- Add a default-off `typed-qualification` feature with a listener-free
+  `qualification run` command for the fixed typed-worker correctness scenario.
+  Successful runs atomically publish a read-back-verified three-file JSON,
+  text, and digest-bound provenance artifact; the command exposes no listener,
+  runtime-service hook, latency/RSS measurement, or physical-trace claim. The
+  unsigned self-reported bundle explicitly carries no source, lockfile,
+  toolchain, binary, CI-run, or execution-attestation binding.

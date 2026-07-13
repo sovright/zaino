@@ -59,6 +59,21 @@ The profile ID binds that schedule and the continuation lifetime. Production
 AEAD, trusted clock and nonce ownership, durable replay storage, instruction/
 memory/timing equivalence, private protobuf/transport framing, and a service
 lifecycle remain integration gates.
+The current offline slice adds a listener-free qualification runner for the real
+typed worker. It executes one fixed nine-command correctness sequence covering
+empty reads, inserts, an exact replay, independent address histories, and clean
+shutdown, then emits only correctness totals and identifier-free aggregate
+worker counters. The default-off `typed-qualification` feature exposes
+`zainod-oram qualification run`, which publishes that report as an atomic,
+read-back-verified three-file JSON, text, and digest-bound provenance artifact.
+The native Linux lane is extended to compile, lint, and test both
+research crates, but exact-head native qualification evidence remains pending.
+The artifact digest binds the compact typed JSON report into provenance only;
+staged read-back separately checks the text rendering. The bundle is unsigned,
+self-reported, and explicitly unbound from source, lockfile, toolchain, binary,
+CI-run identity, or execution attestation.
+This slice is not a benchmark and supplies no latency, RSS, stash, physical
+access-trace, persistence, TDX, mainnet-capacity, or runtime-service evidence.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
