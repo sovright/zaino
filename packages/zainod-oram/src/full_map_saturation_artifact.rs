@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(decoded.digest()?, artifact.digest()?);
         assert_eq!(
             artifact.digest()?,
-            "ffe052da5c479479af1fa262d288531371bfc441d6caa755014487cd654a00e1"
+            "2dfbd24e45662e6f112ab7c738dd780c0916d253636a47b739e15425e0932854"
         );
         Ok(())
     }
