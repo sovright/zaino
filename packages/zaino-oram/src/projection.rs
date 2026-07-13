@@ -1,13 +1,17 @@
 //! Plaintext offline finalized-projection oracle for deterministic fixtures.
 //!
 //! This module models canonical ingest, replay, rebuild, and fail-closed
-//! lifecycle semantics. Its ordinary maps are neither an ORAM nor durable or
-//! authenticated storage, and nothing here is suitable for serving queries.
+//! lifecycle semantics. A private generic coordinator stages each whole block,
+//! waits for every ordered standard-event sink mutation, and commits its
+//! in-memory checkpoint last. Its ordinary maps are neither an ORAM nor durable
+//! or authenticated storage, the sink is not wired to the worker, and nothing
+//! here is suitable for serving queries.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     num::NonZeroUsize,
+    panic::{catch_unwind, AssertUnwindSafe},
 };
 
 use zaino_state::{
@@ -172,6 +176,7 @@ enum ProjectionFault {
     Lifecycle,
     CanonicalChain,
     Extraction,
+    EventSink,
     InvalidEvent,
     DuplicateOutput,
     UnknownSpend,
@@ -247,7 +252,7 @@ impl ProjectionState {
         &mut self,
         event: TransparentBlockEvent,
         capacities: ProjectionCapacities,
-    ) -> Result<(), ProjectionError> {
+    ) -> Result<Option<UtxoEvent>, ProjectionError> {
         match event {
             TransparentBlockEvent::Created {
                 location,
@@ -278,7 +283,7 @@ impl ProjectionState {
         height: u32,
         script_class: ScriptType,
         capacities: ProjectionCapacities,
-    ) -> Result<(), ProjectionError> {
+    ) -> Result<Option<UtxoEvent>, ProjectionError> {
         if self.seen_outputs.contains(&outpoint) {
             return Err(ProjectionError::DuplicateCreatedOutpoint);
         }
@@ -293,7 +298,7 @@ impl ProjectionState {
             CapacityDimension::LiveOutputs,
         )?;
 
-        let owner = match script_class {
+        let (owner, projected) = match script_class {
             ScriptType::P2PKH | ScriptType::P2SH => {
                 let address = address.ok_or(ProjectionError::MissingStandardAddress)?;
                 if address.script_type() != script_class as u8 {
@@ -348,19 +353,19 @@ impl ProjectionState {
                 address_state.events.push(created);
                 address_state.live_utxos.insert(outpoint, utxo);
                 self.total_events = next_total_events;
-                LiveOutput::Standard { address, created }
+                (LiveOutput::Standard { address, created }, Some(created))
             }
             ScriptType::NonStandard => {
                 if address.is_some() {
                     return Err(ProjectionError::UnexpectedNonStandardAddress);
                 }
-                LiveOutput::NonStandard
+                (LiveOutput::NonStandard, None)
             }
         };
 
         self.seen_outputs.insert(outpoint);
         self.live_outputs.insert(outpoint, owner);
-        Ok(())
+        Ok(projected)
     }
 
     fn apply_spent(
@@ -368,14 +373,14 @@ impl ProjectionState {
         previous: Outpoint,
         spending_height: u32,
         capacities: ProjectionCapacities,
-    ) -> Result<(), ProjectionError> {
+    ) -> Result<Option<UtxoEvent>, ProjectionError> {
         let owner = self
             .live_outputs
             .get(&previous)
             .copied()
             .ok_or(ProjectionError::UnknownSpentOutpoint)?;
-        match owner {
-            LiveOutput::NonStandard => {}
+        let projected = match owner {
+            LiveOutput::NonStandard => None,
             LiveOutput::Standard { address, created } => {
                 let address_state = self
                     .addresses
@@ -409,11 +414,19 @@ impl ProjectionState {
                 address_state.live_utxos.remove(&previous);
                 address_state.events.push(spent);
                 self.total_events = next_total_events;
+                Some(spent)
             }
-        }
+        };
         self.live_outputs.remove(&previous);
-        Ok(())
+        Ok(projected)
     }
+}
+
+struct StagedFinalizedBlock {
+    cursor: CanonicalBlockCursor,
+    checkpoint: PublicChainCheckpoint,
+    state: ProjectionState,
+    events: Vec<UtxoEvent>,
 }
 
 /// Deterministic plaintext oracle for finalized `IndexedBlock` fixtures.
@@ -486,6 +499,19 @@ impl OfflineFinalizedProjection {
         &mut self,
         block: &IndexedBlock,
     ) -> Result<OfflineProjectionCheckpoint, ProjectionError> {
+        self.ensure_building()?;
+
+        let staged = self.stage_block(block);
+        match staged {
+            Ok(staged) => Ok(self.commit_staged(staged)),
+            Err(error) => {
+                self.fail_closed(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_building(&mut self) -> Result<(), ProjectionError> {
         match self.readiness {
             ProjectionReadiness::FailedClosed(fault) => {
                 return Err(ProjectionError::AlreadyFailedClosed { fault });
@@ -497,40 +523,38 @@ impl OfflineFinalizedProjection {
             }
             ProjectionReadiness::Building => {}
         }
-
-        let staged = self.stage_block(block);
-        match staged {
-            Ok((cursor, committed, state)) => {
-                self.state = state;
-                self.cursor = cursor;
-                Ok(self.checkpoint_for(committed))
-            }
-            Err(error) => {
-                self.fail_closed(&error);
-                Err(error)
-            }
-        }
+        Ok(())
     }
 
-    fn stage_block(
-        &self,
-        block: &IndexedBlock,
-    ) -> Result<(CanonicalBlockCursor, PublicChainCheckpoint, ProjectionState), ProjectionError>
-    {
+    fn stage_block(&self, block: &IndexedBlock) -> Result<StagedFinalizedBlock, ProjectionError> {
         let candidate = self
             .cursor
             .validate_next(block)
             .map_err(ProjectionError::CanonicalChain)?;
         let events = extract_transparent_events(block).map_err(ProjectionError::Extraction)?;
         let mut state = self.state.clone();
+        let mut projected_events = Vec::with_capacity(events.len());
         for event in events {
-            state.apply(event, self.config.capacities)?;
+            if let Some(event) = state.apply(event, self.config.capacities)? {
+                projected_events.push(event);
+            }
         }
         let (cursor, committed) = self
             .cursor
             .stage_advance(candidate)
             .map_err(ProjectionError::CanonicalChain)?;
-        Ok((cursor, committed, state))
+        Ok(StagedFinalizedBlock {
+            cursor,
+            checkpoint: committed,
+            state,
+            events: projected_events,
+        })
+    }
+
+    fn commit_staged(&mut self, staged: StagedFinalizedBlock) -> OfflineProjectionCheckpoint {
+        self.state = staged.state;
+        self.cursor = staged.cursor;
+        self.checkpoint_for(staged.checkpoint)
     }
 
     /// Publishes readiness only for an exact, explicitly supplied target.
@@ -710,6 +734,107 @@ impl OfflineFinalizedProjection {
     }
 }
 
+/// Synchronous completion boundary for the offline publication-order model.
+trait ProjectionEventSink {
+    type Error;
+
+    /// Returns `Ok` only after the event mutation has completed.
+    ///
+    /// `Err` may represent a rejected, partial, or indeterminate mutation; the
+    /// coordinator therefore discards the whole sink candidate uniformly.
+    fn append_and_wait(&mut self, event: UtxoEvent) -> Result<(), Self::Error>;
+}
+
+/// Owns one volatile sink candidate and publishes only its in-memory cursor.
+struct ProjectionCheckpointCoordinator<S> {
+    projection: OfflineFinalizedProjection,
+    sink: Option<S>,
+}
+
+impl<S> ProjectionCheckpointCoordinator<S>
+where
+    S: ProjectionEventSink,
+{
+    fn new(config: ProjectionConfig, sink: S) -> Self {
+        Self {
+            projection: OfflineFinalizedProjection::new(config),
+            sink: Some(sink),
+        }
+    }
+
+    fn apply_finalized(
+        &mut self,
+        block: &IndexedBlock,
+    ) -> Result<OfflineProjectionCheckpoint, ProjectionError> {
+        if let Err(error) = self.projection.ensure_building() {
+            return Err(self.terminate(error));
+        }
+        let staged = match self.projection.stage_block(block) {
+            Ok(staged) => staged,
+            Err(error) => return Err(self.terminate(error)),
+        };
+        let append_result = catch_unwind(AssertUnwindSafe(|| {
+            self.append_staged_events(&staged.events)
+        }));
+        if !matches!(append_result, Ok(Ok(()))) {
+            return Err(self.terminate(ProjectionError::EventSink));
+        }
+        Ok(self.projection.commit_staged(staged))
+    }
+
+    fn finish(
+        &mut self,
+        target: OfflineProjectionCheckpoint,
+    ) -> Result<OfflineProjectionCheckpoint, ProjectionError> {
+        match self.projection.finish(target) {
+            Ok(checkpoint) => Ok(checkpoint),
+            Err(error) => {
+                self.drop_sink();
+                Err(error)
+            }
+        }
+    }
+
+    fn ready_checkpoint(&self) -> Result<OfflineProjectionCheckpoint, ProjectionUnavailable> {
+        self.projection.ready_checkpoint()
+    }
+
+    fn committed_checkpoint(&self) -> Option<OfflineProjectionCheckpoint> {
+        self.projection.committed_checkpoint()
+    }
+
+    fn append_staged_events(&mut self, events: &[UtxoEvent]) -> Result<(), ()> {
+        let Some(sink) = self.sink.as_mut() else {
+            return Err(());
+        };
+        for event in events.iter().copied() {
+            if sink.append_and_wait(event).is_err() {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    fn terminate(&mut self, error: ProjectionError) -> ProjectionError {
+        self.projection.fail_closed(&error);
+        self.drop_sink();
+        error
+    }
+
+    fn drop_sink(&mut self) {
+        let Some(sink) = self.sink.take() else {
+            return;
+        };
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(sink)));
+    }
+}
+
+impl<S> fmt::Debug for ProjectionCheckpointCoordinator<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProjectionCheckpointCoordinator { ..REDACTED.. }")
+    }
+}
+
 impl fmt::Debug for OfflineFinalizedProjection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OfflineFinalizedProjection")
@@ -753,6 +878,7 @@ enum ProjectionError {
     ReplacementSourceNotReady,
     CanonicalChain(CanonicalChainError),
     Extraction(TransparentEventError),
+    EventSink,
     DuplicateCreatedOutpoint,
     UnknownSpentOutpoint,
     MissingStandardAddress,
@@ -793,6 +919,7 @@ impl ProjectionError {
             | Self::ReplacementSourceNotReady => ProjectionFault::Lifecycle,
             Self::CanonicalChain(_) => ProjectionFault::CanonicalChain,
             Self::Extraction(_) => ProjectionFault::Extraction,
+            Self::EventSink => ProjectionFault::EventSink,
             Self::DuplicateCreatedOutpoint => ProjectionFault::DuplicateOutput,
             Self::UnknownSpentOutpoint => ProjectionFault::UnknownSpend,
             Self::MissingStandardAddress
@@ -834,6 +961,9 @@ impl fmt::Display for ProjectionError {
             }
             Self::Extraction(error) => {
                 write!(f, "offline projection event extraction failed: {error}")
+            }
+            Self::EventSink => {
+                f.write_str("offline projection event sink failed closed")
             }
             Self::DuplicateCreatedOutpoint => {
                 f.write_str("offline projection rejected a previously seen created outpoint")
@@ -915,6 +1045,7 @@ impl std::error::Error for ProjectionError {
             | Self::ApplyAfterReady
             | Self::FinishAfterReadyWithDifferentTarget
             | Self::ReplacementSourceNotReady
+            | Self::EventSink
             | Self::DuplicateCreatedOutpoint
             | Self::UnknownSpentOutpoint
             | Self::MissingStandardAddress
@@ -984,6 +1115,11 @@ const fn map_script_class(script_class: ScriptType) -> UtxoScriptClass {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
     use super::*;
     use zaino_state::{BlockHash, TxInCompact};
 
@@ -993,6 +1129,71 @@ mod tests {
     const THIRD_HASH: [u8; 32] = [0x93; 32];
     const SCHEMA_VERSION: u32 = 1;
     const KEY_EPOCH: u64 = 7;
+
+    #[derive(Clone)]
+    struct SinkObservation {
+        events: Rc<RefCell<Vec<UtxoEvent>>>,
+        attempts: Rc<Cell<usize>>,
+        dropped: Rc<Cell<bool>>,
+    }
+
+    struct RecordingSink {
+        observation: SinkObservation,
+        fail_at: Option<usize>,
+        panic_at: Option<usize>,
+        panic_on_drop: bool,
+    }
+
+    impl RecordingSink {
+        fn new(fail_at: Option<usize>) -> (Self, SinkObservation) {
+            Self::with_faults(fail_at, None, false)
+        }
+
+        fn with_faults(
+            fail_at: Option<usize>,
+            panic_at: Option<usize>,
+            panic_on_drop: bool,
+        ) -> (Self, SinkObservation) {
+            let observation = SinkObservation {
+                events: Rc::new(RefCell::new(Vec::new())),
+                attempts: Rc::new(Cell::new(0)),
+                dropped: Rc::new(Cell::new(false)),
+            };
+            (
+                Self {
+                    observation: observation.clone(),
+                    fail_at,
+                    panic_at,
+                    panic_on_drop,
+                },
+                observation,
+            )
+        }
+    }
+
+    impl ProjectionEventSink for RecordingSink {
+        type Error = ();
+
+        fn append_and_wait(&mut self, event: UtxoEvent) -> Result<(), Self::Error> {
+            let attempt = self.observation.attempts.get();
+            self.observation.attempts.set(attempt.saturating_add(1));
+            if self.fail_at == Some(attempt) {
+                return Err(());
+            }
+            self.observation.events.borrow_mut().push(event);
+            if self.panic_at == Some(attempt) {
+                panic!("identifier-free injected sink panic");
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for RecordingSink {
+        fn drop(&mut self) {
+            self.observation.dropped.set(true);
+            assert!(!self.panic_on_drop, "identifier-free injected drop panic");
+        }
+    }
 
     fn capacities() -> Result<ProjectionCapacities, ProjectionConfigError> {
         ProjectionCapacities::new(64, 64, 16, 128, 32)
@@ -1026,6 +1227,67 @@ mod tests {
 
     fn address(hash: [u8; 20], script_type: ScriptType) -> AddrScript {
         AddrScript::new(hash, script_type as u8)
+    }
+
+    fn expected_projected_events() -> [UtxoEvent; 7] {
+        [
+            UtxoEvent::created(
+                [0x11; 32],
+                0,
+                50,
+                0,
+                UtxoScriptClass::PayToPublicKeyHash,
+                [0xa1; 20],
+            ),
+            UtxoEvent::created(
+                [0x11; 32],
+                1,
+                60,
+                0,
+                UtxoScriptClass::PayToPublicKeyHash,
+                [0xa1; 20],
+            ),
+            UtxoEvent::spent(
+                [0x11; 32],
+                0,
+                50,
+                0,
+                UtxoScriptClass::PayToPublicKeyHash,
+                [0xa1; 20],
+            ),
+            UtxoEvent::created(
+                [0x22; 32],
+                0,
+                40,
+                0,
+                UtxoScriptClass::PayToScriptHash,
+                [0xb2; 20],
+            ),
+            UtxoEvent::spent(
+                [0x22; 32],
+                0,
+                40,
+                1,
+                UtxoScriptClass::PayToScriptHash,
+                [0xb2; 20],
+            ),
+            UtxoEvent::created(
+                [0x33; 32],
+                0,
+                30,
+                1,
+                UtxoScriptClass::PayToPublicKeyHash,
+                [0xa1; 20],
+            ),
+            UtxoEvent::created(
+                [0x33; 32],
+                1,
+                20,
+                1,
+                UtxoScriptClass::PayToScriptHash,
+                [0xc3; 20],
+            ),
+        ]
     }
 
     fn projection_chain() -> FixtureResult<[IndexedBlock; 3]> {
@@ -1105,6 +1367,199 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_coordinator_preserves_event_order_and_skips_nonstandard_history_writes(
+    ) -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (sink, observation) = RecordingSink::new(None);
+        let mut coordinator = ProjectionCheckpointCoordinator::new(config()?, sink);
+
+        let first = coordinator.apply_finalized(&blocks[0])?;
+        assert_eq!(
+            first,
+            canonical_target(0, CanonicalNetwork::Regtest.genesis_hash())
+        );
+        assert_eq!(observation.attempts.get(), 4);
+
+        let second = coordinator.apply_finalized(&blocks[1])?;
+        assert_eq!(second, canonical_target(1, BlockHash(SECOND_HASH)));
+        assert_eq!(observation.attempts.get(), 7);
+
+        let third = coordinator.apply_finalized(&blocks[2])?;
+        assert_eq!(third, canonical_target(2, BlockHash(THIRD_HASH)));
+        assert_eq!(observation.attempts.get(), 7);
+        assert_eq!(
+            observation.events.borrow().as_slice(),
+            &expected_projected_events()
+        );
+
+        assert_eq!(coordinator.finish(third)?, third);
+        assert_eq!(coordinator.ready_checkpoint(), Ok(third));
+        assert!(!observation.dropped.get());
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_coordinator_stages_late_validation_failure_before_sink_calls() -> FixtureResult<()>
+    {
+        let blocks = projection_chain()?;
+        let (sink, observation) = RecordingSink::new(None);
+        let mut coordinator = ProjectionCheckpointCoordinator::new(config()?, sink);
+        let committed = coordinator.apply_finalized(&blocks[0])?;
+        let attempts_before = observation.attempts.get();
+        let events_before = observation.events.borrow().len();
+        let spend = TxInCompact::new([0x22; 32], 0);
+        let first_spend = transaction(0, [0x57; 32], vec![spend], Vec::new());
+        let second_spend = transaction(1, [0x58; 32], vec![spend], Vec::new());
+        let invalid = indexed_block(
+            1,
+            SECOND_HASH,
+            CanonicalNetwork::Regtest.genesis_hash().0,
+            vec![first_spend, second_spend],
+        )?;
+
+        assert_eq!(
+            coordinator.apply_finalized(&invalid),
+            Err(ProjectionError::UnknownSpentOutpoint)
+        );
+        assert_eq!(observation.attempts.get(), attempts_before);
+        assert_eq!(observation.events.borrow().len(), events_before);
+        assert_eq!(coordinator.committed_checkpoint(), Some(committed));
+        assert!(observation.dropped.get());
+        assert!(matches!(
+            coordinator.ready_checkpoint(),
+            Err(ProjectionUnavailable::FailedClosed {
+                fault: ProjectionFault::UnknownSpend,
+            })
+        ));
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[1]),
+            Err(ProjectionError::AlreadyFailedClosed {
+                fault: ProjectionFault::UnknownSpend,
+            })
+        );
+        assert_eq!(observation.attempts.get(), attempts_before);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_coordinator_sink_failure_keeps_prior_checkpoint_and_stops_calls(
+    ) -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (sink, observation) = RecordingSink::new(Some(5));
+        let mut coordinator = ProjectionCheckpointCoordinator::new(config()?, sink);
+        let committed = coordinator.apply_finalized(&blocks[0])?;
+
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[1]),
+            Err(ProjectionError::EventSink)
+        );
+        assert_eq!(observation.attempts.get(), 6);
+        assert_eq!(
+            observation.events.borrow().as_slice(),
+            &expected_projected_events()[..5]
+        );
+        assert_eq!(coordinator.committed_checkpoint(), Some(committed));
+        assert!(observation.dropped.get());
+        assert!(matches!(
+            coordinator.ready_checkpoint(),
+            Err(ProjectionUnavailable::FailedClosed {
+                fault: ProjectionFault::EventSink,
+            })
+        ));
+
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[1]),
+            Err(ProjectionError::AlreadyFailedClosed {
+                fault: ProjectionFault::EventSink,
+            })
+        );
+        assert_eq!(observation.attempts.get(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_coordinator_catches_sink_panic_and_forbids_retry() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (sink, observation) = RecordingSink::with_faults(None, Some(5), false);
+        let mut coordinator = ProjectionCheckpointCoordinator::new(config()?, sink);
+        let committed = coordinator.apply_finalized(&blocks[0])?;
+
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[1]),
+            Err(ProjectionError::EventSink)
+        );
+        assert_eq!(observation.attempts.get(), 6);
+        assert_eq!(observation.events.borrow().len(), 6);
+        assert_eq!(coordinator.committed_checkpoint(), Some(committed));
+        assert!(observation.dropped.get());
+        assert!(matches!(
+            coordinator.ready_checkpoint(),
+            Err(ProjectionUnavailable::FailedClosed {
+                fault: ProjectionFault::EventSink,
+            })
+        ));
+
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[1]),
+            Err(ProjectionError::AlreadyFailedClosed {
+                fault: ProjectionFault::EventSink,
+            })
+        );
+        assert_eq!(observation.attempts.get(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_coordinator_finish_failure_contains_sink_drop_panic() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (sink, observation) = RecordingSink::with_faults(None, None, true);
+        let mut coordinator = ProjectionCheckpointCoordinator::new(config()?, sink);
+        let committed = coordinator.apply_finalized(&blocks[0])?;
+
+        assert!(matches!(
+            coordinator.finish(canonical_target(1, BlockHash(SECOND_HASH))),
+            Err(ProjectionError::TargetNotReached {
+                target_height: 1,
+                committed_height: Some(0),
+            })
+        ));
+        assert!(observation.dropped.get());
+        assert_eq!(observation.attempts.get(), 4);
+        assert_eq!(coordinator.committed_checkpoint(), Some(committed));
+        assert!(matches!(
+            coordinator.ready_checkpoint(),
+            Err(ProjectionUnavailable::FailedClosed {
+                fault: ProjectionFault::Target,
+            })
+        ));
+
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[1]),
+            Err(ProjectionError::AlreadyFailedClosed {
+                fault: ProjectionFault::Target,
+            })
+        );
+        assert_eq!(observation.attempts.get(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_coordinator_debug_and_sink_error_are_redacted() -> FixtureResult<()> {
+        let (sink, _observation) = RecordingSink::new(None);
+        let coordinator = ProjectionCheckpointCoordinator::new(config()?, sink);
+
+        assert_eq!(
+            format!("{coordinator:?}"),
+            "ProjectionCheckpointCoordinator { ..REDACTED.. }"
+        );
+        assert_eq!(
+            ProjectionError::EventSink.to_string(),
+            "offline projection event sink failed closed"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn projection_build_has_exact_multi_output_and_spend_semantics() -> FixtureResult<()> {
         let blocks = projection_chain()?;
         let projection = OfflineFinalizedProjection::build(
@@ -1133,42 +1588,13 @@ mod tests {
         assert_eq!(projection.state.live_outputs.len(), 3);
         assert_eq!(projection.state.seen_outputs.len(), 6);
 
+        let expected_address_a_events = expected_projected_events()
+            .into_iter()
+            .filter(|event| event.script_hash() == &[0xa1; 20])
+            .collect::<Vec<_>>();
         assert_eq!(
             projection.fixture_events(&address_a)?,
-            vec![
-                UtxoEvent::created(
-                    [0x11; 32],
-                    0,
-                    50,
-                    0,
-                    UtxoScriptClass::PayToPublicKeyHash,
-                    [0xa1; 20],
-                ),
-                UtxoEvent::created(
-                    [0x11; 32],
-                    1,
-                    60,
-                    0,
-                    UtxoScriptClass::PayToPublicKeyHash,
-                    [0xa1; 20],
-                ),
-                UtxoEvent::spent(
-                    [0x11; 32],
-                    0,
-                    50,
-                    0,
-                    UtxoScriptClass::PayToPublicKeyHash,
-                    [0xa1; 20],
-                ),
-                UtxoEvent::created(
-                    [0x33; 32],
-                    0,
-                    30,
-                    1,
-                    UtxoScriptClass::PayToPublicKeyHash,
-                    [0xa1; 20],
-                ),
-            ]
+            expected_address_a_events
         );
         assert_eq!(projection.fixture_events(&address_b)?.len(), 2);
         assert_eq!(projection.fixture_events(&address_c)?.len(), 1);

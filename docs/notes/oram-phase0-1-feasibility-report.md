@@ -1,8 +1,8 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
-- Date: 2026-07-12
-- Evaluated branch: `feat/oram-typed-rostl-stores`, stacked on
-  `feat/oram-exclusive-command-worker`
+- Date: 2026-07-13
+- Evaluated branch: `feat/oram-projection-checkpoint-coordinator`, stacked on
+  `feat/oram-typed-rostl-stores`
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
 - Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
@@ -89,6 +89,11 @@ The evaluated worktree implements:
   reconstructs exact standard UTXOs, stages whole blocks before checkpoint
   publication, latches identifier-free failed-closed faults, and models fresh
   rebuild, forward replay, and network/schema/key/checkpoint reconciliation;
+- a private generic finalized-event coordinator that reuses the same staged
+  canonical validation, extraction, capacity, and plaintext spend-owner
+  resolver, collects the complete ordered standard-event batch before its first
+  sink call, and commits cloned state/cursor plus the in-memory checkpoint only
+  after every synchronous sink append succeeds;
 - a default-off static shadow fixture that compares that oracle with ordinary
   Zaino `BlockchainSource::get_address_utxos` results for every standard
   address observed through the same immutable regtest-vector tip, plus an
@@ -132,6 +137,10 @@ The following statements are **not** established by that evidence:
   `zainod-oram` currently contains only the offline corpus runner;
 - no durable ORAM/checkpoint implementation, rollback defense, crash recovery,
   measured rebuild path, or recovery-time objective exists;
+- the finalized-event coordinator is not connected to the worker or `rostl`.
+  Its sink seam is synchronous and generic; a failure can leave a partial event
+  prefix in the discarded sink candidate while the prior in-memory checkpoint
+  remains unadvanced. There is no rollback or automatic retry;
 - the worker mechanics run locally only around the deterministic fake-backed
   executor. An offline typed `rostl` worker construction path compiles only for
   Linux x86_64 and has Linux-native tests in the source, but those tests have
@@ -139,9 +148,10 @@ The following statements are **not** established by that evidence:
   worker is not connected to the projection, checkpoint publisher, or query
   engine;
 - worker queue depth is observable load leakage, caught panics still invoke the
-  process-wide panic hook (including connector-caught backend panics), so real
-  backend panic payloads must be identifier-free and a controlled boundary is
-  still missing. Candidate records are not zeroized, and a volatile mutation
+  process-wide panic hook (including connector/backend, projection-sink, and
+  discarded-sink destructor panics), so real panic payloads must be
+  identifier-free and a controlled boundary is still missing. Candidate
+  records are not zeroized, and a volatile mutation
   that fails before acknowledgement has no exactly-once retry claim;
   an unexpected outer worker-loop panic reports the active accepted command as
   indeterminate, forbids automatic retry, and requires volatile-state discard
@@ -186,6 +196,10 @@ The following statements are **not** established by that evidence:
   not corrupt state or upstream failure behavior;
 - the offline projection uses ordinary cloned Rust maps/vectors: it is not an
   ORAM, authenticated root, durable transaction, or allocator-failure boundary;
+- `TransparentBlockEvent::Spent` carries only a previous outpoint, so the
+  coordinator still relies on the plaintext live-output resolver to recover
+  address/value ownership. A protected owner index or audited resolved
+  finalization feed remains open;
 - static fixture parity is not live-backend shadow parity, finalised-database
   parity, reorg/seam coverage, a source-call trace, or mainnet evidence;
 - dependency licensing is not cleared for the intended distribution.
@@ -248,9 +262,9 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 |---|---|---|
 | Pinned real-ORAM adapter | Partial typed compile evidence | Separate volatile 38-byte directory and 82-byte event-page `rostl` tables cross-compile on Linux x86_64 and can construct the exact worker-owned executor. Portable tests prove the production helper's equal healthy miss/duplicate operation sequence and logical duplicate preservation; Linux-native real-backend tests exist but have not run on target hardware |
 | Append-only event-page or audited upsert design | Partial typed connector | Exact immutable directory and one-event cells avoid tail-page/directory upsert; the keyed planner validates full probe sets, and a module-private synchronous connector scans every bounded ordinal, derives a contiguous next ordinal, reads owned-backend admission counts, and preflights a new directory plus event before writing. A bounded worker owns this core and exposes only whole business commands. The typed backend preserves prior logical bytes on duplicate through `Cmov`; projection integration, authenticated contents, crash atomicity, native execution, and measured whole-history cost remain open |
-| Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state |
-| Staged mutation and fail-closed state | Pass for the in-memory oracle | Whole blocks apply to a cloned candidate; late unknown/double-spend, provenance, and collection-capacity failures leave the current block uncommitted; target failures never publish readiness or expose query results |
-| Checkpoint/replay/rebuild policy | Pass for the in-memory oracle | Opaque cursor candidates prevent forged/stale commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready oracle usable |
+| Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state. The coordinator emits the existing three-block fixture's exact seven standard events in extraction order and performs zero sink writes for its nonstandard-only final block |
+| Staged mutation and fail-closed state | Pass for the in-memory sink model | Whole blocks apply to a cloned candidate before the first sink call; a late invalid event produces zero calls. A mid-block sink failure may leave a partial prefix in the dropped sink candidate, preserves the prior cursor/checkpoint, latches failed-closed, and permits no later calls. This is not backend rollback or block atomicity |
+| Checkpoint/replay/rebuild policy | Partial publication-last model | Opaque cursor candidates prevent forged/stale in-process commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready plaintext oracle usable. The coordinator assigns its cloned cursor/state checkpoint only after all synchronous event calls succeed, but the checkpoint has no authenticated root or durable/atomic coupling to sink state |
 | Single mutation worker and backend telemetry | Partial typed integration | A portable std-thread worker exclusively owns the exact two-table executor, validates a 1..=4096 research queue bound before allocation, bounds accepted-not-started whole business commands with a `sync_channel`, drains FIFO admissions before shutdown/join, removes raw read/insert bypasses, and separates lifecycle from terminal fault health. Its identifier-free queue/lifecycle, completion/failure, admission-rejection, and reply-delivery counters are internal and not approved for export. Deterministic fake-backed tests cover worker mechanics; a private Linux-only offline constructor and native test bind the real typed stores to the same worker, but only the production library path was cross-compiled here and there is no non-test owner caller. There is no stash metric, projection integration, or fixed-cadence suppression policy |
 | Volatile rebuild path | Partial pass | Fresh rebuild and clone-ready forward replay are deterministic in fixtures; no full-corpus runtime or RTO is measured |
 | Shadow comparison with ordinary Zaino | Pass for one static fixture checkpoint | A default-off test independently obtains ordinary UTXOs from `MockchainSource::get_address_utxos` over Zebra full blocks and projection UTXOs from `IndexedBlock` transparent events; it compares every standard address observed through immutable regtest-vector height 200 plus an absent address, at the same height/hash. Live direct/RPC, finalised-database, mainnet, and reorg shadow modes remain missing |
@@ -258,8 +272,10 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Long-run failure bound | Missing | No target-load mixed-operation soak or node-year analysis exists |
 
 Phase 2 now has a deterministic plaintext oracle, one static ordinary-source
-parity result, and a typed volatile ORAM worker path with compile-only Linux
-evidence. It does not have an ORAM-backed projection or live shadow mode.
+parity result, a portable finalized-event/checkpoint ordering coordinator, and
+a typed volatile ORAM worker path with compile-only Linux evidence. The
+coordinator and worker are not connected; there is no ORAM-backed projection or
+live shadow mode.
 
 ## Leakage matrix
 
@@ -351,7 +367,7 @@ the intended redistribution decision.
 
 ## Verification evidence
 
-Commands below were run on 2026-07-12 against the evaluated worktree.
+Commands below were run through 2026-07-13 against the evaluated worktree.
 
 | Command | Result | Interpretation |
 |---|---|---|
@@ -367,14 +383,15 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Exact record constraints, portable production insertion helper, and unsupported-target path compile; real ORAM path not executed |
 | `cargo nextest run -p zaino-oram --no-default-features` | 113 passed | Fixed models, token semantics, complete logical traces, exact records, keyed layout, full-capacity arithmetic, exclusive two-table preflight, and all 16 business-command worker tests pass without optional features |
-| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 132 passed | Adds canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, and reconciliation coverage |
+| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 138 passed | Adds canonical-cursor hardening, corpus provenance/retry, deterministic projection, staged failure, capacity, target, replay, rebuild, reconciliation, exact seven-event sink ordering, late-validation zero-call staging, partial error/panic sink failure, publication-last checkpoint, failed-finish/discard-drop panic containment, and coordinator redaction coverage |
 | `cargo nextest run -p zaino-oram --features rostl-experimental --status-level fail` | 119 passed | Adds directory/page `Pod`/`Cmov` semantics, power-of-two capacity rejection, equal healthy miss/duplicate two-access schedules against the production helper, found-parity/occupancy rejection, and exact typed unsupported-host construction rejection |
-| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 139 passed | Combined keyed layout, two-table command, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection, static ordinary-source shadow parity, 16-test business-command worker suite, and portable typed-`rostl` suite |
+| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 145 passed | Combined keyed layout, two-table command, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection/coordinator, static ordinary-source shadow parity, 16-test business-command worker suite, and portable typed-`rostl` suite |
 | `cargo nextest run -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint --status-level fail` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
 | `cargo nextest run -p zaino-proto --test compact_tx_streamer_legacy_golden --status-level fail` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
 | `cargo nextest run -p zainod-oram --status-level fail` | 2 passed | CLI requires explicit model inputs and rejects a zero progress interval |
 | `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Pass with Rust 1.96.1 | The Linux x86_64 exact directory/event stores, fixed two-access insertion path, and private offline worker constructor compile strictly; they were not linked or executed, have no owner caller, and this is not the exact pinned compiler |
 | `cargo +stable check -p zaino-oram --all-targets --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu` | Environment-blocked before local Linux test checking | The macOS host lacks `x86_64-linux-gnu-gcc`/`g++`, required by transitive native dev dependencies including `aws-lc-sys`, `lmdb-sys`, and `libzcash_script`; run the committed Linux tests natively in CI/target infrastructure |
+| `cargo +stable clippy -p zaino-oram --lib --all-features --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Environment-blocked in transitive native builds | Combined Linux `corpus-zaino` plus `rostl-experimental` checking requires the missing cross C/C++ toolchain for `aws-lc-sys`, `ring`, `lz4-sys`, `lmdb-sys`, and `libzcash_script`; the portable combined path passes strict host Clippy and needs native Linux CI |
 | `cargo nextest run -p zaino-state transparent_events --no-default-features --status-level fail` | 4 passed | Event ordering, coinbase skip, script handling, overflow errors, and redaction |
 | `cargo nextest run -p zaino-state --no-default-features --status-level fail` | 218 passed, 1 skipped | Process isolation avoids the tracing-subscriber collision seen under the legacy in-process runner; the complete no-default unit suite is green |
 | `cargo clippy -p zaino-oram --all-targets --all-features --no-deps -- -D warnings -D clippy::unwrap_used` | Pass | Focused all-feature lint is warning-free and the affected crate has no disallowed `unwrap` use |
@@ -386,6 +403,7 @@ Commands below were run on 2026-07-12 against the evaluated worktree.
 | `RUSTDOCFLAGS='-D warnings' cargo doc -p zaino-oram --no-deps --all-features` | Pass | The research models, shadow seam, and private worker document cleanly |
 | `cargo fmt --all -- --check` | Pass | Rust formatting is clean |
 | Rust Analyzer semantic search of the concrete typed backend | Two `access_position`, one `read`, and one `write_or_insert` call site | The implementation has one independently remapped read path and one independently remapped write-or-insert path; the production helper invokes both for healthy miss and duplicate cases |
+| Rust Analyzer references for projection `stage_block`, `commit_staged`, and sink `append_and_wait` | Stage and commit each have the plaintext-oracle and coordinator call sites; sink append-and-wait has one coordinator call site | The coordinator reuses the existing staging/commit implementation and has one business-event emission boundary rather than duplicating provenance logic |
 | `git diff --check -- docs/notes/oram-phase0-1-feasibility-report.md` | Pass | Report has no whitespace errors |
 | `makers lint-boundary-conversions` | Canonical task unavailable because `makers` is not installed; Rust Analyzer shows no `From`/`TryFrom` implementation in the new worker, and this slice adds no boundary conversion | Re-run the canonical task in CI/tooling-enabled environment |
 

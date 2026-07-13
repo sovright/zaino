@@ -34,6 +34,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   shutdown draining, terminal fault latching, uniform append-ticket-abandonment
   fault latching, and identifier-free internal queue/lifecycle/outcome counters
   with no export-policy claim.
+- A private generic finalized-event/checkpoint coordinator that fully stages
+  canonical validation, transparent event extraction, spend-owner resolution,
+  capacity checks, and an ordered standard-event batch before its first sink
+  call. It commits the cloned plaintext projection checkpoint only after every
+  synchronous sink append succeeds and drops/fails closed on staging, sink, or
+  finish failure. This is an offline ordering model, not worker/`rostl`
+  integration, backend block atomicity, authenticated persistence, or recovery.
 - Exact immutable 38-byte address-directory and 82-byte one-event page
   candidates with canonical dummy encodings, named persistence conversions,
   standard-address validation, redacted diagnostics, and `Pod`/`Cmov` proofs.

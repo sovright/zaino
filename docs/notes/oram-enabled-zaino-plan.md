@@ -28,7 +28,12 @@ projection/service owner calls it yet. Its healthy
 miss/duplicate insertion path always performs read/remap followed by
 write-or-insert/remap, selecting the prior bytes on duplicate. This path has
 only cross-compile evidence on the current macOS host. It is not connected to
-the projection and does not claim crash atomicity. The fork contains no production
+the projection and does not claim crash atomicity. A later portable slice adds
+a private generic finalized-event coordinator: it stages a whole block through
+the existing plaintext spend-owner resolver, completes every synchronous event
+sink call, and commits the in-memory checkpoint last. It is not yet wired to
+the worker or `rostl`; a sink failure can leave a partial prefix in a discarded
+candidate. The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
 mainnet/RSS, recovery, side-channel, hardware, and licensing gates are open.
