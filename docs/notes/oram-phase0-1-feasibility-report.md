@@ -2,8 +2,8 @@
 
 - Date: 2026-07-13
 - Evaluated branch: `feat/oram-projection-owner`, stacked on
-  `ci/oram-native-linux`; native evidence currently comes from parent head
-  `b44a120b`, and owner-head CI is pending
+  `ci/oram-native-linux`; owner integration code head `d71a4031` has native
+  evidence in run `29219929129`
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
 - Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
@@ -286,7 +286,7 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state. The coordinator emits the existing three-block fixture's exact seven standard events in extraction order and performs zero sink writes for its nonstandard-only final block |
 | Staged mutation and fail-closed state | Pass for portable owner integration | Whole blocks apply to a cloned candidate before the first sink call; a late invalid event produces zero calls. A fake backend's sixth event insertion mutates then fails, drops both candidate tables exactly once, preserves only the prior height-0 cursor/checkpoint, rejects retry without later I/O, and shuts down failed closed. This is not backend rollback or block atomicity |
 | Checkpoint/replay/rebuild policy | Partial publication-last model | Opaque cursor candidates prevent forged/stale in-process commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready plaintext oracle usable. The coordinator assigns its cloned cursor/state checkpoint only after all synchronous event calls succeed, but the checkpoint has no authenticated root or durable/atomic coupling to sink state |
-| Single mutation worker and backend telemetry | Partial typed integration | A portable std-thread worker exclusively owns the exact two-table executor, validates a 1..=4096 research queue bound before allocation, bounds accepted-not-started whole business commands with a `sync_channel`, drains FIFO admissions before shutdown/join, removes raw read/insert bypasses, and separates lifecycle from terminal fault health. Its identifier-free counters are internal and not approved for export. The private owner validates exact network/schema/key-epoch and admission compatibility before allocation, owns the coordinator plus worker, and joins it on consuming shutdown without exporting snapshots. Generic native Linux CI already binds the real typed stores to the worker; the new owner-level native path is gated by the same lane. There is no stash metric, runtime projection lifecycle, or fixed-cadence suppression policy |
+| Single mutation worker and backend telemetry | Partial typed integration | A portable std-thread worker exclusively owns the exact two-table executor, validates a 1..=4096 research queue bound before allocation, bounds accepted-not-started whole business commands with a `sync_channel`, drains FIFO admissions before shutdown/join, removes raw read/insert bypasses, and separates lifecycle from terminal fault health. Its identifier-free counters are internal and not approved for export. The private owner validates exact network/schema/key-epoch and admission compatibility before allocation, owns the coordinator plus worker, and joins it on consuming shutdown without exporting snapshots. Generic native Linux CI binds the real typed stores to that owner and completes the full three-block/seven-event lifecycle. There is no stash metric, runtime projection lifecycle, or fixed-cadence suppression policy |
 | Volatile rebuild path | Partial pass | Fresh rebuild and clone-ready forward replay are deterministic in fixtures; no full-corpus runtime or RTO is measured |
 | Shadow comparison with ordinary Zaino | Pass for one static fixture checkpoint | A default-off test independently obtains ordinary UTXOs from `MockchainSource::get_address_utxos` over Zebra full blocks and projection UTXOs from `IndexedBlock` transparent events; it compares every standard address observed through immutable regtest-vector height 200 plus an absent address, at the same height/hash. Live direct/RPC, finalised-database, mainnet, and reorg shadow modes remain missing |
 | Zero query-derived source calls | Pass for current type boundary | The query engine has no validator/LMDB/raw-transaction dependency; this is not yet an integrated readiness or call-trace result |
@@ -400,9 +400,9 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `rustc --version --verbose` | Rust 1.96.0, LLVM 22.1.2, `aarch64-apple-darwin` | Compiler/host pin confirmed |
 | `rust-analyzer --version` | Rust Analyzer 1.96.0 (`ac68faa2`) | Installed from the pinned toolchain for semantic code intelligence |
 | `cargo nextest --version` | `cargo-nextest 0.9.140` | Repository-native test runner installed for the single workspace |
-| [`ORAM - Native Linux` run 29216449821](https://github.com/sovright/zaino/actions/runs/29216449821) environment | Ubuntu 24.04 x86_64, Rust 1.96.0, cargo-nextest 0.9.140; pass in 18m52s for parent branch head `b44a120b` | Immutable action pins, locked dependency resolution, and exact tool versions establish a repeatable generic native CI gate; this predates the owner slice, and the hosted image is not a reproducible release or TDX build |
-| `cargo clippy -p zaino-oram --all-features --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` | Pass in parent-head native Linux CI; 6m11s cold dev-profile build | The pre-owner all-feature/all-target ORAM graph is warning-free on the supported OS/architecture with the pinned compiler; owner-head CI is pending |
-| `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 152 passed, 0 skipped in 1.033s after a cold 12m21s test-profile build at parent head `b44a120b` | Executes the pre-owner generic Linux x86_64 suite, including four native-only typed-backend tests; this is functional small-table evidence, not a benchmark |
+| [`ORAM - Native Linux` run 29219929129](https://github.com/sovright/zaino/actions/runs/29219929129) environment | Ubuntu 24.04 x86_64, Rust 1.96.0, cargo-nextest 0.9.140; pass in 20m31s for owner integration code head `d71a4031` | Immutable action pins, locked dependency resolution, and exact tool versions establish a repeatable generic native CI gate; the hosted image is not a reproducible release or TDX build |
+| `cargo clippy -p zaino-oram --all-features --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` | Pass in owner-head native Linux CI; 6m57s cold dev-profile build | The complete owner all-feature/all-target ORAM graph is warning-free on the supported OS/architecture with the pinned compiler |
+| `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 157 passed, 0 skipped in 1.207s after a cold 13m17s test-profile build at owner code head `d71a4031` | Executes the complete generic Linux x86_64 suite, including the real typed-store projection-owner lifecycle; this is functional small-table evidence, not a benchmark |
 | `rustup target list --installed` | Local pinned 1.96.0: `aarch64-apple-darwin` | Local target inventory only; the native CI evidence is recorded above |
 | `rustup +stable target list --installed` | Includes `x86_64-unknown-linux-gnu`; stable is Rust 1.96.1 | Enables a compile-only supported-path check, not execution evidence |
 | `cargo tree -p zaino-oram --features rostl-experimental --edges normal` | Resolved `rostl` alpha9 to pinned commit `8c3a12d2...` | Dependency pin confirmed |
@@ -435,16 +435,15 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `git diff --check -- docs/notes/oram-phase0-1-feasibility-report.md` | Pass | Report has no whitespace errors |
 | `makers lint-boundary-conversions` | Canonical task unavailable because `makers` is not installed; Rust Analyzer shows no `From`/`TryFrom` implementation in the new worker, and this slice adds no boundary conversion | Re-run the canonical task in CI/tooling-enabled environment |
 
-The four Linux-x86_64-only `#[test]` functions included in the parent-head
-152-test native run are
+The five Linux-x86_64-only `#[test]` functions included in the 157-test
+owner-head native run are
 `exact_typed_stores_preserve_duplicate_values_and_do_not_alias`,
 `full_store_duplicate_still_completes_both_accesses`,
 `exact_typed_executor_runs_behind_the_business_worker`, and
-`synthetic_caught_panic_latches_and_blocks_later_access`. The unsupported-host
-constructor rejection that ran in the parent-head macOS suite is excluded on
-Linux. The owner branch adds a Linux-only exact typed-store owner lifecycle test
-in place of its portable unsupported-backend case; that path is pending native
-CI and is not included in the inherited 152-test evidence.
+`synthetic_caught_panic_latches_and_blocks_later_access`, and
+`linux_rostl_owner_builds_finishes_and_shuts_down`. The unsupported-host
+constructor rejection that runs on macOS is excluded on Linux, so the native
+total is three higher than the 154-test macOS all-feature total.
 
 Two broader `zaino-state` gates remain baseline-blocked outside this slice.
 Warning-denied Clippy with `clippy::unwrap_used` reports four existing

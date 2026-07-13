@@ -146,7 +146,8 @@ executor-command TOCTOU, and the Linux-only offline constructor creates two
 non-aliased ORAM/map pairs. The old raw worker surface has been removed. The
 portable schedule tests exercise the same insertion helper used by the real
 stores. The actual Linux backend and worker ran in the inherited generic native
-CI lane; the new owner-level Linux test is pending this branch's CI, while 154
+CI lane, and owner-head native run `29219929129` executes the complete typed
+store/coordinator/owner lifecycle. The native suite passes 157 tests while 154
 portable all-feature tests pass on this macOS host. Reply abandonment relies on
 the module-private trusted owner
 dropping tickets normally;
