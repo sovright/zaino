@@ -24,8 +24,8 @@ use zainodlib::{
 };
 
 use crate::corpus_artifact::{
-    load_capture, publish_capture, publish_sizing, BackendKind, CaptureProvenance, SelectionMode,
-    SnapshotMode,
+    load_capture, load_sizing, publish_capture, publish_sizing, BackendKind, CaptureProvenance,
+    SelectionMode, SnapshotMode, ValidatedSizing,
 };
 #[cfg(feature = "typed-qualification")]
 use crate::qualification_artifact::publish_qualification;
@@ -125,6 +125,8 @@ enum CorpusSubcommand {
     Capture(CorpusCaptureArgs),
     /// Apply explicit sizing assumptions to a validated capture without node access.
     Size(CorpusSizeArgs),
+    /// Revalidate an existing sizing artifact against its source capture.
+    ValidateSizing(CorpusValidateSizingArgs),
 }
 
 #[derive(Debug, Args)]
@@ -205,6 +207,17 @@ struct CorpusSizeArgs {
     required_headroom_bps: u64,
 }
 
+#[derive(Debug, Args)]
+struct CorpusValidateSizingArgs {
+    /// Complete three-file corpus capture directory to validate and consume.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Complete three-file sizing directory to revalidate against the capture.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+}
+
 impl CorpusSizeArgs {
     fn model(&self) -> Result<MainnetSizingModel, zaino_oram::MainnetCorpusError> {
         MainnetSizingModel::new(
@@ -239,6 +252,7 @@ async fn run(cli: Cli) -> RunnerResult<()> {
         Command::Corpus(command) => match command.command {
             CorpusSubcommand::Capture(args) => run_corpus_capture(args).await,
             CorpusSubcommand::Size(args) => run_corpus_size(args),
+            CorpusSubcommand::ValidateSizing(args) => run_corpus_validate_sizing(args),
         },
         #[cfg(feature = "typed-qualification")]
         Command::Qualification(command) => match command.command {
@@ -279,6 +293,27 @@ fn run_corpus_size(args: CorpusSizeArgs) -> RunnerResult<()> {
     )?;
     println!("sizing_artifact={}", args.output_dir.display());
     Ok(())
+}
+
+fn run_corpus_validate_sizing(args: CorpusValidateSizingArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    println!("{}", format_validated_sizing_summary(&sizing));
+    Ok(())
+}
+
+fn format_validated_sizing_summary(sizing: &ValidatedSizing) -> String {
+    let model = sizing.qualification().model();
+    format!(
+        "sizing_input=valid,measurement_blake2s256:{},qualification_blake2s256:{},directory_capacity:{},directory_admission_limit:{},event_capacity:{},event_admission_limit:{},max_events_per_address:{}",
+        sizing.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+        model.directory_capacity(),
+        model.directory_admission_limit(),
+        model.event_capacity(),
+        model.event_admission_limit(),
+        model.max_events_per_address(),
+    )
 }
 
 async fn run_corpus_capture(args: CorpusCaptureArgs) -> RunnerResult<()> {
@@ -497,7 +532,7 @@ impl Error for RunnerError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeSet, ffi::OsString, fs};
+    use std::{collections::BTreeMap, collections::BTreeSet, ffi::OsString, fs, path::Path};
 
     use crate::corpus_artifact::typed_test_measurement;
 
@@ -545,6 +580,29 @@ mod tests {
             "--required-headroom-bps",
             "3000",
         ]
+    }
+
+    fn valid_sizing_validation_args() -> [&'static str; 7] {
+        [
+            "zainod-oram",
+            "corpus",
+            "validate-sizing",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+        ]
+    }
+
+    fn snapshot_directory(directory: &Path) -> Result<BTreeMap<OsString, Vec<u8>>, std::io::Error> {
+        fs::read_dir(directory)?
+            .map(|entry| {
+                let entry = entry?;
+                let name = entry.file_name();
+                let bytes = fs::read(entry.path())?;
+                Ok((name, bytes))
+            })
+            .collect()
     }
 
     #[cfg(feature = "typed-qualification")]
@@ -751,6 +809,9 @@ mod tests {
         let args = match command.command {
             CorpusSubcommand::Capture(args) => args,
             CorpusSubcommand::Size(_) => panic!("capture arguments parsed as sizing arguments"),
+            CorpusSubcommand::ValidateSizing(_) => {
+                panic!("capture arguments parsed as sizing-validation arguments")
+            }
         };
 
         assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-capture"));
@@ -769,6 +830,9 @@ mod tests {
             CorpusSubcommand::Size(args) => args,
             CorpusSubcommand::Capture(_) => {
                 panic!("sizing arguments parsed as capture arguments")
+            }
+            CorpusSubcommand::ValidateSizing(_) => {
+                panic!("sizing arguments parsed as sizing-validation arguments")
             }
         };
 
@@ -814,6 +878,37 @@ mod tests {
         let mut node_option = valid_sizing_args();
         node_option.extend(["--config", "/tmp/zainod.toml"]);
         assert!(Cli::try_parse_from(node_option).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn corpus_validate_sizing_cli_accepts_only_the_two_input_directories() -> Result<(), clap::Error>
+    {
+        let cli = Cli::try_parse_from(valid_sizing_validation_args())?;
+        let command = parsed_corpus(cli);
+        let args = match command.command {
+            CorpusSubcommand::ValidateSizing(args) => args,
+            CorpusSubcommand::Capture(_) => {
+                panic!("sizing-validation arguments parsed as capture arguments")
+            }
+            CorpusSubcommand::Size(_) => {
+                panic!("sizing-validation arguments parsed as sizing arguments")
+            }
+        };
+
+        assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
+
+        for (rejected, value) in [
+            ("--output-dir", "/tmp/new-artifact"),
+            ("--config", "/tmp/zainod.toml"),
+            ("--directory-capacity", "8"),
+            ("--queue-capacity", "1"),
+        ] {
+            let mut command = valid_sizing_validation_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
         Ok(())
     }
 
@@ -866,6 +961,67 @@ mod tests {
                 OsString::from("qualification.txt"),
             ])
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corpus_validate_sizing_dispatch_is_read_only() -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let capture_dir = parent.path().join("capture");
+        let sizing_dir = parent.path().join("sizing");
+        let measurement = typed_test_measurement()?;
+        let provenance = CaptureProvenance::new(
+            BackendKind::Rpc,
+            SnapshotMode::NonFinalizedState,
+            0,
+            SelectionMode::ServiceableTip,
+            "test-runner",
+            &measurement,
+        )?;
+        publish_capture(&capture_dir, &measurement, &provenance)?;
+        let capture = load_capture(&capture_dir)?;
+        let model =
+            MainnetSizingModel::new(2, 1_000, 8, 6, 16, 12, 8, 4, 20_000, 1_000_000, 3_000)?;
+        let qualification = capture.measurement().apply_model(&model)?;
+        publish_sizing(&sizing_dir, &capture, &qualification, "test-runner")?;
+
+        let sizing = load_sizing(&sizing_dir, &capture)?;
+        let summary = format_validated_sizing_summary(&sizing);
+        assert_eq!(
+            summary,
+            "sizing_input=valid,measurement_blake2s256:f98ee2710b69837cb9fc53c69a82153e80f67e89a237279fc757c4e34e953ed0,qualification_blake2s256:6b65372684f65d095dfce09419c574bb5e73e4f4528559166e1d1e9d3b23ff66,directory_capacity:8,directory_admission_limit:6,event_capacity:16,event_admission_limit:12,max_events_per_address:8"
+        );
+        for forbidden in [
+            "capture_dir",
+            "checkpoint_hash",
+            "config",
+            "latency",
+            "output_dir",
+            "queue",
+            "runner_version",
+            "seed",
+            "sizing_dir",
+            "target_os",
+            "transaction",
+        ] {
+            assert!(!summary.contains(forbidden));
+        }
+
+        let capture_before = snapshot_directory(&capture_dir)?;
+        let sizing_before = snapshot_directory(&sizing_dir)?;
+
+        run(Cli {
+            command: Command::Corpus(CorpusCommand {
+                command: CorpusSubcommand::ValidateSizing(CorpusValidateSizingArgs {
+                    capture_dir: capture_dir.clone(),
+                    sizing_dir: sizing_dir.clone(),
+                }),
+            }),
+        })
+        .await?;
+
+        assert_eq!(snapshot_directory(&capture_dir)?, capture_before);
+        assert_eq!(snapshot_directory(&sizing_dir)?, sizing_before);
         Ok(())
     }
 

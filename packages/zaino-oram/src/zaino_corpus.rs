@@ -118,6 +118,31 @@ impl MainnetSizingModel {
         self.parts().map(|_| ())
     }
 
+    /// Returns the configured directory-table capacity.
+    pub const fn directory_capacity(&self) -> u64 {
+        self.directory_capacity
+    }
+
+    /// Returns the configured directory-table admission limit.
+    pub const fn directory_admission_limit(&self) -> u64 {
+        self.directory_admission_limit
+    }
+
+    /// Returns the configured event-table capacity.
+    pub const fn event_capacity(&self) -> u64 {
+        self.event_capacity
+    }
+
+    /// Returns the configured event-table admission limit.
+    pub const fn event_admission_limit(&self) -> u64 {
+        self.event_admission_limit
+    }
+
+    /// Returns the configured per-address event limit.
+    pub const fn max_events_per_address(&self) -> u64 {
+        self.max_events_per_address
+    }
+
     fn parts(&self) -> Result<(GrowthAssumption, SizingParameters), MainnetCorpusError> {
         let growth = GrowthAssumption::new(self.growth_horizon_years, self.annual_growth_bps)
             .map_err(ZainoCorpusError::Aggregate)?;

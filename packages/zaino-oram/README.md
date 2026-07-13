@@ -94,6 +94,13 @@ measurement artifact without sizing assumptions. The fully offline
 one explicit model into a separate digest-bound atomic qualification. No
 full-mainnet capture or sizing artifact exists yet. Static fixture parity is
 not live-backend, finalised-database, reorg, or mainnet shadow evidence.
+The follow-on load-foundation slice adds read-only access to the explicit table
+capacity and admission inputs. The companion `zainod-oram corpus
+validate-sizing` command reopens an existing capture and sizing directory,
+revalidates both existing bundles, and recomputes the sizing qualification
+against the captured measurement. This creates no artifact and instantiates no
+ORAM backend, store, or worker; it does not execute a load, measure performance,
+or provide mainnet evidence.
 Upstream `rostl` panic/recovery, persistence, side-channel, and licensing gates
 remain unresolved.
 The event coordinator is a portable sink/checkpoint ordering model. A private
@@ -193,15 +200,13 @@ portable schedule tests exercise the same insertion helper used by the real
 stores. The actual Linux backend and worker run in the inherited generic native
 CI lane. Final capture-head native run `29224873175` passed strict all-target,
 all-feature Clippy and all 161 tests while executing the complete typed
-store/coordinator/owner lifecycle. Typed-qualification head `d65a999f` passed
-strict all-target, all-feature Clippy plus the 194-test `zaino-oram` and
-29-test `zainod-oram` suites in native run `29244273040` (job `86797325618`);
-their Linux-only qualification tests exercised the real typed backend. The
-current stress worktree passes 201 `zaino-oram` and 39 `zainod-oram`
-all-feature tests locally; this macOS host executes the
-typed-backend-unavailable branch, so exact-head native `SmokeV1` execution
-evidence is pending. Generic hosted-Linux evidence is not target-CPU, TDX,
-load, benchmark, or physical-trace qualification. Reply abandonment
+store/coordinator/owner lifecycle. Exact `SmokeV1` head `17356db0` passed
+strict all-target, all-feature Clippy for both research crates plus the
+204-test `zaino-oram` and 39-test `zainod-oram` suites in native run
+`29250757780` (job `86818420630`); its Linux-only qualification tests exercised
+the real typed backend. This is generic hosted-Linux correctness evidence, not
+target-CPU, TDX, load, benchmark, billion-operation, mainnet, or physical-trace
+qualification. Reply abandonment
 relies on the module-private trusted owner dropping tickets normally;
 deliberately leaking a ticket with `mem::forget` is outside this offline model.
 

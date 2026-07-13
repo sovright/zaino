@@ -12,6 +12,12 @@
   capture consumption, deterministic typed qualification/provenance digests,
   source-bound qualification recomputation, bounded no-follow artifact reads,
   and dirfd-relative crash-durable no-clobber three-file publication.
+- Add a read-only `corpus validate-sizing` command that reopens an existing
+  sizing directory alongside its separately validated source capture, repeats
+  bounded no-follow validation, and requires the recomputed qualification to
+  remain bound to that capture. It creates no artifact, accepts no runtime or
+  workload tuning, and makes no backend, worker, load, performance, hardware,
+  or mainnet claim.
 - Add a default-off `typed-qualification` feature with a listener-free
   `qualification run` command for the fixed typed-worker correctness scenario.
   Successful runs atomically publish a read-back-verified three-file JSON,

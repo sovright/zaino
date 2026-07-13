@@ -82,11 +82,15 @@ OS/architecture labels plus the report digest. It contains no raw modeled
 address/event/seed fields or per-operation results. The digests deliberately
 commit to the deterministic synthetic schedule and final state.
 
-A successful run yields generic Linux x86_64 CI-smoke evidence only. Exact-head
-native `SmokeV1` execution evidence is pending. The report records no latency,
-throughput, RSS, allocator/page-fault behavior, stash pressure, queue behavior
-under load, physical access trace, persistence/recovery result, target CPU/TDX
-result, or billion-operation reliability result. It is not
+A successful run yields generic Linux x86_64 CI-smoke evidence only. At exact
+`SmokeV1` head `17356db0`, native run `29250757780` (job `86818420630`) passed
+strict all-target, all-feature Clippy for both research crates plus all 204
+`zaino-oram` and 39 `zainod-oram` tests; the Linux-only qualification tests
+exercised the real typed backend. This remains correctness evidence only. The
+report records no latency, throughput, RSS, allocator/page-fault behavior,
+stash pressure, queue behavior under load, physical access trace,
+persistence/recovery result, target CPU/TDX result, mainnet result, or
+billion-operation reliability result. It is not
 source/lockfile/toolchain/binary-bound or execution-attested and supplies no
 node-year failure bound or mainnet-gate result. Unsupported hosts fail before
 creating the output directory.
@@ -193,7 +197,24 @@ before verifying every digest. Structural qualification validation checks its
 internal arithmetic; artifact validation additionally recomputes the complete
 qualification from the captured measurement and requires exact equality.
 
-The qualification can successfully report false directory, event,
+The read-only validation command reopens an already-published sizing directory
+alongside its separately validated source capture:
+
+```console
+cargo run -p zainod-oram -- corpus validate-sizing \
+  --capture-dir <CAPTURE_DIR> \
+  --sizing-dir <SIZING_DIR>
+```
+
+It repeats the bounded no-follow checks, requires the recomputed qualification
+and capture binding to match, and prints the two canonical input digests plus
+the validated directory/event capacity, admission, and per-address model
+inputs. It accepts no output, node configuration, workload, queue, or backend
+arguments and creates no artifact. Logical allocation constraints are
+revalidated, but no ORAM backend, store, or worker is instantiated; the command
+supplies no load, performance, hardware, or mainnet result.
+
+For `corpus size`, the qualification can successfully report false directory, event,
 hot-address, memory, or combined fit flags; those are model results, not command
 failures. Malformed input, invalid model parameters, checked-arithmetic
 overflow, lineage mismatch, digest or text drift, an existing destination, or
@@ -206,4 +227,6 @@ result explicitly records `insertion_bound=false`,
 actual ORAM insertion bound, backend expansion, process RSS, target CPU/TDX
 deployment, load behavior, or physical obliviousness.
 
-Run `cargo run -p zainod-oram -- corpus size --help` for validation details.
+Run `cargo run -p zainod-oram -- corpus size --help` and
+`cargo run -p zainod-oram -- corpus validate-sizing --help` for validation
+details.

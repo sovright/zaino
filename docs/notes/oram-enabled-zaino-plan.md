@@ -59,17 +59,17 @@ The profile ID binds that schedule and the continuation lifetime. Production
 AEAD, trusted clock and nonce ownership, durable replay storage, instruction/
 memory/timing equivalence, private protobuf/transport framing, and a service
 lifecycle remain integration gates.
-The current offline slice adds a listener-free qualification runner for the real
+The typed-qualification slice added a listener-free qualification runner for the real
 typed worker. It executes one fixed nine-command correctness sequence covering
 empty reads, inserts, an exact replay, independent address histories, and clean
 shutdown, then emits only correctness totals and identifier-free aggregate
 worker counters. The default-off `typed-qualification` feature exposes
 `zainod-oram qualification run`, which publishes that report as an atomic,
 read-back-verified three-file JSON, text, and digest-bound provenance artifact.
-The native Linux lane compiles, lints, and tests both research crates. At
-typed-qualification head `d65a999f`, native run `29244273040` (job
-`86797325618`) passed strict all-target/all-feature Clippy plus the 194-test
-`zaino-oram` and 29-test `zainod-oram` suites; their Linux-only qualification
+The native Linux lane compiles, lints, and tests both research crates. At exact
+`SmokeV1` head `17356db0`, native run `29250757780` (job `86818420630`) passed
+strict all-target/all-feature Clippy for both crates plus the 204-test
+`zaino-oram` and 39-test `zainod-oram` suites; its Linux-only qualification
 tests exercised the real typed backend.
 The artifact digest binds the compact typed JSON report into provenance only;
 staged read-back separately checks the text rendering. The bundle is unsigned,
@@ -77,7 +77,7 @@ self-reported, and explicitly unbound from source, lockfile, toolchain, binary,
 CI-run identity, or execution attestation.
 This slice is not a benchmark and supplies no latency, RSS, stash, physical
 access-trace, persistence, TDX, mainnet-capacity, or runtime-service evidence.
-The next isolated offline slice adds a separate named `SmokeV1` stress
+The subsequent isolated offline slice added a separate named `SmokeV1` stress
 qualification. It executes a fixed 64-step mix of reads, unique appends, and
 exact replays across four modeled addresses, checks a bounded reference model
 after each command and in periodic/final sweeps, and checks that a cross-address
@@ -93,7 +93,12 @@ This closes a CI-smoke correctness gap only: target-load and adversarial
 full-map experiments, a `10^9`-operation soak, latency/RSS/stash/queue-load
 measurement, physical trace, persistence and recovery, target CPU/TDX, signed
 provenance, full-mainnet sizing, and the mainnet gate all remain separate
-required work. Exact-head native `SmokeV1` execution evidence is pending.
+required work. The follow-on load-foundation slice adds a read-only `corpus
+validate-sizing` command that reopens and revalidates the existing capture and
+sizing bundles, then recomputes the sizing qualification against its captured
+measurement. It creates no artifact, accepts no runtime or workload knobs,
+instantiates no ORAM backend, store, or worker, and makes no load, performance,
+hardware, or mainnet claim.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the

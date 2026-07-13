@@ -110,6 +110,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and reports independent directory, event, hot-address, modeled-memory, and
   combined modeled fit flags. Backend expansion and position-map width remain
   uncalibrated research inputs rather than measured RSS evidence.
+- Read-only sizing-model accessors for the directory/event capacities,
+  admission limits, and per-address event limit consumed by the companion
+  sizing-input validation command. They expose explicit model inputs, not
+  measurements, and do not run a worker or establish load, performance,
+  hardware, or mainnet evidence.
 - A module-private synchronous two-table command core that owns distinct typed
   fake backend handles, validates their public capacity shape before use, scans
   the full directory plus every bounded event ordinal on successful preflights,

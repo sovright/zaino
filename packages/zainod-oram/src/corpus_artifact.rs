@@ -288,6 +288,30 @@ impl SizingProvenanceV1 {
     }
 }
 
+/// A semantically validated sizing qualification with its canonical typed lineage.
+pub(super) struct ValidatedSizing {
+    qualification: MainnetSizingQualification,
+    measurement_blake2s256: String,
+    qualification_blake2s256: String,
+}
+
+impl ValidatedSizing {
+    /// Returns the validated sizing qualification.
+    pub(super) const fn qualification(&self) -> &MainnetSizingQualification {
+        &self.qualification
+    }
+
+    /// Returns the digest of the capture measurement bound to this qualification.
+    pub(super) fn measurement_blake2s256(&self) -> &str {
+        &self.measurement_blake2s256
+    }
+
+    /// Returns the digest of the canonical typed sizing artifact.
+    pub(super) fn qualification_blake2s256(&self) -> &str {
+        &self.qualification_blake2s256
+    }
+}
+
 /// Loads and revalidates an exact three-file capture directory.
 pub(super) fn load_capture(input_dir: &Path) -> Result<ValidatedCapture, ArtifactError> {
     let source_directory = fs::canonicalize(input_dir).map_err(|source| ArtifactError::Io {
@@ -301,6 +325,25 @@ pub(super) fn load_capture(input_dir: &Path) -> Result<ValidatedCapture, Artifac
         directory,
         measurement: artifact.measurement,
         measurement_blake2s256,
+    })
+}
+
+/// Loads and revalidates an exact three-file sizing directory against its capture.
+pub(super) fn load_sizing(
+    input_dir: &Path,
+    capture: &ValidatedCapture,
+) -> Result<ValidatedSizing, ArtifactError> {
+    let source_directory = fs::canonicalize(input_dir).map_err(|source| ArtifactError::Io {
+        operation: "canonicalize validated sizing directory",
+        source,
+    })?;
+    let directory = open_artifact_directory(&source_directory)?;
+    let (artifact, _) = read_validated_sizing_directory(&directory, capture)?;
+    let qualification_blake2s256 = artifact.digest()?;
+    Ok(ValidatedSizing {
+        qualification: artifact.qualification,
+        measurement_blake2s256: artifact.measurement_blake2s256,
+        qualification_blake2s256,
     })
 }
 
@@ -897,15 +940,6 @@ fn validate_staged_sizing(
         });
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn read_validated_sizing(
-    directory: &Path,
-    capture: &ValidatedCapture,
-) -> Result<(SizingArtifactV1, SizingProvenanceV1), ArtifactError> {
-    let directory = open_artifact_directory(directory)?;
-    read_validated_sizing_directory(&directory, capture)
 }
 
 fn read_validated_sizing_directory(
@@ -1530,6 +1564,17 @@ mod tests {
         file.set_len(maximum_bytes as u64 + 1)
     }
 
+    fn mutate_json_file(
+        path: &Path,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) -> TestResult<Vec<u8>> {
+        let original = fs::read(path)?;
+        let mut value = serde_json::from_slice(&original)?;
+        mutate(&mut value);
+        fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+        Ok(original)
+    }
+
     #[test]
     fn publishes_complete_directory_after_successful_read_back() -> TestResult {
         let parent = tempfile::tempdir()?;
@@ -1614,13 +1659,20 @@ mod tests {
         publish_sizing(&first, &capture, &qualification, "test-runner")?;
         publish_sizing(&second, &capture, &qualification, "test-runner")?;
 
-        let (artifact, provenance) = read_validated_sizing(&first, &capture)?;
-        assert_eq!(artifact.qualification, qualification);
+        let sizing = load_sizing(&first, &capture)?;
+        let artifact = SizingArtifactV1::new(&capture, &qualification)?;
+        let sizing_directory = open_artifact_directory(&first)?;
+        let (_, provenance) = read_validated_sizing_directory(&sizing_directory, &capture)?;
+        assert_eq!(sizing.qualification(), &qualification);
         assert_eq!(
-            artifact.measurement_blake2s256,
+            sizing.measurement_blake2s256(),
             capture.measurement_blake2s256()
         );
-        assert_eq!(provenance.qualification_blake2s256, artifact.digest()?);
+        assert_eq!(sizing.qualification_blake2s256(), artifact.digest()?);
+        assert_eq!(
+            provenance.qualification_blake2s256,
+            sizing.qualification_blake2s256()
+        );
         assert_eq!(
             provenance.sizing_model_blake2s256,
             blake2s256_hex(&serde_json::to_vec(&model)?)
@@ -1642,6 +1694,36 @@ mod tests {
         for forbidden in ["endpoint", "path", "cookie", "credential", "config"] {
             assert!(!provenance_text.contains(forbidden));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn sizing_load_rejects_a_different_validated_capture() -> TestResult {
+        let parent = tempfile::tempdir()?;
+        let (_, capture) = publish_and_load_capture(parent.path())?;
+        let qualification = capture.measurement().apply_model(&sizing_model(0)?)?;
+        let sizing_dir = parent.path().join("sizing");
+        publish_sizing(&sizing_dir, &capture, &qualification, "test-runner")?;
+
+        let other_measurement = typed_measurement_with_one_address()?;
+        let other_provenance = CaptureProvenance::new(
+            BackendKind::Rpc,
+            SnapshotMode::NonFinalizedState,
+            0,
+            SelectionMode::ServiceableTip,
+            "test-runner",
+            &other_measurement,
+        )?;
+        let other_capture_dir = parent.path().join("other-capture");
+        publish_capture(&other_capture_dir, &other_measurement, &other_provenance)?;
+        let other_capture = load_capture(&other_capture_dir)?;
+
+        assert!(matches!(
+            load_sizing(&sizing_dir, &other_capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "sizing artifact measurement digest mismatch"
+            })
+        ));
         Ok(())
     }
 
@@ -1679,7 +1761,7 @@ mod tests {
         let fabricated_artifact = SizingArtifactV1 {
             schema: SIZING_SCHEMA.to_owned(),
             measurement_blake2s256: capture.measurement_blake2s256().to_owned(),
-            qualification: fabricated,
+            qualification: fabricated.clone(),
         };
         assert!(matches!(
             validate_sizing_binding(&capture, &fabricated_artifact),
@@ -1688,7 +1770,22 @@ mod tests {
             })
         ));
 
+        let sizing_dir = parent.path().join("fabricated-sizing");
         let qualification = capture.measurement().apply_model(&model)?;
+        publish_sizing(&sizing_dir, &capture, &qualification, "test-runner")?;
+        let qualification_path = sizing_dir.join(QUALIFICATION_JSON);
+        let mut persisted: SizingArtifactV1 =
+            serde_json::from_slice(&fs::read(&qualification_path)?)?;
+        persisted.qualification = fabricated.clone();
+        fs::write(&qualification_path, serde_json::to_vec_pretty(&persisted)?)?;
+        fs::write(sizing_dir.join(QUALIFICATION_TEXT), fabricated.to_string())?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "sizing qualification does not match the captured measurement and model"
+            })
+        ));
+
         let artifact = SizingArtifactV1::new(&capture, &qualification)?;
         let provenance = SizingProvenanceV1::new("test-runner", &capture, &artifact)?;
 
@@ -1722,6 +1819,84 @@ mod tests {
     }
 
     #[test]
+    fn sizing_load_rejects_typed_json_and_provenance_tampering() -> TestResult {
+        let parent = tempfile::tempdir()?;
+        let (_, capture) = publish_and_load_capture(parent.path())?;
+        let qualification = capture.measurement().apply_model(&sizing_model(0)?)?;
+        let sizing_dir = parent.path().join("sizing");
+        publish_sizing(&sizing_dir, &capture, &qualification, "test-runner")?;
+
+        let qualification_path = sizing_dir.join(QUALIFICATION_JSON);
+        let original_qualification = mutate_json_file(&qualification_path, |value| {
+            value["schema"] = serde_json::json!("wrong-sizing-schema");
+        })?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "sizing schema mismatch"
+            })
+        ));
+        fs::write(&qualification_path, original_qualification)?;
+
+        let provenance_path = sizing_dir.join(PROVENANCE_JSON);
+        let original_provenance = mutate_json_file(&provenance_path, |value| {
+            value["schema"] = serde_json::json!("wrong-sizing-provenance-schema");
+        })?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "sizing provenance schema or runner version is invalid"
+            })
+        ));
+        fs::write(&provenance_path, &original_provenance)?;
+
+        let original_provenance = mutate_json_file(&provenance_path, |value| {
+            value["target_os"] = serde_json::json!("different-host-os");
+        })?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "sizing provenance schema or runner version is invalid"
+            })
+        ));
+        fs::write(&provenance_path, &original_provenance)?;
+
+        let original_provenance = mutate_json_file(&provenance_path, |value| {
+            value["verified_checkpoint_height"] = serde_json::json!(1);
+        })?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "sizing provenance checkpoint does not match the qualification"
+            })
+        ));
+        fs::write(&provenance_path, &original_provenance)?;
+
+        let original_provenance = mutate_json_file(&provenance_path, |value| {
+            value["sizing_model_blake2s256"] = serde_json::json!("00".repeat(32));
+        })?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "sizing model digest mismatch"
+            })
+        ));
+        fs::write(&provenance_path, &original_provenance)?;
+
+        let original_provenance = mutate_json_file(&provenance_path, |value| {
+            value["qualification_blake2s256"] = serde_json::json!("00".repeat(32));
+        })?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "sizing qualification digest mismatch"
+            })
+        ));
+        fs::write(&provenance_path, original_provenance)?;
+        Ok(())
+    }
+
+    #[test]
     fn sizing_read_back_rejects_text_file_set_and_nested_output_tampering() -> TestResult {
         let parent = tempfile::tempdir()?;
         let (capture_dir, capture) = publish_and_load_capture(parent.path())?;
@@ -1729,17 +1904,29 @@ mod tests {
         let output = parent.path().join("sizing");
         publish_sizing(&output, &capture, &qualification, "test-runner")?;
 
-        fs::write(output.join(QUALIFICATION_TEXT), b"tampered\n")?;
+        let qualification_text_path = output.join(QUALIFICATION_TEXT);
+        let qualification_text = fs::read(&qualification_text_path)?;
+        fs::write(&qualification_text_path, b"tampered\n")?;
         assert!(matches!(
-            read_validated_sizing(&output, &capture),
+            load_sizing(&output, &capture),
             Err(ArtifactError::InvalidArtifact {
                 reason: "sizing text does not match the typed qualification"
             })
         ));
+        fs::write(&qualification_text_path, qualification_text)?;
 
         fs::write(output.join("unexpected"), b"extra")?;
         assert!(matches!(
-            read_validated_sizing(&output, &capture),
+            load_sizing(&output, &capture),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "artifact directory does not contain exactly the required files"
+            })
+        ));
+        fs::remove_file(output.join("unexpected"))?;
+
+        fs::remove_file(output.join(PROVENANCE_JSON))?;
+        assert!(matches!(
+            load_sizing(&output, &capture),
             Err(ArtifactError::InvalidArtifact {
                 reason: "artifact directory does not contain exactly the required files"
             })
@@ -1750,6 +1937,42 @@ mod tests {
             publish_sizing(&nested, &capture, &qualification, "test-runner"),
             Err(ArtifactError::InvalidArtifact {
                 reason: "sizing output must not be nested inside its capture input"
+            })
+        ));
+        Ok(())
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn sizing_load_rejects_symlink_and_nonregular_entries_without_reading_them() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir()?;
+        let (_, capture) = publish_and_load_capture(parent.path())?;
+        let qualification = capture.measurement().apply_model(&sizing_model(0)?)?;
+        let sizing_dir = parent.path().join("sizing");
+        publish_sizing(&sizing_dir, &capture, &qualification, "test-runner")?;
+
+        let qualification_json = sizing_dir.join(QUALIFICATION_JSON);
+        let original_json = fs::read(&qualification_json)?;
+        fs::remove_file(&qualification_json)?;
+        symlink(QUALIFICATION_TEXT, &qualification_json)?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::NonRegularFile {
+                name: QUALIFICATION_JSON
+            })
+        ));
+
+        fs::remove_file(&qualification_json)?;
+        fs::write(&qualification_json, original_json)?;
+        let qualification_text = sizing_dir.join(QUALIFICATION_TEXT);
+        fs::remove_file(&qualification_text)?;
+        fs::create_dir(&qualification_text)?;
+        assert!(matches!(
+            load_sizing(&sizing_dir, &capture),
+            Err(ArtifactError::NonRegularFile {
+                name: QUALIFICATION_TEXT
             })
         ));
         Ok(())
@@ -1821,7 +2044,7 @@ mod tests {
             let original = fs::read(&path)?;
             replace_with_oversized_file(&path, maximum_bytes)?;
             assert!(matches!(
-                read_validated_sizing(&sizing_dir, &capture),
+                load_sizing(&sizing_dir, &capture),
                 Err(ArtifactError::FileTooLarge {
                     name: rejected,
                     maximum_bytes: rejected_maximum,
