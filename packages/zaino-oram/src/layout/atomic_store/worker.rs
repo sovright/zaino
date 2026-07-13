@@ -158,7 +158,7 @@ pub(crate) fn spawn_typed_rostl_worker<const DIRECTORY_PROBES: usize, const EVEN
         target_arch = "x86_64"
     ))]
     {
-        return rostl::spawn_rostl_worker(layout, queue_capacity);
+        rostl::spawn_rostl_worker(layout, queue_capacity)
     }
 
     #[cfg(not(all(
@@ -748,6 +748,11 @@ impl std::error::Error for AtomicQueueCapacityError {}
 #[cfg(feature = "corpus-zaino")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicWorkerBuildError {
+    #[cfg(not(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
     TypedBackendUnavailable,
     ConstructionFailed,
 }
@@ -756,6 +761,11 @@ pub(crate) enum AtomicWorkerBuildError {
 impl fmt::Display for AtomicWorkerBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(not(all(
+                feature = "rostl-experimental",
+                target_os = "linux",
+                target_arch = "x86_64"
+            )))]
             Self::TypedBackendUnavailable => {
                 f.write_str("typed atomic worker backend is unavailable")
             }

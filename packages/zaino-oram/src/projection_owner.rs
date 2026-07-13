@@ -139,6 +139,11 @@ fn validated_queue_capacity(value: usize) -> Result<AtomicQueueCapacity, AtomicQ
 
 const fn map_worker_build(error: AtomicWorkerBuildError) -> ProjectionOwnerBuildError {
     match error {
+        #[cfg(not(all(
+            feature = "rostl-experimental",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )))]
         AtomicWorkerBuildError::TypedBackendUnavailable => {
             ProjectionOwnerBuildError::TypedBackendUnavailable
         }
@@ -183,6 +188,11 @@ enum ProjectionOwnerConfigMismatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectionOwnerBuildError {
     ConfigMismatch(ProjectionOwnerConfigMismatch),
+    #[cfg(not(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
     TypedBackendUnavailable,
     ConstructionFailed,
 }
@@ -191,6 +201,11 @@ impl fmt::Display for ProjectionOwnerBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConfigMismatch(_) => f.write_str("projection and layout configuration mismatch"),
+            #[cfg(not(all(
+                feature = "rostl-experimental",
+                target_os = "linux",
+                target_arch = "x86_64"
+            )))]
             Self::TypedBackendUnavailable => f.write_str("typed projection backend is unavailable"),
             Self::ConstructionFailed => f.write_str("projection owner construction failed"),
         }
