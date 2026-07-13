@@ -216,27 +216,32 @@ impl BoundaryChecks {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TerminalBoundary {
-    directory_admission_limit_reached: bool,
-    event_admission_limit_reached: bool,
-    per_address_event_limit_reached: bool,
+// This records the pre-fault boundary state. The worker deliberately exposes
+// only `FailedClosed`, so this is not an internal executor-cause discriminator.
+struct BoundaryCondition {
+    directory_admission_boundary_reached: bool,
+    event_admission_boundary_reached: bool,
+    per_address_event_boundary_reached: bool,
     physical_capacity_reached: bool,
 }
 
-impl TerminalBoundary {
+impl BoundaryCondition {
     const fn for_boundary(boundary: BoundaryKind) -> Self {
         Self {
-            directory_admission_limit_reached: matches!(boundary, BoundaryKind::DirectoryAdmission),
-            event_admission_limit_reached: matches!(boundary, BoundaryKind::EventAdmission),
-            per_address_event_limit_reached: false,
+            directory_admission_boundary_reached: matches!(
+                boundary,
+                BoundaryKind::DirectoryAdmission
+            ),
+            event_admission_boundary_reached: matches!(boundary, BoundaryKind::EventAdmission),
+            per_address_event_boundary_reached: false,
             physical_capacity_reached: false,
         }
     }
 
     fn is_one_hot_logical(self) -> bool {
-        u8::from(self.directory_admission_limit_reached)
-            + u8::from(self.event_admission_limit_reached)
-            + u8::from(self.per_address_event_limit_reached)
+        u8::from(self.directory_admission_boundary_reached)
+            + u8::from(self.event_admission_boundary_reached)
+            + u8::from(self.per_address_event_boundary_reached)
             == 1
             && !self.physical_capacity_reached
     }
@@ -310,7 +315,7 @@ struct SaturationCaseReport {
     checks: BoundaryChecks,
     schedule_blake2s256: String,
     final_state_blake2s256: String,
-    terminal_boundary: TerminalBoundary,
+    boundary_condition: BoundaryCondition,
     worker_trace: SaturationWorkerTrace,
 }
 
@@ -390,9 +395,9 @@ impl TypedWorkerFullMapSaturationReport {
         if *self != expected
             || !self
                 .directory_boundary
-                .terminal_boundary
+                .boundary_condition
                 .is_one_hot_logical()
-            || !self.event_boundary.terminal_boundary.is_one_hot_logical()
+            || !self.event_boundary.boundary_condition.is_one_hot_logical()
         {
             return Err(TypedWorkerFullMapSaturationError::InvalidReport);
         }
@@ -545,7 +550,7 @@ fn build_case_report(spec: CaseSpec, worker_trace: SaturationWorkerTrace) -> Sat
         checks: BoundaryChecks::for_spec(spec),
         schedule_blake2s256: schedule_digest(spec),
         final_state_blake2s256: final_state_digest(spec),
-        terminal_boundary: TerminalBoundary::for_boundary(spec.boundary),
+        boundary_condition: BoundaryCondition::for_boundary(spec.boundary),
         worker_trace,
     }
 }
@@ -898,9 +903,12 @@ mod tests {
         );
         assert!(report
             .directory_boundary
-            .terminal_boundary
+            .boundary_condition
             .is_one_hot_logical());
-        assert!(report.event_boundary.terminal_boundary.is_one_hot_logical());
+        assert!(report
+            .event_boundary
+            .boundary_condition
+            .is_one_hot_logical());
         Ok(())
     }
 

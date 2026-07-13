@@ -254,10 +254,10 @@ mod tests {
                         "df03dc8b7b007c2b014245b561ec2cd1bf045cf0e9aeb7b5c1a2ed9f9f93991b",
                     "final_state_blake2s256":
                         "79aae8224fcbea42e2de93745c28394c1c43b525248ed80a0851e303de835f2b",
-                    "terminal_boundary": {
-                        "directory_admission_limit_reached": true,
-                        "event_admission_limit_reached": false,
-                        "per_address_event_limit_reached": false,
+                    "boundary_condition": {
+                        "directory_admission_boundary_reached": true,
+                        "event_admission_boundary_reached": false,
+                        "per_address_event_boundary_reached": false,
                         "physical_capacity_reached": false
                     },
                     "worker_trace": {
@@ -316,10 +316,10 @@ mod tests {
                         "0992fc8de63fc568d2eab012c4a102ddb8bfcbb33122928fa97f84712a2acde8",
                     "final_state_blake2s256":
                         "b5a2a2088377819fdbf728d65c3b54d0e961d6773fcc141ae29b2be71a78b60c",
-                    "terminal_boundary": {
-                        "directory_admission_limit_reached": false,
-                        "event_admission_limit_reached": true,
-                        "per_address_event_limit_reached": false,
+                    "boundary_condition": {
+                        "directory_admission_boundary_reached": false,
+                        "event_admission_boundary_reached": true,
+                        "per_address_event_boundary_reached": false,
                         "physical_capacity_reached": false
                     },
                     "worker_trace": {

@@ -123,7 +123,7 @@ atomic no-replace path, but writes a distinct `full-map-saturation.json`,
 `zaino-oram-full-map-saturation-provenance-v1` and binds the compact typed
 wrapper digest. The aggregate report records exact logical occupancy, admission
 bounds, physical-capacity reserve, deterministic schedule and final-state digests,
-one-hot terminal-boundary conditions, and identifier-free worker snapshots.
+one-hot pre-fault boundary conditions, and identifier-free worker snapshots.
 
 This profile proves deterministic correctness at both logical admitted-map
 boundaries. It deliberately leaves physical capacity unreached and is not a
