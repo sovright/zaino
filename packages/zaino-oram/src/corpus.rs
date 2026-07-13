@@ -446,7 +446,7 @@ impl CandidateRecordSizes {
 
 /// One identifier-free current or projected storage point.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct CorpusProjection {
+pub(super) struct CorpusProjection {
     year: u16,
     standard_addresses: u64,
     estimate: StorageEstimate,
@@ -455,6 +455,17 @@ struct CorpusProjection {
 impl fmt::Debug for CorpusProjection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CorpusProjection { aggregates_only: true, .. }")
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl CorpusProjection {
+    pub(super) const fn year(&self) -> u16 {
+        self.year
+    }
+
+    pub(super) const fn estimate(&self) -> &StorageEstimate {
+        &self.estimate
     }
 }
 
@@ -488,6 +499,7 @@ pub(super) struct CorpusMeasurement {
 }
 
 impl CorpusMeasurement {
+    #[cfg(feature = "corpus-zaino")]
     pub(super) const fn block_count(&self) -> u64 {
         self.blocks
     }
@@ -528,11 +540,7 @@ impl CorpusMeasurement {
             sizing,
             self.distinct_standard_addresses,
         )?;
-        Ok(CorpusSizingQualification {
-            growth,
-            sizing,
-            projections,
-        })
+        Ok(CorpusSizingQualification { projections })
     }
 }
 
@@ -585,13 +593,11 @@ impl fmt::Display for CorpusMeasurement {
 
 /// Operator-selected sizing assumptions and projections derived from one measurement.
 pub(super) struct CorpusSizingQualification {
-    growth: GrowthAssumption,
-    sizing: SizingParameters,
     projections: Vec<CorpusProjection>,
 }
 
 impl CorpusSizingQualification {
-    fn projections(&self) -> &[CorpusProjection] {
+    pub(super) fn projections(&self) -> &[CorpusProjection] {
         &self.projections
     }
 }
@@ -599,44 +605,6 @@ impl CorpusSizingQualification {
 impl fmt::Debug for CorpusSizingQualification {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CorpusSizingQualification { aggregates_only: true, .. }")
-    }
-}
-
-impl fmt::Display for CorpusSizingQualification {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "schema=oram-corpus-sizing-v1")?;
-        writeln!(
-            f,
-            "growth_assumption=horizon_years:{},annual_growth_bps:{}",
-            self.growth.horizon_years, self.growth.annual_growth_bps,
-        )?;
-        write!(f, "{}", self.sizing)?;
-        for projection in &self.projections {
-            writeln!(
-                f,
-                "projection=year:{},standard_addresses:{},events:{},max_events_per_address:{},directory_load_bps:{},event_load_bps:{},allocated_directory_bytes:{},allocated_event_bytes:{},allocated_table_bytes:{},logical_position_map_bytes:{},logical_total_bytes:{},backend_expanded_bytes:{},usable_memory_bytes:{},fits_directory_admission:{},fits_event_admission:{},fits_address_event_limit:{},fits_configured_limits:{},fits_modeled_memory:{},fits_modeled_constraints:{}",
-                projection.year,
-                projection.standard_addresses,
-                projection.estimate.event_count(),
-                projection.estimate.maximum_events_per_address(),
-                projection.estimate.directory_load_bps(),
-                projection.estimate.event_load_bps(),
-                projection.estimate.allocated_directory_bytes(),
-                projection.estimate.allocated_event_bytes(),
-                projection.estimate.allocated_table_bytes(),
-                projection.estimate.logical_position_map_bytes(),
-                projection.estimate.logical_total_bytes(),
-                projection.estimate.backend_expanded_bytes(),
-                projection.estimate.usable_memory_bytes(),
-                projection.estimate.fits_directory_admission(),
-                projection.estimate.fits_event_admission(),
-                projection.estimate.fits_address_event_limit(),
-                projection.estimate.fits_configured_limits(),
-                projection.estimate.fits_modeled_memory(),
-                projection.estimate.fits_modeled_constraints(),
-            )?;
-        }
-        Ok(())
     }
 }
 
@@ -1386,10 +1354,6 @@ mod tests {
                 "record_sizes=address_key:32,business_utxo:88,persistent_utxo:88,persistent_event:72,logical_store_slot:96,directory_cell:38,event_cell:82\n",
             )
         );
-        let sizing_output = qualification.to_string();
-        assert!(sizing_output.starts_with("schema=oram-corpus-sizing-v1\n"));
-        assert!(sizing_output.contains("growth_assumption=horizon_years:2"));
-        assert_eq!(sizing_output.matches("projection=year:").count(), 3);
         assert!(!output.contains("growth_assumption"));
         assert!(!output.contains("tdx_memory_bytes"));
         assert!(!output.contains("projection="));

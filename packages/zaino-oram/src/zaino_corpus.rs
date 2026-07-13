@@ -14,7 +14,7 @@ use crate::{
         CorpusAccumulator, CorpusAddress, CorpusError, CorpusEvent, CorpusMeasurement,
         CorpusOutpoint, CorpusScriptClass, CorpusSizingQualification, GrowthAssumption,
     },
-    sizing::SizingParameters,
+    sizing::{SizingParameters, StorageEstimate},
 };
 
 /// Aggregate measurement paired with its public canonical-chain checkpoint.
@@ -42,40 +42,39 @@ impl fmt::Display for ZainoCorpusMeasurement {
     }
 }
 
-pub(super) struct ZainoSizingQualification {
-    checkpoint: PublicChainCheckpoint,
-    aggregate: CorpusSizingQualification,
-}
-
-impl fmt::Debug for ZainoSizingQualification {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            "ZainoSizingQualification { public_checkpoint: true, aggregates_only: true, .. }",
-        )
-    }
-}
-
-impl fmt::Display for ZainoSizingQualification {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "network={}", self.checkpoint.network())?;
-        writeln!(f, "final_height={}", self.checkpoint.height())?;
-        writeln!(
-            f,
-            "final_hash={}",
-            self.checkpoint.block_hash().to_rpc_hex()
-        )?;
-        write!(f, "{}", self.aggregate)
-    }
-}
-
 /// Validated growth and sizing inputs applied to a captured mainnet measurement.
 ///
 /// Every value is supplied explicitly by the operator. This research API does
 /// not guess privacy-profile or target-TDX constants.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MainnetSizingModel {
-    growth: GrowthAssumption,
-    sizing: SizingParameters,
+    growth_horizon_years: u16,
+    annual_growth_bps: u64,
+    directory_capacity: u64,
+    directory_admission_limit: u64,
+    event_capacity: u64,
+    event_admission_limit: u64,
+    max_events_per_address: u64,
+    position_map_entry_bytes: u64,
+    backend_expansion_bps: u64,
+    tdx_memory_bytes: u64,
+    required_headroom_bps: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainnetSizingModelDto {
+    growth_horizon_years: u16,
+    annual_growth_bps: u64,
+    directory_capacity: u64,
+    directory_admission_limit: u64,
+    event_capacity: u64,
+    event_admission_limit: u64,
+    max_events_per_address: u64,
+    position_map_entry_bytes: u64,
+    backend_expansion_bps: u64,
+    tdx_memory_bytes: u64,
+    required_headroom_bps: u64,
 }
 
 impl MainnetSizingModel {
@@ -97,9 +96,9 @@ impl MainnetSizingModel {
         tdx_memory_bytes: u64,
         required_headroom_bps: u64,
     ) -> Result<Self, MainnetCorpusError> {
-        let growth = GrowthAssumption::new(growth_horizon_years, annual_growth_bps)
-            .map_err(ZainoCorpusError::Aggregate)?;
-        let sizing = SizingParameters::new(
+        let model = Self {
+            growth_horizon_years,
+            annual_growth_bps,
             directory_capacity,
             directory_admission_limit,
             event_capacity,
@@ -109,10 +108,64 @@ impl MainnetSizingModel {
             backend_expansion_bps,
             tdx_memory_bytes,
             required_headroom_bps,
+        };
+        model.parts()?;
+        Ok(model)
+    }
+
+    /// Revalidates every operator-selected model input.
+    pub fn validate(&self) -> Result<(), MainnetCorpusError> {
+        self.parts().map(|_| ())
+    }
+
+    fn parts(&self) -> Result<(GrowthAssumption, SizingParameters), MainnetCorpusError> {
+        let growth = GrowthAssumption::new(self.growth_horizon_years, self.annual_growth_bps)
+            .map_err(ZainoCorpusError::Aggregate)?;
+        let sizing = SizingParameters::new(
+            self.directory_capacity,
+            self.directory_admission_limit,
+            self.event_capacity,
+            self.event_admission_limit,
+            self.max_events_per_address,
+            self.position_map_entry_bytes,
+            self.backend_expansion_bps,
+            self.tdx_memory_bytes,
+            self.required_headroom_bps,
         )
         .map_err(CorpusError::Sizing)
         .map_err(ZainoCorpusError::Aggregate)?;
-        Ok(Self { growth, sizing })
+        Ok((growth, sizing))
+    }
+
+    fn directory_admission_bps(&self) -> u128 {
+        u128::from(self.directory_admission_limit) * 10_000 / u128::from(self.directory_capacity)
+    }
+
+    fn event_admission_bps(&self) -> u128 {
+        u128::from(self.event_admission_limit) * 10_000 / u128::from(self.event_capacity)
+    }
+}
+
+impl<'de> Deserialize<'de> for MainnetSizingModel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let dto = MainnetSizingModelDto::deserialize(deserializer)?;
+        Self::new(
+            dto.growth_horizon_years,
+            dto.annual_growth_bps,
+            dto.directory_capacity,
+            dto.directory_admission_limit,
+            dto.event_capacity,
+            dto.event_admission_limit,
+            dto.max_events_per_address,
+            dto.position_map_entry_bytes,
+            dto.backend_expansion_bps,
+            dto.tdx_memory_bytes,
+            dto.required_headroom_bps,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -269,23 +322,17 @@ impl MainnetCorpusMeasurement {
         model: &MainnetSizingModel,
     ) -> Result<MainnetSizingQualification, MainnetCorpusError> {
         self.validate()?;
+        let (growth, sizing) = model.parts()?;
         let aggregate = self
             .aggregate
-            .qualify(model.growth, model.sizing)
+            .qualify(growth, sizing)
             .map_err(ZainoCorpusError::Aggregate)?;
-        Ok(MainnetSizingQualification {
-            checkpoint: self.checkpoint.clone(),
-            inner: ZainoSizingQualification {
-                checkpoint: PublicChainCheckpoint::new(
-                    CanonicalNetwork::Mainnet,
-                    self.checkpoint.height,
-                    zaino_state::BlockHash::from_bytes_in_display_order(&decode_checkpoint_hash(
-                        &self.checkpoint.hash,
-                    )?),
-                ),
-                aggregate,
-            },
-        })
+        Ok(MainnetSizingQualification::new(
+            self.checkpoint.clone(),
+            *model,
+            sizing,
+            &aggregate,
+        ))
     }
 }
 
@@ -306,16 +353,236 @@ impl fmt::Display for MainnetCorpusMeasurement {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LoadBasisPointRounding {
+    Floor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainnetSizingEvidence {
+    insertion_bound: bool,
+    backend_calibrated: bool,
+    rss_measured: bool,
+    load_bps_rounding: LoadBasisPointRounding,
+    load_bps_capped: bool,
+}
+
+impl MainnetSizingEvidence {
+    const fn modeled_only() -> Self {
+        Self {
+            insertion_bound: false,
+            backend_calibrated: false,
+            rss_measured: false,
+            load_bps_rounding: LoadBasisPointRounding::Floor,
+            load_bps_capped: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainnetSizingRecordBytes {
+    directory_cell_bytes: u64,
+    event_cell_bytes: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainnetSizingProjection {
+    year: u16,
+    standard_addresses: u64,
+    events: u64,
+    max_events_per_address: u64,
+    #[serde(with = "u128_decimal")]
+    directory_load_bps: u128,
+    #[serde(with = "u128_decimal")]
+    event_load_bps: u128,
+    allocated_directory_bytes: u64,
+    allocated_event_bytes: u64,
+    allocated_table_bytes: u64,
+    logical_position_map_bytes: u64,
+    logical_total_bytes: u64,
+    backend_expanded_bytes: u64,
+    usable_memory_bytes: u64,
+    fits_directory_admission: bool,
+    fits_event_admission: bool,
+    fits_address_event_limit: bool,
+    fits_configured_limits: bool,
+    fits_modeled_memory: bool,
+    fits_modeled_constraints: bool,
+}
+
+impl MainnetSizingProjection {
+    fn from_estimate(year: u16, estimate: &StorageEstimate) -> Self {
+        Self {
+            year,
+            standard_addresses: estimate.address_count(),
+            events: estimate.event_count(),
+            max_events_per_address: estimate.maximum_events_per_address(),
+            directory_load_bps: estimate.directory_load_bps(),
+            event_load_bps: estimate.event_load_bps(),
+            allocated_directory_bytes: estimate.allocated_directory_bytes(),
+            allocated_event_bytes: estimate.allocated_event_bytes(),
+            allocated_table_bytes: estimate.allocated_table_bytes(),
+            logical_position_map_bytes: estimate.logical_position_map_bytes(),
+            logical_total_bytes: estimate.logical_total_bytes(),
+            backend_expanded_bytes: estimate.backend_expanded_bytes(),
+            usable_memory_bytes: estimate.usable_memory_bytes(),
+            fits_directory_admission: estimate.fits_directory_admission(),
+            fits_event_admission: estimate.fits_event_admission(),
+            fits_address_event_limit: estimate.fits_address_event_limit(),
+            fits_configured_limits: estimate.fits_configured_limits(),
+            fits_modeled_memory: estimate.fits_modeled_memory(),
+            fits_modeled_constraints: estimate.fits_modeled_constraints(),
+        }
+    }
+}
+
+impl fmt::Debug for MainnetSizingProjection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MainnetSizingProjection { aggregates_only: true, .. }")
+    }
+}
+
 /// Identifier-free sizing qualification derived from a measured mainnet corpus.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct MainnetSizingQualification {
     checkpoint: MainnetCorpusCheckpoint,
-    inner: ZainoSizingQualification,
+    model: MainnetSizingModel,
+    compiled_record_bytes: MainnetSizingRecordBytes,
+    evidence: MainnetSizingEvidence,
+    projections: Vec<MainnetSizingProjection>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainnetSizingQualificationDto {
+    checkpoint: MainnetCorpusCheckpoint,
+    model: MainnetSizingModel,
+    compiled_record_bytes: MainnetSizingRecordBytes,
+    evidence: MainnetSizingEvidence,
+    projections: Vec<MainnetSizingProjection>,
 }
 
 impl MainnetSizingQualification {
+    fn new(
+        checkpoint: MainnetCorpusCheckpoint,
+        model: MainnetSizingModel,
+        sizing: SizingParameters,
+        aggregate: &CorpusSizingQualification,
+    ) -> Self {
+        Self {
+            checkpoint,
+            model,
+            compiled_record_bytes: MainnetSizingRecordBytes {
+                directory_cell_bytes: sizing.directory_record_bytes(),
+                event_cell_bytes: sizing.event_record_bytes(),
+            },
+            evidence: MainnetSizingEvidence::modeled_only(),
+            projections: aggregate
+                .projections()
+                .iter()
+                .map(|projection| {
+                    MainnetSizingProjection::from_estimate(projection.year(), projection.estimate())
+                })
+                .collect(),
+        }
+    }
+
     /// Returns the measured checkpoint used for this sizing qualification.
     pub const fn checkpoint(&self) -> &MainnetCorpusCheckpoint {
         &self.checkpoint
+    }
+
+    /// Returns the explicit model applied to the captured measurement.
+    pub const fn model(&self) -> &MainnetSizingModel {
+        &self.model
+    }
+
+    /// Revalidates the model, compiled widths, projection arithmetic, and
+    /// identifier-free evidence flags after deserialization.
+    ///
+    /// This is structural validation only. Use [`Self::validate_against`] to
+    /// prove that the rows were derived from a particular measurement.
+    pub fn validate(&self) -> Result<(), MainnetCorpusError> {
+        if !self.checkpoint.is_valid()
+            || (self.checkpoint.height == 0
+                && self.checkpoint.hash != CanonicalNetwork::Mainnet.genesis_hash().to_rpc_hex())
+            || self.evidence != MainnetSizingEvidence::modeled_only()
+        {
+            return Err(ZainoCorpusError::InvalidMainnetSizingQualification.into());
+        }
+        let (_, sizing) = self.model.parts()?;
+        if self.compiled_record_bytes
+            != (MainnetSizingRecordBytes {
+                directory_cell_bytes: sizing.directory_record_bytes(),
+                event_cell_bytes: sizing.event_record_bytes(),
+            })
+            || self.projections.len() != usize::from(self.model.growth_horizon_years) + 1
+        {
+            return Err(ZainoCorpusError::InvalidMainnetSizingQualification.into());
+        }
+
+        let mut previous = None;
+        for (index, projection) in self.projections.iter().enumerate() {
+            let year = u16::try_from(index)
+                .map_err(|_| ZainoCorpusError::InvalidMainnetSizingQualification)?;
+            let expected = sizing
+                .estimate_aggregates(
+                    projection.standard_addresses,
+                    projection.events,
+                    projection.max_events_per_address,
+                )
+                .map_err(CorpusError::Sizing)
+                .map_err(ZainoCorpusError::Aggregate)?;
+            if projection.year != year
+                || *projection != MainnetSizingProjection::from_estimate(year, &expected)
+                || previous.is_some_and(|previous: &MainnetSizingProjection| {
+                    projection.standard_addresses < previous.standard_addresses
+                        || projection.events < previous.events
+                        || projection.max_events_per_address != previous.max_events_per_address
+                })
+            {
+                return Err(ZainoCorpusError::InvalidMainnetSizingQualification.into());
+            }
+            previous = Some(projection);
+        }
+        Ok(())
+    }
+
+    /// Recomputes this qualification from `measurement` and requires an exact
+    /// match, including its checkpoint, model, evidence, and every projection.
+    pub fn validate_against(
+        &self,
+        measurement: &MainnetCorpusMeasurement,
+    ) -> Result<(), MainnetCorpusError> {
+        self.validate()?;
+        let expected = measurement.apply_model(&self.model)?;
+        if *self == expected {
+            Ok(())
+        } else {
+            Err(ZainoCorpusError::InvalidMainnetSizingQualification.into())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MainnetSizingQualification {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let dto = MainnetSizingQualificationDto::deserialize(deserializer)?;
+        let qualification = Self {
+            checkpoint: dto.checkpoint,
+            model: dto.model,
+            compiled_record_bytes: dto.compiled_record_bytes,
+            evidence: dto.evidence,
+            projections: dto.projections,
+        };
+        qualification.validate().map_err(serde::de::Error::custom)?;
+        Ok(qualification)
     }
 }
 
@@ -329,28 +596,87 @@ impl fmt::Debug for MainnetSizingQualification {
 
 impl fmt::Display for MainnetSizingQualification {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.inner.fmt(f)
+        writeln!(f, "network={}", self.checkpoint.network)?;
+        writeln!(f, "final_height={}", self.checkpoint.height)?;
+        writeln!(f, "final_hash={}", self.checkpoint.hash)?;
+        writeln!(f, "schema=oram-corpus-sizing-v1")?;
+        writeln!(
+            f,
+            "growth_assumption=horizon_years:{},annual_growth_bps:{}",
+            self.model.growth_horizon_years, self.model.annual_growth_bps,
+        )?;
+        writeln!(
+            f,
+            "sizing_parameters=directory_capacity:{},directory_admission_limit:{},directory_admission_bps:{},directory_record_bytes:{},event_capacity:{},event_admission_limit:{},event_admission_bps:{},event_record_bytes:{},max_events_per_address:{},position_map_entry_bytes:{},backend_expansion_bps:{},tdx_memory_bytes:{},required_headroom_bps:{}",
+            self.model.directory_capacity,
+            self.model.directory_admission_limit,
+            self.model.directory_admission_bps(),
+            self.compiled_record_bytes.directory_cell_bytes,
+            self.model.event_capacity,
+            self.model.event_admission_limit,
+            self.model.event_admission_bps(),
+            self.compiled_record_bytes.event_cell_bytes,
+            self.model.max_events_per_address,
+            self.model.position_map_entry_bytes,
+            self.model.backend_expansion_bps,
+            self.model.tdx_memory_bytes,
+            self.model.required_headroom_bps,
+        )?;
+        writeln!(
+            f,
+            "sizing_evidence=insertion_bound:false,backend_calibrated:false,rss_measured:false,load_bps_rounding:floor,load_bps_capped:false"
+        )?;
+        for projection in &self.projections {
+            writeln!(
+                f,
+                "projection=year:{},standard_addresses:{},events:{},max_events_per_address:{},directory_load_bps:{},event_load_bps:{},allocated_directory_bytes:{},allocated_event_bytes:{},allocated_table_bytes:{},logical_position_map_bytes:{},logical_total_bytes:{},backend_expanded_bytes:{},usable_memory_bytes:{},fits_directory_admission:{},fits_event_admission:{},fits_address_event_limit:{},fits_configured_limits:{},fits_modeled_memory:{},fits_modeled_constraints:{}",
+                projection.year,
+                projection.standard_addresses,
+                projection.events,
+                projection.max_events_per_address,
+                projection.directory_load_bps,
+                projection.event_load_bps,
+                projection.allocated_directory_bytes,
+                projection.allocated_event_bytes,
+                projection.allocated_table_bytes,
+                projection.logical_position_map_bytes,
+                projection.logical_total_bytes,
+                projection.backend_expanded_bytes,
+                projection.usable_memory_bytes,
+                projection.fits_directory_admission,
+                projection.fits_event_admission,
+                projection.fits_address_event_limit,
+                projection.fits_configured_limits,
+                projection.fits_modeled_memory,
+                projection.fits_modeled_constraints,
+            )?;
+        }
+        Ok(())
     }
 }
 
-fn decode_checkpoint_hash(hash: &str) -> Result<[u8; 32], MainnetCorpusError> {
-    if hash.len() != 64 {
-        return Err(ZainoCorpusError::InvalidMainnetMeasurement.into());
-    }
-    let mut bytes = [0_u8; 32];
-    for (index, pair) in hash.as_bytes().chunks_exact(2).enumerate() {
-        let high = decode_hex_nibble(pair[0])?;
-        let low = decode_hex_nibble(pair[1])?;
-        bytes[index] = (high << 4) | low;
-    }
-    Ok(bytes)
-}
+mod u128_decimal {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
 
-fn decode_hex_nibble(byte: u8) -> Result<u8, MainnetCorpusError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(ZainoCorpusError::InvalidMainnetMeasurement.into()),
+    pub(super) fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let value = encoded.parse::<u128>().map_err(D::Error::custom)?;
+        if value.to_string() != encoded {
+            return Err(D::Error::custom(
+                "u128 decimal strings must use canonical unsigned encoding",
+            ));
+        }
+        Ok(value)
     }
 }
 
@@ -509,6 +835,7 @@ pub(super) enum ZainoCorpusError {
     /// Aggregate mutation failed and the partial scanner state was discarded.
     ScannerPoisoned,
     InvalidMainnetMeasurement,
+    InvalidMainnetSizingQualification,
     CanonicalChain(CanonicalChainError),
     /// One block contains more transactions than an aggregate `u64` can count.
     TransactionCountOverflow {
@@ -533,6 +860,9 @@ impl fmt::Display for ZainoCorpusError {
             Self::InvalidMainnetMeasurement => {
                 f.write_str("mainnet corpus measurement failed semantic validation")
             }
+            Self::InvalidMainnetSizingQualification => {
+                f.write_str("mainnet corpus sizing qualification failed semantic validation")
+            }
             Self::CanonicalChain(error) => {
                 write!(f, "corpus canonical-chain validation failed: {error}")
             }
@@ -555,6 +885,7 @@ impl std::error::Error for ZainoCorpusError {
             Self::EmptyChain
             | Self::ScannerPoisoned
             | Self::InvalidMainnetMeasurement
+            | Self::InvalidMainnetSizingQualification
             | Self::TransactionCountOverflow { .. } => None,
         }
     }
@@ -866,12 +1197,109 @@ mod tests {
     fn one_measurement_supports_multiple_offline_sizing_models(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let measurement = mainnet_measurement()?;
-        let baseline = measurement.apply_model(&model(0)?)?;
+        let baseline_model = model(0)?;
+        let baseline = measurement.apply_model(&baseline_model)?;
         let growth = measurement.apply_model(&model(1_000)?)?;
 
         assert_eq!(baseline.checkpoint(), measurement.checkpoint());
         assert_eq!(growth.checkpoint(), measurement.checkpoint());
         assert_ne!(baseline.to_string(), growth.to_string());
+        assert!(baseline
+            .to_string()
+            .contains("schema=oram-corpus-sizing-v1\n"));
+
+        let model_json = serde_json::to_vec(&baseline_model)?;
+        assert_eq!(
+            serde_json::from_slice::<MainnetSizingModel>(&model_json)?,
+            baseline_model
+        );
+        let qualification_json = serde_json::to_vec(&baseline)?;
+        let decoded: MainnetSizingQualification = serde_json::from_slice(&qualification_json)?;
+        decoded.validate()?;
+        assert_eq!(decoded, baseline);
+        Ok(())
+    }
+
+    #[test]
+    fn sizing_deserialization_rejects_invalid_models_and_derived_rows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let measurement = mainnet_measurement()?;
+        let qualification = measurement.apply_model(&model(1_000)?)?;
+
+        let mut invalid_model = serde_json::to_value(model(0)?)?;
+        invalid_model["directory_capacity"] = serde_json::json!(3);
+        assert!(serde_json::from_value::<MainnetSizingModel>(invalid_model).is_err());
+
+        let mut unknown_model_field = serde_json::to_value(model(0)?)?;
+        unknown_model_field["unknown"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<MainnetSizingModel>(unknown_model_field).is_err());
+
+        let mut missing_model_field = serde_json::to_value(model(0)?)?;
+        let Some(model_fields) = missing_model_field.as_object_mut() else {
+            panic!("serialized sizing model must be a JSON object");
+        };
+        model_fields.remove("event_capacity");
+        assert!(serde_json::from_value::<MainnetSizingModel>(missing_model_field).is_err());
+
+        let mut invalid_evidence = serde_json::to_value(&qualification)?;
+        invalid_evidence["evidence"]["rss_measured"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MainnetSizingQualification>(invalid_evidence).is_err());
+
+        let mut invalid_projection = serde_json::to_value(&qualification)?;
+        invalid_projection["projections"][0]["allocated_table_bytes"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<MainnetSizingQualification>(invalid_projection).is_err());
+
+        let mut noncanonical_load = serde_json::to_value(&qualification)?;
+        noncanonical_load["projections"][0]["directory_load_bps"] = serde_json::json!("0000");
+        assert!(serde_json::from_value::<MainnetSizingQualification>(noncanonical_load).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn source_bound_validation_rejects_structurally_valid_fabricated_growth_rows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let measurement = mainnet_measurement()?;
+        let qualification = measurement.apply_model(&model(1_000)?)?;
+        let mut fabricated = serde_json::to_value(&qualification)?;
+        let Some(projections) = fabricated["projections"].as_array_mut() else {
+            panic!("serialized sizing qualification must contain projection rows");
+        };
+        let year_zero = projections[0].clone();
+        for (year, projection) in projections.iter_mut().enumerate().skip(1) {
+            *projection = year_zero.clone();
+            projection["year"] = serde_json::json!(year);
+        }
+
+        let fabricated: MainnetSizingQualification = serde_json::from_value(fabricated)?;
+        fabricated.validate()?;
+        assert!(fabricated.validate_against(&measurement).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn sizing_validation_covers_zero_horizon_shape_and_growth_overflow(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let measurement = mainnet_measurement()?;
+        let zero_horizon =
+            MainnetSizingModel::new(0, 1_000, 8, 6, 16, 12, 8, 4, 20_000, 1_000_000, 3_000)?;
+        let qualification = measurement.apply_model(&zero_horizon)?;
+        assert_eq!(qualification.projections.len(), 1);
+        assert_eq!(qualification.projections[0].year, 0);
+
+        let mut wrong_year = serde_json::to_value(&qualification)?;
+        wrong_year["projections"][0]["year"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<MainnetSizingQualification>(wrong_year).is_err());
+
+        let mut missing_projection = serde_json::to_value(&qualification)?;
+        let Some(projections) = missing_projection["projections"].as_array_mut() else {
+            panic!("serialized sizing qualification must contain a projection array");
+        };
+        projections.clear();
+        assert!(serde_json::from_value::<MainnetSizingQualification>(missing_projection).is_err());
+
+        let overflow_model =
+            MainnetSizingModel::new(2, u64::MAX, 8, 6, 16, 12, 8, 4, 20_000, 1_000_000, 3_000)?;
+        assert!(measurement.apply_model(&overflow_model).is_err());
         Ok(())
     }
 }

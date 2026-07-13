@@ -1,9 +1,10 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-13
-- Evaluated branch: `feat/oram-corpus-capture`, stacked on
-  `feat/oram-projection-owner`; capture code head `592d1206` has native
-  evidence in run `29223983432`
+- Evaluated branch: `feat/oram-corpus-size`, stacked on
+  `feat/oram-corpus-capture`; capture parent head `bd4554bf` has final native
+  evidence in run `29224873175`, while the sizing slice has the local evidence
+  recorded below and still requires its own native CI run
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
 - Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
@@ -116,6 +117,13 @@ The evaluated worktree implements:
   streams `IndexedBlock` values without retaining them, accepts no sizing
   input, and atomically publishes revalidated JSON, text, and minimal-provenance
   files into a new directory;
+- a fully offline `zainod-oram corpus size` command that requires the complete
+  validated capture directory plus eleven explicit model inputs, binds input
+  reads to one directory handle, rejects symlink/non-regular or oversized
+  entries, recomputes the qualification from the captured measurement, binds
+  input/model/result digests and checkpoint provenance, and atomically
+  publishes typed JSON, exact text, and provenance through one opened parent
+  directory without loading config, contacting a node, or starting a listener;
 - separate pinned, volatile `rostl` tables for the exact 38-byte directory and
   82-byte event-page records. Their private offline Linux-x86_64 constructor
   creates distinct `CircuitORAM` and recursive-position-map instances and
@@ -155,7 +163,8 @@ The following statements are **not** established by that evidence:
 - the continuation protector used by tests is not a selected production AEAD;
 - no private protobuf, gRPC adapter, NFS merge, attestation provider, TLS
   identity, readiness path, or private-service lifecycle exists;
-  `zainod-oram` currently contains only offline corpus capture tooling;
+  `zainod-oram` currently contains only listener-free corpus capture and fully
+  offline sizing tooling;
 - no durable ORAM/checkpoint implementation, rollback defense, crash recovery,
   measured rebuild path, or recovery-time objective exists;
 - the finalized-event coordinator's private sink seam is implemented by the
@@ -242,7 +251,7 @@ The following statements are **not** established by that evidence:
 | Mainnet counts/distributions and growth | Missing | No mainnet output artifact exists | Measure distinct standard scripts, lifetime events, live/peak UTXOs, hot tails, script classes, record sizes, and selected growth horizon |
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov`; generic native Linux CI constructs separate real 38/82-byte backend monomorphizations and exercises both | Measure the target-capacity profile on the selected CPU/TDX platform |
 | Fixed-probe table layout | Partial real integration | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, a complete bounded-history preflight, and a bounded worker with no raw storage bypass. A private offline owner validates exact projection/layout identity and admission limits before composing the coordinator and worker; generic native Linux CI runs 8/16-entry typed stores and the worker-owned exact executor | Add authenticated generation ownership and crash-safe commit/rebuild; select measured capacities/probe counts and trace the backend on target hardware |
-| Full-capacity logical sizing | Partial pass | Version-2 reports bind compiled 38/82-byte cells to shared directory/event allocation validation, charge both full table and position-map domains, keep modeled bytes fixed across occupancy/growth, and expose load/admission/hot-address/modeled-memory flags plus explicit negative evidence markers | Calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and runtime working set on target hardware; select an accepted mainnet profile |
+| Full-capacity logical sizing | Partial pass | Version-2 reports bind compiled 38/82-byte cells to shared directory/event allocation validation, charge both full table and position-map domains, keep modeled bytes fixed across occupancy/growth, and expose load/admission/hot-address/modeled-memory flags plus explicit negative evidence markers. Offline `corpus size` consumes a complete validated capture, recomputes every row, and atomically binds measurement/model/result digests | Calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and runtime working set on target hardware; select an accepted mainnet profile |
 | Compiler pin | Pass | Repository pins Rust 1.96.0 | Pin release flags, LLVM behavior, and reproducible Linux build inputs |
 | CPU/target/TDX pin | Partial target-class gate | An Ubuntu 24.04 x86_64 CI lane with immutable action pins executes the real adapter; the hosted image, CPU generation, TDX instance, firmware/TCB, DOIT, and memory remain unset | Select CPU generations, exact target/release flags, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
 | Pinned ORAM dependency | Partial | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock` | Resolve API/failure/recovery concerns and decide upstream, fork, or replacement |
@@ -375,7 +384,7 @@ behavior, target CPU features, or TDX isolation.
 |---|---|---|---|---|
 | Zaino baseline | `c94ae247de7286fd3337e313559bb3d62bdcbd5d` | Authoritative fork base | Root Apache-2.0 license file | Recorded |
 | `zaino-oram` | Local `0.1.0`, `publish = false` | Research model and candidate adapter | Workspace Apache-2.0 | Research only |
-| `zainod-oram` | Local `0.1.0`, `publish = false` | Listener-free one-shot mainnet corpus capture and atomic artifact publication | Workspace Apache-2.0 | Offline research only |
+| `zainod-oram` | Local `0.1.0`, `publish = false` | Listener-free one-shot mainnet corpus capture plus fully offline logical sizing, both with atomic artifact publication | Workspace Apache-2.0 | Offline research only |
 | `zaino-state` | Local/version `0.3.1`, optional, no default features | Indexed-block corpus adapter | Workspace Apache-2.0 | Enabled only by `corpus-zaino` |
 | `bytemuck` | `1.25.1`, derive/min-const-generics | Exact `Pod` record proof | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
 | `bytemuck_derive` | `1.11.0` | Derive transitive | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
@@ -404,9 +413,9 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `rustc --version --verbose` | Rust 1.96.0, LLVM 22.1.2, `aarch64-apple-darwin` | Compiler/host pin confirmed |
 | `rust-analyzer --version` | Rust Analyzer 1.96.0 (`ac68faa2`) | Installed from the pinned toolchain for semantic code intelligence |
 | `cargo nextest --version` | `cargo-nextest 0.9.140` | Repository-native test runner installed for the single workspace |
-| [`ORAM - Native Linux` run 29223983432, job 86734395199](https://github.com/sovright/zaino/actions/runs/29223983432/job/86734395199) environment | Ubuntu 24.04 x86_64, Rust 1.96.0, cargo-nextest 0.9.140; pass in 18m40s for capture code head `592d1206` | Immutable action pins, locked dependency resolution, and exact tool versions establish a repeatable generic native CI gate; the hosted image is not a reproducible release, target-CPU, or TDX build |
+| [`ORAM - Native Linux` run 29224873175, job 86736864252](https://github.com/sovright/zaino/actions/runs/29224873175/job/86736864252) environment | Ubuntu 24.04 x86_64, Rust 1.96.0, cargo-nextest 0.9.140; pass in 20m02s for capture parent head `bd4554bf` | Immutable action pins, locked dependency resolution, and exact tool versions establish a repeatable generic native CI gate; the hosted image is not a reproducible release, target-CPU, or TDX build |
 | `cargo clippy -p zaino-oram --all-features --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` | Pass in capture-head native Linux CI | The complete capture-head all-feature/all-target ORAM graph is warning-free on the supported OS/architecture with the pinned compiler |
-| `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 161 passed, 0 skipped at capture code head `592d1206` | Executes the complete generic Linux x86_64 suite, including the real typed-store projection-owner lifecycle and capture measurement model; this is functional small-table evidence, not a benchmark or hardware qualification |
+| `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 161 passed, 0 skipped at capture parent head `bd4554bf` | Executes the complete generic Linux x86_64 suite, including the real typed-store projection-owner lifecycle and capture measurement model; this is functional small-table evidence, not a benchmark or hardware qualification |
 | [`ORAM - Native Linux` run 29219929129](https://github.com/sovright/zaino/actions/runs/29219929129) | Historical parent evidence: 157 passed, 0 skipped at owner code head `d71a4031` | Records the first complete native projection-owner lifecycle before the capture slice |
 | `rustup target list --installed` | Local pinned 1.96.0: `aarch64-apple-darwin` | Local target inventory only; the native CI evidence is recorded above |
 | `rustup +stable target list --installed` | Includes `x86_64-unknown-linux-gnu`; stable is Rust 1.96.1 | Enables a compile-only supported-path check, not execution evidence |
@@ -415,13 +424,13 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
 | `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Exact record constraints, portable production insertion helper, and unsupported-target path compile; this local command does not execute the real ORAM path |
-| `cargo nextest run -p zaino-oram --no-default-features` | 113 passed | Fixed models, token semantics, complete logical traces, exact records, keyed layout, full-capacity arithmetic, exclusive two-table preflight, and all 16 business-command worker tests pass without optional features |
-| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 151 passed | Adds canonical-cursor hardening, measured/sizing separation, deterministic measurement JSON and semantic rejection, corpus provenance/retry, deterministic projection/coordinator/owner coverage, exact seven-event sink ordering, failure/panic containment, four projection-to-worker adapter tests, and five owner lifecycle/configuration/fail-closed cases |
+| `cargo nextest run -p zaino-oram --no-default-features` | 115 passed | Fixed models, token semantics, complete logical traces, exact records, keyed layout, full-capacity arithmetic, exclusive two-table preflight, and all 16 business-command worker tests pass without optional features |
+| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 154 passed | Adds canonical-cursor hardening, measured/sizing separation, deterministic measurement JSON and semantic rejection, source-bound sizing recomputation, corpus provenance/retry, deterministic projection/coordinator/owner coverage, exact seven-event sink ordering, failure/panic containment, four projection-to-worker adapter tests, and five owner lifecycle/configuration/fail-closed cases |
 | `cargo nextest run -p zaino-oram --features rostl-experimental --status-level fail` | 119 passed | Adds directory/page `Pod`/`Cmov` semantics, power-of-two capacity rejection, equal healthy miss/duplicate two-access schedules against the production helper, found-parity/occupancy rejection, and exact typed unsupported-host construction rejection |
-| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 158 passed locally on macOS aarch64 | Combined keyed layout, two-table command, full-capacity sizing, trace, exact record, token, corpus/provenance, offline projection/coordinator/owner, static ordinary-source shadow parity, business-command worker suite, and portable typed-`rostl` suite. Five owner cases cover six-dimension pre-allocation rejection, happy lifecycle, mutate-then-fail terminal behavior, unsupported backend, and coarse diagnostics |
+| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 161 passed locally on macOS aarch64 | Combined keyed layout, two-table command, structurally validated and source-bound sizing model/result serialization, trace, exact record, token, corpus/provenance, offline projection/coordinator/owner, static ordinary-source shadow parity, business-command worker suite, and portable typed-`rostl` suite. Five owner cases cover six-dimension pre-allocation rejection, happy lifecycle, mutate-then-fail terminal behavior, unsupported backend, and coarse diagnostics |
 | `cargo nextest run -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint --status-level fail` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
 | `cargo nextest run -p zaino-proto --test compact_tx_streamer_legacy_golden --status-level fail` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
-| `cargo nextest run -p zainod-oram --status-level fail` | 13 passed | Nested capture CLI, paired checkpoint and snapshot selection, canonical digest/provenance, exact three-file publication, atomic concurrent-output refusal, typed tamper rejection, read-back validation, and staging cleanup |
+| `cargo nextest run -p zainod-oram --status-level fail` | 24 passed | Nested capture/size CLI, synchronous offline sizing execution, paired checkpoint and snapshot selection, required model inputs, golden canonical model/qualification digests, dirfd-bound regular-file and byte-limit enforcement, exact three-file publication, atomic concurrent-output refusal, ambiguous-rename inode resolution, source lineage and typed tamper rejection, read-back validation, post-commit parent synchronization, and synchronized staging cleanup |
 | `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Pass with local Rust 1.96.1 | Compile-only precursor for the exact directory/event stores, fixed two-access insertion path, and private offline worker constructor; the exact pinned native CI run above supersedes its execution limitation |
 | `cargo +stable check -p zaino-oram --all-targets --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu` | Environment-blocked before local Linux test checking | The macOS host lacks `x86_64-linux-gnu-gcc`/`g++`, required by transitive native dev dependencies including `aws-lc-sys`, `lmdb-sys`, and `libzcash_script`; the pinned native CI run now covers this host limitation |
 | `cargo +stable clippy -p zaino-oram --lib --all-features --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Environment-blocked in local transitive native builds | Combined Linux `corpus-zaino` plus `rostl-experimental` checking requires the missing cross C/C++ toolchain for `aws-lc-sys`, `ring`, `lz4-sys`, `lmdb-sys`, and `libzcash_script`; pinned native CI now passes the stricter all-target equivalent |
@@ -447,8 +456,10 @@ capture-head native run are
 `exact_typed_executor_runs_behind_the_business_worker`, and
 `synthetic_caught_panic_latches_and_blocks_later_access`, and
 `linux_rostl_owner_builds_finishes_and_shuts_down`. The two unsupported-host
-constructor rejections that run on macOS are excluded on Linux, so the native
-total is three higher than the 158-test macOS all-feature total.
+constructor rejections that run on macOS are excluded on Linux, so that
+capture-head native total was three higher than the 158-test macOS total at
+the same capture head. The current sizing branch adds cross-platform tests and
+is reported separately in the table above.
 
 Two broader `zaino-state` gates remain baseline-blocked outside this slice.
 Warning-denied Clippy with `clippy::unwrap_used` reports four existing
@@ -499,8 +510,9 @@ It is not yet a mainnet measurement:
 
 Therefore `fits_modeled_memory` and `fits_modeled_constraints` are model results
 only. Neither may be used as the 30%-RSS go/no-go result. Those projections are
-not part of the captured measurement artifact; the next offline sizing command
-must recompute them from explicit assumptions.
+not part of the captured measurement artifact; the offline `corpus size`
+command recomputes them from explicit assumptions into a separate artifact.
+No full-mainnet sizing artifact has been produced yet.
 
 ## RSS, benchmark, stash, and queue blockers
 

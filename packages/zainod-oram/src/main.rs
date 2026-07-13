@@ -7,7 +7,7 @@ use std::{error::Error, fmt, num::NonZeroU32, path::PathBuf, process::ExitCode};
 
 use clap::{Args, Parser, Subcommand};
 use zaino_common::Network;
-use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner};
+use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_state::{
     chain_index::NonFinalizedSnapshot, ChainIndex, ChainIndexSnapshot, Height,
     NodeBackedIndexerService, NodeBackedIndexerServiceConfig, ZcashService,
@@ -18,7 +18,8 @@ use zainodlib::{
 };
 
 use crate::corpus_artifact::{
-    publish_capture, BackendKind, CaptureProvenance, SelectionMode, SnapshotMode,
+    load_capture, publish_capture, publish_sizing, BackendKind, CaptureProvenance, SelectionMode,
+    SnapshotMode,
 };
 
 mod corpus_artifact;
@@ -52,6 +53,8 @@ struct CorpusCommand {
 enum CorpusSubcommand {
     /// Capture one fixed canonical mainnet snapshot into an atomic artifact directory.
     Capture(CorpusCaptureArgs),
+    /// Apply explicit sizing assumptions to a validated capture without node access.
+    Size(CorpusSizeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -77,6 +80,79 @@ struct CorpusCaptureArgs {
     target_hash: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct CorpusSizeArgs {
+    /// Complete three-file corpus capture directory to validate and consume.
+    #[arg(long, value_name = "DIR")]
+    input_dir: PathBuf,
+
+    /// New directory that will receive the complete verified sizing artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+
+    /// Number of annual proportional-growth steps to model.
+    #[arg(long)]
+    growth_horizon_years: u16,
+
+    /// Annual proportional address-count growth in basis points.
+    #[arg(long)]
+    annual_growth_bps: u64,
+
+    /// Allocated directory-table slots; must be a supported power of two.
+    #[arg(long)]
+    directory_capacity: u64,
+
+    /// Maximum admitted directory records, strictly below capacity.
+    #[arg(long)]
+    directory_admission_limit: u64,
+
+    /// Allocated event-table slots; must be a supported power of two.
+    #[arg(long)]
+    event_capacity: u64,
+
+    /// Maximum admitted event records, strictly below capacity.
+    #[arg(long)]
+    event_admission_limit: u64,
+
+    /// Maximum admitted event history for any one standard address.
+    #[arg(long)]
+    max_events_per_address: u64,
+
+    /// Modeled bytes for each complete position-map domain entry.
+    #[arg(long)]
+    position_map_entry_bytes: u64,
+
+    /// Operator-supplied backend memory expansion in basis points; at least 10000.
+    #[arg(long)]
+    backend_expansion_bps: u64,
+
+    /// Operator-supplied TDX memory envelope in bytes; not a measured value.
+    #[arg(long)]
+    tdx_memory_bytes: u64,
+
+    /// Reserved memory headroom in basis points; must be below 10000.
+    #[arg(long)]
+    required_headroom_bps: u64,
+}
+
+impl CorpusSizeArgs {
+    fn model(&self) -> Result<MainnetSizingModel, zaino_oram::MainnetCorpusError> {
+        MainnetSizingModel::new(
+            self.growth_horizon_years,
+            self.annual_growth_bps,
+            self.directory_capacity,
+            self.directory_admission_limit,
+            self.event_capacity,
+            self.event_admission_limit,
+            self.max_events_per_address,
+            self.position_map_entry_bytes,
+            self.backend_expansion_bps,
+            self.tdx_memory_bytes,
+            self.required_headroom_bps,
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
@@ -92,8 +168,23 @@ async fn run(cli: Cli) -> RunnerResult<()> {
     match cli.command {
         Command::Corpus(command) => match command.command {
             CorpusSubcommand::Capture(args) => run_corpus_capture(args).await,
+            CorpusSubcommand::Size(args) => run_corpus_size(args),
         },
     }
+}
+
+fn run_corpus_size(args: CorpusSizeArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.input_dir)?;
+    let model = args.model()?;
+    let qualification = capture.measurement().apply_model(&model)?;
+    publish_sizing(
+        &args.output_dir,
+        &capture,
+        &qualification,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!("sizing_artifact={}", args.output_dir.display());
+    Ok(())
 }
 
 async fn run_corpus_capture(args: CorpusCaptureArgs) -> RunnerResult<()> {
@@ -312,6 +403,9 @@ impl Error for RunnerError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::BTreeSet, ffi::OsString, fs};
+
+    use crate::corpus_artifact::typed_test_measurement;
 
     fn valid_args() -> [&'static str; 7] {
         [
@@ -325,16 +419,162 @@ mod tests {
         ]
     }
 
+    fn valid_sizing_args() -> Vec<&'static str> {
+        vec![
+            "zainod-oram",
+            "corpus",
+            "size",
+            "--input-dir",
+            "/tmp/oram-capture",
+            "--output-dir",
+            "/tmp/oram-sizing",
+            "--growth-horizon-years",
+            "2",
+            "--annual-growth-bps",
+            "1000",
+            "--directory-capacity",
+            "8",
+            "--directory-admission-limit",
+            "6",
+            "--event-capacity",
+            "16",
+            "--event-admission-limit",
+            "12",
+            "--max-events-per-address",
+            "8",
+            "--position-map-entry-bytes",
+            "4",
+            "--backend-expansion-bps",
+            "20000",
+            "--tdx-memory-bytes",
+            "1000000",
+            "--required-headroom-bps",
+            "3000",
+        ]
+    }
+
     #[test]
     fn corpus_capture_cli_has_no_sizing_parameters() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(valid_args())?;
         let Command::Corpus(command) = cli.command;
-        let CorpusSubcommand::Capture(args) = command.command;
+        let args = match command.command {
+            CorpusSubcommand::Capture(args) => args,
+            CorpusSubcommand::Size(_) => panic!("capture arguments parsed as sizing arguments"),
+        };
 
         assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-capture"));
         assert_eq!(args.progress_interval.get(), 10_000);
         assert_eq!(args.target_height, None);
         assert_eq!(args.target_hash, None);
+        Ok(())
+    }
+
+    #[test]
+    fn corpus_size_cli_is_offline_and_requires_every_explicit_model_input(
+    ) -> Result<(), Box<dyn Error>> {
+        let cli = Cli::try_parse_from(valid_sizing_args())?;
+        let Command::Corpus(command) = cli.command;
+        let args = match command.command {
+            CorpusSubcommand::Size(args) => args,
+            CorpusSubcommand::Capture(_) => {
+                panic!("sizing arguments parsed as capture arguments")
+            }
+        };
+
+        assert_eq!(args.input_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-sizing"));
+        assert_eq!(args.growth_horizon_years, 2);
+        assert_eq!(args.annual_growth_bps, 1_000);
+        assert_eq!(args.directory_capacity, 8);
+        assert_eq!(args.directory_admission_limit, 6);
+        assert_eq!(args.event_capacity, 16);
+        assert_eq!(args.event_admission_limit, 12);
+        assert_eq!(args.max_events_per_address, 8);
+        assert_eq!(args.position_map_entry_bytes, 4);
+        assert_eq!(args.backend_expansion_bps, 20_000);
+        assert_eq!(args.tdx_memory_bytes, 1_000_000);
+        assert_eq!(args.required_headroom_bps, 3_000);
+        args.model()?.validate()?;
+
+        for required in [
+            "--growth-horizon-years",
+            "--annual-growth-bps",
+            "--directory-capacity",
+            "--directory-admission-limit",
+            "--event-capacity",
+            "--event-admission-limit",
+            "--max-events-per-address",
+            "--position-map-entry-bytes",
+            "--backend-expansion-bps",
+            "--tdx-memory-bytes",
+            "--required-headroom-bps",
+        ] {
+            let mut missing_model_input = valid_sizing_args();
+            let Some(index) = missing_model_input
+                .iter()
+                .position(|value| *value == required)
+            else {
+                panic!("valid sizing fixture must contain {required}");
+            };
+            missing_model_input.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(missing_model_input).is_err());
+        }
+
+        let mut node_option = valid_sizing_args();
+        node_option.extend(["--config", "/tmp/zainod.toml"]);
+        assert!(Cli::try_parse_from(node_option).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corpus_size_dispatch_executes_end_to_end_without_node_or_config_state(
+    ) -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let input_dir = parent.path().join("capture");
+        let output_dir = parent.path().join("sizing");
+        let measurement = typed_test_measurement()?;
+        let provenance = CaptureProvenance::new(
+            BackendKind::Rpc,
+            SnapshotMode::NonFinalizedState,
+            0,
+            SelectionMode::ServiceableTip,
+            "test-runner",
+            &measurement,
+        )?;
+        publish_capture(&input_dir, &measurement, &provenance)?;
+
+        run(Cli {
+            command: Command::Corpus(CorpusCommand {
+                command: CorpusSubcommand::Size(CorpusSizeArgs {
+                    input_dir,
+                    output_dir: output_dir.clone(),
+                    growth_horizon_years: 2,
+                    annual_growth_bps: 1_000,
+                    directory_capacity: 8,
+                    directory_admission_limit: 6,
+                    event_capacity: 16,
+                    event_admission_limit: 12,
+                    max_events_per_address: 8,
+                    position_map_entry_bytes: 4,
+                    backend_expansion_bps: 20_000,
+                    tdx_memory_bytes: 1_000_000,
+                    required_headroom_bps: 3_000,
+                }),
+            }),
+        })
+        .await?;
+
+        let names = fs::read_dir(output_dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                OsString::from("provenance.json"),
+                OsString::from("qualification.json"),
+                OsString::from("qualification.txt"),
+            ])
+        );
         Ok(())
     }
 

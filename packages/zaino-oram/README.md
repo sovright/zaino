@@ -50,10 +50,13 @@ It does **not** contain production encryption, durable ORAM persistence, TDX
 attestation, protobufs, or a network listener, and it makes no production
 privacy claim. The listener-free `zainod-oram corpus capture` runner can feed
 canonical mainnet blocks into the core and atomically publish a revalidated
-measurement artifact without sizing assumptions, but no full-mainnet artifact
-exists yet. Static fixture parity is not live-backend, finalised-database,
-reorg, or mainnet shadow evidence. Upstream `rostl` panic/recovery, persistence,
-side-channel, and licensing gates remain unresolved.
+measurement artifact without sizing assumptions. The fully offline
+`zainod-oram corpus size` command revalidates that complete artifact and applies
+one explicit model into a separate digest-bound atomic qualification. No
+full-mainnet capture or sizing artifact exists yet. Static fixture parity is
+not live-backend, finalised-database, reorg, or mainnet shadow evidence.
+Upstream `rostl` panic/recovery, persistence, side-channel, and licensing gates
+remain unresolved.
 The event coordinator is a portable sink/checkpoint ordering model. A private
 offline owner composes it with the business-command worker and, on supported
 hosts, the typed `rostl` stores, but no runtime or service calls that owner. The
