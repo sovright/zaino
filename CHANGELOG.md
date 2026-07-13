@@ -36,9 +36,10 @@ and this library adheres to Rust's notion of
   named persistence conversions, and `Pod`/`Cmov` proofs. Linux-only table
   allocation and an offline worker constructor now bind separate exact typed
   `rostl` stores; projection/service ownership remains separate work.
-- CI: a path-scoped, pinned Ubuntu 24.04 x86_64 lane runs locked strict Clippy
-  and the complete all-feature `zaino-oram` suite against the native volatile
-  `rostl` backend. This is generic functional validation, not target-capacity,
+- CI: a path-scoped Ubuntu 24.04 x86_64 lane with immutable action pins runs
+  locked strict Clippy and the complete all-feature `zaino-oram` suite with the
+  pinned Rust/nextest tools against the native volatile `rostl` backend. This
+  is generic functional validation, not target-capacity,
   physical-obliviousness, persistence, performance, or TDX evidence.
 - `zaino-oram`: a pure two-table layout model now derives canonical
   network/schema-separated address keys, generates distinct keyed fixed probes,

@@ -27,8 +27,9 @@ two non-aliased ORAM/map pairs and places them behind the same worker; no
 projection/service owner calls it yet. Its healthy
 miss/duplicate insertion path always performs read/remap followed by
 write-or-insert/remap, selecting the prior bytes on duplicate. This path has
-generic native Ubuntu 24.04 x86_64 capacity-8 execution evidence in a dedicated
-pinned CI lane, in addition to the current macOS host's portable and
+generic native Ubuntu 24.04 x86_64 execution evidence at small 8/16-entry table
+capacities in a dedicated CI lane with immutable action pins and pinned
+Rust/nextest tools, in addition to the current macOS host's portable and
 cross-compile checks. It is not connected to the projection and does not claim
 target-capacity behavior, physical obliviousness, TDX qualification, or crash
 atomicity. A later portable slice adds
