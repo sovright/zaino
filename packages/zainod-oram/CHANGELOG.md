@@ -34,3 +34,10 @@
   latency/RSS/stash/queue-load or physical-trace measurement,
   persistence/recovery or hardware qualification, node-year failure bound, or
   mainnet gate.
+- Add `qualification stress --profile full-map-saturation-v1 --output-dir
+  <NEW_DIR>` as a separate deterministic admitted-map boundary qualification.
+  It publishes its own schema and three-file artifact after independent
+  directory-boundary and event-boundary workers reach their exact logical
+  admission limits and fail closed on the next append. It is not physical
+  capacity, random target-load, performance, persistence/recovery, target
+  CPU/TDX, or mainnet-gate evidence.

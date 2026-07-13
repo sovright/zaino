@@ -77,6 +77,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   source/lockfile/toolchain/binary-bound or execution-attested. A portable
   in-memory execution of both exact worker scenarios pins the fixed layout seed
   to a probe-set-viable choice before native CI.
+- A distinct deterministic `FullMapSaturationV1` typed-worker qualification
+  that uses independent workers to reach the directory-admission and
+  event-admission bounds exactly, verifies the complete admitted histories and
+  replay behavior, and requires the next boundary-crossing append to fail
+  closed and latch terminal state. Its separate aggregate report records the
+  remaining physical-capacity reserve and explicitly does not claim physical
+  exhaustion, random or adversarial target-load behavior, benchmark results,
+  persistence/recovery, target CPU/TDX qualification, or mainnet readiness.
 - A private generic finalized-event/checkpoint coordinator that fully stages
   canonical validation, transparent event extraction, spend-owner resolution,
   capacity checks, and an ordered standard-event batch before its first sink

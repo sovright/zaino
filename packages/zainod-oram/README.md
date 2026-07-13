@@ -95,6 +95,45 @@ source/lockfile/toolchain/binary-bound or execution-attested and supplies no
 node-year failure bound or mainnet-gate result. Unsupported hosts fail before
 creating the output directory.
 
+## Typed-worker admitted-map saturation qualification
+
+The `typed-qualification` feature also exposes a separate deterministic
+admitted-map boundary profile:
+
+```console
+cargo run -p zainod-oram --features typed-qualification -- \
+  qualification stress --profile full-map-saturation-v1 \
+  --output-dir <NEW_DIR>
+```
+
+`FullMapSaturationV1` uses two independent workers so one terminal fault cannot
+mask the other case. The directory-boundary case admits six addresses with one
+event each into the fixed 8-slot/6-admitted directory and 16-slot/12-admitted
+event tables, verifies histories, replay behavior, absent reads, and
+cross-address rejection, then requires a seventh-address append to return
+`FailedClosed` and latch terminal state. The event-boundary case admits three
+events for each of four addresses, verifies the same invariants at 12 admitted
+events while directory admission remains below its bound, then requires a
+thirteenth unique event on an existing address to fail closed and latch.
+
+Publication uses the same bounded, no-follow, synchronized sibling-staging and
+atomic no-replace path, but writes a distinct `full-map-saturation.json`,
+`full-map-saturation.txt`, and `provenance.json` bundle. The report schema is
+`zaino-oram-full-map-saturation-v1`; provenance uses
+`zaino-oram-full-map-saturation-provenance-v1` and binds the compact typed
+wrapper digest. The aggregate report records exact logical occupancy, admission
+bounds, physical-capacity reserve, deterministic schedule and final-state digests,
+one-hot terminal-boundary conditions, and identifier-free worker snapshots.
+
+This profile proves deterministic correctness at both logical admitted-map
+boundaries. It deliberately leaves physical capacity unreached and is not a
+random or adversarial target-load experiment, benchmark, latency/RSS/stash or
+queue-load measurement, billion-operation soak, persistence/recovery test,
+physical-trace experiment, target CPU/TDX or attestation result, mainnet sizing
+result, or mainnet gate.
+The bundle is unsigned and self-reported; it binds no source revision, lockfile,
+toolchain, release binary, or execution attestation.
+
 ## Corpus capture
 
 `corpus capture` produces an identifier-free measurement of the transparent

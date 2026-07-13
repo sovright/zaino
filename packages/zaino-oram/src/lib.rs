@@ -23,6 +23,8 @@ mod continuation_token;
 mod corpus;
 mod engine;
 mod envelope;
+#[cfg(feature = "corpus-zaino")]
+mod full_map_saturation;
 mod inner_codec;
 mod layout;
 mod profile;
@@ -43,6 +45,11 @@ mod zaino_corpus;
 #[cfg(all(test, feature = "corpus-zaino"))]
 mod zaino_fixtures;
 
+#[cfg(feature = "corpus-zaino")]
+pub use full_map_saturation::{
+    run_typed_worker_full_map_saturation, TypedWorkerFullMapSaturationError,
+    TypedWorkerFullMapSaturationProfile, TypedWorkerFullMapSaturationReport,
+};
 #[cfg(feature = "corpus-zaino")]
 pub use qualification::{
     run_typed_worker_qualification, TypedWorkerQualificationError, TypedWorkerQualificationReport,

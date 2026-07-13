@@ -679,12 +679,12 @@ fn modeled_address_parts(address: u8) -> (StandardScriptKind, UtxoScriptClass, [
     }
 }
 
-fn modeled_address(address: u8) -> StandardAddress {
+pub(super) fn modeled_address(address: u8) -> StandardAddress {
     let (kind, _, hash) = modeled_address_parts(address);
     StandardAddress::new(kind, hash)
 }
 
-fn absent_address(absent: u8) -> StandardAddress {
+pub(super) fn absent_address(absent: u8) -> StandardAddress {
     let digest = derive_digest(b"absent-address", u64::from(absent));
     let mut hash = [0; 20];
     hash.copy_from_slice(&digest[..20]);
@@ -700,7 +700,7 @@ fn event_counter(address: u8, ordinal: u8) -> u64 {
     u64::from(ordinal) * MODELED_ADDRESSES_U64 + u64::from(address)
 }
 
-fn modeled_event(address: u8, ordinal: u8) -> UtxoEvent {
+pub(super) fn modeled_event(address: u8, ordinal: u8) -> UtxoEvent {
     let counter = event_counter(address, ordinal);
     let txid = derive_digest(b"modeled-event", counter);
     let (_, script_class, script_hash) = modeled_address_parts(address);
@@ -756,7 +756,7 @@ fn final_state_digest(state: &ReferenceState) -> String {
     digest_hex(Digest::finalize(hasher).as_slice())
 }
 
-fn digest_hex(bytes: &[u8]) -> String {
+pub(super) fn digest_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

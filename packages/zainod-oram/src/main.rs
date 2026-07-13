@@ -11,7 +11,9 @@ use clap::{Args, Parser, Subcommand};
 use zaino_common::Network;
 #[cfg(feature = "typed-qualification")]
 use zaino_oram::{
-    run_typed_worker_qualification, run_typed_worker_stress_qualification, TypedWorkerStressProfile,
+    run_typed_worker_full_map_saturation, run_typed_worker_qualification,
+    run_typed_worker_stress_qualification, TypedWorkerFullMapSaturationProfile,
+    TypedWorkerStressProfile,
 };
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_state::{
@@ -28,11 +30,15 @@ use crate::corpus_artifact::{
     SelectionMode, SnapshotMode, ValidatedSizing,
 };
 #[cfg(feature = "typed-qualification")]
+use crate::full_map_saturation_artifact::publish_full_map_saturation;
+#[cfg(feature = "typed-qualification")]
 use crate::qualification_artifact::publish_qualification;
 #[cfg(feature = "typed-qualification")]
 use crate::stress_qualification_artifact::publish_stress_qualification;
 
 mod corpus_artifact;
+#[cfg(feature = "typed-qualification")]
+mod full_map_saturation_artifact;
 #[cfg(feature = "typed-qualification")]
 mod qualification_artifact;
 #[cfg(feature = "typed-qualification")]
@@ -102,15 +108,9 @@ enum StressQualificationProfileArg {
     /// Fixed smoke-level stress qualification profile.
     #[value(name = "smoke-v1")]
     SmokeV1,
-}
-
-#[cfg(feature = "typed-qualification")]
-impl StressQualificationProfileArg {
-    fn core_profile(self) -> TypedWorkerStressProfile {
-        match self {
-            Self::SmokeV1 => TypedWorkerStressProfile::SmokeV1,
-        }
-    }
+    /// Fixed full admitted-map correctness-saturation profile.
+    #[value(name = "full-map-saturation-v1")]
+    FullMapSaturationV1,
 }
 
 #[derive(Debug, Args)]
@@ -272,12 +272,32 @@ fn run_qualification(args: QualificationRunArgs) -> RunnerResult<()> {
 
 #[cfg(feature = "typed-qualification")]
 fn run_stress_qualification(args: QualificationStressArgs) -> RunnerResult<()> {
-    let qualification = run_typed_worker_stress_qualification(args.profile.core_profile())?;
-    publish_stress_qualification(&args.output_dir, &qualification, env!("CARGO_PKG_VERSION"))?;
-    println!(
-        "stress_qualification_artifact={}",
-        args.output_dir.display()
-    );
+    match args.profile {
+        StressQualificationProfileArg::SmokeV1 => {
+            let qualification =
+                run_typed_worker_stress_qualification(TypedWorkerStressProfile::SmokeV1)?;
+            publish_stress_qualification(
+                &args.output_dir,
+                &qualification,
+                env!("CARGO_PKG_VERSION"),
+            )?;
+            println!(
+                "stress_qualification_artifact={}",
+                args.output_dir.display()
+            );
+        }
+        StressQualificationProfileArg::FullMapSaturationV1 => {
+            let full_map_saturation = run_typed_worker_full_map_saturation(
+                TypedWorkerFullMapSaturationProfile::FullMapSaturationV1,
+            )?;
+            publish_full_map_saturation(
+                &args.output_dir,
+                &full_map_saturation,
+                env!("CARGO_PKG_VERSION"),
+            )?;
+            println!("full_map_saturation_artifact={}", args.output_dir.display());
+        }
+    }
     Ok(())
 }
 
@@ -617,15 +637,18 @@ mod tests {
     }
 
     #[cfg(feature = "typed-qualification")]
-    fn valid_stress_qualification_args() -> [&'static str; 7] {
+    fn valid_stress_qualification_args(
+        profile: &'static str,
+        output_dir: &'static str,
+    ) -> [&'static str; 7] {
         [
             "zainod-oram",
             "qualification",
             "stress",
             "--profile",
-            "smoke-v1",
+            profile,
             "--output-dir",
-            "/tmp/oram-stress-qualification",
+            output_dir,
         ]
     }
 
@@ -634,6 +657,19 @@ mod tests {
             Command::Corpus(command) => command,
             #[cfg(feature = "typed-qualification")]
             Command::Qualification(_) => panic!("qualification arguments parsed as corpus"),
+        }
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    fn parsed_stress_qualification(cli: Cli) -> QualificationStressArgs {
+        match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::Stress(args) => args,
+                QualificationSubcommand::Run(_) => {
+                    panic!("fixed qualification arguments parsed as stress")
+                }
+            },
+            Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
         }
     }
 
@@ -664,45 +700,52 @@ mod tests {
     #[test]
     fn stress_qualification_cli_exposes_only_a_named_profile_and_output() -> Result<(), clap::Error>
     {
-        let cli = Cli::try_parse_from(valid_stress_qualification_args())?;
-        let args = match cli.command {
-            Command::Qualification(command) => match command.command {
-                QualificationSubcommand::Stress(args) => args,
-                QualificationSubcommand::Run(_) => {
-                    panic!("fixed qualification arguments parsed as stress")
-                }
-            },
-            Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
-        };
-        assert_eq!(args.profile, StressQualificationProfileArg::SmokeV1);
-        assert!(matches!(
-            args.profile.core_profile(),
-            TypedWorkerStressProfile::SmokeV1
-        ));
+        let smoke = parsed_stress_qualification(Cli::try_parse_from(
+            valid_stress_qualification_args("smoke-v1", "/tmp/oram-stress-qualification"),
+        )?);
+        assert_eq!(smoke.profile, StressQualificationProfileArg::SmokeV1);
         assert_eq!(
-            args.output_dir,
+            smoke.output_dir,
             PathBuf::from("/tmp/oram-stress-qualification")
         );
 
-        for (rejected, value) in [
-            ("--operations", "10"),
-            ("--command-count", "10"),
-            ("--iterations", "10"),
-            ("--concurrency", "2"),
-            ("--seed", "1"),
-            ("--directory-capacity", "8"),
-            ("--directory-admission-limit", "6"),
-            ("--event-capacity", "16"),
-            ("--event-admission-limit", "12"),
-            ("--max-events-per-address", "8"),
-            ("--queue-capacity", "1"),
-            ("--target-height", "1"),
-            ("--target-hash", "11"),
-            ("--config", "/tmp/zainod.toml"),
-        ] {
-            let mut command = valid_stress_qualification_args().to_vec();
-            command.extend([rejected, value]);
-            assert!(Cli::try_parse_from(command).is_err());
+        let full_map =
+            parsed_stress_qualification(Cli::try_parse_from(valid_stress_qualification_args(
+                "full-map-saturation-v1",
+                "/tmp/oram-full-map-saturation",
+            ))?);
+        assert_eq!(
+            full_map.profile,
+            StressQualificationProfileArg::FullMapSaturationV1
+        );
+        assert_eq!(
+            full_map.output_dir,
+            PathBuf::from("/tmp/oram-full-map-saturation")
+        );
+
+        for profile in ["smoke-v1", "full-map-saturation-v1"] {
+            for (rejected, value) in [
+                ("--operations", "10"),
+                ("--command-count", "10"),
+                ("--iterations", "10"),
+                ("--concurrency", "2"),
+                ("--seed", "1"),
+                ("--directory-capacity", "8"),
+                ("--directory-admission-limit", "6"),
+                ("--event-capacity", "16"),
+                ("--event-admission-limit", "12"),
+                ("--max-events-per-address", "8"),
+                ("--queue-capacity", "1"),
+                ("--target-height", "1"),
+                ("--target-hash", "11"),
+                ("--config", "/tmp/zainod.toml"),
+            ] {
+                let mut command =
+                    valid_stress_qualification_args(profile, "/tmp/oram-stress-qualification")
+                        .to_vec();
+                command.extend([rejected, value]);
+                assert!(Cli::try_parse_from(command).is_err());
+            }
         }
 
         let missing_profile = [
@@ -714,7 +757,8 @@ mod tests {
         ];
         assert!(Cli::try_parse_from(missing_profile).is_err());
 
-        let mut unknown_profile = valid_stress_qualification_args();
+        let mut unknown_profile =
+            valid_stress_qualification_args("smoke-v1", "/tmp/oram-stress-qualification");
         unknown_profile[4] = "custom";
         assert!(Cli::try_parse_from(unknown_profile).is_err());
         Ok(())
@@ -782,23 +826,67 @@ mod tests {
         not(all(target_os = "linux", target_arch = "x86_64"))
     ))]
     #[tokio::test]
-    async fn stress_qualification_dispatch_fails_without_publishing_on_unsupported_hosts(
+    async fn stress_profile_dispatch_fails_without_publishing_on_unsupported_hosts(
     ) -> RunnerResult<()> {
         let parent = tempfile::tempdir()?;
-        let output_dir = parent.path().join("stress-qualification");
+        for (profile, output_name) in [
+            (
+                StressQualificationProfileArg::SmokeV1,
+                "stress-qualification",
+            ),
+            (
+                StressQualificationProfileArg::FullMapSaturationV1,
+                "full-map-saturation",
+            ),
+        ] {
+            let output_dir = parent.path().join(output_name);
+            let result = run(Cli {
+                command: Command::Qualification(QualificationCommand {
+                    command: QualificationSubcommand::Stress(QualificationStressArgs {
+                        profile,
+                        output_dir: output_dir.clone(),
+                    }),
+                }),
+            })
+            .await;
 
-        let result = run(Cli {
+            assert!(result.is_err());
+            assert!(!output_dir.exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[tokio::test]
+    async fn full_map_saturation_dispatch_publishes_exactly_three_files() -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let output_dir = parent.path().join("full-map-saturation");
+
+        run(Cli {
             command: Command::Qualification(QualificationCommand {
                 command: QualificationSubcommand::Stress(QualificationStressArgs {
-                    profile: StressQualificationProfileArg::SmokeV1,
+                    profile: StressQualificationProfileArg::FullMapSaturationV1,
                     output_dir: output_dir.clone(),
                 }),
             }),
         })
-        .await;
+        .await?;
 
-        assert!(result.is_err());
-        assert!(!output_dir.exists());
+        let names = fs::read_dir(output_dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                OsString::from("full-map-saturation.json"),
+                OsString::from("full-map-saturation.txt"),
+                OsString::from("provenance.json"),
+            ])
+        );
         Ok(())
     }
 

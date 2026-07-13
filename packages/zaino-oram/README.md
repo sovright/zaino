@@ -27,6 +27,14 @@ offline dependency experiment:
   scenarios and rejects fixed-seed probe-set exhaustion before native CI. It is
   CI-smoke correctness evidence, not target-load, benchmark, billion-operation,
   physical-trace, recovery, TDX, or mainnet evidence;
+- a separate deterministic `FullMapSaturationV1` qualification. Independent
+  workers fill the directory-admission and event-admission bounds exactly while
+  the other table retains reserve, verify the complete admitted state, then
+  require one boundary-crossing append to fail closed and latch terminal state.
+  Its distinct aggregate report is evidence about logical admitted-map
+  boundary correctness only—not physical table exhaustion, random or
+  adversarial target-load behavior, performance, recovery, TDX, or mainnet
+  readiness;
 - compiled privacy-profile validation;
 - a crate-internal versioned request/response codec that seals one
   complete-budget-derived profile ID, fixed checkpoint, prepared query,

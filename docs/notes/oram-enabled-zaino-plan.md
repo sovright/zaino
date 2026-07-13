@@ -99,6 +99,16 @@ sizing bundles, then recomputes the sizing qualification against its captured
 measurement. It creates no artifact, accepts no runtime or workload knobs,
 instantiates no ORAM backend, store, or worker, and makes no load, performance,
 hardware, or mainnet claim.
+The adjacent `FullMapSaturationV1` slice is a separate deterministic
+qualification, not an extension of `SmokeV1`. Two independent workers reach
+the exact directory-admission and event-admission boundaries while retaining
+physical table reserve, verify all admitted histories and replay behavior, and
+then require the next boundary-crossing append to fail closed and latch. Its
+separate aggregate artifact closes only the logical admitted-map boundary
+correctness gap; random or adversarial target-load experiments, actual physical
+capacity exhaustion, performance and memory measurements, persistence and
+recovery, physical traces, target CPU/TDX, signed provenance, full-mainnet
+sizing, and the mainnet gate remain open.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
