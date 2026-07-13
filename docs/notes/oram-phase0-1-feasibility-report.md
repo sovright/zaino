@@ -60,7 +60,17 @@ The evaluated worktree implements:
   fault;
 - compile-time `bytemuck::Pod` and `rostl_primitives::traits::Cmov` checks when
   `rostl-experimental` is enabled;
-- fixed Rust envelope and result-page shapes plus a test-only compiled profile;
+- fixed Rust envelope and result-page shapes plus a test-only compiled profile
+  with a canonical 16-byte identifier derived from every authoritative budget
+  dimension;
+- a crate-internal versioned inner request/response codec that binds the
+  compiled profile, direction, fixed public-chain/projection checkpoint,
+  prepared query, optional fixed continuation field, session binding,
+  protected outcome, `has_more`, and canonical fixed result slots. It uses
+  checked layout arithmetic, rejects the former impossible 128-byte/two-slot
+  codec shape, binds version/profile/session/direction as protection context,
+  rejects one single-bit mutation at every nonce/body/tag byte offset with a
+  non-cryptographic fixture, and pins exact 512-byte test-envelope digests;
 - an allocation-free logical trace recorder bound to the only supported
   read-only unary profile shape: configured sequential reads, zero modeled
   writes/allocations/source calls, one request/response application envelope,
@@ -160,7 +170,15 @@ The following statements are **not** established by that evidence:
 - the logical trace tests do not measure or prove equal instructions, branches,
   allocator activity, memory/page accesses, timing, transport frames, or
   packets;
-- the continuation protector used by tests is not a selected production AEAD;
+- the continuation and inner-envelope protectors used by tests are not selected
+  production AEADs. The inner-envelope protector is a non-cryptographic
+  deterministic integrity fixture, and nonce generation has no production
+  owner;
+- inner-codec tests prove exact/canonical bytes and protection-interface
+  plumbing, not cryptographic authentication or fixed-work decode, token,
+  replay-guard, engine, or encode schedules. The codec transports every
+  present 128-byte token opaquely; semantic validation before replay/engine use
+  remains runtime-adapter work;
 - no private protobuf, gRPC adapter, NFS merge, attestation provider, TLS
   identity, readiness path, or private-service lifecycle exists;
   `zainod-oram` currently contains only listener-free corpus capture and fully
@@ -274,9 +292,9 @@ open the server gate.
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
 | Business and persistent records | Partial pass | Fixed UTXO and 72-byte event types exist with named conversions and adjacent tests; finalized create/spend states are enforced, and an in-memory offline checkpoint/projection model exists; persistent page/directory/checkpoint representations remain incomplete |
-| Fixed envelope codec | Partial | Exact Rust byte-array length is tested; there is no encrypted inner codec or protobuf framing |
-| Compiled profile table | Partial pass | Test profile binds reads, zero logical writes/allocations/source calls, one request/response application frame, fixed bytes, unary completion, response slots, envelope bytes, and cover rounds; padded inner inputs, NFS work, timeout, concurrency, and a production profile ID are absent |
-| Continuation tokens | Partial | Fixed format and semantic rejection tests exist; nonce generation is still caller-supplied, and no reviewed AEAD, key lifecycle, service integration, or fixed-work timing/trace result exists |
+| Fixed envelope codec | Partial pass | A crate-internal versioned codec binds direction, derived profile ID, fixed checkpoint, prepared query, opaque optional token, session binding, outcome/`has_more`, and canonical fixed result slots inside one exact envelope. Version/profile/session/direction are explicit protection context. Checked arithmetic rejects undersized shapes; a non-cryptographic deterministic fixture rejects one single-bit mutation at every byte offset, reseals malformed plaintext to exercise protected canonical rejection, and pins exact request/response digests. All detailed errors map to one external failure class. There is no production AEAD/nonce owner, fixed-work runtime adapter, or protobuf framing |
+| Compiled profile table | Partial pass | Test profiles derive their 16-byte ID from reads, zero logical writes/allocations/source calls, one request/response application frame, fixed bytes, unary completion, response slots, envelope bytes, and cover rounds; regression tests prove every authoritative dimension changes the ID while the diagnostic label does not. Padded multi-input limits, NFS work, timeout, concurrency, and approved production profile entries are absent |
+| Continuation tokens | Partial | Fixed format and semantic rejection tests exist; the inner codec deliberately transports any present 128-byte token opaquely, while validation before replay/engine use remains unintegrated. Nonce generation is still caller-supplied, and no reviewed AEAD, key lifecycle, service integration, or fixed-work timing/trace result exists |
 | Deterministic mock store | Pass for logical modeling | Bounded plaintext mock rejects duplicate/out-of-range/capacity errors |
 | Logical store trace | Pass for the offline model | Allocation-free recorder validates sequential reads, zero modeled writes/allocations/source calls, modeled application frames/bytes, and completion across selected secret/error cases; NFS and physical/runtime dimensions remain outside this evidence |
 | Failure completion schedule | Partial pass | Every injected mock read failure still completes all configured logical reads; physical failure behavior is not equivalent or measured |
@@ -327,8 +345,8 @@ yet stakeholder-approved.
 | Hit versus miss | Must hide | Same work, outer status, bytes, frames, and completion | Equal complete offline logical traces are tested | Open: physical, transport, and outer-status equivalence missing |
 | Invalid-domain versus valid query | Must hide after authenticated decode | Full profile work and protected outcome | Mock engine completes the same modeled trace and protects the outcome | Open: decode/token/wire timing not traced |
 | Store failure versus ordinary outcome | Must hide per completed-query policy and fail readiness safely | Uniform outer behavior; detailed fault remains internal | Every mock failure ordinal completes the same modeled trace. The native backend has only coarse local fail-closed tests; its internal worker reply still distinguishes success, rejection, and failed-closed state and is not service-integrated | Open: target-load readiness and service-level equivalence missing |
-| Exact result count | Must hide | Fixed response slots and encrypted dummy occupancy | Fixed result-page shape exists | Open: no encrypted wire result |
-| Last real page / `has_more` | Must hide | Fixed page and cover-round behavior | Cover-round integer exists only in a test profile | Open |
+| Exact result count | Must hide | Fixed response slots and encrypted dummy occupancy | The inner codec emits the complete configured slot array and canonically encodes dummy/real occupancy under injected whole-envelope protection | Open: no production encryption or runtime/transport evidence |
+| Last real page / `has_more` | Must hide | Fixed page and cover-round behavior | The inner codec binds `has_more` to a present fixed-width opaque continuation field only for `ResultBudgetExceeded`; cover rounds and pagination have no runtime owner | Open |
 | Client continuation count | Permitted only for weak profiles | Strong profile requires fixed cover rounds | No client or service exists | Unset budget |
 | Logical ORAM key | Must hide | No query-derived host address or fallback | Mock receives the key; this is explicitly plaintext test code | Open |
 | Physical ORAM location/path | Must hide | Secret cases must be indistinguishable under accepted trace test | Pinned adapter executes functionally on generic Linux x86_64 CI; no physical trace was captured | Open |
@@ -337,12 +355,12 @@ yet stakeholder-approved.
 | Query-derived allocation | Must hide | Fixed allocation/work budget | Offline recorder validates zero explicit modeled query allocations | Open: allocator/page/instruction measurement absent |
 | Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | Engine has no source dependency and validates zero modeled source calls | Open: no integrated source instrumentation or readiness proof |
 | NFS scan work | Must hide | Complete profile-fixed scan on every query | No NFS merge implementation | Open |
-| Request/response application bytes | Fixed public class | Exactly the attested profile size | Offline profile/trace bind equal fixed application-envelope bytes | Open: no inner codec, protobuf/TLS, or packet capture |
+| Request/response application bytes | Fixed public class | Exactly the attested profile size | Offline profile/trace bind equal fixed application-envelope bytes; the inner codec now rejects undersized compiled shapes and emits one exact protected envelope in each direction | Open: no production AEAD, protobuf/TLS, runtime trace, or packet capture |
 | Frame count and completion shape | Fixed public class | Same across protected outcomes | Offline trace models one request, one response, and unary completion | Open: no network or outer-status evidence |
 | Method class | Permitted only if contract exposes separate methods | Preferred single `QueryPage` hides it | No proto exists | Decision retained, unimplemented |
 | Request arrival and connection duration | Permitted | Declared traffic-analysis leakage | No service exists | Not applicable yet |
 | Client IP/network metadata | Permitted | Outside initial claim | No service exists | Not applicable yet |
-| Service/schema/profile ID | Permitted | Bound into attestation and publicly versioned | Test label only; no attestation | Open |
+| Service/schema/profile ID | Permitted | Bound into attestation and publicly versioned | The inner codec carries a fixed test-only format version and a canonical 16-byte ID derived from the complete logical budget; there is no approved profile table, private schema, or attestation | Open |
 | Coarse network/chain epoch/height/hash/sync lag | Permitted | Public checkpoint and freshness policy | Corpus report plus offline oracle bind network, height/hash, schema, and key epoch with replay/rebuild decisions | Partial; authoritative live feed and serving policy absent |
 | Database capacity and projected growth | Permitted | Aggregate only, never identifier-bearing | Aggregate report types and redacted debug exist | Partial; no mainnet artifact |
 | Aggregate QPS/queue/health | Permitted within allowlist | No outcome/cardinality labels | An internal snapshot exists; no service metrics exporter or fixed-cadence aggregation/suppression policy exists | Open |
@@ -426,10 +444,10 @@ Commands below were run through 2026-07-13 against the evaluated worktree.
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
 | `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Exact record constraints, portable production insertion helper, and unsupported-target path compile; this local command does not execute the real ORAM path |
-| `cargo nextest run -p zaino-oram --no-default-features` | 115 passed | Fixed models, token semantics, complete logical traces, exact records, keyed layout, full-capacity arithmetic, exclusive two-table preflight, and all 16 business-command worker tests pass without optional features |
-| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 154 passed | Adds canonical-cursor hardening, measured/sizing separation, deterministic measurement JSON and semantic rejection, source-bound sizing recomputation, corpus provenance/retry, deterministic projection/coordinator/owner coverage, exact seven-event sink ordering, failure/panic containment, four projection-to-worker adapter tests, and five owner lifecycle/configuration/fail-closed cases |
-| `cargo nextest run -p zaino-oram --features rostl-experimental --status-level fail` | 119 passed | Adds directory/page `Pod`/`Cmov` semantics, power-of-two capacity rejection, equal healthy miss/duplicate two-access schedules against the production helper, found-parity/occupancy rejection, and exact typed unsupported-host construction rejection |
-| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 161 passed locally on macOS aarch64 | Combined keyed layout, two-table command, structurally validated and source-bound sizing model/result serialization, trace, exact record, token, corpus/provenance, offline projection/coordinator/owner, static ordinary-source shadow parity, business-command worker suite, and portable typed-`rostl` suite. Five owner cases cover six-dimension pre-allocation rejection, happy lifecycle, mutate-then-fail terminal behavior, unsupported backend, and coarse diagnostics |
+| `cargo nextest run -p zaino-oram --no-default-features --status-level fail` | 133 passed | Fixed models, token semantics, protected inner-codec shape/canonicality, complete logical traces, exact records, keyed layout, full-capacity arithmetic, exclusive two-table preflight, and all business-command worker tests pass without optional features |
+| `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 172 passed | Adds canonical-cursor hardening, measured/sizing separation, deterministic measurement JSON and semantic rejection, source-bound sizing recomputation, corpus provenance/retry, deterministic projection/coordinator/owner coverage, exact seven-event sink ordering, failure/panic containment, projection-to-worker adapter tests, and owner lifecycle/configuration/fail-closed cases |
+| `cargo nextest run -p zaino-oram --features rostl-experimental --status-level fail` | 139 passed | Adds directory/page `Pod`/`Cmov` semantics, power-of-two capacity rejection, equal healthy miss/duplicate two-access schedules against the production helper, found-parity/occupancy rejection, and exact typed unsupported-host construction rejection |
+| `cargo nextest run -p zaino-oram --all-features --status-level fail` | 179 passed locally on macOS aarch64 | Combined inner codec, keyed layout, two-table command, structurally validated and source-bound sizing model/result serialization, trace, exact record, token, corpus/provenance, offline projection/coordinator/owner, static ordinary-source shadow parity, business-command worker suite, and portable typed-`rostl` suite. Exact-head native evidence remains pending |
 | `cargo nextest run -p zaino-state --features test_dependencies shadow_parity::tests::fixture_binds_ordinary_cases_to_the_exact_static_checkpoint --status-level fail` | 1 passed | The feature-gated ordinary fixture binds its full block prefix and address cases to immutable regtest-vector height/hash 200 |
 | `cargo nextest run -p zaino-proto --test compact_tx_streamer_legacy_golden --status-level fail` | 1 passed | Pins the upstream-baseline legacy service name, ordered RPC surface, and normalized proto schema fingerprint |
 | `cargo nextest run -p zainod-oram --status-level fail` | 24 passed | Nested capture/size CLI, synchronous offline sizing execution, paired checkpoint and snapshot selection, required model inputs, golden canonical model/qualification digests, dirfd-bound regular-file and byte-limit enforcement, exact three-file publication, atomic concurrent-output refusal, ambiguous-rename inode resolution, source lineage and typed tamper rejection, read-back validation, post-commit parent synchronization, and synchronized staging cleanup |
@@ -460,9 +478,10 @@ capture-head native run are
 `linux_rostl_owner_builds_finishes_and_shuts_down`. The two unsupported-host
 constructor rejections that run on macOS are excluded on Linux, so that
 capture-head native total was three higher than the 158-test macOS total at
-the same capture head. The sizing code head adds three cross-platform tests;
-its native total is likewise three higher than the current 161-test macOS
-all-feature total and is reported separately in the table above.
+the same capture head. The sizing code head adds three cross-platform tests and
+its 164-test native total is reported separately in the table above. The
+current inner-codec head has 179 local all-feature tests; no exact-head native
+total is inferred before that workflow runs.
 
 Two broader `zaino-state` gates remain baseline-blocked outside this slice.
 Warning-denied Clippy with `clippy::unwrap_used` reports four existing
@@ -606,8 +625,9 @@ exposing a private server:
 6. design or obtain typed upstream failure/recovery behavior and an
    authenticated persistence/checkpoint protocol;
 7. resolve git-dependency and TDX/verifier licensing with an exact SBOM;
-8. complete the Phase 1 inner codec and fixed-work token/runtime parity without
-   opening a network listener; retain the new legacy schema golden;
+8. complete the remaining Phase 1 fixed-work token/runtime parity and private
+   schema/legacy evidence without opening a network listener; retain the new
+   legacy schema golden;
 9. obtain independent security review of the evidence and then revisit this
    decision.
 

@@ -19,6 +19,15 @@ and this library adheres to Rust's notion of
   and a pinned volatile `rostl` feasibility adapter. These remain offline
   research components and do not establish a production host-obliviousness
   claim.
+- `zaino-oram`: a crate-internal fixed request/response codec now binds a
+  complete-budget-derived profile ID, checkpoint, session, query, opaque
+  continuation field, protected outcome, and canonical result slots inside one
+  direction-separated fixed envelope. Profile/session/direction are supplied
+  as protection context, checked layout arithmetic rejects impossible shapes,
+  and exact digest/canonicality tests cover the whole envelope. The injected
+  deterministic protector is a non-cryptographic test fixture only; there is
+  no production AEAD, nonce lifecycle, runtime adapter, listener, or fixed-work
+  claim.
 - `zaino-state`: a reusable transparent create/spend event-extraction seam for
   ORAM-agnostic projection consumers.
 - `zaino-oram` / `zaino-state`: a default-off offline shadow fixture compares

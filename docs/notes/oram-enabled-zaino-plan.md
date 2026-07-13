@@ -41,7 +41,16 @@ sink call, and commits the in-memory checkpoint last. The owning atomic worker
 now implements that private sink boundary and consumes each append reply before
 returning. The private offline owner composes the coordinator, worker, and
 `rostl` stores, while a sink failure can still leave a partial prefix in a
-discarded candidate. The fork contains no production
+discarded candidate. A later listener-free contract slice adds a crate-internal
+versioned request/response codec with checked profile-capacity coupling, a
+complete-budget-derived profile ID, fixed checkpoint/query/token/session/result
+fields, direction separation, canonical decoding, and an injected
+whole-envelope protection interface. Its deterministic protector is a
+non-cryptographic test fixture; opaque token semantics, production AEAD, nonce
+ownership, and uniform runtime failure handling remain integration gates. The
+codec has no runtime caller and does not establish fixed-work
+token/replay/engine behavior.
+The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
 mainnet/RSS, recovery, side-channel, hardware, and licensing gates are open.

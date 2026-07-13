@@ -11,7 +11,7 @@ pub(super) const TXID_BYTES: usize = 32;
 /// The research corpus gate must confirm that every script accepted by the
 /// private transparent-address API fits this bound. Unsupported shapes fail
 /// closed instead of entering a variable-length fallback.
-const TRANSPARENT_SCRIPT_CAPACITY: usize = 34;
+pub(super) const TRANSPARENT_SCRIPT_CAPACITY: usize = 34;
 
 /// Exact byte width of the append-only event candidate exercised by the
 /// experimental ORAM adapter.
@@ -102,17 +102,17 @@ impl TransparentUtxo {
     }
 
     /// Returns the transaction identifier.
-    const fn txid(&self) -> &[u8; TXID_BYTES] {
+    pub(super) const fn txid(&self) -> &[u8; TXID_BYTES] {
         &self.txid
     }
 
     /// Returns the transparent output index.
-    const fn output_index(&self) -> u32 {
+    pub(super) const fn output_index(&self) -> u32 {
         self.output_index
     }
 
     /// Returns the output value in zatoshis.
-    const fn value_zat(&self) -> u64 {
+    pub(super) const fn value_zat(&self) -> u64 {
         self.value_zat
     }
 
@@ -122,12 +122,12 @@ impl TransparentUtxo {
     }
 
     /// Returns the occupied locking-script byte length.
-    const fn script_len(&self) -> usize {
+    pub(super) const fn script_len(&self) -> usize {
         self.script_len as usize
     }
 
     /// Returns every real and padded locking-script byte.
-    const fn padded_script(&self) -> &[u8; TRANSPARENT_SCRIPT_CAPACITY] {
+    pub(super) const fn padded_script(&self) -> &[u8; TRANSPARENT_SCRIPT_CAPACITY] {
         &self.script
     }
 }
@@ -964,6 +964,8 @@ pub(super) enum QueryOutcome {
     InvalidDomain,
     /// The store could not complete at least one logical read.
     StoreFailure,
+    /// The protected projection has no ready checkpoint for this query round.
+    ProjectionNotReady,
 }
 
 impl fmt::Debug for QueryOutcome {
@@ -995,12 +997,12 @@ impl UtxoResultSlot {
     }
 
     /// Returns whether this slot contains a real UTXO.
-    const fn is_occupied(&self) -> bool {
+    pub(super) const fn is_occupied(&self) -> bool {
         self.occupied
     }
 
     /// Returns the fixed record for both real and dummy slots.
-    const fn padded_utxo(&self) -> &TransparentUtxo {
+    pub(super) const fn padded_utxo(&self) -> &TransparentUtxo {
         &self.utxo
     }
 }
@@ -1042,6 +1044,11 @@ impl<const N: usize> UtxoResultPage<N> {
     /// Returns every real and dummy result slot.
     pub(super) const fn slots(&self) -> &[UtxoResultSlot; N] {
         &self.slots
+    }
+
+    /// Returns whether every fixed slot is the canonical dummy value.
+    pub(super) fn is_all_dummy(&self) -> bool {
+        self.slots.iter().all(|slot| !slot.is_occupied())
     }
 
     /// Counts real records inside the protected page.

@@ -1,11 +1,13 @@
 use std::{fmt, mem::size_of};
 
-const PROFILE_ID_BYTES: usize = 16;
+use crate::profile::PROFILE_ID_BYTES;
+
 const QUERY_DIGEST_BYTES: usize = 32;
 const NONCE_BYTES: usize = 24;
 const AUTHENTICATION_BYTES: usize = 16;
 const PROTECTED_BODY_BYTES: usize = 88;
-const CONTINUATION_TOKEN_BYTES: usize = NONCE_BYTES + PROTECTED_BODY_BYTES + AUTHENTICATION_BYTES;
+pub(super) const CONTINUATION_TOKEN_BYTES: usize =
+    NONCE_BYTES + PROTECTED_BODY_BYTES + AUTHENTICATION_BYTES;
 
 const VERSION_START: usize = 0;
 const PROFILE_ID_START: usize = VERSION_START + size_of::<u16>();
@@ -111,9 +113,17 @@ impl fmt::Debug for ContinuationExpectation {
 /// is used outside the deterministic research model.
 #[repr(transparent)]
 #[derive(Clone, PartialEq, Eq)]
-struct ContinuationToken([u8; CONTINUATION_TOKEN_BYTES]);
+pub(super) struct ContinuationToken([u8; CONTINUATION_TOKEN_BYTES]);
 
 impl ContinuationToken {
+    /// Carries one exact inner-envelope field without validating token semantics.
+    ///
+    /// A runtime adapter must call [`Self::validate`] before the token can reach
+    /// replay protection or engine execution.
+    pub(super) const fn from_opaque_bytes(bytes: [u8; CONTINUATION_TOKEN_BYTES]) -> Self {
+        Self(bytes)
+    }
+
     /// Encodes and protects one continuation state.
     ///
     /// The caller must supply a nonce that is unique for the protector's key.
@@ -145,7 +155,7 @@ impl ContinuationToken {
         Ok(Self(token))
     }
 
-    const fn as_bytes(&self) -> &[u8; CONTINUATION_TOKEN_BYTES] {
+    pub(super) const fn opaque_bytes(&self) -> &[u8; CONTINUATION_TOKEN_BYTES] {
         &self.0
     }
 
@@ -457,7 +467,7 @@ mod tests {
     fn token_round_trip_preserves_state_and_exact_size() -> Result<(), ContinuationTokenError> {
         let state = state();
         let token = ContinuationToken::issue(&state, &protector());
-        let encoded = ContinuationToken::try_from_bytes(token.as_bytes())?;
+        let encoded = ContinuationToken::try_from_bytes(token.opaque_bytes())?;
         let decoded = encoded.validate(
             &protector(),
             &expectation(),
@@ -465,7 +475,7 @@ mod tests {
         )?;
 
         assert_eq!(decoded, state);
-        assert_eq!(token.as_bytes().len(), CONTINUATION_TOKEN_BYTES);
+        assert_eq!(token.opaque_bytes().len(), CONTINUATION_TOKEN_BYTES);
         assert_eq!(size_of::<ContinuationToken>(), CONTINUATION_TOKEN_BYTES);
         Ok(())
     }
@@ -493,7 +503,7 @@ mod tests {
         let token = ContinuationToken::issue(&state(), &protector());
 
         for index in 0..CONTINUATION_TOKEN_BYTES {
-            let mut tampered = *token.as_bytes();
+            let mut tampered = *token.opaque_bytes();
             tampered[index] ^= 0x80;
             let tampered = ContinuationToken::try_from_bytes(&tampered)?;
             assert_eq!(

@@ -1,11 +1,11 @@
 //! Research foundations for Zaino's host-oblivious private-query service.
 //!
-//! This crate currently provides fixed data shapes, deterministic trace and
-//! exclusive two-table command models, and fake stores. An optional pinned
-//! `rostl` adapter is an offline-only compile/behavior experiment; it does not
-//! supply production recovery or persistence. The crate has no production
-//! encryption, attestation, or network service and makes no production privacy
-//! claim.
+//! This crate currently provides fixed data shapes, a crate-internal
+//! protected inner-envelope contract, deterministic trace and exclusive
+//! two-table command models, and fake stores. An optional pinned `rostl`
+//! adapter is an offline-only compile/behavior experiment; it does not supply
+//! production recovery or persistence. The crate has no production encryption,
+//! attestation, or network service and makes no production privacy claim.
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
@@ -23,6 +23,7 @@ mod continuation_token;
 mod corpus;
 mod engine;
 mod envelope;
+mod inner_codec;
 mod layout;
 mod profile;
 #[cfg(feature = "corpus-zaino")]

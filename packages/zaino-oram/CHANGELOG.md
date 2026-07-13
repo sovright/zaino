@@ -18,6 +18,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   validation and identifier-free reports.
 - A fixed continuation-token codec with injected protection and atomic replay
   interfaces.
+- A crate-internal, versioned private request/response codec with a
+  complete-budget-derived profile identifier, checkpoint and session binding,
+  optional opaque continuation field, canonical result slots, checked
+  profile-capacity coupling, direction separation, and an injected
+  whole-envelope protection interface. Profile/session/direction are explicit
+  protection context. A non-cryptographic deterministic fixture pins exact
+  request/response digests, rejects one single-bit mutation at every envelope
+  offset, and exercises protected noncanonical fields. No production AEAD,
+  nonce lifecycle, token validation integration, runtime adapter, or fixed-work
+  claim is supplied.
 - A Linux-x86_64-only volatile `rostl` experiment pinned at `8c3a12d2`; other
   targets reject construction and no production obliviousness claim is made.
 - Separate typed `rostl` stores for the exact 38-byte directory and 82-byte

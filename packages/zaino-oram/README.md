@@ -18,6 +18,13 @@ offline dependency experiment:
   thread and admits only whole `read_history` and `append` business commands,
   with no raw probe, key, record, read, or insert surface;
 - compiled privacy-profile validation;
+- a crate-internal versioned request/response codec that seals one
+  complete-budget-derived profile ID, fixed checkpoint, prepared query,
+  optional opaque 128-byte continuation field, session binding, protected
+  outcome, and exact result slots into a single compile-time envelope. Checked
+  layout arithmetic rejects profile/page shapes that cannot fit; the protection
+  interface binds version/profile/session/direction context and must open the
+  whole nonce/body/tag envelope before canonical decoding;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -46,10 +53,17 @@ offline dependency experiment:
   worker for the offline projection owner; it has no runtime/service caller,
   and unsupported hosts reject construction before creating upstream state.
 
-It does **not** contain production encryption, durable ORAM persistence, TDX
-attestation, protobufs, or a network listener, and it makes no production
-privacy claim. The listener-free `zainod-oram corpus capture` runner can feed
-canonical mainnet blocks into the core and atomically publish a revalidated
+It does **not** contain a production envelope protector or nonce owner,
+production encryption, durable ORAM persistence, TDX attestation, protobufs,
+or a network listener, and it makes no production privacy claim. Codec tests
+use a non-cryptographic deterministic integrity fixture; they prove exact
+bytes, protection-interface plumbing, one single-bit rejection at every byte
+offset, and canonical rejection—not cryptographic authentication,
+confidentiality, or equal runtime work. Continuation fields remain opaque here;
+a future runtime must validate them before replay protection or engine use and
+must collapse detailed decode failures to the single external failure class.
+The listener-free `zainod-oram corpus capture` runner can feed canonical
+mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline
 `zainod-oram corpus size` command revalidates that complete artifact and applies
 one explicit model into a separate digest-bound atomic qualification. No
@@ -154,9 +168,10 @@ portable schedule tests exercise the same insertion helper used by the real
 stores. The actual Linux backend and worker run in the inherited generic native
 CI lane. Capture-head native run `29223983432` passed strict all-target,
 all-feature Clippy and all 161 tests while executing the complete typed
-store/coordinator/owner lifecycle; 158 portable all-feature tests pass on this
-macOS host. This generic hosted-Linux evidence is not target-CPU, TDX, load,
-benchmark, or physical-trace qualification. Reply abandonment
+store/coordinator/owner lifecycle. The current inner-codec branch passes 179
+all-feature tests on this macOS host; exact-head native evidence remains
+pending. Generic hosted-Linux evidence is not target-CPU, TDX, load, benchmark,
+or physical-trace qualification. Reply abandonment
 relies on the module-private trusted owner dropping tickets normally;
 deliberately leaking a ticket with `mem::forget` is outside this offline model.
 

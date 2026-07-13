@@ -1,14 +1,22 @@
 use std::{fmt, marker::PhantomData};
 
+use blake2::{Blake2s256, Digest};
+
 use crate::{envelope::FixedEnvelope, trace::QueryAccessBudget};
+
+pub(super) const PROFILE_ID_BYTES: usize = 16;
+const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v1";
+const UNARY_FIXED_ENVELOPE_TAG: u8 = 1;
 
 /// A compiled privacy budget for one fixed query class.
 ///
-/// No production profile is provided yet. The label is diagnostic only:
-/// attestation must bind this complete structure and its exact compiled page
-/// and envelope shapes, so a reused label cannot silently weaken the budget.
+/// No production profile is provided yet. The fixed identifier is derived from
+/// every authoritative budget dimension; the label remains diagnostic only.
+/// Attestation must bind this complete structure and its exact compiled page
+/// and envelope shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PrivacyProfile {
+    profile_id: [u8; PROFILE_ID_BYTES],
     label: &'static str,
     access_budget: QueryAccessBudget,
     response_slots: usize,
@@ -17,7 +25,7 @@ pub(super) struct PrivacyProfile {
 
 impl PrivacyProfile {
     /// Validates and builds a compiled privacy profile.
-    pub(super) const fn new(
+    pub(super) fn new(
         label: &'static str,
         store_reads: usize,
         response_slots: usize,
@@ -39,15 +47,21 @@ impl PrivacyProfile {
         if cover_rounds == 0 {
             return Err(PrivacyProfileError::ZeroCoverRounds);
         }
+        let access_budget =
+            QueryAccessBudget::read_only_unary_fixed_envelope(store_reads, envelope_bytes);
+        let profile_id = derive_profile_id(&access_budget, response_slots, cover_rounds)?;
         Ok(Self {
+            profile_id,
             label,
-            access_budget: QueryAccessBudget::read_only_unary_fixed_envelope(
-                store_reads,
-                envelope_bytes,
-            ),
+            access_budget,
             response_slots,
             cover_rounds,
         })
+    }
+
+    /// Returns the fixed identifier bound into protected request state.
+    pub(super) const fn profile_id(&self) -> &[u8; PROFILE_ID_BYTES] {
+        &self.profile_id
     }
 
     /// Returns the human-readable, non-authoritative profile label.
@@ -114,6 +128,8 @@ pub(super) enum PrivacyProfileError {
     ZeroEnvelopeBytes,
     /// Every profile must declare at least one query/cover round.
     ZeroCoverRounds,
+    /// A profile dimension cannot fit the canonical 64-bit identifier format.
+    DimensionTooLarge,
     /// The page's compile-time slot count differs from the profile.
     ResponseShapeMismatch {
         /// Slots required by the profile.
@@ -145,6 +161,9 @@ impl fmt::Display for PrivacyProfileError {
             Self::ZeroResponseSlots => write!(f, "privacy profile has zero response slots"),
             Self::ZeroEnvelopeBytes => write!(f, "privacy profile has zero envelope bytes"),
             Self::ZeroCoverRounds => write!(f, "privacy profile has zero cover rounds"),
+            Self::DimensionTooLarge => {
+                f.write_str("privacy profile dimension exceeds canonical identifier width")
+            }
             Self::ResponseShapeMismatch {
                 required,
                 available,
@@ -171,6 +190,57 @@ impl fmt::Display for PrivacyProfileError {
 }
 
 impl std::error::Error for PrivacyProfileError {}
+
+/// Derives the public profile identifier from the complete authoritative
+/// logical budget. The diagnostic label is deliberately excluded.
+fn derive_profile_id(
+    access_budget: &QueryAccessBudget,
+    response_slots: usize,
+    cover_rounds: usize,
+) -> Result<[u8; PROFILE_ID_BYTES], PrivacyProfileError> {
+    let mut hasher = Blake2s256::new();
+    Digest::update(&mut hasher, PROFILE_ID_DOMAIN);
+    for dimension in [
+        access_budget.store_reads(),
+        access_budget.store_writes(),
+        access_budget.allocations(),
+        access_budget.source_calls(),
+        access_budget.request_frames(),
+        access_budget.response_frames(),
+        access_budget.request_bytes(),
+        access_budget.response_bytes(),
+        response_slots,
+        cover_rounds,
+    ] {
+        update_profile_dimension(&mut hasher, dimension)?;
+    }
+    Digest::update(&mut hasher, [UNARY_FIXED_ENVELOPE_TAG]);
+    let digest = Digest::finalize(hasher);
+    let mut profile_id = [0; PROFILE_ID_BYTES];
+    profile_id.copy_from_slice(&digest[..PROFILE_ID_BYTES]);
+    Ok(profile_id)
+}
+
+fn update_profile_dimension(
+    hasher: &mut Blake2s256,
+    dimension: usize,
+) -> Result<(), PrivacyProfileError> {
+    let dimension = u64::try_from(dimension).map_err(|_| PrivacyProfileError::DimensionTooLarge)?;
+    Digest::update(hasher, dimension.to_be_bytes());
+    Ok(())
+}
+
+/// Returns whether every byte equals the canonical zero sentinel.
+pub(super) const fn all_zero<const N: usize>(bytes: &[u8; N]) -> bool {
+    let mut index = 0;
+    while index < N {
+        if bytes[index] != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
 
 /// A profile sealed to exact compile-time page and envelope shapes.
 pub(super) struct CompiledQueryShape<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize> {
@@ -210,31 +280,30 @@ mod tests {
     use super::*;
     use crate::trace::CompletionShape;
 
-    const PROFILE: PrivacyProfile = PrivacyProfile {
-        label: "test-v1",
-        access_budget: QueryAccessBudget::read_only_unary_fixed_envelope(4, 128),
-        response_slots: 2,
-        cover_rounds: 3,
-    };
+    fn profile() -> PrivacyProfile {
+        PrivacyProfile::new("test-v1", 4, 2, 128, 3)
+            .expect("test profile has nonzero authoritative dimensions")
+    }
 
     #[test]
     fn profile_exposes_complete_compiled_budget() {
-        assert_eq!(PROFILE.label(), "test-v1");
-        assert_eq!(PROFILE.store_reads(), 4);
-        assert_eq!(PROFILE.access_budget().store_writes(), 0);
-        assert_eq!(PROFILE.access_budget().allocations(), 0);
-        assert_eq!(PROFILE.access_budget().source_calls(), 0);
-        assert_eq!(PROFILE.access_budget().request_frames(), 1);
-        assert_eq!(PROFILE.access_budget().response_frames(), 1);
-        assert_eq!(PROFILE.access_budget().request_bytes(), 128);
-        assert_eq!(PROFILE.access_budget().response_bytes(), 128);
+        let profile = profile();
+        assert_eq!(profile.label(), "test-v1");
+        assert_eq!(profile.store_reads(), 4);
+        assert_eq!(profile.access_budget().store_writes(), 0);
+        assert_eq!(profile.access_budget().allocations(), 0);
+        assert_eq!(profile.access_budget().source_calls(), 0);
+        assert_eq!(profile.access_budget().request_frames(), 1);
+        assert_eq!(profile.access_budget().response_frames(), 1);
+        assert_eq!(profile.access_budget().request_bytes(), 128);
+        assert_eq!(profile.access_budget().response_bytes(), 128);
         assert_eq!(
-            PROFILE.access_budget().completion(),
+            profile.access_budget().completion(),
             CompletionShape::UnaryFixedEnvelope
         );
-        assert_eq!(PROFILE.response_slots(), 2);
-        assert_eq!(PROFILE.envelope_bytes(), 128);
-        assert_eq!(PROFILE.cover_rounds(), 3);
+        assert_eq!(profile.response_slots(), 2);
+        assert_eq!(profile.envelope_bytes(), 128);
+        assert_eq!(profile.cover_rounds(), 3);
     }
 
     #[test]
@@ -258,23 +327,45 @@ mod tests {
     }
 
     #[test]
+    fn profile_identifier_binds_every_authoritative_dimension_but_not_label() {
+        let baseline = profile();
+        assert_eq!(
+            baseline.profile_id(),
+            &[96, 146, 31, 125, 196, 142, 21, 149, 166, 20, 67, 106, 34, 169, 176, 109,]
+        );
+        let relabeled = PrivacyProfile::new("renamed", 4, 2, 128, 3)
+            .expect("relabeled test profile remains valid");
+        assert_eq!(baseline.profile_id(), relabeled.profile_id());
+
+        for changed in [
+            PrivacyProfile::new("test-v1", 5, 2, 128, 3),
+            PrivacyProfile::new("test-v1", 4, 3, 128, 3),
+            PrivacyProfile::new("test-v1", 4, 2, 129, 3),
+            PrivacyProfile::new("test-v1", 4, 2, 128, 4),
+        ] {
+            let changed = changed.expect("changed authoritative dimension remains nonzero");
+            assert_ne!(baseline.profile_id(), changed.profile_id());
+        }
+    }
+
+    #[test]
     fn compiled_shape_rejects_every_mismatch() {
         assert!(matches!(
-            CompiledQueryShape::<1, 128>::new(PROFILE),
+            CompiledQueryShape::<1, 128>::new(profile()),
             Err(PrivacyProfileError::ResponseShapeMismatch {
                 required: 2,
                 available: 1,
             })
         ));
         assert!(matches!(
-            CompiledQueryShape::<3, 128>::new(PROFILE),
+            CompiledQueryShape::<3, 128>::new(profile()),
             Err(PrivacyProfileError::ResponseShapeMismatch {
                 required: 2,
                 available: 3,
             })
         ));
         assert!(matches!(
-            CompiledQueryShape::<2, 127>::new(PROFILE),
+            CompiledQueryShape::<2, 127>::new(profile()),
             Err(PrivacyProfileError::EnvelopeShapeMismatch {
                 required: 128,
                 available: 127,
@@ -284,7 +375,7 @@ mod tests {
 
     #[test]
     fn compiled_shape_couples_page_envelope_and_cover_profile() {
-        let shape = CompiledQueryShape::<2, 128>::new(PROFILE)
+        let shape = CompiledQueryShape::<2, 128>::new(profile())
             .expect("test profile exactly matches its compiled shapes");
         assert_eq!(shape.profile().cover_rounds(), 3);
         assert_eq!(shape.empty_envelope().as_bytes().len(), 128);
