@@ -41,6 +41,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   synchronous sink append succeeds and drops/fails closed on staging, sink, or
   finish failure. This is an offline ordering model, not worker/`rostl`
   integration, backend block atomicity, authenticated persistence, or recovery.
+- A private `corpus-zaino` event-sink implementation on the owning atomic
+  worker. It rejects nonstandard events before admission, derives P2PKH/P2SH
+  addresses through the existing business conversion, submits only the whole
+  append command, consumes the reply synchronously, and collapses worker
+  failures to identifier-free sink errors. No owner composes the coordinator,
+  worker, and typed `rostl` stores yet.
 - Exact immutable 38-byte address-directory and 82-byte one-event page
   candidates with canonical dummy encodings, named persistence conversions,
   standard-address validation, redacted diagnostics, and `Pod`/`Cmov` proofs.

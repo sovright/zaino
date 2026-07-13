@@ -1,9 +1,9 @@
 //! Exclusive, in-memory two-table execution for one fixed layout generation.
 //!
 //! This module models a synchronous owner and a nested bounded worker that
-//! consumes that complete owner. It is not wired to `rostl`, projection, or
-//! the query engine, and it makes no persistence or physical-obliviousness
-//! claim.
+//! consumes that complete owner. A private projection sink seam can drive the
+//! worker, but no projection coordinator, query engine, or service constructs
+//! that owner, and it makes no persistence or physical-obliviousness claim.
 //! "Exclusive" means one executor command completes its scan and preflight
 //! without another executor command interleaving. A new-address append still
 //! performs two sequential writes; it is not an all-or-nothing transaction,

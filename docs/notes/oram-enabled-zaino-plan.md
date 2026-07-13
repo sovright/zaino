@@ -31,9 +31,11 @@ only cross-compile evidence on the current macOS host. It is not connected to
 the projection and does not claim crash atomicity. A later portable slice adds
 a private generic finalized-event coordinator: it stages a whole block through
 the existing plaintext spend-owner resolver, completes every synchronous event
-sink call, and commits the in-memory checkpoint last. It is not yet wired to
-the worker or `rostl`; a sink failure can leave a partial prefix in a discarded
-candidate. The fork contains no production
+sink call, and commits the in-memory checkpoint last. The owning atomic worker
+now implements that private sink boundary and consumes each append reply before
+returning, but no owner composes the coordinator, worker, and `rostl` stores. A
+sink failure can leave a partial prefix in a discarded candidate. The fork
+contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
 mainnet/RSS, recovery, side-channel, hardware, and licensing gates are open.

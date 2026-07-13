@@ -22,6 +22,8 @@ use std::{
 };
 
 use super::*;
+#[cfg(feature = "corpus-zaino")]
+use crate::projection::ProjectionEventSink;
 
 #[cfg(feature = "rostl-experimental")]
 mod rostl;
@@ -142,6 +144,22 @@ impl AtomicWorker {
                 Err(AtomicWorkerError::WorkerPanicked)
             }
         }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl ProjectionEventSink for AtomicWorker {
+    type Error = AtomicProjectionSinkError;
+
+    fn append_and_wait(&mut self, event: UtxoEvent) -> Result<(), Self::Error> {
+        let address = StandardAddress::from_event(&event)
+            .map_err(|_| AtomicProjectionSinkError::InvalidEvent)?;
+        self.handle
+            .try_append(address, event)
+            .map_err(|_| AtomicProjectionSinkError::Worker)?
+            .wait()
+            .map(|_| ())
+            .map_err(|_| AtomicProjectionSinkError::Worker)
     }
 }
 
@@ -676,6 +694,27 @@ enum AtomicWorkerError {
     WorkerPanicked,
 }
 
+/// Identifier-free projection-to-worker boundary failure.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicProjectionSinkError {
+    InvalidEvent,
+    Worker,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl fmt::Display for AtomicProjectionSinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEvent => f.write_str("projection event is not a supported standard event"),
+            Self::Worker => f.write_str("projection event mutation failed"),
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::error::Error for AtomicProjectionSinkError {}
+
 impl fmt::Display for AtomicWorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1002,6 +1041,116 @@ mod tests {
             UtxoScriptClass::PayToPublicKeyHash,
             address.hash,
         )
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn projection_sink_waits_for_the_worker_mutation() -> TestResult<()> {
+        let (mut worker, observation) = worker(1, None)?;
+        let owner = StandardAddress::new(StandardScriptKind::PayToScriptHash, [0x2a; 20]);
+        let projected = UtxoEvent::created(
+            [0x4a; TXID_BYTES],
+            14,
+            15,
+            16,
+            UtxoScriptClass::PayToScriptHash,
+            owner.hash,
+        );
+
+        ProjectionEventSink::append_and_wait(&mut worker, projected)?;
+
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.accepted, 1);
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.in_flight, 0);
+        assert_eq!(
+            lock_test(&observation)
+                .iter()
+                .filter(|call| call.operation == OperationKind::Write)
+                .count(),
+            2
+        );
+        let history = worker.handle().try_read_history(owner)?.wait()?;
+        assert_eq!(history.events()[0], Some(projected));
+        worker.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn projection_sink_consumes_terminal_mutation_failure() -> TestResult<()> {
+        let control = WriteControl {
+            call: 1,
+            outcome: WriteOutcome::MutateThenFail,
+        };
+        let (mut worker, observation) = worker_with_event_write(control)?;
+        let owner = address(0x2b);
+
+        assert_eq!(
+            ProjectionEventSink::append_and_wait(&mut worker, event(owner, 0x4b)),
+            Err(AtomicProjectionSinkError::Worker)
+        );
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.fault, Some(WorkerFault::Terminal));
+        assert_eq!(snapshot.reply_delivery_failed, 0);
+        let calls_after_failure = lock_test(&observation).len();
+        assert!(matches!(
+            worker.handle().try_read_history(owner),
+            Err(AtomicWorkerError::FailedClosed)
+        ));
+        assert_eq!(lock_test(&observation).len(), calls_after_failure);
+        worker.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn projection_sink_rejects_nonstandard_events_before_admission() -> TestResult<()> {
+        let (mut worker, observation) = worker(1, None)?;
+        let event = UtxoEvent::created(
+            [0x6b; TXID_BYTES],
+            11,
+            12,
+            13,
+            UtxoScriptClass::NonStandard,
+            [0x7c; 20],
+        );
+
+        assert_eq!(
+            ProjectionEventSink::append_and_wait(&mut worker, event),
+            Err(AtomicProjectionSinkError::InvalidEvent)
+        );
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.accepted, 0);
+        assert_eq!(snapshot.completed, 0);
+        assert_eq!(snapshot.failed, 0);
+        assert!(lock_test(&observation).is_empty());
+        worker.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn projection_sink_errors_and_debug_output_are_identifier_free() -> TestResult<()> {
+        let (worker, _) = worker(1, None)?;
+
+        assert_eq!(
+            AtomicProjectionSinkError::InvalidEvent.to_string(),
+            "projection event is not a supported standard event"
+        );
+        assert_eq!(
+            AtomicProjectionSinkError::Worker.to_string(),
+            "projection event mutation failed"
+        );
+        assert_eq!(
+            format!("{:?}", AtomicProjectionSinkError::InvalidEvent),
+            "InvalidEvent"
+        );
+        assert_eq!(format!("{:?}", AtomicProjectionSinkError::Worker), "Worker");
+        assert_eq!(format!("{worker:?}"), "AtomicWorker { ..REDACTED.. }");
+        worker.shutdown()?;
+        Ok(())
     }
 
     fn wait_for(

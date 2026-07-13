@@ -4,8 +4,9 @@
 //! lifecycle semantics. A private generic coordinator stages each whole block,
 //! waits for every ordered standard-event sink mutation, and commits its
 //! in-memory checkpoint last. Its ordinary maps are neither an ORAM nor durable
-//! or authenticated storage, the sink is not wired to the worker, and nothing
-//! here is suitable for serving queries.
+//! or authenticated storage. The sink seam is privately bound to the atomic
+//! worker, but no coordinator constructs that candidate and nothing here is
+//! suitable for serving queries.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -735,7 +736,7 @@ impl OfflineFinalizedProjection {
 }
 
 /// Synchronous completion boundary for the offline publication-order model.
-trait ProjectionEventSink {
+pub(super) trait ProjectionEventSink {
     type Error;
 
     /// Returns `Ok` only after the event mutation has completed.

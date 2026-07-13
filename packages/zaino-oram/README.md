@@ -29,6 +29,9 @@ offline dependency experiment:
   block into cloned plaintext resolver state, performs every ordered standard
   event sink call synchronously, and commits the in-memory checkpoint only
   after all calls succeed;
+- a feature-gated private sink implementation on the owning business-command
+  worker that derives the standard address from each event, admits one whole
+  append command, and consumes its reply before reporting completion;
 - a fixed continuation-token codec with injected protection/replay interfaces;
 - `rostl-experimental`, pinned to `8c3a12d2`, which binds separate volatile
   `CircuitORAM` and recursive-position-map instances to the exact 38-byte
@@ -44,8 +47,10 @@ mainnet blocks into the core, but no full-mainnet measurement artifact exists
 yet. Static fixture parity is not live-backend, finalised-database, reorg, or
 mainnet shadow evidence. Upstream `rostl` panic/recovery, persistence,
 side-channel, and licensing gates remain unresolved.
-The event coordinator is a portable sink/checkpoint ordering model, not a
-worker or `rostl` integration. It retains the plaintext outpoint-owner resolver
+The event coordinator is a portable sink/checkpoint ordering model. Its sink
+trait is implemented for the private business-command worker, but no owner
+constructs the coordinator with that worker or with `rostl`. The coordinator
+retains the plaintext outpoint-owner resolver
 needed to map spends to standard-address events. A sink failure may leave a
 partial event prefix in the discarded sink candidate; the prior in-memory
 checkpoint does not advance, the coordinator drops the sink and fails closed,
@@ -54,8 +59,9 @@ public network, height/hash, schema version, and key epoch. It has no
 authenticated state root, durable publication, rollback defense, or
 crash-atomic coupling to sink mutations.
 The worker can own either the fake-backed command core or, on Linux x86_64, the
-two exact typed volatile `rostl` stores. It is not connected to the projection,
-query engine, or checkpoint publication. Its
+two exact typed volatile `rostl` stores. It implements the private synchronous
+projection-event sink, but no projection owner constructs it and it is not
+connected to the query engine or checkpoint publication. Its
 internal snapshot exposes queue/lifecycle plus aggregate completion, rejection,
 and reply-delivery counters; no safe export policy is claimed. Queue saturation
 rejects without fallback, shutdown drains accepted FIFO commands, and cloned
@@ -117,7 +123,8 @@ not crash atomicity, persistence, rollback, or a physical obliviousness claim.
 The connector is wired to the module-private business-command worker, whose
 Linux-only offline constructor can own the two typed `rostl` stores. That
 constructor currently has no non-test owner caller. The connector is not wired
-to the projection, query engine, or checkpoint publisher.
+to a projection coordinator, query engine, or checkpoint publisher; only the
+private worker sink implementation reaches its business append command.
 
 Cross-table script ownership is checked for the requested event, but an
 unrelated event collision cannot be associated with its directory without more
