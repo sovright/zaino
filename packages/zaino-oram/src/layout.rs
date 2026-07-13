@@ -24,6 +24,14 @@ use crate::records::{
 
 mod atomic_store;
 
+#[cfg(feature = "corpus-zaino")]
+pub(super) use atomic_store::{
+    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQueueCapacity,
+    AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+};
+#[cfg(all(test, feature = "corpus-zaino"))]
+pub(super) use atomic_store::{spawn_atomic_worker_for_tests, BackendFailure, UniqueTable};
+
 const LAYOUT_FORMAT_VERSION: u8 = 1;
 const ADDRESS_KEY_DOMAIN: &[u8] = b"zaino-oram-address-key-v1";
 const PROBE_DOMAIN: &[u8] = b"zaino-oram-fixed-probe-v1";
@@ -34,7 +42,7 @@ const MAXIMUM_PROBE_COUNT: usize = 64;
 
 /// Network domain included in canonical address keys and probe plans.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LayoutNetwork {
+pub(super) enum LayoutNetwork {
     Mainnet,
     Testnet,
     Regtest,
@@ -118,7 +126,7 @@ impl fmt::Debug for ProbeSeed {
 }
 
 /// Immutable identity shared by both protected tables in one generation.
-struct LayoutIdentity {
+pub(super) struct LayoutIdentity {
     network: LayoutNetwork,
     schema_version: u32,
     key_epoch: NonZeroU64,
@@ -127,7 +135,7 @@ struct LayoutIdentity {
 }
 
 impl LayoutIdentity {
-    fn new(
+    pub(super) fn new(
         network: LayoutNetwork,
         schema_version: u32,
         key_epoch: u64,
@@ -348,10 +356,10 @@ impl fmt::Debug for TableShape {
 
 /// Directory-table configuration that cannot be swapped with the event table.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct DirectoryTableConfiguration<const PROBES: usize>(TableShape);
+pub(super) struct DirectoryTableConfiguration<const PROBES: usize>(TableShape);
 
 impl<const PROBES: usize> DirectoryTableConfiguration<PROBES> {
-    fn new(capacity: u64, admission_limit: u64) -> Result<Self, LayoutConfigError> {
+    pub(super) fn new(capacity: u64, admission_limit: u64) -> Result<Self, LayoutConfigError> {
         TableShape::new(TableKind::Directory, capacity, admission_limit, PROBES).map(Self)
     }
 }
@@ -364,10 +372,10 @@ impl<const PROBES: usize> fmt::Debug for DirectoryTableConfiguration<PROBES> {
 
 /// Event-table configuration that cannot be swapped with the directory table.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct EventTableConfiguration<const PROBES: usize>(TableShape);
+pub(super) struct EventTableConfiguration<const PROBES: usize>(TableShape);
 
 impl<const PROBES: usize> EventTableConfiguration<PROBES> {
-    fn new(capacity: u64, admission_limit: u64) -> Result<Self, LayoutConfigError> {
+    pub(super) fn new(capacity: u64, admission_limit: u64) -> Result<Self, LayoutConfigError> {
         TableShape::new(TableKind::Event, capacity, admission_limit, PROBES).map(Self)
     }
 }
@@ -819,7 +827,7 @@ struct ScanOutcome<T> {
 }
 
 /// Pure keyed planner for a two-table immutable layout generation.
-struct FixedProbeLayout<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize> {
+pub(super) struct FixedProbeLayout<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize> {
     identity: LayoutIdentity,
     directory: DirectoryTableConfiguration<DIRECTORY_PROBES>,
     event: EventTableConfiguration<EVENT_PROBES>,
@@ -830,7 +838,7 @@ struct FixedProbeLayout<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize
 impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
     FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>
 {
-    fn new(
+    pub(super) fn new(
         identity: LayoutIdentity,
         directory: DirectoryTableConfiguration<DIRECTORY_PROBES>,
         event: EventTableConfiguration<EVENT_PROBES>,
@@ -851,6 +859,36 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
         };
         layout.profile_binding = layout.profile_binding();
         Ok(layout)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn network(&self) -> LayoutNetwork {
+        self.identity.network
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn schema_version(&self) -> u32 {
+        self.identity.schema_version
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn key_epoch(&self) -> u64 {
+        self.identity.key_epoch.get()
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn directory_admission_limit(&self) -> u32 {
+        self.directory.0.admission_limit
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn event_admission_limit(&self) -> u32 {
+        self.event.0.admission_limit
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn max_events_per_address(&self) -> u32 {
+        self.max_events_per_address
     }
 
     fn address_key(&self, address: StandardAddress) -> AddressKey {

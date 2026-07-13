@@ -27,6 +27,8 @@ mod layout;
 mod profile;
 #[cfg(feature = "corpus-zaino")]
 mod projection;
+#[cfg(feature = "corpus-zaino")]
+mod projection_owner;
 mod records;
 mod sizing;
 mod store;

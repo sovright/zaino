@@ -3,8 +3,8 @@
 //! The worker consumes the complete executor, so no raw table handle, slot,
 //! read, or insert operation crosses the command boundary. It remains a
 //! volatile, module-private research model. Its feature-gated child can build
-//! the exact typed `rostl` executor on Linux x86_64 for offline evidence, but
-//! no projection, query-engine, or service owner calls that constructor.
+//! the exact typed `rostl` executor on Linux x86_64 for the crate-internal
+//! offline projection owner, but no query engine or service owns it.
 //! Append reply tickets fail the worker closed when dropped unconsumed, while
 //! merely retaining a ticket never stalls later work or shutdown. Deliberately
 //! leaking a ticket with `mem::forget` is outside this trusted module-private
@@ -34,13 +34,13 @@ const MAX_WORKER_QUEUE_CAPACITY: usize = 4_096;
 const WORKER_THREAD_NAME: &str = "zaino-oram-atomic";
 
 #[derive(Clone, Copy)]
-struct AtomicQueueCapacity(NonZeroUsize);
+pub(crate) struct AtomicQueueCapacity(NonZeroUsize);
 
 impl AtomicQueueCapacity {
-    fn try_new(value: usize) -> Result<Self, AtomicWorkerError> {
+    pub(crate) fn try_new(value: usize) -> Result<Self, AtomicQueueCapacityError> {
         match NonZeroUsize::new(value) {
             Some(value) if value.get() <= MAX_WORKER_QUEUE_CAPACITY => Ok(Self(value)),
-            Some(_) | None => Err(AtomicWorkerError::InvalidQueueCapacity),
+            Some(_) | None => Err(AtomicQueueCapacityError::Invalid),
         }
     }
 
@@ -50,7 +50,7 @@ impl AtomicQueueCapacity {
 }
 
 /// Owns the worker thread and the only command handle into its executor.
-struct AtomicWorker {
+pub(crate) struct AtomicWorker {
     handle: AtomicWorkerHandle,
     join: Option<JoinHandle<WorkerExit>>,
 }
@@ -148,18 +148,65 @@ impl AtomicWorker {
 }
 
 #[cfg(feature = "corpus-zaino")]
+pub(crate) fn spawn_typed_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
+    layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
+    queue_capacity: AtomicQueueCapacity,
+) -> Result<AtomicWorker, AtomicWorkerBuildError> {
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    {
+        return rostl::spawn_rostl_worker(layout, queue_capacity);
+    }
+
+    #[cfg(not(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    {
+        let _ = (layout, queue_capacity);
+        Err(AtomicWorkerBuildError::TypedBackendUnavailable)
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+pub(crate) fn shutdown_atomic_worker(worker: AtomicWorker) -> Result<(), ()> {
+    worker.shutdown().map(|_| ()).map_err(|_| ())
+}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
+pub(super) fn spawn_atomic_worker_for_tests<
+    D,
+    E,
+    const DIRECTORY_PROBES: usize,
+    const EVENT_PROBES: usize,
+>(
+    executor: ExclusiveTwoTableExecutor<D, E, DIRECTORY_PROBES, EVENT_PROBES>,
+    queue_capacity: AtomicQueueCapacity,
+) -> Result<AtomicWorker, AtomicWorkerBuildError>
+where
+    D: UniqueTable<PersistentAddressDirectory> + Send + 'static,
+    E: UniqueTable<PersistentAddressEventPage> + Send + 'static,
+{
+    AtomicWorker::spawn(executor, queue_capacity)
+        .map_err(|_| AtomicWorkerBuildError::ConstructionFailed)
+}
+
+#[cfg(feature = "corpus-zaino")]
 impl ProjectionEventSink for AtomicWorker {
     type Error = AtomicProjectionSinkError;
 
     fn append_and_wait(&mut self, event: UtxoEvent) -> Result<(), Self::Error> {
-        let address = StandardAddress::from_event(&event)
-            .map_err(|_| AtomicProjectionSinkError::InvalidEvent)?;
+        let address = StandardAddress::from_event(&event).map_err(|_| AtomicProjectionSinkError)?;
         self.handle
             .try_append(address, event)
-            .map_err(|_| AtomicProjectionSinkError::Worker)?
+            .map_err(|_| AtomicProjectionSinkError)?
             .wait()
             .map(|_| ())
-            .map_err(|_| AtomicProjectionSinkError::Worker)
+            .map_err(|_| AtomicProjectionSinkError)
     }
 }
 
@@ -678,10 +725,51 @@ enum WorkerExit {
     Panicked,
 }
 
+/// Identifier-free queue-bound validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicQueueCapacityError {
+    Invalid,
+}
+
+impl fmt::Display for AtomicQueueCapacityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid => write!(
+                f,
+                "atomic worker queue capacity must be in 1..={MAX_WORKER_QUEUE_CAPACITY}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AtomicQueueCapacityError {}
+
+/// Coarse typed-worker construction failure for the offline owner.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicWorkerBuildError {
+    TypedBackendUnavailable,
+    ConstructionFailed,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl fmt::Display for AtomicWorkerBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TypedBackendUnavailable => {
+                f.write_str("typed atomic worker backend is unavailable")
+            }
+            Self::ConstructionFailed => f.write_str("typed atomic worker construction failed"),
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::error::Error for AtomicWorkerBuildError {}
+
 /// Identifier-free failure from worker startup, admission, execution, or join.
 #[derive(Debug)]
 enum AtomicWorkerError {
-    InvalidQueueCapacity,
     ThreadSpawn(io::Error),
     QueueFull,
     NotRunning,
@@ -697,18 +785,12 @@ enum AtomicWorkerError {
 /// Identifier-free projection-to-worker boundary failure.
 #[cfg(feature = "corpus-zaino")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AtomicProjectionSinkError {
-    InvalidEvent,
-    Worker,
-}
+pub(crate) struct AtomicProjectionSinkError;
 
 #[cfg(feature = "corpus-zaino")]
 impl fmt::Display for AtomicProjectionSinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidEvent => f.write_str("projection event is not a supported standard event"),
-            Self::Worker => f.write_str("projection event mutation failed"),
-        }
+        f.write_str("projection event mutation failed")
     }
 }
 
@@ -718,10 +800,6 @@ impl std::error::Error for AtomicProjectionSinkError {}
 impl fmt::Display for AtomicWorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidQueueCapacity => write!(
-                f,
-                "atomic worker queue capacity must be in 1..={MAX_WORKER_QUEUE_CAPACITY}"
-            ),
             Self::ThreadSpawn(_) => f.write_str("atomic worker could not start"),
             Self::QueueFull => f.write_str("atomic worker queue is full"),
             Self::NotRunning => f.write_str("atomic worker is not accepting work"),
@@ -740,8 +818,7 @@ impl std::error::Error for AtomicWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ThreadSpawn(error) => Some(error),
-            Self::InvalidQueueCapacity
-            | Self::QueueFull
+            Self::QueueFull
             | Self::NotRunning
             | Self::WorkerDisconnected
             | Self::AcceptedOutcomeIndeterminate
@@ -1089,7 +1166,7 @@ mod tests {
 
         assert_eq!(
             ProjectionEventSink::append_and_wait(&mut worker, event(owner, 0x4b)),
-            Err(AtomicProjectionSinkError::Worker)
+            Err(AtomicProjectionSinkError)
         );
         let snapshot = worker.snapshot();
         assert_eq!(snapshot.fault, Some(WorkerFault::Terminal));
@@ -1119,7 +1196,7 @@ mod tests {
 
         assert_eq!(
             ProjectionEventSink::append_and_wait(&mut worker, event),
-            Err(AtomicProjectionSinkError::InvalidEvent)
+            Err(AtomicProjectionSinkError)
         );
         let snapshot = worker.snapshot();
         assert_eq!(snapshot.accepted, 0);
@@ -1136,18 +1213,13 @@ mod tests {
         let (worker, _) = worker(1, None)?;
 
         assert_eq!(
-            AtomicProjectionSinkError::InvalidEvent.to_string(),
-            "projection event is not a supported standard event"
-        );
-        assert_eq!(
-            AtomicProjectionSinkError::Worker.to_string(),
+            AtomicProjectionSinkError.to_string(),
             "projection event mutation failed"
         );
         assert_eq!(
-            format!("{:?}", AtomicProjectionSinkError::InvalidEvent),
-            "InvalidEvent"
+            format!("{AtomicProjectionSinkError:?}"),
+            "AtomicProjectionSinkError"
         );
-        assert_eq!(format!("{:?}", AtomicProjectionSinkError::Worker), "Worker");
         assert_eq!(format!("{worker:?}"), "AtomicWorker { ..REDACTED.. }");
         worker.shutdown()?;
         Ok(())
@@ -1659,11 +1731,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert!(matches!(
             AtomicQueueCapacity::try_new(0),
-            Err(AtomicWorkerError::InvalidQueueCapacity)
+            Err(AtomicQueueCapacityError::Invalid)
         ));
         assert!(matches!(
             AtomicQueueCapacity::try_new(MAX_WORKER_QUEUE_CAPACITY + 1),
-            Err(AtomicWorkerError::InvalidQueueCapacity)
+            Err(AtomicQueueCapacityError::Invalid)
         ));
 
         let (worker, _) = worker(1, None)?;

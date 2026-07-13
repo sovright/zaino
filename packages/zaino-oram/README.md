@@ -32,13 +32,17 @@ offline dependency experiment:
 - a feature-gated private sink implementation on the owning business-command
   worker that derives the standard address from each event, admits one whole
   append command, and consumes its reply before reporting completion;
+- a crate-internal offline projection owner that validates network, schema, key
+  epoch, and all three projection/layout admission bounds before backend
+  allocation, then exclusively owns the coordinator and worker through coarse
+  readiness and consuming shutdown outcomes;
 - a fixed continuation-token codec with injected protection/replay interfaces;
 - `rostl-experimental`, pinned to `8c3a12d2`, which binds separate volatile
   `CircuitORAM` and recursive-position-map instances to the exact 38-byte
   directory and 82-byte event-page records on Linux x86_64. A private offline
   construction path places those stores behind the same business-command
-  worker; it has no projection/service owner caller yet, and unsupported hosts
-  reject construction before creating upstream state.
+  worker for the offline projection owner; it has no runtime/service caller,
+  and unsupported hosts reject construction before creating upstream state.
 
 It does **not** contain production encryption, durable ORAM persistence, TDX
 attestation, protobufs, or a network listener, and it makes no production
@@ -47,10 +51,10 @@ mainnet blocks into the core, but no full-mainnet measurement artifact exists
 yet. Static fixture parity is not live-backend, finalised-database, reorg, or
 mainnet shadow evidence. Upstream `rostl` panic/recovery, persistence,
 side-channel, and licensing gates remain unresolved.
-The event coordinator is a portable sink/checkpoint ordering model. Its sink
-trait is implemented for the private business-command worker, but no owner
-constructs the coordinator with that worker or with `rostl`. The coordinator
-retains the plaintext outpoint-owner resolver
+The event coordinator is a portable sink/checkpoint ordering model. A private
+offline owner composes it with the business-command worker and, on supported
+hosts, the typed `rostl` stores, but no runtime or service calls that owner. The
+coordinator retains the plaintext outpoint-owner resolver
 needed to map spends to standard-address events. A sink failure may leave a
 partial event prefix in the discarded sink candidate; the prior in-memory
 checkpoint does not advance, the coordinator drops the sink and fails closed,
@@ -60,8 +64,8 @@ authenticated state root, durable publication, rollback defense, or
 crash-atomic coupling to sink mutations.
 The worker can own either the fake-backed command core or, on Linux x86_64, the
 two exact typed volatile `rostl` stores. It implements the private synchronous
-projection-event sink, but no projection owner constructs it and it is not
-connected to the query engine or checkpoint publication. Its
+projection-event sink and is consumed by the private offline projection owner,
+but it is not connected to the query engine or durable checkpoint publication. Its
 internal snapshot exposes queue/lifecycle plus aggregate completion, rejection,
 and reply-delivery counters; no safe export policy is claimed. Queue saturation
 rejects without fallback, shutdown drains accepted FIFO commands, and cloned
@@ -116,15 +120,17 @@ The module-private synchronous connector obtains occupancy from its owned typed
 backends, scans the directory and every bounded event ordinal on successful
 preflights, validates a contiguous history, derives the next ordinal, and
 preflights both insertions before its first write. A possible partial or
-uncertain mutation terminal-latches the connector as unusable, pending owner
-discard and rebuild. Its fake handles model the command semantics portably; the
+uncertain mutation terminal-latches the connector as unusable. The offline owner
+preserves only the prior committed checkpoint, consumes and joins the failed
+worker, and forbids retry or later backend I/O; rebuild orchestration remains
+absent. Its fake handles model the command semantics portably; the
 offline Linux constructor separately owns the two real typed backends. This is
 not crash atomicity, persistence, rollback, or a physical obliviousness claim.
 The connector is wired to the module-private business-command worker, whose
 Linux-only offline constructor can own the two typed `rostl` stores. That
-constructor currently has no non-test owner caller. The connector is not wired
-to a projection coordinator, query engine, or checkpoint publisher; only the
-private worker sink implementation reaches its business append command.
+constructor is composed with the projection coordinator by the private offline
+owner. No runtime or service calls the owner, and the connector is not wired to
+a query engine or durable checkpoint publisher.
 
 Cross-table script ownership is checked for the requested event, but an
 unrelated event collision cannot be associated with its directory without more
@@ -139,8 +145,10 @@ occupancy model inputs; the module-private connector and worker close
 executor-command TOCTOU, and the Linux-only offline constructor creates two
 non-aliased ORAM/map pairs. The old raw worker surface has been removed. The
 portable schedule tests exercise the same insertion helper used by the real
-stores, but the actual Linux backend and worker tests have not run on this
-macOS host. Reply abandonment relies on the module-private trusted owner
+stores. The actual Linux backend and worker ran in the inherited generic native
+CI lane; the new owner-level Linux test is pending this branch's CI, while 154
+portable all-feature tests pass on this macOS host. Reply abandonment relies on
+the module-private trusted owner
 dropping tickets normally;
 deliberately leaking a ticket with `mem::forget` is outside this offline model.
 
@@ -153,7 +161,7 @@ record sizes are safe only in distinct typed stores; a future unified padded
 value needs an authenticated kind tag.
 Slots, ordinals, occupancy, and nested event fields remain sensitive and must
 not enter logs, errors, or metrics. The volatile two-ORAM worker has no
-authenticated composite commit, projection/checkpoint connector, or seed
+authenticated composite commit, durable checkpoint coupling, or seed
 persistence/rotation protocol. The
 logical sizing model charges every allocated 38-byte directory cell, every
 allocated 82-byte event cell, and position-map entries for both full capacity

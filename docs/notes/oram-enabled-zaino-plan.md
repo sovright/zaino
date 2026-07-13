@@ -23,23 +23,25 @@ observations, and terminal-latches a possibly partial mutation for discard. The
 worker admits only whole history-read/append commands; the former raw-key and
 raw-record worker surface is removed. Their deterministic fake model prevents
 executor-command interleaving. A private Linux-only offline constructor creates
-two non-aliased ORAM/map pairs and places them behind the same worker; no
-projection/service owner calls it yet. Its healthy
+two non-aliased ORAM/map pairs and places them behind the same worker. A
+crate-internal offline owner validates the projection/layout identity and
+admission profile before allocation, composes the finalized-event coordinator
+with that worker, and consumes shutdown without exposing raw stores. No runtime
+or service calls the owner. Its healthy
 miss/duplicate insertion path always performs read/remap followed by
 write-or-insert/remap, selecting the prior bytes on duplicate. This path has
 generic native Ubuntu 24.04 x86_64 execution evidence at small 8/16-entry table
 capacities in a dedicated CI lane with immutable action pins and pinned
 Rust/nextest tools, in addition to the current macOS host's portable and
-cross-compile checks. It is not connected to the projection and does not claim
-target-capacity behavior, physical obliviousness, TDX qualification, or crash
-atomicity. A later portable slice adds
+cross-compile checks. This does not claim target-capacity behavior, physical
+obliviousness, TDX qualification, or crash atomicity. A later portable slice adds
 a private generic finalized-event coordinator: it stages a whole block through
 the existing plaintext spend-owner resolver, completes every synchronous event
 sink call, and commits the in-memory checkpoint last. The owning atomic worker
 now implements that private sink boundary and consumes each append reply before
-returning, but no owner composes the coordinator, worker, and `rostl` stores. A
-sink failure can leave a partial prefix in a discarded candidate. The fork
-contains no production
+returning. The private offline owner composes the coordinator, worker, and
+`rostl` stores, while a sink failure can still leave a partial prefix in a
+discarded candidate. The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
 mainnet/RSS, recovery, side-channel, hardware, and licensing gates are open.
@@ -409,6 +411,9 @@ Deliverables:
 - one bounded worker that owns that command core, exposes no raw storage
   operations, drains accepted FIFO work, and fails commands that have not yet
   entered the executor without executor I/O after a terminal fault;
+- one offline owner that validates projection/layout compatibility before
+  allocation, exclusively composes the checkpoint coordinator with the worker,
+  and joins or fails closed on consuming shutdown without exporting raw handles;
 - deterministic projection from `IndexedBlock` fixtures and finalised snapshots;
 - single-worker mutation queue, capacity/stash/queue telemetry, and fail-closed transitions;
 - research-only volatile rebuild path if durable external memory is not yet available;

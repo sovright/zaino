@@ -29,7 +29,7 @@ use crate::{
 
 /// Explicit bounds for every identifier-bearing offline projection collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProjectionCapacities {
+pub(super) struct ProjectionCapacities {
     max_seen_outputs: NonZeroUsize,
     max_live_outputs: NonZeroUsize,
     max_standard_addresses: NonZeroUsize,
@@ -38,7 +38,7 @@ struct ProjectionCapacities {
 }
 
 impl ProjectionCapacities {
-    fn new(
+    pub(super) fn new(
         max_seen_outputs: usize,
         max_live_outputs: usize,
         max_standard_addresses: usize,
@@ -83,11 +83,23 @@ impl ProjectionCapacities {
             CapacityDimension::AddressEvents => self.max_events_per_address,
         }
     }
+
+    pub(super) const fn max_standard_addresses(self) -> usize {
+        self.max_standard_addresses.get()
+    }
+
+    pub(super) const fn max_total_events(self) -> usize {
+        self.max_total_events.get()
+    }
+
+    pub(super) const fn max_events_per_address(self) -> usize {
+        self.max_events_per_address.get()
+    }
 }
 
 /// Offline model identity and capacity configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProjectionConfig {
+pub(super) struct ProjectionConfig {
     network: CanonicalNetwork,
     schema_version: u32,
     key_epoch: u64,
@@ -95,7 +107,7 @@ struct ProjectionConfig {
 }
 
 impl ProjectionConfig {
-    fn new(
+    pub(super) fn new(
         network: CanonicalNetwork,
         schema_version: u32,
         key_epoch: u64,
@@ -111,11 +123,27 @@ impl ProjectionConfig {
             capacities,
         })
     }
+
+    pub(super) const fn network(self) -> CanonicalNetwork {
+        self.network
+    }
+
+    pub(super) const fn schema_version(self) -> u32 {
+        self.schema_version
+    }
+
+    pub(super) const fn key_epoch(self) -> u64 {
+        self.key_epoch
+    }
+
+    pub(super) const fn capacities(self) -> ProjectionCapacities {
+        self.capacities
+    }
 }
 
 /// Invalid offline model configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionConfigError {
+pub(super) enum ProjectionConfigError {
     ZeroSchemaVersion,
     ZeroCapacity { dimension: CapacityDimension },
 }
@@ -747,7 +775,7 @@ pub(super) trait ProjectionEventSink {
 }
 
 /// Owns one volatile sink candidate and publishes only its in-memory cursor.
-struct ProjectionCheckpointCoordinator<S> {
+pub(super) struct ProjectionCheckpointCoordinator<S> {
     projection: OfflineFinalizedProjection,
     sink: Option<S>,
 }
@@ -756,7 +784,7 @@ impl<S> ProjectionCheckpointCoordinator<S>
 where
     S: ProjectionEventSink,
 {
-    fn new(config: ProjectionConfig, sink: S) -> Self {
+    pub(super) fn new(config: ProjectionConfig, sink: S) -> Self {
         Self {
             projection: OfflineFinalizedProjection::new(config),
             sink: Some(sink),
@@ -804,6 +832,51 @@ where
         self.projection.committed_checkpoint()
     }
 
+    pub(super) fn apply_finalized_chain(
+        &mut self,
+        block: &IndexedBlock,
+    ) -> Result<PublicChainCheckpoint, ProjectionCoordinatorCommandError> {
+        self.apply_finalized(block)
+            .map(|checkpoint| checkpoint.chain())
+            .map_err(|_| ProjectionCoordinatorCommandError::FailedClosed)
+    }
+
+    pub(super) fn finish_chain(
+        &mut self,
+        target: PublicChainCheckpoint,
+    ) -> Result<PublicChainCheckpoint, ProjectionCoordinatorCommandError> {
+        let target = self.projection.checkpoint_for(target);
+        self.finish(target)
+            .map(|checkpoint| checkpoint.chain())
+            .map_err(|_| ProjectionCoordinatorCommandError::FailedClosed)
+    }
+
+    pub(super) fn status(&self) -> ProjectionCoordinatorStatus {
+        match self.projection.readiness {
+            ProjectionReadiness::Building => ProjectionCoordinatorStatus::Building {
+                committed: self
+                    .projection
+                    .committed_checkpoint()
+                    .map(|checkpoint| checkpoint.chain()),
+            },
+            ProjectionReadiness::Ready(checkpoint) => ProjectionCoordinatorStatus::Ready {
+                checkpoint: checkpoint.chain(),
+            },
+            ProjectionReadiness::FailedClosed(_) => ProjectionCoordinatorStatus::FailedClosed {
+                committed: self
+                    .projection
+                    .committed_checkpoint()
+                    .map(|checkpoint| checkpoint.chain()),
+            },
+        }
+    }
+
+    pub(super) fn into_shutdown_parts(mut self) -> (ProjectionCoordinatorStatus, Option<S>) {
+        let status = self.status();
+        let sink = self.sink.take();
+        (status, sink)
+    }
+
     fn append_staged_events(&mut self, events: &[UtxoEvent]) -> Result<(), ()> {
         let Some(sink) = self.sink.as_mut() else {
             return Err(());
@@ -828,6 +901,24 @@ where
         };
         let _ = catch_unwind(AssertUnwindSafe(|| drop(sink)));
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectionCoordinatorStatus {
+    Building {
+        committed: Option<PublicChainCheckpoint>,
+    },
+    Ready {
+        checkpoint: PublicChainCheckpoint,
+    },
+    FailedClosed {
+        committed: Option<PublicChainCheckpoint>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectionCoordinatorCommandError {
+    FailedClosed,
 }
 
 impl<S> fmt::Debug for ProjectionCheckpointCoordinator<S> {
@@ -1068,7 +1159,7 @@ impl std::error::Error for ProjectionError {
 
 /// Identifier-free bounded collection dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CapacityDimension {
+pub(super) enum CapacityDimension {
     SeenOutputs,
     LiveOutputs,
     StandardAddresses,
@@ -1124,10 +1215,11 @@ mod tests {
     use super::*;
     use zaino_state::{BlockHash, TxInCompact};
 
-    use crate::zaino_fixtures::{indexed_block, output, transaction, FixtureResult};
+    use crate::zaino_fixtures::{
+        indexed_block, output, projection_chain, transaction, FixtureResult, SECOND_HASH,
+        THIRD_HASH,
+    };
 
-    const SECOND_HASH: [u8; 32] = [0x92; 32];
-    const THIRD_HASH: [u8; 32] = [0x93; 32];
     const SCHEMA_VERSION: u32 = 1;
     const KEY_EPOCH: u64 = 7;
 
@@ -1289,63 +1381,6 @@ mod tests {
                 [0xc3; 20],
             ),
         ]
-    }
-
-    fn projection_chain() -> FixtureResult<[IndexedBlock; 3]> {
-        let address_a = [0xa1; 20];
-        let address_b = [0xb2; 20];
-        let address_c = [0xc3; 20];
-        let first_txid = [0x11; 32];
-        let second_txid = [0x22; 32];
-        let third_txid = [0x33; 32];
-
-        let first = transaction(
-            0,
-            first_txid,
-            vec![TxInCompact::null_prevout()],
-            vec![
-                output(50, address_a, ScriptType::P2PKH)?,
-                output(60, address_a, ScriptType::P2PKH)?,
-                output(70, [0xdd; 20], ScriptType::NonStandard)?,
-            ],
-        );
-        let same_block_spend = transaction(
-            1,
-            second_txid,
-            vec![TxInCompact::new(first_txid, 0)],
-            vec![output(40, address_b, ScriptType::P2SH)?],
-        );
-        let genesis = indexed_block(
-            0,
-            CanonicalNetwork::Regtest.genesis_hash().0,
-            [0; 32],
-            vec![first, same_block_spend],
-        )?;
-
-        let cross_block_spend = transaction(
-            0,
-            third_txid,
-            vec![TxInCompact::new(second_txid, 0)],
-            vec![
-                output(30, address_a, ScriptType::P2PKH)?,
-                output(20, address_c, ScriptType::P2SH)?,
-            ],
-        );
-        let second = indexed_block(
-            1,
-            SECOND_HASH,
-            CanonicalNetwork::Regtest.genesis_hash().0,
-            vec![cross_block_spend],
-        )?;
-
-        let nonstandard_spend = transaction(
-            0,
-            [0x44; 32],
-            vec![TxInCompact::new(first_txid, 2)],
-            Vec::new(),
-        );
-        let third = indexed_block(2, THIRD_HASH, SECOND_HASH, vec![nonstandard_spend])?;
-        Ok([genesis, second, third])
     }
 
     fn expected_utxo(

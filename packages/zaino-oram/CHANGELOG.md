@@ -22,8 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   targets reject construction and no production obliviousness claim is made.
 - Separate typed `rostl` stores for the exact 38-byte directory and 82-byte
   event-page records, plus a private Linux-only offline constructor that places
-  both stores behind the exclusive business-command worker for native proof;
-  no projection/service owner calls it yet. Healthy misses and
+  both stores behind the exclusive business-command worker for native proof and
+  the crate-internal offline projection owner. Healthy misses and
   duplicates share one read/remap plus one write-or-insert/remap schedule;
   `Cmov` selection preserves the prior logical bytes on duplicate, and
   uncertain upstream outcomes fail the store closed. Native Linux execution,
@@ -39,14 +39,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   capacity checks, and an ordered standard-event batch before its first sink
   call. It commits the cloned plaintext projection checkpoint only after every
   synchronous sink append succeeds and drops/fails closed on staging, sink, or
-  finish failure. This is an offline ordering model, not worker/`rostl`
-  integration, backend block atomicity, authenticated persistence, or recovery.
+  finish failure. This is an offline ordering model, not backend block
+  atomicity, authenticated persistence, or recovery.
 - A private `corpus-zaino` event-sink implementation on the owning atomic
   worker. It rejects nonstandard events before admission, derives P2PKH/P2SH
   addresses through the existing business conversion, submits only the whole
   append command, consumes the reply synchronously, and collapses worker
-  failures to identifier-free sink errors. No owner composes the coordinator,
-  worker, and typed `rostl` stores yet.
+  failures to an identifier-free sink error.
+- A crate-internal offline projection owner that rejects network, schema, key
+  epoch, directory admission, event admission, or per-address bound mismatches
+  before backend allocation; owns the coordinator and worker without exposing
+  table handles or snapshots; and consumes shutdown into coarse stopped or
+  failed-closed outcomes. Portable fake-backed tests cover complete build,
+  finish, shutdown, and mutate-then-fail retry prohibition; a Linux x86_64 test
+  drives the same owner over the exact typed `rostl` stores.
 - Exact immutable 38-byte address-directory and 82-byte one-event page
   candidates with canonical dummy encodings, named persistence conversions,
   standard-address validation, redacted diagnostics, and `Pod`/`Cmov` proofs.
@@ -67,9 +73,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   derives the append ordinal from a contiguous owned-backend history, obtains
   admission counts from those backends, and preflights both immutable inserts
   without executor-command interleaving. Any uncertain or partial mutation
-  terminal-latches the candidate for discard; the core and worker remain
-  disconnected from the projection and real `rostl` adapter and make no backend
-  non-aliasing, crash-atomicity, or physical-obliviousness claim.
+  terminal-latches the candidate for discard. The private owner composes this
+  core and worker with the projection and real `rostl` adapter, but makes no
+  authenticated block-atomicity, persistence, or physical-obliviousness claim.
 
 ### Changed
 

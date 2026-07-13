@@ -1,9 +1,9 @@
 //! Exclusive, in-memory two-table execution for one fixed layout generation.
 //!
-//! This module models a synchronous owner and a nested bounded worker that
-//! consumes that complete owner. A private projection sink seam can drive the
-//! worker, but no projection coordinator, query engine, or service constructs
-//! that owner, and it makes no persistence or physical-obliviousness claim.
+//! This module models a synchronous executor and a nested bounded worker that
+//! consumes that complete executor. The crate-internal offline projection owner
+//! drives the worker through a private sink seam; no query engine or service
+//! consumes it, and it makes no persistence or physical-obliviousness claim.
 //! "Exclusive" means one executor command completes its scan and preflight
 //! without another executor command interleaving. A new-address append still
 //! performs two sequential writes; it is not an all-or-nothing transaction,
@@ -22,6 +22,12 @@ use super::*;
 
 mod worker;
 
+#[cfg(feature = "corpus-zaino")]
+pub(crate) use worker::{
+    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQueueCapacity,
+    AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+};
+
 /// A sparse fixed-capacity table whose insert never overwrites an existing key.
 ///
 /// Each handle must have unaliased backing state for the lifetime of a command.
@@ -32,7 +38,7 @@ mod worker;
 /// physically discard backend state. Backend panic payloads must not contain
 /// identifiers or other protected data because the process-wide panic hook
 /// still runs.
-trait UniqueTable<T> {
+pub(crate) trait UniqueTable<T> {
     fn capacity(&self) -> usize;
 
     fn read(&mut self, index: usize) -> Result<Option<T>, BackendFailure>;
@@ -44,7 +50,7 @@ trait UniqueTable<T> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BackendFailure;
+pub(crate) struct BackendFailure;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutorState {
@@ -667,6 +673,27 @@ impl fmt::Display for AtomicStoreError {
 }
 
 impl std::error::Error for AtomicStoreError {}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
+pub(crate) fn spawn_atomic_worker_for_tests<
+    D,
+    E,
+    const DIRECTORY_PROBES: usize,
+    const EVENT_PROBES: usize,
+>(
+    layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
+    directory: D,
+    events: E,
+    queue_capacity: AtomicQueueCapacity,
+) -> Result<AtomicWorker, AtomicWorkerBuildError>
+where
+    D: UniqueTable<PersistentAddressDirectory> + Send + 'static,
+    E: UniqueTable<PersistentAddressEventPage> + Send + 'static,
+{
+    let executor = ExclusiveTwoTableExecutor::new(layout, directory, events)
+        .map_err(|_| AtomicWorkerBuildError::ConstructionFailed)?;
+    worker::spawn_atomic_worker_for_tests(executor, queue_capacity)
+}
 
 #[cfg(test)]
 mod tests {
