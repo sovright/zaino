@@ -2,8 +2,9 @@
 //!
 //! The codec pins canonical big-endian fields inside one compile-time fixed
 //! envelope and injects a whole-envelope protection interface. It supplies no
-//! production protector, nonce owner, runtime adapter, or fixed-work trace;
-//! those remain separate review gates.
+//! production protector or nonce owner. Its private listener-free runtime child
+//! composes the codec with the logical engine and fixed phase recorder; no
+//! network, production AEAD, or physical fixed-work claim is made.
 //!
 //! Deviation from the named `to_wire` / `try_from_wire` convention: this
 //! format has no intermediate proto or wire structs. Codec-local helpers write
@@ -14,8 +15,13 @@
 
 use std::{fmt, marker::PhantomData};
 
+use blake2::{Blake2s256, Digest};
+
 use crate::{
-    continuation_token::{ContinuationToken, CONTINUATION_TOKEN_BYTES},
+    continuation_token::{
+        ContinuationProtectionContext, ContinuationToken, CONTINUATION_CONTEXT_BYTES,
+        CONTINUATION_TOKEN_BYTES,
+    },
     envelope::FixedEnvelope,
     profile::{all_zero, CompiledQueryShape, PROFILE_ID_BYTES},
     records::{
@@ -23,6 +29,8 @@ use crate::{
         TRANSPARENT_SCRIPT_CAPACITY, TXID_BYTES,
     },
 };
+
+mod runtime;
 
 const FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
@@ -57,6 +65,8 @@ const RESPONSE_SLOTS_START: usize = RESPONSE_OUTCOME_START + 1;
 const REQUEST_FLAG_CONTINUATION: u8 = 1 << 0;
 const RESPONSE_FLAG_HAS_MORE: u8 = 1 << 0;
 const QUERY_FLAG_DOMAIN_VALID: u8 = 1 << 0;
+const QUERY_DIGEST_DOMAIN: &[u8] = b"zaino-oram/utxo-query/v1";
+const UTXO_QUERY_METHOD_TAG: u8 = 1;
 
 type EnvelopePartsMut<'a> = (
     &'a mut [u8; ENVELOPE_NONCE_BYTES],
@@ -290,6 +300,19 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
         }
     }
 
+    fn continuation_protection_context(
+        &self,
+        checkpoint: &PrivateQueryCheckpoint,
+    ) -> Result<ContinuationProtectionContext, InnerCodecError> {
+        if CHECKPOINT_BYTES + SESSION_BINDING_BYTES != CONTINUATION_CONTEXT_BYTES {
+            return Err(InnerCodecError::LayoutInvariant);
+        }
+        let mut bytes = [0; CONTINUATION_CONTEXT_BYTES];
+        encode_checkpoint(&mut bytes, 0, checkpoint)?;
+        write_array(&mut bytes, CHECKPOINT_BYTES, &self.session_binding)?;
+        Ok(ContinuationProtectionContext::new(bytes))
+    }
+
     fn encode_request<P>(
         &self,
         request: &PrivateQueryRequest,
@@ -329,6 +352,18 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
     where
         P: EnvelopeProtector,
     {
+        self.decode_request_with_nonce(envelope, protector)
+            .map(|(request, _nonce)| request)
+    }
+
+    fn decode_request_with_nonce<P>(
+        &self,
+        envelope: &FixedEnvelope<ENVELOPE_BYTES>,
+        protector: &P,
+    ) -> Result<(PrivateQueryRequest, [u8; ENVELOPE_NONCE_BYTES]), InnerCodecError>
+    where
+        P: EnvelopeProtector,
+    {
         let mut bytes = *envelope.as_bytes();
         let (nonce, body, authentication) = split_envelope_mut(&mut bytes)?;
         if !protector.open(
@@ -339,6 +374,7 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
         ) {
             return Err(InnerCodecError::AuthenticationFailed);
         }
+        let authenticated_nonce = *nonce;
         let checkpoint = self.decode_header(body, EnvelopeDirection::Request)?;
         let query = decode_query(body, REQUEST_QUERY_START)?;
         let continuation = decode_optional_token(
@@ -349,7 +385,23 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
         )?;
         validate_binding(body, REQUEST_SESSION_BINDING_START, &self.session_binding)?;
         ensure_zero(body, REQUEST_BODY_BYTES)?;
-        Ok(PrivateQueryRequest::new(checkpoint, query, continuation))
+        Ok((
+            PrivateQueryRequest::new(checkpoint, query, continuation),
+            authenticated_nonce,
+        ))
+    }
+
+    fn query_digest(&self, query: &UtxoQuery) -> [u8; 32] {
+        let mut hasher = Blake2s256::new();
+        Digest::update(&mut hasher, QUERY_DIGEST_DOMAIN);
+        Digest::update(&mut hasher, [UTXO_QUERY_METHOD_TAG]);
+        Digest::update(&mut hasher, query.address_key().as_bytes());
+        Digest::update(&mut hasher, query.minimum_height().to_be_bytes());
+        Digest::update(&mut hasher, [u8::from(query.domain_valid())]);
+        let digest = Digest::finalize(hasher);
+        let mut query_digest = [0; 32];
+        query_digest.copy_from_slice(&digest);
+        query_digest
     }
 
     fn encode_response<P>(
@@ -746,7 +798,8 @@ fn validate_response_shape<const N: usize>(
         }
         QueryOutcome::InvalidDomain
         | QueryOutcome::StoreFailure
-        | QueryOutcome::ProjectionNotReady => {
+        | QueryOutcome::ProjectionNotReady
+        | QueryOutcome::InvalidContinuation => {
             if has_more || continuation.is_some() || !page.is_all_dummy() {
                 return Err(InnerCodecError::InvalidResponseShape);
             }
@@ -776,6 +829,7 @@ const fn outcome_tag(outcome: QueryOutcome) -> u8 {
         QueryOutcome::InvalidDomain => 2,
         QueryOutcome::StoreFailure => 3,
         QueryOutcome::ProjectionNotReady => 4,
+        QueryOutcome::InvalidContinuation => 5,
     }
 }
 
@@ -786,6 +840,7 @@ const fn outcome_from_tag(tag: u8) -> Result<QueryOutcome, InnerCodecError> {
         2 => Ok(QueryOutcome::InvalidDomain),
         3 => Ok(QueryOutcome::StoreFailure),
         4 => Ok(QueryOutcome::ProjectionNotReady),
+        5 => Ok(QueryOutcome::InvalidContinuation),
         _ => Err(InnerCodecError::UnknownOutcome),
     }
 }
@@ -854,8 +909,8 @@ fn offset(start: usize, width: usize) -> Result<usize, InnerCodecError> {
 
 /// A protected inner envelope failed shape or canonical validation.
 ///
-/// These detailed variants are module-internal diagnostics only. A future
-/// runtime adapter must map every variant through
+/// These detailed variants are module-internal diagnostics only. The private
+/// runtime adapter maps every variant through
 /// [`InnerCodecError::into_uniform_external_failure`] before recording
 /// outcome-labelled telemetry or producing a caller-visible failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -898,6 +953,8 @@ impl fmt::Display for UniformExternalFailure {
         f.write_str("private query failed")
     }
 }
+
+impl std::error::Error for UniformExternalFailure {}
 
 impl fmt::Display for InnerCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1041,7 +1098,7 @@ mod tests {
     }
 
     fn profile<const SLOTS: usize, const BYTES: usize>() -> PrivacyProfile {
-        PrivacyProfile::new("codec-test-v1", 4, SLOTS, BYTES, 2)
+        PrivacyProfile::new("codec-test-v1", 4, SLOTS, BYTES, 2, 60)
             .expect("test profile inputs are nonzero")
     }
 
@@ -1065,6 +1122,7 @@ mod tests {
             RESPONSE_SLOTS,
             ENVELOPE_BYTES,
             cover_rounds,
+            60,
         )
         .expect("alternate test profile inputs are nonzero");
         let shape = CompiledQueryShape::new(profile)
@@ -1158,8 +1216,8 @@ mod tests {
         assert_eq!(
             digest(&envelope),
             [
-                208, 66, 216, 138, 209, 3, 242, 181, 104, 174, 248, 16, 139, 214, 158, 242, 103,
-                86, 161, 69, 49, 89, 243, 50, 96, 75, 234, 195, 226, 173, 130, 94,
+                58, 218, 14, 250, 254, 79, 227, 179, 92, 73, 1, 166, 80, 85, 231, 206, 249, 183,
+                251, 248, 185, 70, 180, 248, 109, 96, 3, 199, 0, 136, 78, 1,
             ]
         );
         Ok(())
@@ -1247,8 +1305,8 @@ mod tests {
         assert_eq!(
             digest(&envelope),
             [
-                143, 184, 230, 133, 55, 157, 71, 88, 139, 92, 45, 65, 154, 195, 141, 191, 248, 14,
-                27, 78, 133, 199, 139, 132, 183, 35, 181, 9, 182, 14, 85, 77,
+                236, 152, 200, 74, 186, 79, 54, 80, 95, 110, 49, 158, 110, 76, 8, 14, 214, 239, 44,
+                249, 243, 159, 35, 207, 203, 186, 163, 169, 41, 1, 42, 220,
             ]
         );
         Ok(())
@@ -1518,10 +1576,11 @@ mod tests {
             outcome_response(QueryOutcome::InvalidDomain)?,
             outcome_response(QueryOutcome::StoreFailure)?,
             outcome_response(QueryOutcome::ProjectionNotReady)?,
+            outcome_response(QueryOutcome::InvalidContinuation)?,
         ];
 
         for (index, response) in cases.iter().enumerate() {
-            let nonce_byte = u8::try_from(index + 1).expect("seven test cases fit u8");
+            let nonce_byte = u8::try_from(index + 1).expect("eight test cases fit u8");
             let envelope = codec.encode_response(
                 response,
                 [nonce_byte; ENVELOPE_NONCE_BYTES],

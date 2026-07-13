@@ -10,6 +10,57 @@ pub(super) enum CompletionShape {
     UnaryFixedEnvelope,
 }
 
+/// Version of the ordered logical runtime schedule bound into each profile.
+pub(super) const RUNTIME_SCHEDULE_VERSION: u16 = 1;
+
+/// One public, ordered phase in a successfully protected query round.
+///
+/// These phases model logical control-plane work only. They do not establish
+/// equal instructions, allocations, memory accesses, timing, or transport
+/// behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimePhase {
+    /// The fixed request envelope was opened and canonically decoded.
+    RequestDecode,
+    /// One clock read and both server-owned output nonces were acquired.
+    NonceAcquisition,
+    /// One continuation open and the complete semantic comparison set ran.
+    TokenOpen,
+    /// One real or cover replay-guard operation ran.
+    ReplayGuard,
+    /// Runtime and checkpoint readiness were selected without early return.
+    ReadinessSelect,
+    /// The engine began its complete configured store schedule.
+    EngineExecution,
+    /// The fixed result page was normalized to its protected outcome.
+    ResultNormalization,
+    /// One real or cover continuation token was issued.
+    TokenIssue,
+    /// One fixed response was built, encoded, and protected.
+    ResponseEncode,
+    /// The unary fixed-envelope round completed.
+    Completion,
+}
+
+impl RuntimePhase {
+    pub(super) const COUNT: usize = 10;
+
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::RequestDecode => 0,
+            Self::NonceAcquisition => 1,
+            Self::TokenOpen => 2,
+            Self::ReplayGuard => 3,
+            Self::ReadinessSelect => 4,
+            Self::EngineExecution => 5,
+            Self::ResultNormalization => 6,
+            Self::TokenIssue => 7,
+            Self::ResponseEncode => 8,
+            Self::Completion => 9,
+        }
+    }
+}
+
 /// The complete logical-access budget for one fixed-profile query round.
 ///
 /// Frame and byte fields model application envelopes, not network frames or
@@ -57,6 +108,16 @@ impl QueryAccessBudget {
         0
     }
 
+    /// Returns the exact logical replay-state lookup count.
+    pub(super) const fn replay_reads(&self) -> usize {
+        1
+    }
+
+    /// Returns the exact real-or-cover replay-state write-back count.
+    pub(super) const fn replay_writes(&self) -> usize {
+        1
+    }
+
     /// Returns the modeled request application-frame count.
     pub(super) const fn request_frames(&self) -> usize {
         1
@@ -81,6 +142,11 @@ impl QueryAccessBudget {
     pub(super) const fn completion(&self) -> CompletionShape {
         CompletionShape::UnaryFixedEnvelope
     }
+
+    /// Returns the exact ordered runtime-phase count.
+    pub(super) const fn runtime_phases(&self) -> usize {
+        RuntimePhase::COUNT
+    }
 }
 
 /// An allocation-free, key-free logical trace for one offline query round.
@@ -94,10 +160,13 @@ pub(super) struct AccessTrace {
     store_writes: usize,
     allocations: usize,
     source_calls: usize,
+    replay_reads: usize,
+    replay_writes: usize,
     request_frames: usize,
     response_frames: usize,
     request_bytes: usize,
     response_bytes: usize,
+    runtime_phases: usize,
     completion: CompletionShape,
 }
 
@@ -126,6 +195,18 @@ impl AccessTrace {
         self.source_calls
     }
 
+    /// Returns the completed logical replay-state lookup count.
+    #[cfg(test)]
+    pub(super) const fn replay_reads(&self) -> usize {
+        self.replay_reads
+    }
+
+    /// Returns the completed logical replay-state write-back count.
+    #[cfg(test)]
+    pub(super) const fn replay_writes(&self) -> usize {
+        self.replay_writes
+    }
+
     /// Returns the modeled request application-frame count.
     #[cfg(test)]
     pub(super) const fn request_frames(&self) -> usize {
@@ -150,6 +231,12 @@ impl AccessTrace {
         self.response_bytes
     }
 
+    /// Returns the completed ordered runtime-phase count.
+    #[cfg(test)]
+    pub(super) const fn runtime_phases(&self) -> usize {
+        self.runtime_phases
+    }
+
     /// Returns the completed public application-envelope shape.
     #[cfg(test)]
     pub(super) const fn completion(&self) -> CompletionShape {
@@ -164,11 +251,14 @@ pub(super) struct TraceRecorder {
     store_writes: usize,
     allocations: usize,
     source_calls: usize,
+    replay_reads: usize,
+    replay_writes: usize,
     request_frames: usize,
     response_frames: usize,
     request_bytes: usize,
     response_bytes: usize,
     next_read_ordinal: usize,
+    next_runtime_phase: usize,
     completion: Option<CompletionShape>,
 }
 
@@ -180,13 +270,37 @@ impl TraceRecorder {
             store_writes: 0,
             allocations: 0,
             source_calls: 0,
+            replay_reads: 0,
+            replay_writes: 0,
             request_frames: 0,
             response_frames: 0,
             request_bytes: 0,
             response_bytes: 0,
             next_read_ordinal: 0,
+            next_runtime_phase: 0,
             completion: None,
         }
+    }
+
+    /// Records the next phase in the profile's public logical runtime order.
+    pub(super) fn record_runtime_phase(&mut self, phase: RuntimePhase) -> Result<(), TraceError> {
+        let actual = phase.ordinal();
+        if actual != self.next_runtime_phase {
+            return Err(TraceError::RuntimePhaseOrder {
+                expected: self.next_runtime_phase,
+                actual,
+            });
+        }
+        self.next_runtime_phase =
+            increment(self.next_runtime_phase, TraceDimension::RuntimePhases)?;
+        Ok(())
+    }
+
+    /// Records one fixed replay lookup and one real-or-cover write-back.
+    pub(super) fn record_replay_access(&mut self) -> Result<(), TraceError> {
+        self.replay_reads = increment(self.replay_reads, TraceDimension::ReplayReads)?;
+        self.replay_writes = increment(self.replay_writes, TraceDimension::ReplayWrites)?;
+        Ok(())
     }
 
     /// Records the next public, sequential logical store-read ordinal.
@@ -274,6 +388,16 @@ impl TraceRecorder {
             self.source_calls,
         )?;
         validate_dimension(
+            TraceDimension::ReplayReads,
+            expected.replay_reads(),
+            self.replay_reads,
+        )?;
+        validate_dimension(
+            TraceDimension::ReplayWrites,
+            expected.replay_writes(),
+            self.replay_writes,
+        )?;
+        validate_dimension(
             TraceDimension::RequestFrames,
             expected.request_frames(),
             self.request_frames,
@@ -293,6 +417,11 @@ impl TraceRecorder {
             expected.response_bytes(),
             self.response_bytes,
         )?;
+        validate_dimension(
+            TraceDimension::RuntimePhases,
+            expected.runtime_phases(),
+            self.next_runtime_phase,
+        )?;
 
         let completion = self.completion.ok_or(TraceError::MissingCompletion)?;
         if completion != expected.completion() {
@@ -307,10 +436,13 @@ impl TraceRecorder {
             store_writes: self.store_writes,
             allocations: self.allocations,
             source_calls: self.source_calls,
+            replay_reads: self.replay_reads,
+            replay_writes: self.replay_writes,
             request_frames: self.request_frames,
             response_frames: self.response_frames,
             request_bytes: self.request_bytes,
             response_bytes: self.response_bytes,
+            runtime_phases: self.next_runtime_phase,
             completion,
         })
     }
@@ -329,6 +461,10 @@ pub(super) enum TraceDimension {
     Allocations,
     /// Query-derived source calls.
     SourceCalls,
+    /// Logical replay-state lookups.
+    ReplayReads,
+    /// Logical real-or-cover replay-state write-backs.
+    ReplayWrites,
     /// Modeled request application frames.
     RequestFrames,
     /// Modeled response application frames.
@@ -337,6 +473,8 @@ pub(super) enum TraceDimension {
     RequestBytes,
     /// Modeled response application-envelope bytes.
     ResponseBytes,
+    /// Ordered logical runtime phases.
+    RuntimePhases,
 }
 
 impl fmt::Display for TraceDimension {
@@ -347,10 +485,13 @@ impl fmt::Display for TraceDimension {
             Self::StoreReadOrdinal => "store-read ordinal",
             Self::Allocations => "modeled allocations",
             Self::SourceCalls => "source calls",
+            Self::ReplayReads => "replay reads",
+            Self::ReplayWrites => "replay writes",
             Self::RequestFrames => "modeled request frames",
             Self::ResponseFrames => "modeled response frames",
             Self::RequestBytes => "modeled request bytes",
             Self::ResponseBytes => "modeled response bytes",
+            Self::RuntimePhases => "ordered runtime phases",
         };
         f.write_str(label)
     }
@@ -364,6 +505,13 @@ pub(super) enum TraceError {
         /// Next required ordinal.
         expected: usize,
         /// Ordinal the engine attempted.
+        actual: usize,
+    },
+    /// Runtime phases were recorded out of their fixed public order.
+    RuntimePhaseOrder {
+        /// Next required phase ordinal.
+        expected: usize,
+        /// Phase ordinal the runtime attempted.
         actual: usize,
     },
     /// One public counter overflowed.
@@ -399,6 +547,10 @@ impl fmt::Display for TraceError {
             Self::StoreReadOrdinal { expected, actual } => write!(
                 f,
                 "logical store read ordinal {actual} does not match next public ordinal {expected}"
+            ),
+            Self::RuntimePhaseOrder { expected, actual } => write!(
+                f,
+                "logical runtime phase {actual} does not match next public phase {expected}"
             ),
             Self::CounterOverflow { dimension } => {
                 write!(f, "logical trace {dimension} counter overflowed")
@@ -460,12 +612,34 @@ mod tests {
         QueryAccessBudget::read_only_unary_fixed_envelope(2, ENVELOPE_BYTES)
     }
 
+    fn record_prefix(recorder: &mut TraceRecorder) -> Result<(), TraceError> {
+        recorder.record_runtime_phase(RuntimePhase::RequestDecode)?;
+        recorder.record_runtime_phase(RuntimePhase::NonceAcquisition)?;
+        recorder.record_runtime_phase(RuntimePhase::TokenOpen)?;
+        recorder.record_replay_access()?;
+        recorder.record_runtime_phase(RuntimePhase::ReplayGuard)?;
+        recorder.record_runtime_phase(RuntimePhase::ReadinessSelect)?;
+        recorder.record_runtime_phase(RuntimePhase::EngineExecution)
+    }
+
+    fn record_suffix(recorder: &mut TraceRecorder) -> Result<(), TraceError> {
+        recorder.record_runtime_phase(RuntimePhase::ResultNormalization)?;
+        recorder.record_runtime_phase(RuntimePhase::TokenIssue)?;
+        recorder.record_runtime_phase(RuntimePhase::ResponseEncode)?;
+        recorder.record_runtime_phase(RuntimePhase::Completion)
+    }
+
     fn completed_trace() -> Result<AccessTrace, TraceError> {
         let mut recorder = TraceRecorder::new();
         recorder.record_request_frame(ENVELOPE_BYTES)?;
+        record_prefix(&mut recorder)?;
         recorder.record_store_read(0)?;
         recorder.record_store_read(1)?;
+        recorder.record_runtime_phase(RuntimePhase::ResultNormalization)?;
+        recorder.record_runtime_phase(RuntimePhase::TokenIssue)?;
+        recorder.record_runtime_phase(RuntimePhase::ResponseEncode)?;
         recorder.record_response_frame(ENVELOPE_BYTES)?;
+        recorder.record_runtime_phase(RuntimePhase::Completion)?;
         recorder.record_completion(CompletionShape::UnaryFixedEnvelope)?;
         recorder.finish(budget())
     }
@@ -477,10 +651,13 @@ mod tests {
         assert_eq!(trace.store_writes(), 0);
         assert_eq!(trace.allocations(), 0);
         assert_eq!(trace.source_calls(), 0);
+        assert_eq!(trace.replay_reads(), 1);
+        assert_eq!(trace.replay_writes(), 1);
         assert_eq!(trace.request_frames(), 1);
         assert_eq!(trace.response_frames(), 1);
         assert_eq!(trace.request_bytes(), ENVELOPE_BYTES);
         assert_eq!(trace.response_bytes(), ENVELOPE_BYTES);
+        assert_eq!(trace.runtime_phases(), RuntimePhase::COUNT);
         assert_eq!(trace.completion(), CompletionShape::UnaryFixedEnvelope);
         Ok(())
     }
@@ -521,9 +698,11 @@ mod tests {
         ] {
             let mut recorder = TraceRecorder::new();
             recorder.record_request_frame(ENVELOPE_BYTES)?;
+            record_prefix(&mut recorder)?;
             recorder.record_store_read(0)?;
             recorder.record_store_read(1)?;
             record_extra(&mut recorder)?;
+            record_suffix(&mut recorder)?;
             recorder.record_response_frame(ENVELOPE_BYTES)?;
             recorder.record_completion(CompletionShape::UnaryFixedEnvelope)?;
             assert!(matches!(
@@ -531,6 +710,24 @@ mod tests {
                 Err(TraceError::BudgetMismatch { actual: 1, .. })
             ));
         }
+
+        let mut duplicate_replay = TraceRecorder::new();
+        duplicate_replay.record_request_frame(ENVELOPE_BYTES)?;
+        record_prefix(&mut duplicate_replay)?;
+        duplicate_replay.record_store_read(0)?;
+        duplicate_replay.record_store_read(1)?;
+        duplicate_replay.record_replay_access()?;
+        record_suffix(&mut duplicate_replay)?;
+        duplicate_replay.record_response_frame(ENVELOPE_BYTES)?;
+        duplicate_replay.record_completion(CompletionShape::UnaryFixedEnvelope)?;
+        assert_eq!(
+            duplicate_replay.finish(budget()),
+            Err(TraceError::BudgetMismatch {
+                dimension: TraceDimension::ReplayReads,
+                expected: 1,
+                actual: 2,
+            })
+        );
         Ok(())
     }
 
@@ -539,8 +736,10 @@ mod tests {
     {
         let mut wrong_bytes = TraceRecorder::new();
         wrong_bytes.record_request_frame(ENVELOPE_BYTES - 1)?;
+        record_prefix(&mut wrong_bytes)?;
         wrong_bytes.record_store_read(0)?;
         wrong_bytes.record_store_read(1)?;
+        record_suffix(&mut wrong_bytes)?;
         wrong_bytes.record_response_frame(ENVELOPE_BYTES)?;
         wrong_bytes.record_completion(CompletionShape::UnaryFixedEnvelope)?;
         assert_eq!(
@@ -561,11 +760,36 @@ mod tests {
 
         let mut missing = TraceRecorder::new();
         missing.record_request_frame(ENVELOPE_BYTES)?;
+        record_prefix(&mut missing)?;
         missing.record_store_read(0)?;
         missing.record_store_read(1)?;
+        record_suffix(&mut missing)?;
         missing.record_response_frame(ENVELOPE_BYTES)?;
         assert_eq!(missing.finish(budget()), Err(TraceError::MissingCompletion));
         Ok(())
+    }
+
+    #[test]
+    fn recorder_rejects_skipped_or_reordered_runtime_phases() {
+        let mut skipped = TraceRecorder::new();
+        assert_eq!(
+            skipped.record_runtime_phase(RuntimePhase::TokenOpen),
+            Err(TraceError::RuntimePhaseOrder {
+                expected: 0,
+                actual: 2,
+            })
+        );
+
+        skipped
+            .record_runtime_phase(RuntimePhase::RequestDecode)
+            .expect("first runtime phase is valid");
+        assert_eq!(
+            skipped.record_runtime_phase(RuntimePhase::RequestDecode),
+            Err(TraceError::RuntimePhaseOrder {
+                expected: 1,
+                actual: 0,
+            })
+        );
     }
 
     #[test]

@@ -2,10 +2,13 @@ use std::{fmt, marker::PhantomData};
 
 use blake2::{Blake2s256, Digest};
 
-use crate::{envelope::FixedEnvelope, trace::QueryAccessBudget};
+use crate::{
+    envelope::FixedEnvelope,
+    trace::{QueryAccessBudget, RUNTIME_SCHEDULE_VERSION},
+};
 
 pub(super) const PROFILE_ID_BYTES: usize = 16;
-const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v1";
+const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v2";
 const UNARY_FIXED_ENVELOPE_TAG: u8 = 1;
 
 /// A compiled privacy budget for one fixed query class.
@@ -21,6 +24,7 @@ pub(super) struct PrivacyProfile {
     access_budget: QueryAccessBudget,
     response_slots: usize,
     cover_rounds: usize,
+    continuation_ttl_seconds: u64,
 }
 
 impl PrivacyProfile {
@@ -31,6 +35,7 @@ impl PrivacyProfile {
         response_slots: usize,
         envelope_bytes: usize,
         cover_rounds: usize,
+        continuation_ttl_seconds: u64,
     ) -> Result<Self, PrivacyProfileError> {
         if label.is_empty() {
             return Err(PrivacyProfileError::EmptyLabel);
@@ -47,15 +52,24 @@ impl PrivacyProfile {
         if cover_rounds == 0 {
             return Err(PrivacyProfileError::ZeroCoverRounds);
         }
+        if continuation_ttl_seconds == 0 {
+            return Err(PrivacyProfileError::ZeroContinuationTtl);
+        }
         let access_budget =
             QueryAccessBudget::read_only_unary_fixed_envelope(store_reads, envelope_bytes);
-        let profile_id = derive_profile_id(&access_budget, response_slots, cover_rounds)?;
+        let profile_id = derive_profile_id(
+            &access_budget,
+            response_slots,
+            cover_rounds,
+            continuation_ttl_seconds,
+        )?;
         Ok(Self {
             profile_id,
             label,
             access_budget,
             response_slots,
             cover_rounds,
+            continuation_ttl_seconds,
         })
     }
 
@@ -94,6 +108,11 @@ impl PrivacyProfile {
         self.cover_rounds
     }
 
+    /// Returns the fixed absolute-lifetime budget for continuation tokens.
+    pub(super) const fn continuation_ttl_seconds(&self) -> u64 {
+        self.continuation_ttl_seconds
+    }
+
     const fn validate_response_slots<const N: usize>(&self) -> Result<(), PrivacyProfileError> {
         if self.response_slots != N {
             return Err(PrivacyProfileError::ResponseShapeMismatch {
@@ -128,6 +147,8 @@ pub(super) enum PrivacyProfileError {
     ZeroEnvelopeBytes,
     /// Every profile must declare at least one query/cover round.
     ZeroCoverRounds,
+    /// Every profile must fix a nonzero continuation lifetime bucket.
+    ZeroContinuationTtl,
     /// A profile dimension cannot fit the canonical 64-bit identifier format.
     DimensionTooLarge,
     /// The page's compile-time slot count differs from the profile.
@@ -161,6 +182,9 @@ impl fmt::Display for PrivacyProfileError {
             Self::ZeroResponseSlots => write!(f, "privacy profile has zero response slots"),
             Self::ZeroEnvelopeBytes => write!(f, "privacy profile has zero envelope bytes"),
             Self::ZeroCoverRounds => write!(f, "privacy profile has zero cover rounds"),
+            Self::ZeroContinuationTtl => {
+                f.write_str("privacy profile has zero continuation lifetime")
+            }
             Self::DimensionTooLarge => {
                 f.write_str("privacy profile dimension exceeds canonical identifier width")
             }
@@ -197,6 +221,7 @@ fn derive_profile_id(
     access_budget: &QueryAccessBudget,
     response_slots: usize,
     cover_rounds: usize,
+    continuation_ttl_seconds: u64,
 ) -> Result<[u8; PROFILE_ID_BYTES], PrivacyProfileError> {
     let mut hasher = Blake2s256::new();
     Digest::update(&mut hasher, PROFILE_ID_DOMAIN);
@@ -205,15 +230,20 @@ fn derive_profile_id(
         access_budget.store_writes(),
         access_budget.allocations(),
         access_budget.source_calls(),
+        access_budget.replay_reads(),
+        access_budget.replay_writes(),
         access_budget.request_frames(),
         access_budget.response_frames(),
         access_budget.request_bytes(),
         access_budget.response_bytes(),
+        access_budget.runtime_phases(),
         response_slots,
         cover_rounds,
     ] {
         update_profile_dimension(&mut hasher, dimension)?;
     }
+    Digest::update(&mut hasher, RUNTIME_SCHEDULE_VERSION.to_be_bytes());
+    Digest::update(&mut hasher, continuation_ttl_seconds.to_be_bytes());
     Digest::update(&mut hasher, [UNARY_FIXED_ENVELOPE_TAG]);
     let digest = Digest::finalize(hasher);
     let mut profile_id = [0; PROFILE_ID_BYTES];
@@ -281,7 +311,7 @@ mod tests {
     use crate::trace::CompletionShape;
 
     fn profile() -> PrivacyProfile {
-        PrivacyProfile::new("test-v1", 4, 2, 128, 3)
+        PrivacyProfile::new("test-v1", 4, 2, 128, 3, 60)
             .expect("test profile has nonzero authoritative dimensions")
     }
 
@@ -293,6 +323,8 @@ mod tests {
         assert_eq!(profile.access_budget().store_writes(), 0);
         assert_eq!(profile.access_budget().allocations(), 0);
         assert_eq!(profile.access_budget().source_calls(), 0);
+        assert_eq!(profile.access_budget().replay_reads(), 1);
+        assert_eq!(profile.access_budget().replay_writes(), 1);
         assert_eq!(profile.access_budget().request_frames(), 1);
         assert_eq!(profile.access_budget().response_frames(), 1);
         assert_eq!(profile.access_budget().request_bytes(), 128);
@@ -304,25 +336,30 @@ mod tests {
         assert_eq!(profile.response_slots(), 2);
         assert_eq!(profile.envelope_bytes(), 128);
         assert_eq!(profile.cover_rounds(), 3);
+        assert_eq!(profile.continuation_ttl_seconds(), 60);
     }
 
     #[test]
     fn profile_rejects_zero_budgets() {
         assert_eq!(
-            PrivacyProfile::new("test", 0, 1, 1, 1),
+            PrivacyProfile::new("test", 0, 1, 1, 1, 1),
             Err(PrivacyProfileError::ZeroStoreReads)
         );
         assert_eq!(
-            PrivacyProfile::new("test", 1, 0, 1, 1),
+            PrivacyProfile::new("test", 1, 0, 1, 1, 1),
             Err(PrivacyProfileError::ZeroResponseSlots)
         );
         assert_eq!(
-            PrivacyProfile::new("test", 1, 1, 0, 1),
+            PrivacyProfile::new("test", 1, 1, 0, 1, 1),
             Err(PrivacyProfileError::ZeroEnvelopeBytes)
         );
         assert_eq!(
-            PrivacyProfile::new("test", 1, 1, 1, 0),
+            PrivacyProfile::new("test", 1, 1, 1, 0, 1),
             Err(PrivacyProfileError::ZeroCoverRounds)
+        );
+        assert_eq!(
+            PrivacyProfile::new("test", 1, 1, 1, 1, 0),
+            Err(PrivacyProfileError::ZeroContinuationTtl)
         );
     }
 
@@ -331,17 +368,18 @@ mod tests {
         let baseline = profile();
         assert_eq!(
             baseline.profile_id(),
-            &[96, 146, 31, 125, 196, 142, 21, 149, 166, 20, 67, 106, 34, 169, 176, 109,]
+            &[30, 75, 48, 100, 125, 142, 222, 254, 71, 12, 164, 175, 235, 24, 236, 183,]
         );
-        let relabeled = PrivacyProfile::new("renamed", 4, 2, 128, 3)
+        let relabeled = PrivacyProfile::new("renamed", 4, 2, 128, 3, 60)
             .expect("relabeled test profile remains valid");
         assert_eq!(baseline.profile_id(), relabeled.profile_id());
 
         for changed in [
-            PrivacyProfile::new("test-v1", 5, 2, 128, 3),
-            PrivacyProfile::new("test-v1", 4, 3, 128, 3),
-            PrivacyProfile::new("test-v1", 4, 2, 129, 3),
-            PrivacyProfile::new("test-v1", 4, 2, 128, 4),
+            PrivacyProfile::new("test-v1", 5, 2, 128, 3, 60),
+            PrivacyProfile::new("test-v1", 4, 3, 128, 3, 60),
+            PrivacyProfile::new("test-v1", 4, 2, 129, 3, 60),
+            PrivacyProfile::new("test-v1", 4, 2, 128, 4, 60),
+            PrivacyProfile::new("test-v1", 4, 2, 128, 3, 61),
         ] {
             let changed = changed.expect("changed authoritative dimension remains nonzero");
             assert_ne!(baseline.profile_id(), changed.profile_id());

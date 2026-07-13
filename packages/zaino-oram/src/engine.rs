@@ -2,22 +2,26 @@ use crate::{
     profile::{CompiledQueryShape, PrivacyProfile, PrivacyProfileError},
     records::{QueryOutcome, TransparentUtxo, UtxoQuery, UtxoResultPage},
     store::{ObliviousStore, StoreSlot},
-    trace::{AccessTrace, CompletionShape, TraceError, TraceRecorder},
+    trace::{TraceError, TraceRecorder},
 };
 
-/// The fixed page and modeled logical schedule produced by one query.
-struct QueryExecution<const RESPONSE_SLOTS: usize> {
+/// The fixed page and next logical store-slot cursor produced by one query.
+pub(super) struct QueryExecution<const RESPONSE_SLOTS: usize> {
     page: UtxoResultPage<RESPONSE_SLOTS>,
-    trace: AccessTrace,
+    next_cursor: Option<usize>,
 }
 
 impl<const RESPONSE_SLOTS: usize> QueryExecution<RESPONSE_SLOTS> {
-    fn page(&self) -> &UtxoResultPage<RESPONSE_SLOTS> {
+    pub(super) const fn page(&self) -> &UtxoResultPage<RESPONSE_SLOTS> {
         &self.page
     }
 
-    fn trace(&self) -> &AccessTrace {
-        &self.trace
+    const fn next_cursor(&self) -> Option<usize> {
+        self.next_cursor
+    }
+
+    pub(super) fn into_parts(self) -> (UtxoResultPage<RESPONSE_SLOTS>, Option<usize>) {
+        (self.page, self.next_cursor)
     }
 }
 
@@ -26,7 +30,7 @@ impl<const RESPONSE_SLOTS: usize> QueryExecution<RESPONSE_SLOTS> {
 /// This foundation guarantees only an exact logical store-call sequence and
 /// fixed Rust data shapes. It does not claim data-independent instructions,
 /// memory accesses, allocations, or timing.
-struct PrivateQueryEngine<S, const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize> {
+pub(super) struct PrivateQueryEngine<S, const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize> {
     store: S,
     shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
 }
@@ -36,7 +40,7 @@ impl<S, const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
 where
     S: ObliviousStore,
 {
-    fn new(
+    pub(super) fn new(
         store: S,
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
     ) -> Result<Self, PrivacyProfileError> {
@@ -51,7 +55,7 @@ where
         Ok(Self { store, shape })
     }
 
-    fn profile(&self) -> &PrivacyProfile {
+    pub(super) fn profile(&self) -> &PrivacyProfile {
         self.shape.profile()
     }
 
@@ -61,14 +65,18 @@ where
     /// [`QueryOutcome::StoreFailure`] after the configured call sequence; the
     /// later runtime must also latch a redacted health fault and fail readiness.
     ///
-    /// Request/response frames and bytes are modeled fixed application
-    /// envelopes. They are not protobuf, gRPC, HTTP/2, TLS, or packet evidence.
-    fn execute(&mut self, query: &UtxoQuery) -> Result<QueryExecution<RESPONSE_SLOTS>, TraceError> {
-        let mut trace = TraceRecorder::new();
-        trace.record_request_frame(ENVELOPE_BYTES)?;
+    /// `cursor` is an absolute logical store-slot ordinal. Every execution
+    /// still reads the complete configured domain; matching slots below the
+    /// cursor are ignored and the first omitted match becomes the next cursor.
+    pub(super) fn execute_from(
+        &mut self,
+        query: &UtxoQuery,
+        cursor: usize,
+        trace: &mut TraceRecorder,
+    ) -> Result<QueryExecution<RESPONSE_SLOTS>, TraceError> {
         let mut page = UtxoResultPage::empty();
         let mut real_slots = 0;
-        let mut result_budget_exceeded = false;
+        let mut next_cursor = None;
         let mut store_failed = false;
 
         for slot in 0..self.profile().store_reads() {
@@ -83,32 +91,31 @@ where
             let candidate: TransparentUtxo = *store_slot.record();
             let matches = store_slot.is_occupied()
                 && query.domain_valid()
-                && candidate.height() >= query.minimum_height();
+                && candidate.height() >= query.minimum_height()
+                && slot >= cursor;
             if matches {
                 if real_slots < self.profile().response_slots() {
                     page.set_slot(real_slots, candidate);
                     real_slots += 1;
-                } else {
-                    result_budget_exceeded = true;
+                } else if next_cursor.is_none() {
+                    next_cursor = Some(slot);
                 }
             }
         }
 
         let outcome = if store_failed {
             page = UtxoResultPage::empty();
+            next_cursor = None;
             QueryOutcome::StoreFailure
         } else if !query.domain_valid() {
             QueryOutcome::InvalidDomain
-        } else if result_budget_exceeded {
+        } else if next_cursor.is_some() {
             QueryOutcome::ResultBudgetExceeded
         } else {
             QueryOutcome::Complete
         };
         page.set_outcome(outcome);
-        trace.record_response_frame(ENVELOPE_BYTES)?;
-        trace.record_completion(CompletionShape::UnaryFixedEnvelope)?;
-        let trace = trace.finish(self.profile().access_budget())?;
-        Ok(QueryExecution { page, trace })
+        Ok(QueryExecution { page, next_cursor })
     }
 }
 
@@ -126,7 +133,7 @@ mod tests {
     type TestEngine = PrivateQueryEngine<PlaintextMockStore, RESPONSE_SLOTS, ENVELOPE_BYTES>;
 
     fn profile() -> PrivacyProfile {
-        PrivacyProfile::new("unit-test-v1", 4, RESPONSE_SLOTS, ENVELOPE_BYTES, 2)
+        PrivacyProfile::new("unit-test-v1", 4, RESPONSE_SLOTS, ENVELOPE_BYTES, 2, 60)
             .expect("unit-test privacy profile constants are valid")
     }
 
@@ -166,22 +173,20 @@ mod tests {
         execution: &QueryExecution<RESPONSE_SLOTS>,
         expected_outcome: QueryOutcome,
         expected_real_count: usize,
+        expected_next_cursor: Option<usize>,
     ) {
         assert_eq!(execution.page().outcome(), expected_outcome);
         assert_eq!(execution.page().slots().len(), RESPONSE_SLOTS);
         assert_eq!(execution.page().real_count(), expected_real_count);
-        assert_eq!(execution.trace().store_reads(), 4);
-        assert_eq!(execution.trace().store_writes(), 0);
-        assert_eq!(execution.trace().allocations(), 0);
-        assert_eq!(execution.trace().source_calls(), 0);
-        assert_eq!(execution.trace().request_frames(), 1);
-        assert_eq!(execution.trace().response_frames(), 1);
-        assert_eq!(execution.trace().request_bytes(), ENVELOPE_BYTES);
-        assert_eq!(execution.trace().response_bytes(), ENVELOPE_BYTES);
-        assert_eq!(
-            execution.trace().completion(),
-            CompletionShape::UnaryFixedEnvelope
-        );
+        assert_eq!(execution.next_cursor(), expected_next_cursor);
+    }
+
+    fn execute(
+        engine: &mut TestEngine,
+        query: &UtxoQuery,
+        cursor: usize,
+    ) -> Result<QueryExecution<RESPONSE_SLOTS>, TraceError> {
+        engine.execute_from(query, cursor, &mut TraceRecorder::new())
     }
 
     #[test]
@@ -190,45 +195,42 @@ mod tests {
         let key = address(1);
 
         let mut hit = engine_with(&[(0, utxo(1, 10))])?;
-        let hit_execution = hit.execute(&UtxoQuery::new(key, 0))?;
-        assert_fixed_logical_schedule(&hit_execution, QueryOutcome::Complete, 1);
+        let hit_execution = execute(&mut hit, &UtxoQuery::new(key, 0), 0)?;
+        assert_fixed_logical_schedule(&hit_execution, QueryOutcome::Complete, 1, None);
 
         let mut miss = engine_with(&[])?;
-        let miss_execution = miss.execute(&UtxoQuery::new(address(9), 0))?;
-        assert_fixed_logical_schedule(&miss_execution, QueryOutcome::Complete, 0);
+        let miss_execution = execute(&mut miss, &UtxoQuery::new(address(9), 0), 0)?;
+        assert_fixed_logical_schedule(&miss_execution, QueryOutcome::Complete, 0, None);
 
         let mut filtered = engine_with(&[(0, utxo(1, 10))])?;
-        let filtered_execution = filtered.execute(&UtxoQuery::new(key, 11))?;
-        assert_fixed_logical_schedule(&filtered_execution, QueryOutcome::Complete, 0);
+        let filtered_execution = execute(&mut filtered, &UtxoQuery::new(key, 11), 0)?;
+        assert_fixed_logical_schedule(&filtered_execution, QueryOutcome::Complete, 0, None);
 
         let mut exactly_full = engine_with(&[(0, utxo(1, 10)), (1, utxo(2, 11))])?;
-        let exactly_full_execution = exactly_full.execute(&UtxoQuery::new(key, 0))?;
+        let exactly_full_execution = execute(&mut exactly_full, &UtxoQuery::new(key, 0), 0)?;
         assert_fixed_logical_schedule(
             &exactly_full_execution,
             QueryOutcome::Complete,
             RESPONSE_SLOTS,
+            None,
         );
 
         let mut cap_hit = engine_with(&[(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))])?;
-        let cap_hit_execution = cap_hit.execute(&UtxoQuery::new(key, 0))?;
+        let cap_hit_execution = execute(&mut cap_hit, &UtxoQuery::new(key, 0), 0)?;
         assert_fixed_logical_schedule(
             &cap_hit_execution,
             QueryOutcome::ResultBudgetExceeded,
             RESPONSE_SLOTS,
+            Some(2),
         );
 
         let mut late = engine_with(&[(3, utxo(4, 13))])?;
-        let late_execution = late.execute(&UtxoQuery::new(key, 0))?;
-        assert_fixed_logical_schedule(&late_execution, QueryOutcome::Complete, 1);
+        let late_execution = execute(&mut late, &UtxoQuery::new(key, 0), 0)?;
+        assert_fixed_logical_schedule(&late_execution, QueryOutcome::Complete, 1, None);
 
         for engine in [&hit, &miss, &filtered, &exactly_full, &cap_hit, &late] {
             assert_eq!(engine.store.read_slots(), &expected_schedule_slots());
         }
-        assert_eq!(hit_execution.trace(), miss_execution.trace());
-        assert_eq!(hit_execution.trace(), filtered_execution.trace());
-        assert_eq!(hit_execution.trace(), exactly_full_execution.trace());
-        assert_eq!(hit_execution.trace(), cap_hit_execution.trace());
-        assert_eq!(hit_execution.trace(), late_execution.trace());
         Ok(())
     }
 
@@ -243,8 +245,8 @@ mod tests {
         let invalid_query = UtxoQuery::from_untrusted_address_key(&[7; 31], 0);
         let mut invalid = engine_with(&[(0, utxo(1, 10))])
             .expect("unit-test mock entries fit their bounded slot domain");
-        let invalid_execution = invalid.execute(&invalid_query)?;
-        assert_fixed_logical_schedule(&invalid_execution, QueryOutcome::InvalidDomain, 0);
+        let invalid_execution = execute(&mut invalid, &invalid_query, 0)?;
+        assert_fixed_logical_schedule(&invalid_execution, QueryOutcome::InvalidDomain, 0, None);
         assert_eq!(invalid.store.read_slots(), &expected_schedule_slots());
 
         for failing_ordinal in 1..=4 {
@@ -255,11 +257,31 @@ mod tests {
             let store = store.with_failure_on_read(failing_ordinal);
             let mut failing = TestEngine::new(store, shape())
                 .expect("mock and profile expose the same complete slot domain");
-            let failure_execution = failing.execute(&UtxoQuery::new(key, 0))?;
-            assert_fixed_logical_schedule(&failure_execution, QueryOutcome::StoreFailure, 0);
+            let failure_execution = execute(&mut failing, &UtxoQuery::new(key, 0), 0)?;
+            assert_fixed_logical_schedule(&failure_execution, QueryOutcome::StoreFailure, 0, None);
             assert_eq!(failing.store.read_slots(), &expected_schedule_slots());
-            assert_eq!(invalid_execution.trace(), failure_execution.trace());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_cursor_is_the_first_omitted_store_slot(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let entries = [(0, utxo(1, 10)), (2, utxo(2, 11)), (3, utxo(3, 12))];
+        let mut engine = engine_with(&entries)?;
+
+        let first = execute(&mut engine, &UtxoQuery::new(key, 0), 0)?;
+        assert_fixed_logical_schedule(
+            &first,
+            QueryOutcome::ResultBudgetExceeded,
+            RESPONSE_SLOTS,
+            Some(3),
+        );
+
+        let second = execute(&mut engine, &UtxoQuery::new(key, 0), 3)?;
+        assert_fixed_logical_schedule(&second, QueryOutcome::Complete, 1, None);
+        assert_eq!(engine.store.read_slots(), &[0, 1, 2, 3, 0, 1, 2, 3]);
         Ok(())
     }
 

@@ -25,6 +25,16 @@ offline dependency experiment:
   layout arithmetic rejects profile/page shapes that cannot fit; the protection
   interface binds version/profile/session/direction context and must open the
   whole nonce/body/tag envelope before canonical decoding;
+- a module-private listener-free runtime adapter that executes a versioned
+  ten-phase logical schedule across decode, server material, token open,
+  replay access, readiness selection, complete store scanning, fixed result
+  normalization, token issue, response protection, and completion. It uses
+  absolute logical store-slot continuation cursors and returns one protected
+  fixed `InvalidContinuation` shape for invalid, expired, mismatched, or
+  replayed tokens when no higher-priority store or projection-readiness failure
+  applies. Token protection binds the checkpoint and codec session; each path
+  models one replay lookup and write-back, while cover writes use a separate
+  non-durable slot rather than the real-token namespace;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -55,13 +65,18 @@ offline dependency experiment:
 
 It does **not** contain a production envelope protector or nonce owner,
 production encryption, durable ORAM persistence, TDX attestation, protobufs,
-or a network listener, and it makes no production privacy claim. Codec tests
+or a network listener, and it makes no production privacy claim. Codec and
+runtime tests
 use a non-cryptographic deterministic integrity fixture; they prove exact
 bytes, protection-interface plumbing, one single-bit rejection at every byte
-offset, and canonical rejection—not cryptographic authentication,
-confidentiality, or equal runtime work. Continuation fields remain opaque here;
-a future runtime must validate them before replay protection or engine use and
-must collapse detailed decode failures to the single external failure class.
+offset, canonical rejection, and equality of the modeled logical phase/store
+schedule—not cryptographic authentication, confidentiality, equal
+instructions, allocator behavior, memory/page accesses, timing, or transport
+work. The private runtime validates opaque continuation fields through injected
+interfaces before engine use and collapses their semantic failures to one
+protected outcome unless store or projection readiness takes precedence; it
+does not supply production AEAD, nonce uniqueness, trusted time, or durable
+replay protection.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline
@@ -168,7 +183,7 @@ portable schedule tests exercise the same insertion helper used by the real
 stores. The actual Linux backend and worker run in the inherited generic native
 CI lane. Capture-head native run `29223983432` passed strict all-target,
 all-feature Clippy and all 161 tests while executing the complete typed
-store/coordinator/owner lifecycle. The current inner-codec branch passes 179
+store/coordinator/owner lifecycle. The current runtime-adapter branch passes 190
 all-feature tests on this macOS host; exact-head native evidence remains
 pending. Generic hosted-Linux evidence is not target-CPU, TDX, load, benchmark,
 or physical-trace qualification. Reply abandonment

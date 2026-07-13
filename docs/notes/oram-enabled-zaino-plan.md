@@ -46,10 +46,19 @@ versioned request/response codec with checked profile-capacity coupling, a
 complete-budget-derived profile ID, fixed checkpoint/query/token/session/result
 fields, direction separation, canonical decoding, and an injected
 whole-envelope protection interface. Its deterministic protector is a
-non-cryptographic test fixture; opaque token semantics, production AEAD, nonce
-ownership, and uniform runtime failure handling remain integration gates. The
-codec has no runtime caller and does not establish fixed-work
-token/replay/engine behavior.
+non-cryptographic test fixture. A private listener-free child runtime now owns
+the modeled decode/token/replay/full-scan/issuance/encode sequence. It validates
+absolute store-slot cursors, preserves token expiry across pages, maps semantic
+token failures to one protected fixed `InvalidContinuation` page when no
+higher-priority store or projection-readiness failure applies, and records the
+same ordered ten-phase logical trace for successful protected outcomes. Token
+protector context binds the checkpoint and codec session, and every replay path
+models one lookup plus one write-back while cover writes stay outside the
+real-token namespace.
+The profile ID binds that schedule and the continuation lifetime. Production
+AEAD, trusted clock and nonce ownership, durable replay storage, instruction/
+memory/timing equivalence, private protobuf/transport framing, and a service
+lifecycle remain integration gates.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
@@ -532,7 +541,7 @@ Do not describe `GetTaddressTransactions` as private while it still performs one
 |---|---|---|
 | Threat model/decisions | `docs/adr/0007-*.md`, this note | accepted adversary, leakage profiles, stop/go rules |
 | ORAM library | `packages/zaino-oram/Cargo.toml`, `src/{lib,engine,store,records,error}.rs` | isolated, pinned engine with mock and `rostl` adapters |
-| Padding/tokens | `packages/zaino-oram/src/{padding,continuation}.rs` | fixed envelopes, cover budgets, AEAD-bound tokens |
+| Padding/tokens | `packages/zaino-oram/src/{envelope.rs,inner_codec.rs,continuation_token.rs,profile.rs,trace.rs}` and `src/inner_codec/runtime.rs` | fixed envelopes, cover budgets, protection-bound tokens, and listener-free logical runtime |
 | Projection/recovery | `packages/zaino-oram/src/{ingest,projection,checkpoint}.rs` | finalized projection, watermark, rebuild/recovery |
 | Attestation | `packages/zaino-oram/src/attestation/{mod,mock,tdx}.rs` | quote-bound in-memory TLS identity/evidence |
 | Public-chain feed | `packages/zaino-state/src/chain_index.rs`, `non_finalised_state.rs`, adjacent types/tests | narrow indexed-block/checkpoint/NFS snapshot seam |

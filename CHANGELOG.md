@@ -26,8 +26,21 @@ and this library adheres to Rust's notion of
   as protection context, checked layout arithmetic rejects impossible shapes,
   and exact digest/canonicality tests cover the whole envelope. The injected
   deterministic protector is a non-cryptographic test fixture only; there is
-  no production AEAD, nonce lifecycle, runtime adapter, listener, or fixed-work
-  claim.
+  no production AEAD, nonce lifecycle, listener, or physical fixed-work claim.
+- `zaino-oram`: a private listener-free runtime adapter now composes canonical
+  request decode, one server-material acquisition, real-or-cover token open and
+  replay access, a complete store-domain scan, fixed result normalization, one
+  real-or-cover token issue, and protected response encode into a versioned
+  ten-phase logical trace. Absolute store-slot cursors paginate without skips
+  or duplicates; invalid, expired, mismatched, and replayed tokens complete the
+  same modeled schedule and return one protected `InvalidContinuation` shape
+  when no higher-priority store or projection-readiness failure applies.
+  Token protection binds the checkpoint and codec session, and each completed
+  protected round after server-material acquisition models one replay lookup
+  plus write-back without cover writes entering the real-token namespace.
+  The profile ID now binds the phase schedule and continuation lifetime. This
+  is deterministic logical-model evidence only, not production AEAD, trusted
+  time/nonces, transport, timing, physical ORAM, or TDX evidence.
 - `zaino-state`: a reusable transparent create/spend event-extraction seam for
   ORAM-agnostic projection consumers.
 - `zaino-oram` / `zaino-state`: a default-off offline shadow fixture compares

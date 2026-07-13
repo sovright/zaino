@@ -966,6 +966,8 @@ pub(super) enum QueryOutcome {
     StoreFailure,
     /// The protected projection has no ready checkpoint for this query round.
     ProjectionNotReady,
+    /// The opaque continuation was invalid, expired, mismatched, or replayed.
+    InvalidContinuation,
 }
 
 impl fmt::Debug for QueryOutcome {
@@ -1618,6 +1620,8 @@ mod tests {
             QueryOutcome::ResultBudgetExceeded,
             QueryOutcome::InvalidDomain,
             QueryOutcome::StoreFailure,
+            QueryOutcome::ProjectionNotReady,
+            QueryOutcome::InvalidContinuation,
         ];
         for outcome in outcomes {
             assert_eq!(format!("{outcome:?}"), "QueryOutcome([REDACTED])");

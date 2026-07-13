@@ -26,8 +26,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   protection context. A non-cryptographic deterministic fixture pins exact
   request/response digests, rejects one single-bit mutation at every envelope
   offset, and exercises protected noncanonical fields. No production AEAD,
-  nonce lifecycle, token validation integration, runtime adapter, or fixed-work
-  claim is supplied.
+  nonce lifecycle or physical fixed-work claim is supplied.
+- A module-private listener-free runtime adapter that validates opaque tokens
+  before engine use, performs one real-or-cover replay operation and token
+  issue per completed protected round after server-material acquisition, scans
+  the complete store domain, paginates with absolute logical store-slot cursors,
+  and records an ordered ten-phase logical schedule. Token failures collapse to
+  a protected fixed
+  `InvalidContinuation` response after the same modeled work when no
+  higher-priority store or projection-readiness failure applies. Token
+  protection binds the checkpoint and codec session; every replay path models
+  one lookup and one write-back, with cover writes isolated from the real-token
+  namespace. Test profiles bind the runtime schedule version, replay budget,
+  and continuation lifetime into their ID; all protectors, clock/nonces,
+  replay storage, and stores remain injected research fixtures rather than
+  production implementations.
 - A Linux-x86_64-only volatile `rostl` experiment pinned at `8c3a12d2`; other
   targets reject construction and no production obliviousness claim is made.
 - Separate typed `rostl` stores for the exact 38-byte directory and 82-byte
