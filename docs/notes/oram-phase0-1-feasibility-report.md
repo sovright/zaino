@@ -1,8 +1,11 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-14
-- Evaluated worktree: `feat/oram-target-load-foundation`, stacked on exact
-  full-map-saturation head `a169da2b6edfb44b87f5f66c0e1fcd93aa02514a`.
+- Evaluated recovery code head: `feat/oram-recovery-foundation` at
+  `c53a06f18f37f83810ed68488b060f02e4fc85b8`, stacked on exact target-load
+  head `79d54a0059a0daa6bb59cea945e8a1d0da6a84ed`.
+  The target-load branch is itself stacked on exact full-map-saturation head
+  `a169da2b6edfb44b87f5f66c0e1fcd93aa02514a`.
   The `SmokeV1` parent at `17356db0` passed strict all-target/all-feature Clippy
   for both research crates plus the 204-test `zaino-oram` and 39-test
   `zainod-oram` suites in native run `29250757780` (job `86818420630`).
@@ -14,6 +17,11 @@
   all 210 `zaino-oram` and 53 `zainod-oram` tests passed, including both real
   typed-backend boundary cases and the native three-file runner publication.
   Exact source hashes and nextest run IDs are recorded below.
+- The recovery code head passed strict local feature-on/feature-off gates and
+  234 portable tests. An exact detached copy on the dedicated GCP builder
+  passed strict native Clippy, 244 tests including the Linux-only typed-ROSTL
+  restart/rebuild path, and warning-denied rustdoc. Exact commands and the
+  native nextest run ID are recorded below.
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
 - Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
@@ -595,6 +603,10 @@ the explicitly named predecessor head.
 | Native `cargo clippy -p zaino-oram -p zainod-oram --all-features --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` | Pass in 2m12s on the exact checksum-matched full-map-saturation source | Both complete research crate surfaces are warning-free and contain no disallowed production `unwrap` |
 | Native `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 210 passed, 0 skipped; nextest run `9373bae3-f743-4a56-b792-0d3ccc8d056b` | Rechecks the complete library suite and adds the Linux-only real-backend full-map-saturation runner. This is small-table deterministic correctness, not physical-capacity or target-load evidence |
 | Native `cargo nextest run -p zainod-oram --all-features --locked --no-tests fail --status-level fail` | 53 passed, 0 skipped; nextest run `b4c22e6b-5f2c-4ae8-8dda-69201e256219` | Rechecks every daemon runner/artifact path, including native full-map publication and dispatch; the bundle remains unsigned and non-attested |
+| Local `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` at recovery code head `c53a06f1` | 234 passed, 0 skipped; nextest run `ae2fca52-788b-48e5-b69e-9823b10d84b6` | Covers fixed manifest encoding/MAC/freshness, crash-boundary failpoints, rollback/equivocation/corruption rejection, deterministic semantic roots, and portable fresh-worker restart/rebuild. This is not native ROSTL, full-corpus, or RTO evidence |
+| Native `cargo clippy -p zaino-oram --features "corpus-zaino rostl-experimental" --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` at exact recovery code head `c53a06f1` | Pass on the dedicated generic Linux x86_64 builder with Rust 1.96.0 | Covers the complete changed library graph plus the real typed ROSTL path; this is a developer gate, not target-CPU, TDX, or attestation evidence |
+| Native `cargo nextest run -p zaino-oram --features "corpus-zaino rostl-experimental" --locked --status-level fail` at exact recovery code head `c53a06f1` | 244 passed, 0 skipped; nextest run `ad8e8dda-6f63-4aba-8c66-7cc8313676ab` | Adds Linux-only typed-ROSTL shutdown, authenticated-manifest restart classification, fresh-worker genesis replay under a new projection epoch, and semantic-root/checkpoint equivalence. This is generic-host correctness, not durable ROSTL state or measured RTO evidence |
+| Native `RUSTDOCFLAGS='-D warnings' cargo doc -p zaino-oram --features "corpus-zaino rostl-experimental" --no-deps --locked` at exact recovery code head `c53a06f1` | Pass on the dedicated generic Linux x86_64 builder | The recovery contract and feature-complete library documentation are warning-free |
 | Native `zainod-oram qualification stress --profile full-map-saturation-v1 --output-dir <NEW_DIR>` | Pass; canonical wrapper BLAKE2s-256 `2dfbd24e45662e6f112ab7c738dd780c0916d253636a47b739e15425e0932854` | Publishes exactly `full-map-saturation.json`, `full-map-saturation.txt`, and digest-bound `provenance.json`; this synthetic artifact validates runner plumbing only and is not a benchmark or hardware/mainnet result |
 | `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Pass with local Rust 1.96.1 | Compile-only precursor for the exact directory/event stores, fixed two-access insertion path, and private offline worker constructor; the exact pinned native CI run above supersedes its execution limitation |
 | `cargo +stable check -p zaino-oram --all-targets --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu` | Environment-blocked before local Linux test checking | The macOS host lacks `x86_64-linux-gnu-gcc`/`g++`, required by transitive native dev dependencies including `aws-lc-sys`, `lmdb-sys`, and `libzcash_script`; the pinned native CI run now covers this host limitation |
