@@ -197,7 +197,7 @@ impl ValidatedCapture {
         &self.measurement
     }
 
-    fn measurement_blake2s256(&self) -> &str {
+    pub(super) fn measurement_blake2s256(&self) -> &str {
         &self.measurement_blake2s256
     }
 }
@@ -290,6 +290,8 @@ impl SizingProvenanceV1 {
 
 /// A semantically validated sizing qualification with its canonical typed lineage.
 pub(super) struct ValidatedSizing {
+    #[cfg(feature = "typed-qualification")]
+    directory: ArtifactDirectory,
     qualification: MainnetSizingQualification,
     measurement_blake2s256: String,
     qualification_blake2s256: String,
@@ -341,6 +343,8 @@ pub(super) fn load_sizing(
     let (artifact, _) = read_validated_sizing_directory(&directory, capture)?;
     let qualification_blake2s256 = artifact.digest()?;
     Ok(ValidatedSizing {
+        #[cfg(feature = "typed-qualification")]
+        directory,
         qualification: artifact.qualification,
         measurement_blake2s256: artifact.measurement_blake2s256,
         qualification_blake2s256,
@@ -462,6 +466,29 @@ pub(super) fn publish_verified_artifact(
     validate: impl FnOnce(&ArtifactDirectory) -> Result<(), ArtifactError>,
 ) -> Result<(), ArtifactError> {
     publish_verified_directory(output_dir, files, PublishFailpoint::None, validate)
+}
+
+/// Publishes a derived artifact outside both validated source directories.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn publish_verified_derived_artifact(
+    output_dir: &Path,
+    capture: &ValidatedCapture,
+    sizing: &ValidatedSizing,
+    files: &[ArtifactFile],
+    validate: impl FnOnce(&ArtifactDirectory) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    let output = open_artifact_output(output_dir)?;
+    if directory_is_within(&capture.directory, &output.parent)? {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "derived artifact output must not be nested inside its capture input",
+        });
+    }
+    if directory_is_within(&sizing.directory, &output.parent)? {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "derived artifact output must not be nested inside its sizing input",
+        });
+    }
+    publish_verified_output(&output, files, PublishFailpoint::None, validate)
 }
 
 fn publish_verified_output(
@@ -2076,6 +2103,77 @@ mod tests {
             ),
             Err(ArtifactError::InvalidArtifact {
                 reason: "sizing output must not be nested inside its capture input"
+            })
+        ));
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        any(target_vendor = "apple", target_os = "linux")
+    ))]
+    #[test]
+    fn derived_artifact_rejects_direct_and_symlink_nested_source_outputs() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir()?;
+        let (capture_dir, capture) = publish_and_load_capture(parent.path())?;
+        let qualification = capture.measurement().apply_model(&sizing_model(0)?)?;
+        let sizing_dir = parent.path().join("sizing");
+        publish_sizing(&sizing_dir, &capture, &qualification, "test-runner")?;
+        let sizing = load_sizing(&sizing_dir, &capture)?;
+
+        assert!(matches!(
+            publish_verified_derived_artifact(
+                &capture_dir.join("nested-derived"),
+                &capture,
+                &sizing,
+                &test_files(),
+                |_| Ok(())
+            ),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "derived artifact output must not be nested inside its capture input"
+            })
+        ));
+        assert!(matches!(
+            publish_verified_derived_artifact(
+                &sizing_dir.join("nested-derived"),
+                &capture,
+                &sizing,
+                &test_files(),
+                |_| Ok(())
+            ),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "derived artifact output must not be nested inside its sizing input"
+            })
+        ));
+
+        let capture_alias = parent.path().join("capture-alias");
+        let sizing_alias = parent.path().join("sizing-alias");
+        symlink(&capture_dir, &capture_alias)?;
+        symlink(&sizing_dir, &sizing_alias)?;
+        assert!(matches!(
+            publish_verified_derived_artifact(
+                &capture_alias.join("nested-derived"),
+                &capture,
+                &sizing,
+                &test_files(),
+                |_| Ok(())
+            ),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "derived artifact output must not be nested inside its capture input"
+            })
+        ));
+        assert!(matches!(
+            publish_verified_derived_artifact(
+                &sizing_alias.join("nested-derived"),
+                &capture,
+                &sizing,
+                &test_files(),
+                |_| Ok(())
+            ),
+            Err(ArtifactError::InvalidArtifact {
+                reason: "derived artifact output must not be nested inside its sizing input"
             })
         ));
         Ok(())

@@ -39,6 +39,8 @@ mod sizing;
 mod store;
 #[cfg(feature = "corpus-zaino")]
 mod stress_qualification;
+#[cfg(feature = "corpus-zaino")]
+mod target_load;
 mod trace;
 #[cfg(feature = "corpus-zaino")]
 mod zaino_corpus;
@@ -58,6 +60,11 @@ pub use qualification::{
 pub use stress_qualification::{
     run_typed_worker_stress_qualification, TypedWorkerStressProfile,
     TypedWorkerStressQualificationError, TypedWorkerStressQualificationReport,
+};
+#[cfg(feature = "corpus-zaino")]
+pub use target_load::{
+    run_typed_worker_target_load, TypedWorkerTargetLoadError, TypedWorkerTargetLoadProfile,
+    TypedWorkerTargetLoadReport,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use zaino_corpus::{

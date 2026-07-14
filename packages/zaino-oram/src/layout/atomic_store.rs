@@ -683,6 +683,47 @@ impl fmt::Display for AtomicStoreError {
 impl std::error::Error for AtomicStoreError {}
 
 #[cfg(all(test, feature = "corpus-zaino"))]
+pub(crate) struct QualificationMemoryTable<T> {
+    slots: Vec<Option<T>>,
+    occupied: u64,
+}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
+impl<T> QualificationMemoryTable<T> {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            slots: std::iter::repeat_with(|| None).take(capacity).collect(),
+            occupied: 0,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
+impl<T: Copy> UniqueTable<T> for QualificationMemoryTable<T> {
+    fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn read(&mut self, index: usize) -> Result<Option<T>, BackendFailure> {
+        self.slots.get(index).copied().ok_or(BackendFailure)
+    }
+
+    fn occupied_records(&mut self) -> Result<u64, BackendFailure> {
+        Ok(self.occupied)
+    }
+
+    fn insert_unique(&mut self, index: usize, value: T) -> Result<(), BackendFailure> {
+        let slot = self.slots.get_mut(index).ok_or(BackendFailure)?;
+        if slot.is_some() {
+            return Err(BackendFailure);
+        }
+        *slot = Some(value);
+        self.occupied = self.occupied.checked_add(1).ok_or(BackendFailure)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
 pub(crate) fn spawn_atomic_worker_for_tests<
     D,
     E,

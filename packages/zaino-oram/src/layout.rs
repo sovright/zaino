@@ -31,7 +31,9 @@ pub(super) use atomic_store::{
     AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
 #[cfg(all(test, feature = "corpus-zaino"))]
-pub(super) use atomic_store::{spawn_atomic_worker_for_tests, BackendFailure, UniqueTable};
+pub(super) use atomic_store::{
+    spawn_atomic_worker_for_tests, BackendFailure, QualificationMemoryTable, UniqueTable,
+};
 
 const LAYOUT_FORMAT_VERSION: u8 = 1;
 const ADDRESS_KEY_DOMAIN: &[u8] = b"zaino-oram-address-key-v1";
@@ -930,6 +932,36 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
             *destination = slot.backend_index()?;
         }
         Ok(indices)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) fn qualification_directory_probe_indices(
+        &self,
+        address: StandardAddress,
+    ) -> Result<[usize; DIRECTORY_PROBES], ()> {
+        self.directory_backend_indices(&self.directory_plan(address))
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) fn qualification_event_probe_indices(
+        &self,
+        address: StandardAddress,
+        directory_index: usize,
+        ordinal: u64,
+    ) -> Result<[usize; EVENT_PROBES], ()> {
+        let directory_slot = DirectorySlot(u32::try_from(directory_index).map_err(|_| ())?);
+        let directory_plan = self.directory_plan(address);
+        if !directory_plan.slots.contains(&directory_slot) {
+            return Err(());
+        }
+        let directory = BoundDirectory {
+            profile_binding: directory_plan.profile_binding,
+            slot: directory_slot,
+            address_key: directory_plan.address_key,
+        };
+        let event_plan = self.event_plan(&directory, ordinal).map_err(|_| ())?;
+        self.event_backend_indices(&event_plan).map_err(|_| ())
     }
 
     fn event_plan(

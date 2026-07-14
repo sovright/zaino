@@ -780,56 +780,18 @@ const fn map_worker_build(error: AtomicWorkerBuildError) -> TypedWorkerFullMapSa
 mod tests {
     use super::*;
     use crate::{
-        layout::{spawn_atomic_worker_for_tests, BackendFailure, UniqueTable},
+        layout::{spawn_atomic_worker_for_tests, QualificationMemoryTable},
         records::{PersistentAddressDirectory, PersistentAddressEventPage},
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    struct MemoryTable<T> {
-        slots: Vec<Option<T>>,
-        occupied: u64,
-    }
-
-    impl<T> MemoryTable<T> {
-        fn new(capacity: usize) -> Self {
-            Self {
-                slots: std::iter::repeat_with(|| None).take(capacity).collect(),
-                occupied: 0,
-            }
-        }
-    }
-
-    impl<T: Copy> UniqueTable<T> for MemoryTable<T> {
-        fn capacity(&self) -> usize {
-            self.slots.len()
-        }
-
-        fn read(&mut self, index: usize) -> Result<Option<T>, BackendFailure> {
-            self.slots.get(index).copied().ok_or(BackendFailure)
-        }
-
-        fn occupied_records(&mut self) -> Result<u64, BackendFailure> {
-            Ok(self.occupied)
-        }
-
-        fn insert_unique(&mut self, index: usize, value: T) -> Result<(), BackendFailure> {
-            let slot = self.slots.get_mut(index).ok_or(BackendFailure)?;
-            if slot.is_some() {
-                return Err(BackendFailure);
-            }
-            *slot = Some(value);
-            self.occupied = self.occupied.checked_add(1).ok_or(BackendFailure)?;
-            Ok(())
-        }
-    }
-
     fn fake_worker(spec: CaseSpec) -> TestResult<AtomicWorker> {
         let layout = build_saturation_layout(spec)?;
-        let directory = MemoryTable::<PersistentAddressDirectory>::new(usize::try_from(
-            WORKER_SHAPE.directory_capacity,
-        )?);
-        let events = MemoryTable::<PersistentAddressEventPage>::new(usize::try_from(
+        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::new(
+            usize::try_from(WORKER_SHAPE.directory_capacity)?,
+        );
+        let events = QualificationMemoryTable::<PersistentAddressEventPage>::new(usize::try_from(
             WORKER_SHAPE.event_capacity,
         )?);
         let queue_capacity =

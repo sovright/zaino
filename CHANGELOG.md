@@ -75,6 +75,20 @@ and this library adheres to Rust's notion of
   hot-address, modeled-memory, and combined modeled fit with explicit negative
   evidence markers; backend expansion remains an uncalibrated research
   assumption rather than measured RSS evidence.
+- `zaino-oram` / `zainod-oram`: add a source-bound
+  `BuilderFoundationV1` target-load foundation for generic Linux x86_64
+  builders. It consumes validated capture and sizing artifacts inside a fixed
+  64..=512-directory/128..=4096-event envelope, reserves 16 directory and 48
+  event admission slots during warmup, then measures exactly 256 shuffled
+  single-caller commands: 160 hot reads, 48 reads from the resident non-hot
+  warmup set (the fixed `cold` class), 32 unique hot appends, and 16 unique cold
+  appends. The distinct read-back-verified artifact records typed-worker call
+  latency, mixed-phase wall-clock completion rates, process-wide RSS plus the
+  process-lifetime HWM, clean-shutdown lifecycle counters, and logical probe collisions,
+  while marking queue contention unmeasured and stash/physical access
+  `backend-unobservable`. This is research-only generic-builder evidence, not
+  target hardware/TDX, persistence/recovery, `10^9` operations, full-mainnet,
+  attestation, physical-obliviousness, or mainnet-readiness qualification.
 - `zaino-oram`: a module-private synchronous command core now owns two typed
   fake table handles, validates their public capacity shape, performs a full
   directory plus bounded-history successful preflight, derives the next

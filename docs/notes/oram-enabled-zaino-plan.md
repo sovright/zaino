@@ -105,10 +105,54 @@ the exact directory-admission and event-admission boundaries while retaining
 physical table reserve, verify all admitted histories and replay behavior, and
 then require the next boundary-crossing append to fail closed and latch. Its
 separate aggregate artifact closes only the logical admitted-map boundary
-correctness gap; random or adversarial target-load experiments, actual physical
-capacity exhaustion, performance and memory measurements, persistence and
-recovery, physical traces, target CPU/TDX, signed provenance, full-mainnet
-sizing, and the mainnet gate remain open.
+correctness gap. At that slice boundary, random or adversarial target-load
+experiments, actual physical capacity exhaustion, performance and memory
+measurements, persistence and recovery, physical traces, target CPU/TDX, signed
+provenance, full-mainnet sizing, and the mainnet gate remained open.
+The next `BuilderFoundationV1` slice adds a separate source-bound target-load
+foundation for a generic Linux x86_64 builder. It consumes a complete validated
+capture plus its recomputed sizing qualification, then uses the sizing model's
+exact directory/event capacities, admission limits, and per-address event bound
+only when they fit a fixed research envelope: power-of-two directory capacity
+64..=512 with admission at least 48, power-of-two event capacity 128..=4096
+with admission at least 96, 3..=64 events per address, four probes per table,
+and a one-command worker queue. Warmup stops 16 directory slots and 48 event
+slots below the supplied admission limits. The deterministic shuffled measured
+phase then performs exactly 256 blocking commands: 160 hot reads, 48 reads from
+the resident non-hot warmup set (the fixed `cold` class), 32 unique appends to
+hot addresses, and 16 unique appends to new cold addresses, filling both
+logical admission limits while checking every result against an in-memory
+reference model. The report records typed-worker call latency with synthetic
+input preparation and result verification outside each command timer. Its
+nearest-rank percentiles therefore describe the synchronous worker API; with
+48 append samples, append p99 equals the maximum. Mixed-phase completion rates
+use the entire measured-phase wall clock, including driver preparation and
+correctness checks, and are not isolated read or append throughput. It also
+records process-wide `/proc/self/status` RSS samples and the process-lifetime
+`VmHWM` (including pre-run driver/runtime memory), clean-shutdown lifecycle/queue counters,
+and a deterministic logical occupied-probe collision schedule. It explicitly
+marks queue contention as unmeasured and both stash state and physical access
+traces as `backend-unobservable`.
+
+The listener-free command is:
+
+```text
+zainod-oram qualification target-load \
+  --profile builder-foundation-v1 \
+  --capture-dir <CAPTURE_DIR> \
+  --sizing-dir <SIZING_DIR> \
+  --output-dir <NEW_DIR>
+```
+
+Publication is restricted to Linux x86_64 and produces a distinct
+read-back-verified JSON/text/provenance bundle. The output may not be nested
+under either validated input, and staged read-back is rebound to both loaded
+sources. Even when executed on the
+dedicated GCP builder, this profile is only a bounded single-caller research
+measurement. It does not qualify the intended CPU or TDX instance, durable
+persistence or recovery, a `10^9`-operation soak, full-mainnet capacity,
+attestation, signed provenance, stash behavior, physical-obliviousness, or
+mainnet readiness.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the

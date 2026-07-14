@@ -1,8 +1,8 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
-- Date: 2026-07-13
-- Evaluated worktree: `feat/oram-full-map-saturation`, stacked on exact
-  load-foundation head `b0180d301218dae46df26c736756ca4c43e56fca`.
+- Date: 2026-07-14
+- Evaluated worktree: `feat/oram-target-load-foundation`, stacked on exact
+  full-map-saturation head `a169da2b6edfb44b87f5f66c0e1fcd93aa02514a`.
   The `SmokeV1` parent at `17356db0` passed strict all-target/all-feature Clippy
   for both research crates plus the 204-test `zaino-oram` and 39-test
   `zainod-oram` suites in native run `29250757780` (job `86818420630`).
@@ -27,9 +27,10 @@ mainnet/host-oblivious privacy claim.**
 
 **Offline research may continue** in the non-published `zaino-oram` package.
 The implemented work is useful evidence for API shape, fixed records, aggregate
-corpus accounting, logical schedules, and a pinned upstream experiment. It does
-not establish equal physical work, production encryption, durable ORAM state,
-TDX isolation, attestation, wire-shape equivalence, or mainnet capacity.
+corpus accounting, logical schedules, and bounded generic-builder measurement
+plumbing around a pinned upstream experiment. It does not establish equal
+physical work, production encryption, durable ORAM state, TDX isolation,
+attestation, wire-shape equivalence, or mainnet capacity.
 
 This is a gate decision, not a conclusion that ORAM is infeasible. Server work
 must remain closed until the Phase 0 blockers in this report have measured,
@@ -194,6 +195,28 @@ The evaluated worktree implements:
   report records physical reserve and explicitly marks physical exhaustion,
   random/adversarial target load, performance, recovery, target hardware/TDX,
   and mainnet qualification absent;
+- a separate source-bound `BuilderFoundationV1` typed-worker target-load
+  foundation for generic Linux x86_64 builders. The runner reopens a complete
+  capture and sizing bundle, requires exact source-bound sizing recomputation,
+  and consumes that model's table capacities, admission limits, and per-address
+  event bound only inside a fixed builder envelope: power-of-two directory
+  capacity 64..=512 with admission at least 48, power-of-two event capacity
+  128..=4096 with admission at least 96, 3..=64 events per address, four probes
+  per table, and queue capacity one. Warmup reserves 16 directory and 48 event
+  admission slots. Its deterministic shuffled measured phase executes exactly
+  256 blocking commands: 160 hot reads, 48 reads from the resident non-hot
+  warmup set (the fixed `cold` class), 32 unique hot appends, and 16 unique cold
+  appends. It fills both logical admission limits,
+  checks each result against a bounded reference model, and validates a logical
+  occupied-probe collision schedule;
+- target-load evidence fields for typed-worker call latency, nearest-rank
+  percentiles, mixed-phase wall-clock completion rates, process-wide Linux
+  `/proc/self/status` RSS samples plus process-lifetime `VmHWM`, and clean-shutdown aggregate
+  queue/lifecycle counters. Queue contention is explicitly unmeasured, while
+  stash current/peak state and physical access traces are explicitly
+  `backend-unobservable`. The separate Linux-x86_64-only three-file artifact is
+  unsigned and self-reported. Publication rejects output nested under either
+  validated source and rebinds staged read-back to both inputs;
 - separate pinned, volatile `rostl` tables for the exact 38-byte directory and
   82-byte event-page records. Their private offline Linux-x86_64 constructor
   creates distinct `CircuitORAM` and recursive-position-map instances and
@@ -224,15 +247,20 @@ The evaluated worktree implements:
 
 The following statements are **not** established by that evidence:
 
-- `rostl` has executed only in small 8/16-entry table tests on a generic
-  GitHub-hosted Ubuntu 24.04 x86_64 VM. That is not the intended CPU, TDX
-  platform, release profile, capacity, or workload;
+- the previously reviewed native `rostl` evidence uses small 8/16-entry table
+  tests on generic Ubuntu 24.04 x86_64. The target-load foundation permits only
+  its bounded 64..=512 directory and 128..=4096 event builder envelope. Neither
+  is the intended CPU, TDX platform, accepted release profile, full-mainnet
+  capacity, or final workload;
 - the 72-byte record has not been benchmarked at mainnet capacity;
 - no production privacy profile or accepted profile constants exist;
-- no mainnet corpus report, TDX RSS result, latency result, stash result,
-  target-load queue result, assembly result, or physical trace result exists.
-  The fixed scenario's aggregate worker counters are correctness telemetry, not
-  performance or physical-obliviousness evidence;
+- no mainnet corpus report, target-TDX RSS or latency result, stash result,
+  target-load queue-contention result, assembly result, or physical trace result
+  exists. `BuilderFoundationV1` measures process-wide RSS plus process-lifetime
+  HWM, typed-worker call latency, mixed-phase completion rates, and lifecycle
+  counters only on a generic builder;
+  it exposes neither backend stash state nor physical accesses and is not
+  target-hardware or physical-obliviousness evidence;
 - the logical trace tests do not measure or prove equal instructions, branches,
   allocator activity, memory/page accesses, timing, transport frames, or
   packets;
@@ -350,12 +378,12 @@ The following statements are **not** established by that evidence:
 | CPU/target/TDX pin | Partial target-class gate | An Ubuntu 24.04 x86_64 CI lane with immutable action pins executes the real adapter; the hosted image, CPU generation, TDX instance, firmware/TCB, DOIT, and memory remain unset | Select CPU generations, exact target/release flags, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
 | Pinned ORAM dependency | Partial | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock` | Resolve API/failure/recovery concerns and decide upstream, fork, or replacement |
 | Dependency/license inventory | Blocked | Manifest declarations recorded below; `rostl` checkout has no root license text | Obtain authoritative license files/confirmation and complete automated transitive audit |
-| Random full-map experiments | Missing (adjacent deterministic correctness only) | Fixed `SmokeV1` covers a 64-step mixed workload. Separate `FullMapSaturationV1` workers reach the exact 6-entry directory-admission and 12-entry event-admission bounds, verify all admitted state, and fail closed on the next append while retaining physical capacity. These small-table generic-host scenarios are neither random nor physical full-map target load and are not benchmarks | Run mixed random reads/inserts at measured target capacity/load; avoid repeated key-zero microbenchmarks and keep the result schema separate from both deterministic profiles |
-| Memory/RSS gate | Missing | Sizing code is a logical model only | Measure peak RSS on intended TDX hardware with at least 30% headroom and no host swapping |
-| Latency/stash/queue gate | Missing | No target-hardware measurements | Record latency distribution, sustained QPS, stash pressure, queue depth, update contention, and failure behavior |
+| Random full-map experiments | Partial builder foundation | Fixed `SmokeV1` covers a 64-step mixed workload, while separate `FullMapSaturationV1` workers exercise exact logical admission failures. Source-bound `BuilderFoundationV1` adds a deterministic shuffled 256-command hot/cold read/unique-append workload that fills both sizing-derived logical admission limits inside a fixed builder envelope and requires logical occupied-probe collisions. It is neither random/adversarial physical full-map load nor a long-run benchmark | Run mixed random reads/inserts and adversarial collisions at measured full-mainnet target capacity/load; keep that result schema separate from all deterministic profiles |
+| Memory/RSS gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` samples process-wide `VmRSS` before spawn, after spawn, after warmup, and after the measured phase, plus process-lifetime `VmHWM`, on Linux x86_64. The HWM includes driver/runtime memory predating the run. This is whole-process generic-builder evidence, not backend-only memory or intended-TDX headroom | Measure peak RSS, initialization pressure, page faults, and swapping on intended TDX hardware with at least 30% headroom |
+| Latency/stash/queue gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` records synchronous typed-worker call latency and mixed-phase wall-clock completion rates with a single caller and queue capacity one. Synthetic input preparation and verification are outside command latency but inside the phase wall; per-class rates are not isolated throughput. It also records clean-shutdown lifecycle/queue counters, while queue contention is unmeasured and stash/physical access is backend-unobservable | Record target-hardware latency distribution, sustained QPS, stash pressure, loaded queue depth, update contention, and failure behavior |
 | Assembly/compiler-preservation experiment | Missing | No release assembly or instruction trace | Resolve the concern tracked by [`rostl` issue #8](https://github.com/obliviouslabs/rostl/issues/8) for the pinned binary/toolchain |
 | Failure probability | Missing | No long-run or analytical bound | Address [`rostl` issue #24](https://github.com/obliviouslabs/rostl/issues/24) and document node-year risk |
-| Typed capacity/stash/queue failure | Partial | Local validation is typed; the research worker has nonblocking bounded admission, a typed identifier-free `QueueFull`, no fallback, and terminal backend/panic latching. `SmokeV1` checks the per-address limit. Separate `FullMapSaturationV1` workers reach the directory and event admission bounds independently, return `FailedClosed` on the next append, latch terminal state, and reject two later commands at admission. Neither profile loads the queue or observes a stash | Replace panic-based upstream boundaries, type stash exhaustion, and prove capacity/stash/queue behavior under native target load |
+| Typed capacity/stash/queue failure | Partial | Local validation is typed; the research worker has nonblocking bounded admission, a typed identifier-free `QueueFull`, no fallback, and terminal backend/panic latching. `SmokeV1` checks the per-address limit. Separate `FullMapSaturationV1` workers reach the directory and event admission bounds independently, fail closed on the next append, and latch terminal state. `BuilderFoundationV1` reaches both source-sized admission limits in one healthy run and requires a clean stopped snapshot, but its single caller does not load the queue and the backend exposes no stash telemetry | Replace panic-based upstream boundaries, type stash exhaustion, and prove capacity/stash/queue behavior under native target load |
 | Persistence/recovery/RTO | Blocked | Candidate adapter is deliberately volatile and is not an `ObliviousStore` backend | Design authenticated atomic persistence or measure a cold rebuild and publish an RTO |
 | Go/no-go stakeholder acceptance | Missing | No accepted numeric profile or client contract | Security, operator, and client teams approve the exact leakage budget |
 
@@ -658,8 +686,41 @@ result.
 No target hardware benchmark has been run. The fixed 64-step `SmokeV1` mixed
 scenario and the independent `FullMapSaturationV1` logical admission-boundary
 cases are deterministic correctness and failure-semantics exercises. The latter
-retains physical capacity in both tables. Neither satisfies the target-load or
-physical full-map experiment below. Required evidence still includes:
+retains physical capacity in both tables.
+
+`BuilderFoundationV1` is the next bounded measurement foundation. It consumes
+the separately validated capture and sizing artifacts rather than accepting
+capacity or workload knobs at the command line. Within its fixed builder
+envelope, warmup stops 16 directory slots and 48 event slots below the supplied
+admission limits. The measured phase then shuffles exactly 160 hot reads, 48
+reads from the resident non-hot warmup set (the fixed `cold` class), 32 unique
+hot appends, and 16 unique cold appends; those 256
+commands fill both logical admission limits. The report binds the source
+digests and deterministic schedule/final-state digests, checks a logical
+occupied-probe collision schedule, measures synchronous typed-worker call
+latency and mixed-phase wall-clock completion rates, samples whole-process RSS
+and process-lifetime HWM, and
+requires clean aggregate shutdown counters. Because the current backend does
+not expose them, stash current/peak state and physical access traces are
+reported as `backend-unobservable`; the single-caller run also makes no queue
+contention claim.
+
+The exact listener-free invocation is:
+
+```text
+zainod-oram qualification target-load \
+  --profile builder-foundation-v1 \
+  --capture-dir <CAPTURE_DIR> \
+  --sizing-dir <SIZING_DIR> \
+  --output-dir <NEW_DIR>
+```
+
+The command publishes only on Linux x86_64. A successful run on the dedicated
+GCP/Linux builder remains generic-builder, single-caller research evidence. It
+does not establish target CPU/TDX behavior, full-mainnet capacity, durable
+persistence/recovery, a `10^9`-operation failure bound, signed or attested
+execution, backend physical-obliviousness, or mainnet readiness. Required
+evidence still includes:
 
 1. a full mainnet build at an explicit public checkpoint and growth horizon;
 2. random full-map mixed reads/inserts, adversarial collision patterns, and
@@ -677,9 +738,10 @@ unsuitable for such a claim. The stores are volatile, do not implement the
 engine's `ObliviousStore`, expose no upstream stash metric, and have not run on
 the intended target. The private offline Linux constructor creates separate
 exact directory/event ORAM and position-map instances and moves their executor
-into the worker. Its small 8/16-entry table functional tests pass on generic
-Ubuntu 24.04 x86_64 CI. The private projection owner consumes that constructor,
-but has no runtime/service caller. The
+into the worker. Prior functional tests cover small 8/16-entry tables on
+generic Ubuntu 24.04 x86_64; the bounded builder profile does not change that
+host qualification boundary. The private projection owner consumes that
+constructor, but has no runtime/service caller. The
 tables, synchronous executor, and outer worker boundary catch panics and latch
 coarse failed-closed state, but Rust's process-wide panic hook still runs and
 this is not recovery. Upstream open work includes Circuit ORAM stash recovery
@@ -736,9 +798,10 @@ exposing a private server:
    and publish only its identifier-free, digest-bound artifact;
 2. produce and review the full-mainnet distribution and calibrated sizing
    artifact;
-3. extend the pinned generic Linux x86_64 CI gate into a reproducible release
-   artifact and target-capacity run without calling that a privacy
-   qualification;
+3. execute the fixed source-bound `BuilderFoundationV1` profile on the generic
+   Linux x86_64 builder, retain its three-file artifact, and extend that gate
+   toward a reproducible release artifact without calling either result a
+   target-hardware or privacy qualification;
 4. select target CPU/TDX instances and measure random full-map performance,
    stash/queue behavior, RSS, swapping, and rebuild time;
 5. extend the logical trace into release-binary source, allocator, physical

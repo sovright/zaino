@@ -41,3 +41,20 @@
   admission limits and fail closed on the next append. It is not physical
   capacity, random target-load, performance, persistence/recovery, target
   CPU/TDX, or mainnet-gate evidence.
+- Add `qualification target-load --profile builder-foundation-v1
+  --capture-dir <CAPTURE_DIR> --sizing-dir <SIZING_DIR> --output-dir <NEW_DIR>`
+  as a listener-free source-bound builder experiment. The command accepts no
+  capacity, operation-count, concurrency, seed, backend, queue, or service
+  configuration knobs. It revalidates the complete capture/sizing pair, runs
+  the fixed 256-command `BuilderFoundationV1` workload inside its bounded table
+  envelope, and publishes exactly `target-load.json`, `target-load.txt`, and a
+  digest-bound `provenance.json` after staged read-back verification on Linux
+  x86_64. The publisher rejects output nested under either validated source and
+  rebinds staged JSON to both inputs. The unsigned artifact records typed-worker
+  call latency, mixed-phase wall-clock completion rates, process-wide RSS plus
+  process-lifetime HWM, lifecycle queue
+  counters, logical probe collisions, and explicit `backend-unobservable`
+  stash/physical-access markers. It is generic-builder research evidence only,
+  not target hardware/TDX, persistence/recovery, a `10^9`-operation soak,
+  full-mainnet capacity, attestation, physical-obliviousness, or mainnet
+  readiness.

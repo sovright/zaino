@@ -85,6 +85,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   remaining physical-capacity reserve and explicitly does not claim physical
   exhaustion, random or adversarial target-load behavior, benchmark results,
   persistence/recovery, target CPU/TDX qualification, or mainnet readiness.
+- A separate source-bound `BuilderFoundationV1` typed-worker target-load
+  foundation for generic Linux x86_64 builders. It consumes the exact
+  capture-bound sizing model within a fixed research envelope: power-of-two
+  directory capacity 64..=512 with admission at least 48, power-of-two event
+  capacity 128..=4096 with admission at least 96, 3..=64 events per address,
+  four probes per table, and queue capacity one. Warmup reserves 16 directory
+  and 48 event admission slots; the deterministic shuffled measured phase then
+  runs 160 hot reads, 48 reads from the resident non-hot warmup set (the fixed
+  `cold` class), 32 unique hot appends, and 16 unique cold appends, filling both
+  logical admission limits. Its aggregate report records
+  reference-model correctness, logical occupied-probe collisions,
+  typed-worker call latency, mixed-phase wall-clock completion rates,
+  process-wide Linux RSS plus process-lifetime HWM, and clean-shutdown
+  queue/lifecycle counters. Queue contention
+  remains unmeasured, and backend stash state plus physical access traces are
+  explicitly `backend-unobservable`. This bounded 256-command profile is not
+  target CPU/TDX, persistence/recovery, `10^9`-operation, full-mainnet,
+  attestation, physical-obliviousness, or mainnet-readiness evidence.
 - A private generic finalized-event/checkpoint coordinator that fully stages
   canonical validation, transparent event extraction, spend-owner resolution,
   capacity checks, and an ordered standard-event batch before its first sink

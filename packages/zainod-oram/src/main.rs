@@ -12,8 +12,8 @@ use zaino_common::Network;
 #[cfg(feature = "typed-qualification")]
 use zaino_oram::{
     run_typed_worker_full_map_saturation, run_typed_worker_qualification,
-    run_typed_worker_stress_qualification, TypedWorkerFullMapSaturationProfile,
-    TypedWorkerStressProfile,
+    run_typed_worker_stress_qualification, run_typed_worker_target_load,
+    TypedWorkerFullMapSaturationProfile, TypedWorkerStressProfile, TypedWorkerTargetLoadProfile,
 };
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_state::{
@@ -35,6 +35,8 @@ use crate::full_map_saturation_artifact::publish_full_map_saturation;
 use crate::qualification_artifact::publish_qualification;
 #[cfg(feature = "typed-qualification")]
 use crate::stress_qualification_artifact::publish_stress_qualification;
+#[cfg(feature = "typed-qualification")]
+use crate::target_load_artifact::publish_target_load;
 
 mod corpus_artifact;
 #[cfg(feature = "typed-qualification")]
@@ -43,6 +45,8 @@ mod full_map_saturation_artifact;
 mod qualification_artifact;
 #[cfg(feature = "typed-qualification")]
 mod stress_qualification_artifact;
+#[cfg(feature = "typed-qualification")]
+mod target_load_artifact;
 
 type RunnerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -80,6 +84,8 @@ enum QualificationSubcommand {
     Run(QualificationRunArgs),
     /// Run a fixed stress profile and publish aggregate evidence.
     Stress(QualificationStressArgs),
+    /// Run a sizing-bound builder target-load profile and publish aggregate evidence.
+    TargetLoad(QualificationTargetLoadArgs),
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -103,6 +109,26 @@ struct QualificationStressArgs {
 }
 
 #[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTargetLoadArgs {
+    /// Versioned fixed builder target-load profile to execute.
+    #[arg(long, value_enum)]
+    profile: TargetLoadProfileArg,
+
+    /// Complete three-file capture directory bound to the sizing input.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Complete three-file sizing directory to validate and consume.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+
+    /// New directory that will receive the complete verified evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StressQualificationProfileArg {
     /// Fixed smoke-level stress qualification profile.
@@ -111,6 +137,14 @@ enum StressQualificationProfileArg {
     /// Fixed full admitted-map correctness-saturation profile.
     #[value(name = "full-map-saturation-v1")]
     FullMapSaturationV1,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TargetLoadProfileArg {
+    /// Fixed single-caller profile for the generic Linux x86_64 builder.
+    #[value(name = "builder-foundation-v1")]
+    BuilderFoundationV1,
 }
 
 #[derive(Debug, Args)]
@@ -258,6 +292,7 @@ async fn run(cli: Cli) -> RunnerResult<()> {
         Command::Qualification(command) => match command.command {
             QualificationSubcommand::Run(args) => run_qualification(args),
             QualificationSubcommand::Stress(args) => run_stress_qualification(args),
+            QualificationSubcommand::TargetLoad(args) => run_target_load(args),
         },
     }
 }
@@ -298,6 +333,32 @@ fn run_stress_qualification(args: QualificationStressArgs) -> RunnerResult<()> {
             println!("full_map_saturation_artifact={}", args.output_dir.display());
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_target_load(args: QualificationTargetLoadArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    let profile = match args.profile {
+        TargetLoadProfileArg::BuilderFoundationV1 => {
+            TypedWorkerTargetLoadProfile::BuilderFoundationV1
+        }
+    };
+    let target_load = run_typed_worker_target_load(
+        profile,
+        sizing.qualification(),
+        sizing.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+    )?;
+    publish_target_load(
+        &args.output_dir,
+        &capture,
+        &sizing,
+        &target_load,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!("target_load_artifact={}", args.output_dir.display());
     Ok(())
 }
 
@@ -626,6 +687,27 @@ mod tests {
     }
 
     #[cfg(feature = "typed-qualification")]
+    fn publish_target_load_inputs(parent: &Path) -> RunnerResult<(PathBuf, PathBuf)> {
+        let capture_dir = parent.join("target-load-capture");
+        let sizing_dir = parent.join("target-load-sizing");
+        let measurement = typed_test_measurement()?;
+        let provenance = CaptureProvenance::new(
+            BackendKind::Rpc,
+            SnapshotMode::NonFinalizedState,
+            0,
+            SelectionMode::ServiceableTip,
+            "test-runner",
+            &measurement,
+        )?;
+        publish_capture(&capture_dir, &measurement, &provenance)?;
+        let capture = load_capture(&capture_dir)?;
+        let model = MainnetSizingModel::new(0, 0, 64, 48, 128, 96, 3, 4, 20_000, 1_000_000, 3_000)?;
+        let qualification = capture.measurement().apply_model(&model)?;
+        publish_sizing(&sizing_dir, &capture, &qualification, "test-runner")?;
+        Ok((capture_dir, sizing_dir))
+    }
+
+    #[cfg(feature = "typed-qualification")]
     fn valid_qualification_args() -> [&'static str; 5] {
         [
             "zainod-oram",
@@ -652,6 +734,23 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_target_load_args() -> [&'static str; 11] {
+        [
+            "zainod-oram",
+            "qualification",
+            "target-load",
+            "--profile",
+            "builder-foundation-v1",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--output-dir",
+            "/tmp/oram-target-load",
+        ]
+    }
+
     fn parsed_corpus(cli: Cli) -> CorpusCommand {
         match cli.command {
             Command::Corpus(command) => command,
@@ -668,6 +767,9 @@ mod tests {
                 QualificationSubcommand::Run(_) => {
                     panic!("fixed qualification arguments parsed as stress")
                 }
+                QualificationSubcommand::TargetLoad(_) => {
+                    panic!("target-load arguments parsed as stress")
+                }
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
         }
@@ -682,6 +784,9 @@ mod tests {
                 QualificationSubcommand::Run(args) => args,
                 QualificationSubcommand::Stress(_) => {
                     panic!("stress arguments parsed as fixed qualification")
+                }
+                QualificationSubcommand::TargetLoad(_) => {
+                    panic!("target-load arguments parsed as fixed qualification")
                 }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
@@ -762,6 +867,60 @@ mod tests {
         unknown_profile[4] = "custom";
         assert!(Cli::try_parse_from(unknown_profile).is_err());
         Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn target_load_cli_requires_only_named_profile_and_source_bound_artifacts(
+    ) -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_target_load_args())?;
+        let args = match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::TargetLoad(args) => args,
+                QualificationSubcommand::Run(_) | QualificationSubcommand::Stress(_) => {
+                    panic!("target-load arguments parsed as another qualification command")
+                }
+            },
+            Command::Corpus(_) => panic!("target-load arguments parsed as corpus"),
+        };
+        assert_eq!(args.profile, TargetLoadProfileArg::BuilderFoundationV1);
+        assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-target-load"));
+
+        for (rejected, value) in [
+            ("--operations", "10"),
+            ("--concurrency", "2"),
+            ("--seed", "1"),
+            ("--directory-capacity", "64"),
+            ("--event-capacity", "128"),
+            ("--queue-capacity", "1"),
+            ("--config", "/tmp/zainod.toml"),
+        ] {
+            let mut command = valid_target_load_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "typed-qualification"))]
+    #[test]
+    fn target_load_cli_is_absent_without_typed_qualification() {
+        assert!(Cli::try_parse_from([
+            "zainod-oram",
+            "qualification",
+            "target-load",
+            "--profile",
+            "builder-foundation-v1",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--output-dir",
+            "/tmp/oram-target-load",
+        ])
+        .is_err());
     }
 
     #[cfg(all(
@@ -887,6 +1046,72 @@ mod tests {
                 OsString::from("provenance.json"),
             ])
         );
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[tokio::test]
+    async fn target_load_dispatch_consumes_source_bound_sizing_and_publishes_three_files(
+    ) -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let (capture_dir, sizing_dir) = publish_target_load_inputs(parent.path())?;
+        let output_dir = parent.path().join("target-load");
+
+        run(Cli {
+            command: Command::Qualification(QualificationCommand {
+                command: QualificationSubcommand::TargetLoad(QualificationTargetLoadArgs {
+                    profile: TargetLoadProfileArg::BuilderFoundationV1,
+                    capture_dir,
+                    sizing_dir,
+                    output_dir: output_dir.clone(),
+                }),
+            }),
+        })
+        .await?;
+
+        let names = fs::read_dir(output_dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                OsString::from("provenance.json"),
+                OsString::from("target-load.json"),
+                OsString::from("target-load.txt"),
+            ])
+        );
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        not(all(target_os = "linux", target_arch = "x86_64"))
+    ))]
+    #[tokio::test]
+    async fn target_load_dispatch_fails_without_publication_on_unsupported_hosts(
+    ) -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let (capture_dir, sizing_dir) = publish_target_load_inputs(parent.path())?;
+        let output_dir = parent.path().join("target-load");
+
+        let result = run(Cli {
+            command: Command::Qualification(QualificationCommand {
+                command: QualificationSubcommand::TargetLoad(QualificationTargetLoadArgs {
+                    profile: TargetLoadProfileArg::BuilderFoundationV1,
+                    capture_dir,
+                    sizing_dir,
+                    output_dir: output_dir.clone(),
+                }),
+            }),
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(!output_dir.exists());
         Ok(())
     }
 
