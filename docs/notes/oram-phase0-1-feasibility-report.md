@@ -27,10 +27,11 @@ mainnet/host-oblivious privacy claim.**
 
 **Offline research may continue** in the non-published `zaino-oram` package.
 The implemented work is useful evidence for API shape, fixed records, aggregate
-corpus accounting, logical schedules, and bounded generic-builder measurement
-plumbing around a pinned upstream experiment. It does not establish equal
-physical work, production encryption, durable ORAM state, TDX isolation,
-attestation, wire-shape equivalence, or mainnet capacity.
+corpus accounting, logical schedules, bounded generic-builder measurement
+plumbing, and an authenticated public projection-manifest/rebuild contract
+around a pinned upstream experiment. It does not establish equal physical work,
+production encryption, durable ORAM state, a measured recovery-time objective,
+TDX isolation, attestation, wire-shape equivalence, or mainnet capacity.
 
 This is a gate decision, not a conclusion that ORAM is infeasible. Server work
 must remain closed until the Phase 0 blockers in this report have measured,
@@ -137,6 +138,16 @@ The evaluated worktree implements:
   mismatches before allocation; exclusively owns the coordinator and worker;
   exposes only coarse building/ready/failed-closed state and consuming shutdown;
   and never exposes a raw table handle or worker snapshot;
+- a crate-internal fixed-width public projection manifest authenticated with a
+  keyed BLAKE2s MAC. Immutable content-addressed publication binds monotonic
+  sequence/predecessor digests, projection identity and per-rebuild epoch,
+  finalized height/hash, event count, and a deterministic semantic event-log
+  root. An injected external freshness witness advances the exact
+  sequence/digest pair; `CURRENT` remains a non-authoritative hint;
+- deterministic publication failpoints before/after the immutable-manifest,
+  hint, and witness boundaries; strict restart classification rejects stale,
+  corrupt, torn, or equivocating state, requires a fresh genesis-forward worker
+  rebuild, and remains unready when freshness evidence is missing or invalid;
 - a default-off static shadow fixture that compares that oracle with ordinary
   Zaino `BlockchainSource::get_address_utxos` results for every standard
   address observed through the same immutable regtest-vector tip, plus an
@@ -279,8 +290,11 @@ The following statements are **not** established by that evidence:
   identity, readiness path, or private-service lifecycle exists;
   `zainod-oram` contains only listener-free corpus capture, offline sizing, and
   the fixed typed-worker correctness qualification;
-- no durable ORAM/checkpoint implementation, rollback defense, crash recovery,
-  measured rebuild path, or recovery-time objective exists;
+- no durable ORAM backend, production freshness-witness/key owner, atomic
+  coupling between public publication and ROSTL buckets/position maps/stash,
+  measured full-corpus rebuild path, or recovery-time objective exists. The
+  public manifest foundation detects rollback/corruption only when its injected
+  external witness and authentication key are correctly owned;
 - the typed qualification neither persists worker state nor connects it to the
   logical private-query runtime, a network listener, mainnet data, or TDX. Its
   nine commands establish only deterministic typed-worker semantics; they do
@@ -300,9 +314,10 @@ The following statements are **not** established by that evidence:
   typed `rostl` stores, preserves directory/event duplicates without aliasing,
   exercises a full-store duplicate, runs append/read/shutdown through the real
   executor behind the business worker, and checks synthetic caught-panic
-  fail-closed behavior. The private owner and coordinator now consume that
-  constructor, but they are not connected to a durable checkpoint publisher,
-  query engine, or service lifecycle;
+  fail-closed behavior. The private owner and coordinator can now consume an
+  injected authenticated public-manifest publisher and exercise restart/rebuild
+  in portable and Linux-gated tests, but no production key/witness owner,
+  durable ROSTL state, query engine, or service lifecycle exists;
 - worker queue depth is observable load leakage, caught panics still invoke the
   process-wide panic hook (including connector/backend, projection-sink, and
   discarded-sink destructor panics), so real panic payloads must be
@@ -384,7 +399,7 @@ The following statements are **not** established by that evidence:
 | Assembly/compiler-preservation experiment | Missing | No release assembly or instruction trace | Resolve the concern tracked by [`rostl` issue #8](https://github.com/obliviouslabs/rostl/issues/8) for the pinned binary/toolchain |
 | Failure probability | Missing | No long-run or analytical bound | Address [`rostl` issue #24](https://github.com/obliviouslabs/rostl/issues/24) and document node-year risk |
 | Typed capacity/stash/queue failure | Partial | Local validation is typed; the research worker has nonblocking bounded admission, a typed identifier-free `QueueFull`, no fallback, and terminal backend/panic latching. `SmokeV1` checks the per-address limit. Separate `FullMapSaturationV1` workers reach the directory and event admission bounds independently, fail closed on the next append, and latch terminal state. `BuilderFoundationV1` reaches both source-sized admission limits in one healthy run and requires a clean stopped snapshot, but its single caller does not load the queue and the backend exposes no stash telemetry | Replace panic-based upstream boundaries, type stash exhaustion, and prove capacity/stash/queue behavior under native target load |
-| Persistence/recovery/RTO | Blocked | Candidate adapter is deliberately volatile and is not an `ObliviousStore` backend | Design authenticated atomic persistence or measure a cold rebuild and publish an RTO |
+| Persistence/recovery/RTO | Partial public-manifest foundation; production gate blocked | Fixed authenticated manifests, exact digest-bound external freshness transitions, deterministic crash-boundary tests, and fresh-worker genesis replay establish a fail-closed public publication/rebuild contract. The candidate ROSTL adapter remains volatile; no production witness/key owner, composite ORAM-state commit, full-corpus timing, or RTO exists | Wire production key/freshness ownership and either implement authenticated atomic ORAM persistence or measure a target-hardware cold rebuild and publish an accepted RTO |
 | Go/no-go stakeholder acceptance | Missing | No accepted numeric profile or client contract | Security, operator, and client teams approve the exact leakage budget |
 
 Phase 0 does not pass. Mainnet capacity, hardware memory, physical behavior,
@@ -420,9 +435,9 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Append-only event-page or audited upsert design | Partial typed connector | Exact immutable directory and one-event cells avoid tail-page/directory upsert; the keyed planner validates full probe sets, and a module-private synchronous connector scans every bounded ordinal, derives a contiguous next ordinal, reads owned-backend admission counts, and preflights a new directory plus event before writing. A bounded worker owns this core and exposes only whole business commands. The private offline owner composes its projection sink with the coordinator and typed `rostl` constructor. Authenticated contents, crash atomicity, target-load execution, and measured whole-history cost remain open |
 | Deterministic finalized projection | Pass for fixtures | Genesis-forward `IndexedBlock` fixtures cover multiple outputs, repeated addresses, same-block and cross-block spends, empty results, nonstandard spend resolution, duplicate-after-spend rejection, and identical rebuild state. The coordinator emits the existing three-block fixture's exact seven standard events in extraction order and performs zero sink writes for its nonstandard-only final block |
 | Staged mutation and fail-closed state | Pass for portable owner integration | Whole blocks apply to a cloned candidate before the first sink call; a late invalid event produces zero calls. A fake backend's sixth event insertion mutates then fails, drops both candidate tables exactly once, preserves only the prior height-0 cursor/checkpoint, rejects retry without later I/O, and shuts down failed closed. This is not backend rollback or block atomicity |
-| Checkpoint/replay/rebuild policy | Partial publication-last model | Opaque cursor candidates prevent forged/stale in-process commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild; failed replay/replacement leaves the old ready plaintext oracle usable. The coordinator assigns its cloned cursor/state checkpoint only after all synchronous event calls succeed, but the checkpoint has no authenticated root or durable/atomic coupling to sink state |
+| Checkpoint/replay/rebuild policy | Partial authenticated public-manifest model | Opaque cursor candidates prevent forged/stale in-process commits; explicit network/schema/key targets distinguish finish, forward replay, and rebuild. A fixed authenticated manifest binds lineage, identity, per-rebuild epoch, finalized checkpoint, count, and semantic event-log root; an exact digest-bound external witness is freshness authority, while deterministic failpoints cover every publication boundary. The coordinator publishes after sink success and commits cloned in-memory state last. The manifest does not durably or atomically couple ROSTL buckets, position maps, stash, or read mutations |
 | Single mutation worker and backend telemetry | Partial typed integration | A portable std-thread worker exclusively owns the exact two-table executor, validates a 1..=4096 research queue bound before allocation, bounds accepted-not-started whole business commands with a `sync_channel`, drains FIFO admissions before shutdown/join, removes raw read/insert bypasses, and separates lifecycle from terminal fault health. Its identifier-free counters are internal and not approved for export. The private owner validates exact network/schema/key-epoch and admission compatibility before allocation, owns the coordinator plus worker, and joins it on consuming shutdown without exporting snapshots. Generic native Linux CI binds the real typed stores to that owner and completes the full three-block/seven-event lifecycle. There is no stash metric, runtime projection lifecycle, or fixed-cadence suppression policy |
-| Volatile rebuild path | Partial pass | Fresh rebuild and clone-ready forward replay are deterministic in fixtures; no full-corpus runtime or RTO is measured |
+| Volatile rebuild path | Partial pass | Portable and Linux-x86_64-gated typed-worker tests shut down, classify the authenticated prior manifest, allocate a fresh worker under a new projection epoch, replay genesis-forward, and reproduce the same semantic event-log root/checkpoint while advancing publication lineage. No production owner, full-corpus runtime, target-hardware timing, or RTO is measured |
 | Shadow comparison with ordinary Zaino | Pass for one static fixture checkpoint | A default-off test independently obtains ordinary UTXOs from `MockchainSource::get_address_utxos` over Zebra full blocks and projection UTXOs from `IndexedBlock` transparent events; it compares every standard address observed through immutable regtest-vector height 200 plus an absent address, at the same height/hash. Live direct/RPC, finalised-database, mainnet, and reorg shadow modes remain missing |
 | Zero query-derived source calls | Pass for current type boundary | The query engine has no validator/LMDB/raw-transaction dependency; this is not yet an integrated readiness or call-trace result |
 | Long-run failure bound | Missing | No target-load mixed-operation soak or node-year analysis exists |
@@ -471,7 +486,7 @@ yet stakeholder-approved.
 | Logs, errors, traces, metric labels | Must exclude private values/outcomes | Allowlisted aggregate/public fields only | New sensitive types use redacted debug; no end-to-end log audit | Open |
 | CPU instructions/branches/timing | Must not distinguish secret cases above accepted threshold | Pinned release build, assembly review, classifier/trace gate | Not measured | Blocker |
 | Page faults, memory addresses, allocations | Must not distinguish secret cases above accepted threshold | Release-binary physical trace gate | Not measured | Blocker |
-| Persistent storage traffic and rollback | Must hide keys and detect stale/corrupt state | Authenticated atomic state and freshness/checkpoint policy | No persistence | Blocker |
+| Persistent storage traffic and rollback | Must hide keys and detect stale/corrupt state | Authenticated atomic state and freshness/checkpoint policy | Public manifest integrity/freshness and volatile rebuild classification are modeled with an injected exact digest-bound witness; ORAM state and its traffic remain volatile/unqualified | Blocker |
 | Denial of service, delay, drop, reordering | Out of scope for confidentiality | Detect integrity/freshness failures and fail closed; cannot prevent DoS | Research adapter has a local failed-closed latch only | Open integrity/recovery work |
 | Power, thermal, frequency, speculative and undocumented CPU channels | Out of scope for first claim | State exclusion explicitly and avoid broader wording | Documented in plan/ADR | Must remain excluded |
 
@@ -774,20 +789,40 @@ the Circuit ORAM state used here. Reads mutate the ORAM, so data buckets,
 position maps, stash state, key epoch, and checkpoint publication cannot be
 snapshotted independently without risking corruption or stale mappings.
 
-No implementation or measurement currently provides:
+The recovery foundation now implements the public-manifest half of the
+contract. A fixed manifest is authenticated with a keyed MAC and stored as an
+immutable content-addressed file; it binds its predecessor, a monotonic
+publication sequence, network/schema/key identity, a per-rebuild projection
+epoch, finalized height/hash, event count, and a deterministic semantic
+event-log root. An injected external witness compares and advances the exact
+sequence/digest pair. The `CURRENT` file is only an atomic repairable hint and
+is never freshness authority. Four deterministic failpoints exercise crashes
+before immutable commit, after immutable commit, after the hint, and after the
+witness. Restart loads only the witness-selected authenticated manifest and
+then requires a fresh worker to replay the public stream from genesis under a
+new projection epoch; missing, stale, corrupt, torn, or equivocating evidence
+stays unready. Tests cover portable fake workers and the Linux-x86_64 typed
+ROSTL path.
 
-- authenticated atomic advancement of ORAM state and public checkpoint/root;
-- rollback/freshness detection against a hostile host;
-- crash/failpoint recovery at every mutation/checkpoint boundary;
-- a durable external-memory backend;
-- deterministic startup comparison with authoritative finalised state;
-- a measured cold rebuild path and declared RTO;
-- key rotation or migration recovery.
+This does not make the ORAM durable. No implementation or measurement currently
+provides:
 
-`catch_unwind` around an offline experiment is not a recovery protocol. Until
-one of the persistence options in the delivery plan is implemented and tested,
-the private endpoint must not exist, or must remain unready in a later offline
-prototype.
+- authenticated atomic advancement of ROSTL data buckets, position maps,
+  stash, query-induced mutations, and the public manifest as one transaction;
+- production ownership, rollback guarantees, provisioning, or rotation for the
+  manifest authentication key and external freshness witness;
+- a durable external-memory backend or resumable ROSTL worker;
+- integration with authoritative live finalised state or a service readiness
+  lifecycle;
+- a full-corpus target-hardware cold-rebuild measurement and declared RTO;
+- key-rotation or schema-migration recovery; or
+- recovery-directory hardening beyond the current trusted, exclusive-writer
+  boundary and final-component file/directory checks.
+
+`catch_unwind` plus a public manifest is not a durable ORAM recovery protocol.
+Until one of the persistence options in the delivery plan is implemented and
+tested—or a measured cold rebuild meets the accepted RTO—the private endpoint
+must not exist, or must remain unready in a later offline prototype.
 
 ## Work allowed under the NO-GO
 
@@ -806,8 +841,9 @@ exposing a private server:
    stash/queue behavior, RSS, swapping, and rebuild time;
 5. extend the logical trace into release-binary source, allocator, physical
    storage, instruction/memory/page, and real transport-frame instrumentation;
-6. design or obtain typed upstream failure/recovery behavior and an
-   authenticated persistence/checkpoint protocol;
+6. implement production key/freshness-witness ownership and either obtain typed
+   durable upstream recovery behavior or qualify the authenticated
+   genesis-forward rebuild protocol against a declared target-hardware RTO;
 7. resolve git-dependency and TDX/verifier licensing with an exact SBOM;
 8. extend the completed logical token/runtime phase model into private schema,
    real source/NFS, transport, allocator, instruction/memory/page, timing, and

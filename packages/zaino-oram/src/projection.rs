@@ -15,6 +15,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
 };
 
+use blake2::{Blake2s256, Digest};
 use zaino_state::{
     extract_transparent_events, AddrScript, IndexedBlock, Outpoint, ScriptType,
     TransparentBlockEvent, TransparentEventError,
@@ -24,8 +25,18 @@ use crate::{
     canonical_chain::{
         CanonicalBlockCursor, CanonicalChainError, CanonicalNetwork, PublicChainCheckpoint,
     },
-    records::{TransparentUtxo, UtxoEvent, UtxoRecordError, UtxoScriptClass},
+    checkpoint::{
+        NoopProjectionCheckpointPublisher, ProjectionCheckpointPublisher, ProjectionEventLogRoot,
+        ProjectionPublication,
+    },
+    records::{
+        persistent_utxo_event_commitment, TransparentUtxo, UtxoEvent, UtxoRecordError,
+        UtxoScriptClass,
+    },
 };
+
+const PROJECTION_EVENT_LOG_INITIAL_DOMAIN: &[u8] = b"zaino-oram-projection-event-log-initial-v1";
+const PROJECTION_EVENT_LOG_STEP_DOMAIN: &[u8] = b"zaino-oram-projection-event-log-step-v1";
 
 /// Explicit bounds for every identifier-bearing offline projection collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,27 +58,27 @@ impl ProjectionCapacities {
     ) -> Result<Self, ProjectionConfigError> {
         Ok(Self {
             max_seen_outputs: NonZeroUsize::new(max_seen_outputs).ok_or(
-                ProjectionConfigError::ZeroCapacity {
+                ProjectionConfigError::EmptyCapacity {
                     dimension: CapacityDimension::SeenOutputs,
                 },
             )?,
             max_live_outputs: NonZeroUsize::new(max_live_outputs).ok_or(
-                ProjectionConfigError::ZeroCapacity {
+                ProjectionConfigError::EmptyCapacity {
                     dimension: CapacityDimension::LiveOutputs,
                 },
             )?,
             max_standard_addresses: NonZeroUsize::new(max_standard_addresses).ok_or(
-                ProjectionConfigError::ZeroCapacity {
+                ProjectionConfigError::EmptyCapacity {
                     dimension: CapacityDimension::StandardAddresses,
                 },
             )?,
             max_total_events: NonZeroUsize::new(max_total_events).ok_or(
-                ProjectionConfigError::ZeroCapacity {
+                ProjectionConfigError::EmptyCapacity {
                     dimension: CapacityDimension::TotalEvents,
                 },
             )?,
             max_events_per_address: NonZeroUsize::new(max_events_per_address).ok_or(
-                ProjectionConfigError::ZeroCapacity {
+                ProjectionConfigError::EmptyCapacity {
                     dimension: CapacityDimension::AddressEvents,
                 },
             )?,
@@ -103,6 +114,7 @@ pub(super) struct ProjectionConfig {
     network: CanonicalNetwork,
     schema_version: u32,
     key_epoch: u64,
+    projection_epoch: u64,
     capacities: ProjectionCapacities,
 }
 
@@ -111,15 +123,20 @@ impl ProjectionConfig {
         network: CanonicalNetwork,
         schema_version: u32,
         key_epoch: u64,
+        projection_epoch: u64,
         capacities: ProjectionCapacities,
     ) -> Result<Self, ProjectionConfigError> {
         if schema_version == 0 {
-            return Err(ProjectionConfigError::ZeroSchemaVersion);
+            return Err(ProjectionConfigError::SchemaVersionZero);
+        }
+        if projection_epoch == 0 {
+            return Err(ProjectionConfigError::InvalidProjectionEpoch);
         }
         Ok(Self {
             network,
             schema_version,
             key_epoch,
+            projection_epoch,
             capacities,
         })
     }
@@ -136,6 +153,10 @@ impl ProjectionConfig {
         self.key_epoch
     }
 
+    pub(super) const fn projection_epoch(self) -> u64 {
+        self.projection_epoch
+    }
+
     pub(super) const fn capacities(self) -> ProjectionCapacities {
         self.capacities
     }
@@ -144,15 +165,19 @@ impl ProjectionConfig {
 /// Invalid offline model configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProjectionConfigError {
-    ZeroSchemaVersion,
-    ZeroCapacity { dimension: CapacityDimension },
+    SchemaVersionZero,
+    InvalidProjectionEpoch,
+    EmptyCapacity { dimension: CapacityDimension },
 }
 
 impl fmt::Display for ProjectionConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ZeroSchemaVersion => f.write_str("offline projection schema version is zero"),
-            Self::ZeroCapacity { dimension } => {
+            Self::SchemaVersionZero => f.write_str("offline projection schema version is zero"),
+            Self::InvalidProjectionEpoch => {
+                f.write_str("offline projection lifecycle epoch is zero")
+            }
+            Self::EmptyCapacity { dimension } => {
                 write!(f, "offline projection {} capacity is zero", dimension)
             }
         }
@@ -167,14 +192,21 @@ struct OfflineProjectionCheckpoint {
     chain: PublicChainCheckpoint,
     schema_version: u32,
     key_epoch: u64,
+    projection_epoch: u64,
 }
 
 impl OfflineProjectionCheckpoint {
-    const fn new(chain: PublicChainCheckpoint, schema_version: u32, key_epoch: u64) -> Self {
+    const fn new(
+        chain: PublicChainCheckpoint,
+        schema_version: u32,
+        key_epoch: u64,
+        projection_epoch: u64,
+    ) -> Self {
         Self {
             chain,
             schema_version,
             key_epoch,
+            projection_epoch,
         }
     }
 
@@ -188,6 +220,10 @@ impl OfflineProjectionCheckpoint {
 
     const fn key_epoch(&self) -> u64 {
         self.key_epoch
+    }
+
+    const fn projection_epoch(&self) -> u64 {
+        self.projection_epoch
     }
 }
 
@@ -206,6 +242,7 @@ enum ProjectionFault {
     CanonicalChain,
     Extraction,
     EventSink,
+    Publication,
     InvalidEvent,
     DuplicateOutput,
     UnknownSpend,
@@ -231,6 +268,7 @@ enum RebuildReason {
     NetworkMismatch,
     SchemaVersionMismatch,
     KeyEpochMismatch,
+    ProjectionEpochMismatch,
     LocalAhead,
     HashMismatch,
 }
@@ -265,6 +303,46 @@ struct ProjectionState {
     seen_outputs: HashSet<Outpoint>,
     live_outputs: HashMap<Outpoint, LiveOutput>,
     total_events: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProjectionEventLogAccumulator {
+    root: ProjectionEventLogRoot,
+    events: u64,
+}
+
+impl ProjectionEventLogAccumulator {
+    fn new(config: ProjectionConfig) -> Self {
+        let mut hasher = Blake2s256::new();
+        hasher.update(PROJECTION_EVENT_LOG_INITIAL_DOMAIN);
+        hasher.update([canonical_network_tag(config.network())]);
+        hasher.update(config.schema_version().to_le_bytes());
+        hasher.update(config.key_epoch().to_le_bytes());
+        Self {
+            root: ProjectionEventLogRoot::from_bytes(finalize_blake2s(hasher)),
+            events: 0,
+        }
+    }
+
+    fn append(&mut self, event: &UtxoEvent) -> Result<(), ProjectionError> {
+        let next_events = self
+            .events
+            .checked_add(1)
+            .ok_or(ProjectionError::EventLogCounterOverflow)?;
+        let commitment = persistent_utxo_event_commitment(event);
+        let mut hasher = Blake2s256::new();
+        hasher.update(PROJECTION_EVENT_LOG_STEP_DOMAIN);
+        hasher.update(self.root.as_bytes());
+        hasher.update(next_events.to_le_bytes());
+        hasher.update(commitment);
+        self.root = ProjectionEventLogRoot::from_bytes(finalize_blake2s(hasher));
+        self.events = next_events;
+        Ok(())
+    }
+
+    const fn root(self) -> ProjectionEventLogRoot {
+        self.root
+    }
 }
 
 impl ProjectionState {
@@ -456,6 +534,7 @@ struct StagedFinalizedBlock {
     checkpoint: PublicChainCheckpoint,
     state: ProjectionState,
     events: Vec<UtxoEvent>,
+    event_log: ProjectionEventLogAccumulator,
 }
 
 /// Deterministic plaintext oracle for finalized `IndexedBlock` fixtures.
@@ -464,6 +543,7 @@ struct OfflineFinalizedProjection {
     config: ProjectionConfig,
     cursor: CanonicalBlockCursor,
     state: ProjectionState,
+    event_log: ProjectionEventLogAccumulator,
     readiness: ProjectionReadiness,
 }
 
@@ -471,6 +551,7 @@ impl OfflineFinalizedProjection {
     fn new(config: ProjectionConfig) -> Self {
         Self {
             cursor: CanonicalBlockCursor::new(config.network),
+            event_log: ProjectionEventLogAccumulator::new(config),
             config,
             state: ProjectionState::new(),
             readiness: ProjectionReadiness::Building,
@@ -562,9 +643,11 @@ impl OfflineFinalizedProjection {
             .map_err(ProjectionError::CanonicalChain)?;
         let events = extract_transparent_events(block).map_err(ProjectionError::Extraction)?;
         let mut state = self.state.clone();
+        let mut event_log = self.event_log;
         let mut projected_events = Vec::with_capacity(events.len());
         for event in events {
             if let Some(event) = state.apply(event, self.config.capacities)? {
+                event_log.append(&event)?;
                 projected_events.push(event);
             }
         }
@@ -577,11 +660,13 @@ impl OfflineFinalizedProjection {
             checkpoint: committed,
             state,
             events: projected_events,
+            event_log,
         })
     }
 
     fn commit_staged(&mut self, staged: StagedFinalizedBlock) -> OfflineProjectionCheckpoint {
         self.state = staged.state;
+        self.event_log = staged.event_log;
         self.cursor = staged.cursor;
         self.checkpoint_for(staged.checkpoint)
     }
@@ -632,6 +717,9 @@ impl OfflineFinalizedProjection {
         if target.key_epoch() != self.config.key_epoch {
             return Err(ProjectionError::TargetKeyEpochMismatch);
         }
+        if target.projection_epoch() != self.config.projection_epoch {
+            return Err(ProjectionError::TargetProjectionEpochMismatch);
+        }
         let committed = self.cursor.checkpoint();
         let Some(committed) = committed else {
             return Err(ProjectionError::TargetNotReached {
@@ -679,6 +767,11 @@ impl OfflineFinalizedProjection {
         if authoritative.key_epoch() != self.config.key_epoch {
             return ReconcileAction::RebuildRequired {
                 reason: RebuildReason::KeyEpochMismatch,
+            };
+        }
+        if authoritative.projection_epoch() != self.config.projection_epoch {
+            return ReconcileAction::RebuildRequired {
+                reason: RebuildReason::ProjectionEpochMismatch,
             };
         }
         let Some(local) = self.cursor.checkpoint() else {
@@ -755,7 +848,12 @@ impl OfflineFinalizedProjection {
     }
 
     const fn checkpoint_for(&self, chain: PublicChainCheckpoint) -> OfflineProjectionCheckpoint {
-        OfflineProjectionCheckpoint::new(chain, self.config.schema_version, self.config.key_epoch)
+        OfflineProjectionCheckpoint::new(
+            chain,
+            self.config.schema_version,
+            self.config.key_epoch,
+            self.config.projection_epoch,
+        )
     }
 
     fn fail_closed(&mut self, error: &ProjectionError) {
@@ -774,20 +872,32 @@ pub(super) trait ProjectionEventSink {
     fn append_and_wait(&mut self, event: UtxoEvent) -> Result<(), Self::Error>;
 }
 
-/// Owns one volatile sink candidate and publishes only its in-memory cursor.
-pub(super) struct ProjectionCheckpointCoordinator<S> {
+/// Owns one volatile sink candidate and publishes its rebuild checkpoint last.
+pub(super) struct ProjectionCheckpointCoordinator<S, P = NoopProjectionCheckpointPublisher> {
     projection: OfflineFinalizedProjection,
     sink: Option<S>,
+    publisher: Option<P>,
 }
 
-impl<S> ProjectionCheckpointCoordinator<S>
+impl<S> ProjectionCheckpointCoordinator<S, NoopProjectionCheckpointPublisher>
 where
     S: ProjectionEventSink,
 {
     pub(super) fn new(config: ProjectionConfig, sink: S) -> Self {
+        Self::with_publisher(config, sink, NoopProjectionCheckpointPublisher)
+    }
+}
+
+impl<S, P> ProjectionCheckpointCoordinator<S, P>
+where
+    S: ProjectionEventSink,
+    P: ProjectionCheckpointPublisher,
+{
+    pub(super) fn with_publisher(config: ProjectionConfig, sink: S, publisher: P) -> Self {
         Self {
             projection: OfflineFinalizedProjection::new(config),
             sink: Some(sink),
+            publisher: Some(publisher),
         }
     }
 
@@ -802,11 +912,27 @@ where
             Ok(staged) => staged,
             Err(error) => return Err(self.terminate(error)),
         };
+        let publication = match ProjectionPublication::new(
+            staged.checkpoint,
+            self.projection.config.schema_version(),
+            self.projection.config.key_epoch(),
+            self.projection.config.projection_epoch(),
+            staged.event_log.root(),
+        ) {
+            Ok(publication) => publication,
+            Err(_) => return Err(self.terminate(ProjectionError::Publication)),
+        };
         let append_result = catch_unwind(AssertUnwindSafe(|| {
             self.append_staged_events(&staged.events)
         }));
         if !matches!(append_result, Ok(Ok(()))) {
             return Err(self.terminate(ProjectionError::EventSink));
+        }
+        let publication_result = catch_unwind(AssertUnwindSafe(|| {
+            self.publish_staged_checkpoint(&publication)
+        }));
+        if !matches!(publication_result, Ok(Ok(()))) {
+            return Err(self.terminate(ProjectionError::Publication));
         }
         Ok(self.projection.commit_staged(staged))
     }
@@ -819,6 +945,7 @@ where
             Ok(checkpoint) => Ok(checkpoint),
             Err(error) => {
                 self.drop_sink();
+                self.drop_publisher();
                 Err(error)
             }
         }
@@ -873,6 +1000,7 @@ where
 
     pub(super) fn into_shutdown_parts(mut self) -> (ProjectionCoordinatorStatus, Option<S>) {
         let status = self.status();
+        self.drop_publisher();
         let sink = self.sink.take();
         (status, sink)
     }
@@ -889,9 +1017,17 @@ where
         Ok(())
     }
 
+    fn publish_staged_checkpoint(&mut self, publication: &ProjectionPublication) -> Result<(), ()> {
+        let Some(publisher) = self.publisher.as_mut() else {
+            return Err(());
+        };
+        publisher.publish_and_wait(publication).map_err(|_| ())
+    }
+
     fn terminate(&mut self, error: ProjectionError) -> ProjectionError {
         self.projection.fail_closed(&error);
         self.drop_sink();
+        self.drop_publisher();
         error
     }
 
@@ -900,6 +1036,13 @@ where
             return;
         };
         let _ = catch_unwind(AssertUnwindSafe(|| drop(sink)));
+    }
+
+    fn drop_publisher(&mut self) {
+        let Some(publisher) = self.publisher.take() else {
+            return;
+        };
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(publisher)));
     }
 }
 
@@ -921,7 +1064,7 @@ pub(super) enum ProjectionCoordinatorCommandError {
     FailedClosed,
 }
 
-impl<S> fmt::Debug for ProjectionCheckpointCoordinator<S> {
+impl<S, P> fmt::Debug for ProjectionCheckpointCoordinator<S, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProjectionCheckpointCoordinator { ..REDACTED.. }")
     }
@@ -971,6 +1114,8 @@ enum ProjectionError {
     CanonicalChain(CanonicalChainError),
     Extraction(TransparentEventError),
     EventSink,
+    Publication,
+    EventLogCounterOverflow,
     DuplicateCreatedOutpoint,
     UnknownSpentOutpoint,
     MissingStandardAddress,
@@ -989,6 +1134,7 @@ enum ProjectionError {
     TargetNetworkMismatch,
     TargetSchemaVersionMismatch,
     TargetKeyEpochMismatch,
+    TargetProjectionEpochMismatch,
     TargetNotReached {
         target_height: u32,
         committed_height: Option<u32>,
@@ -1012,6 +1158,8 @@ impl ProjectionError {
             Self::CanonicalChain(_) => ProjectionFault::CanonicalChain,
             Self::Extraction(_) => ProjectionFault::Extraction,
             Self::EventSink => ProjectionFault::EventSink,
+            Self::Publication => ProjectionFault::Publication,
+            Self::EventLogCounterOverflow => ProjectionFault::CorruptState,
             Self::DuplicateCreatedOutpoint => ProjectionFault::DuplicateOutput,
             Self::UnknownSpentOutpoint => ProjectionFault::UnknownSpend,
             Self::MissingStandardAddress
@@ -1026,6 +1174,7 @@ impl ProjectionError {
             Self::TargetNetworkMismatch
             | Self::TargetSchemaVersionMismatch
             | Self::TargetKeyEpochMismatch
+            | Self::TargetProjectionEpochMismatch
             | Self::TargetNotReached { .. }
             | Self::TargetExceeded { .. }
             | Self::TargetHashMismatch { .. } => ProjectionFault::Target,
@@ -1056,6 +1205,12 @@ impl fmt::Display for ProjectionError {
             }
             Self::EventSink => {
                 f.write_str("offline projection event sink failed closed")
+            }
+            Self::Publication => {
+                f.write_str("offline projection checkpoint publication failed closed")
+            }
+            Self::EventLogCounterOverflow => {
+                f.write_str("offline projection event-log counter overflowed")
             }
             Self::DuplicateCreatedOutpoint => {
                 f.write_str("offline projection rejected a previously seen created outpoint")
@@ -1099,6 +1254,9 @@ impl fmt::Display for ProjectionError {
             Self::TargetKeyEpochMismatch => {
                 f.write_str("offline projection target key epoch does not match configuration")
             }
+            Self::TargetProjectionEpochMismatch => {
+                f.write_str("offline projection target lifecycle epoch does not match configuration")
+            }
             Self::TargetNotReached {
                 target_height,
                 committed_height,
@@ -1138,6 +1296,8 @@ impl std::error::Error for ProjectionError {
             | Self::FinishAfterReadyWithDifferentTarget
             | Self::ReplacementSourceNotReady
             | Self::EventSink
+            | Self::Publication
+            | Self::EventLogCounterOverflow
             | Self::DuplicateCreatedOutpoint
             | Self::UnknownSpentOutpoint
             | Self::MissingStandardAddress
@@ -1150,6 +1310,7 @@ impl std::error::Error for ProjectionError {
             | Self::TargetNetworkMismatch
             | Self::TargetSchemaVersionMismatch
             | Self::TargetKeyEpochMismatch
+            | Self::TargetProjectionEpochMismatch
             | Self::TargetNotReached { .. }
             | Self::TargetExceeded { .. }
             | Self::TargetHashMismatch { .. } => None,
@@ -1205,6 +1366,21 @@ const fn map_script_class(script_class: ScriptType) -> UtxoScriptClass {
     }
 }
 
+const fn canonical_network_tag(network: CanonicalNetwork) -> u8 {
+    match network {
+        CanonicalNetwork::Mainnet => 1,
+        CanonicalNetwork::Testnet => 2,
+        CanonicalNetwork::Regtest => 3,
+    }
+}
+
+fn finalize_blake2s(hasher: Blake2s256) -> [u8; 32] {
+    let digest = hasher.finalize();
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1222,6 +1398,7 @@ mod tests {
 
     const SCHEMA_VERSION: u32 = 1;
     const KEY_EPOCH: u64 = 7;
+    const PROJECTION_EPOCH: u64 = 11;
 
     #[derive(Clone)]
     struct SinkObservation {
@@ -1232,6 +1409,23 @@ mod tests {
 
     struct RecordingSink {
         observation: SinkObservation,
+        fail_at: Option<usize>,
+        panic_at: Option<usize>,
+        panic_on_drop: bool,
+    }
+
+    #[derive(Clone)]
+    struct PublisherObservation {
+        checkpoints: Rc<RefCell<Vec<PublicChainCheckpoint>>>,
+        roots: Rc<RefCell<Vec<ProjectionEventLogRoot>>>,
+        attempts: Rc<Cell<usize>>,
+        dropped: Rc<Cell<bool>>,
+    }
+
+    struct RecordingPublisher {
+        observation: PublisherObservation,
+        sink_attempts: Rc<Cell<usize>>,
+        required_sink_attempts: Vec<usize>,
         fail_at: Option<usize>,
         panic_at: Option<usize>,
         panic_on_drop: bool,
@@ -1288,6 +1482,80 @@ mod tests {
         }
     }
 
+    impl RecordingPublisher {
+        fn with_faults(
+            sink_observation: &SinkObservation,
+            required_sink_attempts: Vec<usize>,
+            fail_at: Option<usize>,
+            panic_at: Option<usize>,
+            panic_on_drop: bool,
+        ) -> (Self, PublisherObservation) {
+            let observation = PublisherObservation {
+                checkpoints: Rc::new(RefCell::new(Vec::new())),
+                roots: Rc::new(RefCell::new(Vec::new())),
+                attempts: Rc::new(Cell::new(0)),
+                dropped: Rc::new(Cell::new(false)),
+            };
+            (
+                Self {
+                    observation: observation.clone(),
+                    sink_attempts: Rc::clone(&sink_observation.attempts),
+                    required_sink_attempts,
+                    fail_at,
+                    panic_at,
+                    panic_on_drop,
+                },
+                observation,
+            )
+        }
+    }
+
+    impl ProjectionCheckpointPublisher for RecordingPublisher {
+        type Error = ();
+
+        fn publish_and_wait(
+            &mut self,
+            publication: &ProjectionPublication,
+        ) -> Result<(), Self::Error> {
+            let attempt = self.observation.attempts.get();
+            let required = self
+                .required_sink_attempts
+                .get(attempt)
+                .copied()
+                .ok_or(())?;
+            if self.sink_attempts.get() != required {
+                return Err(());
+            }
+            self.observation.attempts.set(attempt.saturating_add(1));
+            self.observation
+                .checkpoints
+                .borrow_mut()
+                .push(publication.chain());
+            self.observation
+                .roots
+                .borrow_mut()
+                .push(publication.event_log_root());
+            if self.panic_at == Some(attempt) {
+                panic!("identifier-free injected publisher panic");
+            }
+            if self.fail_at == Some(attempt) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for RecordingPublisher {
+        fn drop(&mut self) {
+            self.observation.dropped.set(true);
+            assert!(
+                !self.panic_on_drop,
+                "identifier-free injected publisher drop panic"
+            );
+        }
+    }
+
     fn capacities() -> Result<ProjectionCapacities, ProjectionConfigError> {
         ProjectionCapacities::new(64, 64, 16, 128, 32)
     }
@@ -1297,6 +1565,7 @@ mod tests {
             CanonicalNetwork::Regtest,
             SCHEMA_VERSION,
             KEY_EPOCH,
+            PROJECTION_EPOCH,
             capacities()?,
         )
     }
@@ -1307,10 +1576,27 @@ mod tests {
         schema_version: u32,
         key_epoch: u64,
     ) -> OfflineProjectionCheckpoint {
+        target_with_projection_epoch(
+            height,
+            block_hash,
+            schema_version,
+            key_epoch,
+            PROJECTION_EPOCH,
+        )
+    }
+
+    fn target_with_projection_epoch(
+        height: u32,
+        block_hash: BlockHash,
+        schema_version: u32,
+        key_epoch: u64,
+        projection_epoch: u64,
+    ) -> OfflineProjectionCheckpoint {
         OfflineProjectionCheckpoint::new(
             PublicChainCheckpoint::new(CanonicalNetwork::Regtest, height, block_hash),
             schema_version,
             key_epoch,
+            projection_epoch,
         )
     }
 
@@ -1431,6 +1717,96 @@ mod tests {
         assert_eq!(coordinator.finish(third)?, third);
         assert_eq!(coordinator.ready_checkpoint(), Ok(third));
         assert!(!observation.dropped.get());
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_coordinator_publishes_after_sink_completion_before_commit() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (sink, sink_observation) = RecordingSink::new(None);
+        let (publisher, publication_observation) =
+            RecordingPublisher::with_faults(&sink_observation, vec![4, 7, 7], None, None, false);
+        let mut coordinator =
+            ProjectionCheckpointCoordinator::with_publisher(config()?, sink, publisher);
+
+        let first = coordinator.apply_finalized(&blocks[0])?;
+        assert_eq!(publication_observation.attempts.get(), 1);
+        assert_eq!(
+            publication_observation.checkpoints.borrow().as_slice(),
+            &[first.chain()]
+        );
+        assert_eq!(coordinator.committed_checkpoint(), Some(first));
+
+        let second = coordinator.apply_finalized(&blocks[1])?;
+        assert_eq!(publication_observation.attempts.get(), 2);
+        assert_eq!(
+            publication_observation.checkpoints.borrow().as_slice(),
+            &[first.chain(), second.chain()]
+        );
+        assert_ne!(
+            publication_observation.roots.borrow()[0],
+            publication_observation.roots.borrow()[1]
+        );
+        assert_eq!(coordinator.committed_checkpoint(), Some(second));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_publication_failure_keeps_prior_commit_and_forbids_retry() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (sink, sink_observation) = RecordingSink::new(None);
+        let (publisher, publication_observation) =
+            RecordingPublisher::with_faults(&sink_observation, vec![4, 7], Some(1), None, false);
+        let mut coordinator =
+            ProjectionCheckpointCoordinator::with_publisher(config()?, sink, publisher);
+        let committed = coordinator.apply_finalized(&blocks[0])?;
+
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[1]),
+            Err(ProjectionError::Publication)
+        );
+        assert_eq!(publication_observation.attempts.get(), 2);
+        assert_eq!(coordinator.committed_checkpoint(), Some(committed));
+        assert!(sink_observation.dropped.get());
+        assert!(publication_observation.dropped.get());
+        assert!(matches!(
+            coordinator.ready_checkpoint(),
+            Err(ProjectionUnavailable::FailedClosed {
+                fault: ProjectionFault::Publication,
+            })
+        ));
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[1]),
+            Err(ProjectionError::AlreadyFailedClosed {
+                fault: ProjectionFault::Publication,
+            })
+        );
+        assert_eq!(sink_observation.attempts.get(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_coordinator_contains_publisher_and_drop_panics() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (sink, sink_observation) = RecordingSink::new(None);
+        let (publisher, publication_observation) =
+            RecordingPublisher::with_faults(&sink_observation, vec![4], None, Some(0), true);
+        let mut coordinator =
+            ProjectionCheckpointCoordinator::with_publisher(config()?, sink, publisher);
+
+        assert_eq!(
+            coordinator.apply_finalized(&blocks[0]),
+            Err(ProjectionError::Publication)
+        );
+        assert!(sink_observation.dropped.get());
+        assert!(publication_observation.dropped.get());
+        assert_eq!(coordinator.committed_checkpoint(), None);
+        assert!(matches!(
+            coordinator.ready_checkpoint(),
+            Err(ProjectionUnavailable::FailedClosed {
+                fault: ProjectionFault::Publication,
+            })
+        ));
         Ok(())
     }
 
@@ -1651,6 +2027,25 @@ mod tests {
 
         assert_eq!(first.ready_checkpoint()?, second.ready_checkpoint()?);
         assert!(first.state == second.state);
+        assert_eq!(first.event_log.root(), second.event_log.root());
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_root_changes_only_with_the_projected_event_stream() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let empty_root = OfflineFinalizedProjection::new(config()?).event_log.root();
+        let mut first = OfflineFinalizedProjection::new(config()?);
+        first.apply_finalized(&blocks[0])?;
+        let first_root = first.event_log.root();
+        assert_ne!(first_root, empty_root);
+
+        first.apply_finalized(&blocks[1])?;
+        let second_root = first.event_log.root();
+        assert_ne!(second_root, first_root);
+
+        first.apply_finalized(&blocks[2])?;
+        assert_eq!(first.event_log.root(), second_root);
         Ok(())
     }
 
@@ -1824,6 +2219,7 @@ mod tests {
                 CanonicalNetwork::Regtest,
                 SCHEMA_VERSION,
                 KEY_EPOCH,
+                PROJECTION_EPOCH,
                 capacities,
             )?;
             let mut projection = OfflineFinalizedProjection::new(config);
@@ -1968,6 +2364,7 @@ mod tests {
                 ),
                 SCHEMA_VERSION,
                 KEY_EPOCH,
+                PROJECTION_EPOCH,
             )),
             ReconcileAction::RebuildRequired {
                 reason: RebuildReason::NetworkMismatch,
@@ -1983,6 +2380,18 @@ mod tests {
             replayed.reconcile(target(1, BlockHash(SECOND_HASH), SCHEMA_VERSION, 8)),
             ReconcileAction::RebuildRequired {
                 reason: RebuildReason::KeyEpochMismatch,
+            }
+        );
+        assert_eq!(
+            replayed.reconcile(target_with_projection_epoch(
+                1,
+                BlockHash(SECOND_HASH),
+                SCHEMA_VERSION,
+                KEY_EPOCH,
+                PROJECTION_EPOCH + 1,
+            )),
+            ReconcileAction::RebuildRequired {
+                reason: RebuildReason::ProjectionEpochMismatch,
             }
         );
 
@@ -2076,6 +2485,7 @@ mod tests {
             ),
             SCHEMA_VERSION,
             KEY_EPOCH,
+            PROJECTION_EPOCH,
         );
         assert!(matches!(
             OfflineFinalizedProjection::build(config, mainnet_target, [&blocks[0]]),
@@ -2101,6 +2511,20 @@ mod tests {
                 [&blocks[0]],
             ),
             Err(ProjectionError::TargetKeyEpochMismatch)
+        ));
+        assert!(matches!(
+            OfflineFinalizedProjection::build(
+                config,
+                target_with_projection_epoch(
+                    0,
+                    CanonicalNetwork::Regtest.genesis_hash(),
+                    SCHEMA_VERSION,
+                    KEY_EPOCH,
+                    PROJECTION_EPOCH + 1,
+                ),
+                [&blocks[0]],
+            ),
+            Err(ProjectionError::TargetProjectionEpochMismatch)
         ));
 
         let target = canonical_target(0, CanonicalNetwork::Regtest.genesis_hash());
@@ -2129,12 +2553,28 @@ mod tests {
         ] {
             assert_eq!(
                 ProjectionCapacities::new(values[0], values[1], values[2], values[3], values[4]),
-                Err(ProjectionConfigError::ZeroCapacity { dimension })
+                Err(ProjectionConfigError::EmptyCapacity { dimension })
             );
         }
         assert_eq!(
-            ProjectionConfig::new(CanonicalNetwork::Regtest, 0, KEY_EPOCH, capacities()?),
-            Err(ProjectionConfigError::ZeroSchemaVersion)
+            ProjectionConfig::new(
+                CanonicalNetwork::Regtest,
+                0,
+                KEY_EPOCH,
+                PROJECTION_EPOCH,
+                capacities()?,
+            ),
+            Err(ProjectionConfigError::SchemaVersionZero)
+        );
+        assert_eq!(
+            ProjectionConfig::new(
+                CanonicalNetwork::Regtest,
+                SCHEMA_VERSION,
+                KEY_EPOCH,
+                0,
+                capacities()?,
+            ),
+            Err(ProjectionConfigError::InvalidProjectionEpoch)
         );
 
         let blocks = projection_chain()?;
@@ -2170,6 +2610,7 @@ mod tests {
             CanonicalNetwork::Regtest,
             SCHEMA_VERSION,
             KEY_EPOCH,
+            PROJECTION_EPOCH,
             capacities,
         )?;
         let target = OfflineProjectionCheckpoint::new(
@@ -2180,6 +2621,7 @@ mod tests {
             ),
             SCHEMA_VERSION,
             KEY_EPOCH,
+            PROJECTION_EPOCH,
         );
         let projection =
             OfflineFinalizedProjection::build(config, target, fixture.indexed_blocks().iter())?;

@@ -115,6 +115,7 @@ struct PrivateQueryCheckpoint {
     /// Canonical 32-byte block hash in RPC/display byte order.
     block_hash_display: [u8; BLOCK_HASH_BYTES],
     schema_version: u32,
+    /// Volatile projection lifecycle; rolls on every restart/rebuild.
     projection_epoch: u64,
     key_epoch: u64,
 }

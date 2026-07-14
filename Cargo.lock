@@ -6048,8 +6048,10 @@ dependencies = [
  "rostl-primitives",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "zaino-state",
+ "zeroize",
 ]
 
 [[package]]

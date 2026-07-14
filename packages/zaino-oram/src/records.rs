@@ -1,5 +1,8 @@
 use std::fmt;
 
+#[cfg(feature = "corpus-zaino")]
+use blake2::{Blake2s256, Digest};
+
 /// Byte length of an address-derived ORAM key.
 pub(super) const ADDRESS_KEY_BYTES: usize = 32;
 
@@ -29,6 +32,9 @@ const UTXO_EVENT_FLAG_SPENT: u8 = 1 << 1;
 const UTXO_EVENT_KNOWN_FLAGS: u8 = UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT;
 const ADDRESS_CELL_FORMAT_VERSION: u8 = 1;
 const ADDRESS_CELL_FLAG_OCCUPIED: u8 = 1;
+#[cfg(feature = "corpus-zaino")]
+const PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN: &[u8] =
+    b"zaino-oram-persistent-utxo-event-commitment-v1";
 
 /// A domain-separated digest of a canonical transparent locking script.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -418,6 +424,23 @@ impl PersistentUtxoEvent {
             ),
         })
     }
+}
+
+/// Commits to the exact named persistence-boundary encoding of one event.
+///
+/// Keeping this helper beside [`PersistentUtxoEvent`] prevents the projection
+/// accumulator from duplicating the on-disk field layout or adding byte
+/// accessors to the persistence-only type.
+#[cfg(feature = "corpus-zaino")]
+pub(super) fn persistent_utxo_event_commitment(src: &UtxoEvent) -> [u8; 32] {
+    let persistent = PersistentUtxoEvent::from_business(src);
+    let mut hasher = Blake2s256::new();
+    hasher.update(PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN);
+    hasher.update(persistent.0);
+    let digest = hasher.finalize();
+    let mut commitment = [0; 32];
+    commitment.copy_from_slice(&digest);
+    commitment
 }
 
 impl Default for PersistentUtxoEvent {

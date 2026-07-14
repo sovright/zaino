@@ -8,6 +8,8 @@
 //! without another executor command interleaving. A new-address append still
 //! performs two sequential writes; it is not an all-or-nothing transaction,
 //! and a second-write failure leaves an unusable partial candidate.
+//! Higher-layer checkpoint publication records rebuild provenance only; this
+//! executor remains volatile and cannot resume either table after a crash.
 //!
 //! Catching a backend panic does not suppress the process-wide panic hook.
 //! Real backend integration therefore remains blocked on a panic-free or

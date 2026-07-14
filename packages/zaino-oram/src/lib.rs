@@ -19,6 +19,8 @@
 
 #[cfg(feature = "corpus-zaino")]
 mod canonical_chain;
+#[cfg(feature = "corpus-zaino")]
+mod checkpoint;
 mod continuation_token;
 mod corpus;
 mod engine;

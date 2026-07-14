@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- A crate-internal recovery foundation for the volatile projection worker: a
+  fixed 160-byte public manifest payload plus 32-byte authenticator binds
+  monotonic publication and predecessor digests, projection identity/epoch,
+  finalized checkpoint, event count, deterministic semantic event-log root,
+  and an explicit rebuild-required durability mode. Immutable
+  content-addressed publication,
+  a non-authoritative atomic `CURRENT` hint, an injected digest-bound external
+  freshness witness, strict decoding, directory/file checks, and four
+  deterministic crash failpoints reject rollback, corruption, equivocation,
+  and incomplete publication. The projection publishes after all worker
+  mutations and commits in-memory state last; restart creates a fresh worker,
+  rolls the projection epoch, and replays genesis-forward. Portable and
+  Linux-x86_64-gated typed-worker tests prove deterministic rebuild/root
+  equivalence. This does not persist or resume ROSTL tables, position maps,
+  stash state, or query-induced mutations, and supplies no production key or
+  freshness-witness owner or measured RTO.
 - Initial dependency-free research foundation: fixed transparent-UTXO records,
   fixed envelopes, exact compiled privacy-profile shapes, a bounded plaintext
   mock store, modeled logical store-call schedules, and equivalence tests. No

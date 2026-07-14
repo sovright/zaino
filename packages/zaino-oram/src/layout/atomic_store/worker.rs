@@ -4,7 +4,9 @@
 //! read, or insert operation crosses the command boundary. It remains a
 //! volatile, module-private research model. Its feature-gated child can build
 //! the exact typed `rostl` executor on Linux x86_64 for the crate-internal
-//! offline projection owner, but no query engine or service owns it.
+//! offline projection owner, but no query engine or service owns it. Restart
+//! creates a fresh worker and rebuilds from public blocks; no worker snapshot,
+//! stash, position map, or table content is restored.
 //! Append reply tickets fail the worker closed when dropped unconsumed, while
 //! merely retaining a ticket never stalls later work or shutdown. Deliberately
 //! leaking a ticket with `mem::forget` is outside this trusted module-private

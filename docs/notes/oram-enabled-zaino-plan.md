@@ -4,6 +4,7 @@
   for server integration** pending the measured blockers in
   [the feasibility report](oram-phase0-1-feasibility-report.md).
 - Prepared: 2026-07-12.
+- Updated: 2026-07-14.
 - Target fork point: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d), the live `origin/dev` head inspected for this plan.
 - Design seed: [TEE-backed lightwalletd / Zaino with `rostl` and `oblivious_node`](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3).
 
@@ -153,6 +154,28 @@ measurement. It does not qualify the intended CPU or TDX instance, durable
 persistence or recovery, a `10^9`-operation soak, full-mainnet capacity,
 attestation, signed provenance, stash behavior, physical-obliviousness, or
 mainnet readiness.
+The following recovery-foundation slice adds a crate-internal, fixed-width
+authenticated public projection manifest. Each immutable content-addressed
+manifest binds a monotonic publication sequence, the prior manifest digest,
+network/schema/key identity, a per-rebuild projection epoch, finalized
+height/hash, event count, and a deterministic semantic event-log root. A keyed
+BLAKE2s MAC authenticates the manifest while an injected external freshness
+witness advances only from the exact prior sequence/digest pair to the exact
+next pair. Publication orders the immutable manifest and non-authoritative
+`CURRENT` hint before the external witness, with deterministic failpoints at
+each boundary; restart ignores `CURRENT`, authenticates the witness-selected
+manifest, and either requires a fresh genesis-forward worker rebuild or remains
+unready. The projection coordinator publishes only after all worker mutations
+succeed and commits its in-memory checkpoint only after publication; publisher
+errors and panics fail the candidate closed. Portable fake-worker tests and a
+Linux-x86_64-gated typed-ROSTL test exercise shutdown, restart, a new projection
+epoch, and semantic-root equivalence across deterministic rebuild.
+
+This is public checkpoint/freshness and rebuild-contract evidence, not durable
+ORAM recovery. The ROSTL buckets, recursive position maps, stash, table
+contents, and query-induced mutations remain volatile; no production
+freshness-witness or key owner is wired, no cold-rebuild RTO is measured, and
+the recovery directory remains a trusted, exclusive-writer boundary.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
@@ -373,6 +396,18 @@ The first real-ORAM milestone may be volatile and rebuild on restart, but it mus
 
 Serializing raw in-memory ORAM occasionally is not automatically correct: reads mutate it, host rollback must be detected, and a crash must not resurrect a stale logical-to-physical mapping.
 
+The implemented recovery foundation covers only the authenticated public side
+of this boundary. Its fixed manifest and injected digest-bound freshness
+witness can detect stale, corrupt, torn, or equivocating public publications;
+its only declared durability mode requires discarding the volatile worker and
+replaying the canonical public event stream from genesis into a fresh
+projection epoch. `CURRENT` is a repairable hint, never freshness authority.
+Missing or inconsistent witness state leaves the projection unready. This does
+not atomically persist, resume, or authenticate the underlying ROSTL tables,
+position maps, stash, or query-induced remaps. Advancing to production still
+requires a production key/witness lifecycle plus either a durable composite
+ORAM transaction or a target-hardware rebuild that meets the declared RTO.
+
 ## Private wire contract
 
 Use an outer protobuf message with one always-present, exactly sized `bytes envelope`. Repeated dummy protobuf records are unsuitable because proto3 omission and encoding length can change the visible shape.
@@ -529,6 +564,9 @@ Deliverables:
 - one offline owner that validates projection/layout compatibility before
   allocation, exclusively composes the checkpoint coordinator with the worker,
   and joins or fails closed on consuming shutdown without exporting raw handles;
+- one authenticated public-manifest publisher with digest-bound external
+  freshness, deterministic semantic event-log roots, per-rebuild projection
+  epochs, crash-boundary failpoints, and fail-closed restart classification;
 - deterministic projection from `IndexedBlock` fixtures and finalised snapshots;
 - single-worker mutation queue, capacity/stash/queue telemetry, and fail-closed transitions;
 - research-only volatile rebuild path if durable external memory is not yet available;
@@ -549,6 +587,9 @@ Deliverables:
 - finalised checkpoint/watermark protocol and catch-up replay;
 - race-free NFS snapshot plus complete fixed-work recent-chain scan;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;
+- production ownership of manifest authentication keys and the external
+  freshness witness, with a measured rebuild RTO or composite durable ORAM
+  state;
 - crash/failpoint harness for every mutation/checkpoint boundary;
 - shadow mode on live direct and RPC validator backends.
 

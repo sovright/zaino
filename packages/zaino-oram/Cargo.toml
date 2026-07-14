@@ -27,7 +27,9 @@ rand = { version = "0.9.4", optional = true }
 rostl-oram = { git = "https://github.com/obliviouslabs/rostl", rev = "8c3a12d2febf17b024f2e949428b3bc526d74172", version = "0.1.0-alpha9", optional = true }
 rostl-primitives = { git = "https://github.com/obliviouslabs/rostl", rev = "8c3a12d2febf17b024f2e949428b3bc526d74172", version = "0.1.0-alpha9", optional = true }
 serde = { workspace = true, features = ["derive"] }
+tempfile.workspace = true
 zaino-state = { version = "0.3.1", path = "../zaino-state", default-features = false, optional = true }
+zeroize = "1.9.0"
 
 [dev-dependencies]
 serde_json.workspace = true

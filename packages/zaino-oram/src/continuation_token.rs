@@ -25,8 +25,10 @@ const AUTHENTICATION_TOKEN_START: usize = PROTECTED_BODY_TOKEN_START + PROTECTED
 /// Canonical checkpoint and session-binding bytes used as token-protector
 /// associated data.
 ///
-/// The checkpoint currently has no authenticated projection root; adding one
-/// requires a token format and profile version change.
+/// The projection epoch is intended to roll on every restart/rebuild so tokens
+/// from an earlier volatile worker lifecycle cannot be replayed into the new
+/// candidate. The checkpoint still has no authenticated semantic projection
+/// root; adding one requires a token format and profile version change.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ContinuationProtectionContext([u8; CONTINUATION_CONTEXT_BYTES]);
 

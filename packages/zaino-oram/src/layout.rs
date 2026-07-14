@@ -8,7 +8,8 @@
 //! backend interfaces under one synchronous owner and terminal-latches an
 //! uncertain generation. Neither layer authenticates record contents, persists
 //! the secret seed, proves crash atomicity, or establishes physical
-//! obliviousness.
+//! obliviousness. A higher-layer authenticated public projection manifest does
+//! not change those properties or make either table resumable after restart.
 
 use std::{fmt, num::NonZeroU64};
 

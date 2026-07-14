@@ -6,6 +6,7 @@ use zaino_state::IndexedBlock;
 
 use crate::{
     canonical_chain::{CanonicalNetwork, PublicChainCheckpoint},
+    checkpoint::{NoopProjectionCheckpointPublisher, ProjectionCheckpointPublisher},
     layout::{
         shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQueueCapacity,
         AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError, FixedProbeLayout,
@@ -15,26 +16,59 @@ use crate::{
 };
 
 /// Owns the only worker handle for one unpublished offline projection candidate.
-struct OfflineProjectionOwner {
-    coordinator: ProjectionCheckpointCoordinator<AtomicWorker>,
+struct OfflineProjectionOwner<P = NoopProjectionCheckpointPublisher> {
+    coordinator: ProjectionCheckpointCoordinator<AtomicWorker, P>,
 }
 
-impl OfflineProjectionOwner {
+impl OfflineProjectionOwner<NoopProjectionCheckpointPublisher> {
     fn new<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
         projection: ProjectionConfig,
         layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
         queue_capacity: usize,
     ) -> Result<Self, ProjectionOwnerBuildError> {
-        validate_configuration(projection, &layout)?;
-        let queue_capacity = validated_queue_capacity(queue_capacity)
-            .map_err(|_| ProjectionOwnerBuildError::ConstructionFailed)?;
-        let worker = spawn_typed_rostl_worker(layout, queue_capacity).map_err(map_worker_build)?;
-        Ok(Self::from_worker(projection, worker))
+        Self::new_with_publisher(
+            projection,
+            layout,
+            queue_capacity,
+            NoopProjectionCheckpointPublisher,
+        )
     }
 
     fn from_worker(projection: ProjectionConfig, worker: AtomicWorker) -> Self {
         Self {
             coordinator: ProjectionCheckpointCoordinator::new(projection, worker),
+        }
+    }
+}
+
+impl<P> OfflineProjectionOwner<P>
+where
+    P: ProjectionCheckpointPublisher,
+{
+    fn new_with_publisher<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
+        projection: ProjectionConfig,
+        layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
+        queue_capacity: usize,
+        publisher: P,
+    ) -> Result<Self, ProjectionOwnerBuildError> {
+        validate_configuration(projection, &layout)?;
+        let queue_capacity = validated_queue_capacity(queue_capacity)
+            .map_err(|_| ProjectionOwnerBuildError::ConstructionFailed)?;
+        let worker = spawn_typed_rostl_worker(layout, queue_capacity).map_err(map_worker_build)?;
+        Ok(Self::from_worker_with_publisher(
+            projection, worker, publisher,
+        ))
+    }
+
+    fn from_worker_with_publisher(
+        projection: ProjectionConfig,
+        worker: AtomicWorker,
+        publisher: P,
+    ) -> Self {
+        Self {
+            coordinator: ProjectionCheckpointCoordinator::with_publisher(
+                projection, worker, publisher,
+            ),
         }
     }
 
@@ -78,7 +112,7 @@ impl OfflineProjectionOwner {
     }
 }
 
-impl fmt::Debug for OfflineProjectionOwner {
+impl<P> fmt::Debug for OfflineProjectionOwner<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OfflineProjectionOwner { ..REDACTED.. }")
     }
@@ -259,8 +293,14 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use tempfile::TempDir;
+
     use super::*;
     use crate::{
+        checkpoint::{
+            Blake2sManifestAuthenticator, ProjectionFreshness, ProjectionFreshnessWitness,
+            ProjectionManifestStore, ProjectionRestartPlan, PublishedProjectionManifest,
+        },
         layout::{
             spawn_atomic_worker_for_tests, BackendFailure, DirectoryTableConfiguration,
             EventTableConfiguration, LayoutIdentity, UniqueTable,
@@ -274,6 +314,7 @@ mod tests {
     const EVENT_PROBES: usize = 8;
     const SCHEMA_VERSION: u32 = 1;
     const KEY_EPOCH: u64 = 7;
+    const PROJECTION_EPOCH: u64 = 11;
     const GENERATION: u64 = 11;
     const DIRECTORY_CAPACITY: u64 = 8;
     const DIRECTORY_ADMISSION: u64 = 3;
@@ -282,6 +323,66 @@ mod tests {
     const MAX_EVENTS_PER_ADDRESS: u64 = 4;
 
     type OwnerLayout = FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>;
+    type RecoveryPublisher =
+        ProjectionManifestStore<Blake2sManifestAuthenticator, SharedFreshnessWitness>;
+
+    const MANIFEST_KEY: [u8; 32] = [0x72; 32];
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FreshnessWitnessError {
+        Conflict,
+        InvalidTransition,
+        Poisoned,
+    }
+
+    impl fmt::Display for FreshnessWitnessError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Conflict => f.write_str("freshness witness compare conflict"),
+                Self::InvalidTransition => f.write_str("freshness witness transition is invalid"),
+                Self::Poisoned => f.write_str("freshness witness mutex poisoned"),
+            }
+        }
+    }
+
+    impl std::error::Error for FreshnessWitnessError {}
+
+    #[derive(Clone, Default)]
+    struct SharedFreshnessWitness(Arc<Mutex<Option<ProjectionFreshness>>>);
+
+    impl ProjectionFreshnessWitness for SharedFreshnessWitness {
+        type Error = FreshnessWitnessError;
+
+        fn current(&mut self) -> Result<Option<ProjectionFreshness>, Self::Error> {
+            self.0
+                .lock()
+                .map(|value| *value)
+                .map_err(|_| FreshnessWitnessError::Poisoned)
+        }
+
+        fn compare_and_advance(
+            &mut self,
+            expected: Option<ProjectionFreshness>,
+            next: ProjectionFreshness,
+        ) -> Result<(), Self::Error> {
+            let mut value = self.0.lock().map_err(|_| FreshnessWitnessError::Poisoned)?;
+            if *value != expected {
+                return Err(FreshnessWitnessError::Conflict);
+            }
+            let valid_transition = match expected {
+                None => next.sequence() == 1,
+                Some(current) => current
+                    .sequence()
+                    .checked_add(1)
+                    .is_some_and(|sequence| sequence == next.sequence()),
+            };
+            if !valid_transition {
+                return Err(FreshnessWitnessError::InvalidTransition);
+            }
+            *value = Some(next);
+            Ok(())
+        }
+    }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct TableStats {
@@ -375,6 +476,26 @@ mod tests {
         max_total_events: usize,
         max_events_per_address: usize,
     ) -> FixtureResult<ProjectionConfig> {
+        projection_config_with_epoch(
+            network,
+            schema_version,
+            key_epoch,
+            PROJECTION_EPOCH,
+            max_standard_addresses,
+            max_total_events,
+            max_events_per_address,
+        )
+    }
+
+    fn projection_config_with_epoch(
+        network: CanonicalNetwork,
+        schema_version: u32,
+        key_epoch: u64,
+        projection_epoch: u64,
+        max_standard_addresses: usize,
+        max_total_events: usize,
+        max_events_per_address: usize,
+    ) -> FixtureResult<ProjectionConfig> {
         let capacities = ProjectionCapacities::new(
             6,
             4,
@@ -386,19 +507,63 @@ mod tests {
             network,
             schema_version,
             key_epoch,
+            projection_epoch,
             capacities,
         )?)
     }
 
     fn compatible_projection_config() -> FixtureResult<ProjectionConfig> {
-        projection_config(
+        compatible_projection_config_with_epoch(PROJECTION_EPOCH)
+    }
+
+    fn compatible_projection_config_with_epoch(
+        projection_epoch: u64,
+    ) -> FixtureResult<ProjectionConfig> {
+        projection_config_with_epoch(
             CanonicalNetwork::Regtest,
             SCHEMA_VERSION,
             KEY_EPOCH,
+            projection_epoch,
             usize::try_from(DIRECTORY_ADMISSION)?,
             usize::try_from(EVENT_ADMISSION)?,
             usize::try_from(MAX_EVENTS_PER_ADDRESS)?,
         )
+    }
+
+    fn recovery_publisher(
+        directory: &TempDir,
+        witness: SharedFreshnessWitness,
+    ) -> FixtureResult<RecoveryPublisher> {
+        Ok(ProjectionManifestStore::new(
+            directory.path(),
+            Blake2sManifestAuthenticator::new(MANIFEST_KEY),
+            witness,
+        ))
+    }
+
+    fn restart_manifest_and_epoch(
+        directory: &TempDir,
+        witness: SharedFreshnessWitness,
+        authoritative: PublicChainCheckpoint,
+    ) -> FixtureResult<(PublishedProjectionManifest, u64)> {
+        let mut reader = recovery_publisher(directory, witness)?;
+        let ProjectionRestartPlan::Rebuild {
+            prior_manifest: Some(manifest),
+            authoritative: planned,
+            next_projection_epoch,
+        } = reader.restart_plan(
+            CanonicalNetwork::Regtest,
+            SCHEMA_VERSION,
+            KEY_EPOCH,
+            authoritative,
+        )
+        else {
+            return Err("completed volatile worker must produce a rebuild plan".into());
+        };
+        if planned != authoritative {
+            return Err("rebuild plan changed the authoritative checkpoint".into());
+        }
+        Ok((manifest, next_projection_epoch))
     }
 
     fn owner_layout(
@@ -432,6 +597,19 @@ mod tests {
         fail_on_event_write: Option<usize>,
     ) -> FixtureResult<(OfflineProjectionOwner, TableObservation, TableObservation)> {
         let projection = compatible_projection_config()?;
+        let (worker, directory_observation, event_observation) =
+            fake_worker(projection, fail_on_event_write)?;
+        Ok((
+            OfflineProjectionOwner::from_worker(projection, worker),
+            directory_observation,
+            event_observation,
+        ))
+    }
+
+    fn fake_worker(
+        projection: ProjectionConfig,
+        fail_on_event_write: Option<usize>,
+    ) -> FixtureResult<(AtomicWorker, TableObservation, TableObservation)> {
         let layout = compatible_layout()?;
         validate_configuration(projection, &layout)?;
         let directory_observation = TableObservation::default();
@@ -448,11 +626,7 @@ mod tests {
         );
         let worker =
             spawn_atomic_worker_for_tests(layout, directory, events, validated_queue_capacity(1)?)?;
-        Ok((
-            OfflineProjectionOwner::from_worker(projection, worker),
-            directory_observation,
-            event_observation,
-        ))
+        Ok((worker, directory_observation, event_observation))
     }
 
     fn assert_mismatch(
@@ -464,6 +638,28 @@ mod tests {
             .expect_err("configuration mismatch must precede queue validation");
         assert_eq!(error, ProjectionOwnerBuildError::ConfigMismatch(expected));
         Ok(())
+    }
+
+    fn run_owner_to_ready<P>(
+        mut owner: OfflineProjectionOwner<P>,
+        blocks: &[IndexedBlock],
+    ) -> FixtureResult<PublicChainCheckpoint>
+    where
+        P: ProjectionCheckpointPublisher,
+    {
+        let mut target = None;
+        for block in blocks {
+            target = Some(owner.apply_finalized(block)?);
+        }
+        let target = target.ok_or("fixture chain must be nonempty")?;
+        assert_eq!(owner.finish(target)?, target);
+        assert!(matches!(
+            owner.shutdown(),
+            ProjectionOwnerShutdownOutcome::Stopped {
+                readiness: ProjectionOwnerReadiness::Ready { checkpoint },
+            } if checkpoint == target
+        ));
+        Ok(target)
     }
 
     #[test]
@@ -605,6 +801,47 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn authenticated_manifest_restart_rebuilds_a_fresh_worker_with_a_new_epoch() -> FixtureResult<()>
+    {
+        let directory = TempDir::new()?;
+        let witness = SharedFreshnessWitness::default();
+        let blocks = projection_chain()?;
+        let first_config = compatible_projection_config()?;
+        let (first_worker, _, _) = fake_worker(first_config, None)?;
+        let first_owner = OfflineProjectionOwner::from_worker_with_publisher(
+            first_config,
+            first_worker,
+            recovery_publisher(&directory, witness.clone())?,
+        );
+        let target = run_owner_to_ready(first_owner, &blocks)?;
+
+        let (first_manifest, next_projection_epoch) =
+            restart_manifest_and_epoch(&directory, witness.clone(), target)?;
+        assert_eq!(next_projection_epoch, PROJECTION_EPOCH + 1);
+
+        let second_config = compatible_projection_config_with_epoch(next_projection_epoch)?;
+        let (second_worker, _, _) = fake_worker(second_config, None)?;
+        let second_owner = OfflineProjectionOwner::from_worker_with_publisher(
+            second_config,
+            second_worker,
+            recovery_publisher(&directory, witness.clone())?,
+        );
+        let rebuilt_target = run_owner_to_ready(second_owner, &blocks)?;
+        assert_eq!(rebuilt_target, target);
+
+        let (second_manifest, later_epoch) =
+            restart_manifest_and_epoch(&directory, witness, target)?;
+        assert_eq!(second_manifest.projection_epoch(), next_projection_epoch);
+        assert_eq!(later_epoch, next_projection_epoch + 1);
+        assert_eq!(
+            second_manifest.event_log_root(),
+            first_manifest.event_log_root()
+        );
+        assert!(second_manifest.publication_sequence() > first_manifest.publication_sequence());
+        Ok(())
+    }
+
     #[cfg(not(all(
         feature = "rostl-experimental",
         target_os = "linux",
@@ -640,6 +877,45 @@ mod tests {
             ProjectionOwnerShutdownOutcome::Stopped {
                 readiness: ProjectionOwnerReadiness::Ready { checkpoint: target },
             }
+        );
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn linux_rostl_owner_rebuilds_from_authenticated_manifest_with_a_new_epoch() -> FixtureResult<()>
+    {
+        let directory = TempDir::new()?;
+        let witness = SharedFreshnessWitness::default();
+        let blocks = projection_chain()?;
+        let first_owner = OfflineProjectionOwner::new_with_publisher(
+            compatible_projection_config()?,
+            compatible_layout()?,
+            1,
+            recovery_publisher(&directory, witness.clone())?,
+        )?;
+        let target = run_owner_to_ready(first_owner, &blocks)?;
+        let (first_manifest, next_epoch) =
+            restart_manifest_and_epoch(&directory, witness.clone(), target)?;
+
+        let second_owner = OfflineProjectionOwner::new_with_publisher(
+            compatible_projection_config_with_epoch(next_epoch)?,
+            compatible_layout()?,
+            1,
+            recovery_publisher(&directory, witness.clone())?,
+        )?;
+        assert_eq!(run_owner_to_ready(second_owner, &blocks)?, target);
+        let (second_manifest, later_epoch) =
+            restart_manifest_and_epoch(&directory, witness, target)?;
+        assert_eq!(second_manifest.projection_epoch(), next_epoch);
+        assert_eq!(later_epoch, next_epoch + 1);
+        assert_eq!(
+            second_manifest.event_log_root(),
+            first_manifest.event_log_root()
         );
         Ok(())
     }

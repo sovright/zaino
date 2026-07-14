@@ -8,6 +8,17 @@ and this library adheres to Rust's notion of
 ## Unreleased
 
 ### Added
+
+- `zaino-oram`: a crate-internal authenticated public-manifest and volatile
+  rebuild foundation now binds publication lineage, projection identity/epoch,
+  finalized checkpoint, event count, and a deterministic semantic event-log
+  root to a fixed-width keyed-MAC record plus an injected digest-bound external
+  freshness witness. Content-addressed publication, a non-authoritative atomic
+  hint, crash-boundary failpoints, and restart tests fail closed on stale,
+  corrupt, equivocating, or incomplete public state. Restart always allocates a
+  fresh worker and replays genesis-forward under a new projection epoch; the
+  underlying ROSTL tables, position maps, stash, and read mutations remain
+  volatile, with no production witness/key integration or measured RTO.
 - `zaino-oram`: a non-published, dependency-free research foundation for
   private transparent-UTXO queries, including fixed records and envelopes,
   exact compiled profile shapes, a bounded plaintext mock store, and tests for
