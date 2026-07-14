@@ -6,7 +6,7 @@
 
 use std::{
     collections::BTreeMap,
-    fmt, fs,
+    fmt,
     time::{Duration, Instant},
 };
 
@@ -20,6 +20,7 @@ use crate::{
         DirectoryTableConfiguration, EventTableConfiguration, FixedProbeLayout, LayoutIdentity,
         LayoutNetwork, StandardAddress, StandardScriptKind,
     },
+    process_memory::{sample_process_memory, ProcessMemorySample},
     records::{UtxoEvent, UtxoScriptClass},
     stress_qualification::digest_hex,
     zaino_corpus::MainnetSizingQualification,
@@ -725,7 +726,7 @@ fn worker_shape_is_supported(shape: TargetLoadWorkerShape) -> bool {
         && warm_event_target <= max_warm_events
 }
 
-fn is_blake2s256_hex(value: &str) -> bool {
+pub(super) fn is_blake2s256_hex(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -1419,7 +1420,8 @@ fn run_builder_foundation_v1(
         qualification_blake2s256,
     )?;
     let plan = TargetLoadPlan::build(&inputs)?;
-    let baseline = sample_process_memory()?;
+    let baseline =
+        sample_process_memory().map_err(|_| TypedWorkerTargetLoadError::MeasurementFailed)?;
     let layout = build_target_layout(inputs.worker_shape, plan.layout_seed)?;
     let queue_capacity = AtomicQueueCapacity::try_new(
         usize::try_from(inputs.worker_shape.queue_capacity)
@@ -1427,7 +1429,9 @@ fn run_builder_foundation_v1(
     )
     .map_err(|_| TypedWorkerTargetLoadError::ConstructionFailed)?;
     let worker = spawn_typed_rostl_worker(layout, queue_capacity).map_err(map_worker_build)?;
-    execute_with_worker(worker, &inputs, &plan, baseline, sample_process_memory)
+    execute_with_worker(worker, &inputs, &plan, baseline, || {
+        sample_process_memory().map_err(|_| TypedWorkerTargetLoadError::MeasurementFailed)
+    })
 }
 
 #[cfg(all(
@@ -1464,46 +1468,6 @@ const fn map_worker_build(error: AtomicWorkerBuildError) -> TypedWorkerTargetLoa
     }
 }
 
-#[derive(Clone, Copy)]
-struct ProcessMemorySample {
-    rss_bytes: u64,
-    hwm_bytes: u64,
-}
-
-fn sample_process_memory() -> Result<ProcessMemorySample, TypedWorkerTargetLoadError> {
-    let status = fs::read_to_string("/proc/self/status")
-        .map_err(|_| TypedWorkerTargetLoadError::MeasurementFailed)?;
-    parse_process_status(&status)
-}
-
-fn parse_process_status(status: &str) -> Result<ProcessMemorySample, TypedWorkerTargetLoadError> {
-    Ok(ProcessMemorySample {
-        rss_bytes: parse_status_kib(status, "VmRSS:")?,
-        hwm_bytes: parse_status_kib(status, "VmHWM:")?,
-    })
-}
-
-fn parse_status_kib(status: &str, field: &str) -> Result<u64, TypedWorkerTargetLoadError> {
-    let Some(value) = status.lines().find_map(|line| line.strip_prefix(field)) else {
-        return Err(TypedWorkerTargetLoadError::MeasurementFailed);
-    };
-    let mut parts = value.split_ascii_whitespace();
-    let Some(number) = parts.next() else {
-        return Err(TypedWorkerTargetLoadError::MeasurementFailed);
-    };
-    let Some(unit) = parts.next() else {
-        return Err(TypedWorkerTargetLoadError::MeasurementFailed);
-    };
-    if unit != "kB" || parts.next().is_some() {
-        return Err(TypedWorkerTargetLoadError::MeasurementFailed);
-    }
-    number
-        .parse::<u64>()
-        .map_err(|_| TypedWorkerTargetLoadError::MeasurementFailed)?
-        .checked_mul(1_024)
-        .ok_or(TypedWorkerTargetLoadError::MeasurementFailed)
-}
-
 struct ExecutionEvidence {
     timing: TargetLoadTimingReport,
     rss: TargetLoadRssReport,
@@ -1530,11 +1494,11 @@ where
         let rss = TargetLoadRssReport {
             sampling_source: "proc-status-vmrss-vmhwm".to_owned(),
             measurement_scope: "whole-process-including-driver-and-runtime".to_owned(),
-            baseline_rss_bytes: baseline.rss_bytes,
-            post_spawn_rss_bytes: post_spawn.rss_bytes,
-            post_warmup_rss_bytes: post_warmup.rss_bytes,
-            post_workload_rss_bytes: post_workload.rss_bytes,
-            process_lifetime_hwm_bytes: post_workload.hwm_bytes,
+            baseline_rss_bytes: baseline.rss_bytes(),
+            post_spawn_rss_bytes: post_spawn.rss_bytes(),
+            post_warmup_rss_bytes: post_warmup.rss_bytes(),
+            post_workload_rss_bytes: post_workload.rss_bytes(),
+            process_lifetime_hwm_bytes: post_workload.hwm_bytes(),
         };
         if !rss.validate() {
             return Err(TypedWorkerTargetLoadError::MeasurementFailed);
@@ -1868,28 +1832,16 @@ mod tests {
         let plan = TargetLoadPlan::build(&inputs)?;
         let worker = fake_worker(&inputs, &plan)?;
         let mut samples = [
-            ProcessMemorySample {
-                rss_bytes: 2_000_000,
-                hwm_bytes: 5_000_000,
-            },
-            ProcessMemorySample {
-                rss_bytes: 3_000_000,
-                hwm_bytes: 5_000_000,
-            },
-            ProcessMemorySample {
-                rss_bytes: 4_000_000,
-                hwm_bytes: 5_000_000,
-            },
+            ProcessMemorySample::new(2_000_000, 5_000_000),
+            ProcessMemorySample::new(3_000_000, 5_000_000),
+            ProcessMemorySample::new(4_000_000, 5_000_000),
         ]
         .into_iter();
         Ok(execute_with_worker(
             worker,
             &inputs,
             &plan,
-            ProcessMemorySample {
-                rss_bytes: 1_000_000,
-                hwm_bytes: 1_000_000,
-            },
+            ProcessMemorySample::new(1_000_000, 1_000_000),
             || {
                 samples
                     .next()
@@ -2010,18 +1962,6 @@ mod tests {
             report.validate(),
             Err(TypedWorkerTargetLoadError::InvalidReport)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn proc_status_parser_requires_both_kib_fields() -> TestResult {
-        let sample = parse_process_status(
-            "Name:\ttest\nVmHWM:\t  4096 kB\nVmRSS:\t  3072 kB\nThreads:\t1\n",
-        )?;
-        assert_eq!(sample.rss_bytes, 3_072 * 1_024);
-        assert_eq!(sample.hwm_bytes, 4_096 * 1_024);
-        assert!(parse_process_status("VmRSS:\t3072 kB\n").is_err());
-        assert!(parse_process_status("VmHWM:\t4096 bytes\nVmRSS:\t3072 kB\n").is_err());
         Ok(())
     }
 

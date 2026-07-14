@@ -29,6 +29,8 @@ mod envelope;
 mod full_map_saturation;
 mod inner_codec;
 mod layout;
+#[cfg(feature = "corpus-zaino")]
+mod process_memory;
 mod profile;
 #[cfg(feature = "corpus-zaino")]
 mod projection;
@@ -53,6 +55,11 @@ mod zaino_fixtures;
 pub use full_map_saturation::{
     run_typed_worker_full_map_saturation, TypedWorkerFullMapSaturationError,
     TypedWorkerFullMapSaturationProfile, TypedWorkerFullMapSaturationReport,
+};
+#[cfg(feature = "corpus-zaino")]
+pub use projection_owner::{
+    TypedWorkerColdRebuildError, TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport,
+    TypedWorkerColdRebuildSession,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use qualification::{

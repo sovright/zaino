@@ -7,7 +7,8 @@ use zaino_oram::{MainnetSizingQualification, TypedWorkerTargetLoadReport};
 
 use crate::corpus_artifact::{
     artifact_blake2s256_hex, publish_verified_derived_artifact, read_artifact_file,
-    ArtifactDirectory, ArtifactError, ArtifactFile, ValidatedCapture, ValidatedSizing,
+    validate_derived_source_lineage, ArtifactDirectory, ArtifactError, ArtifactFile,
+    ValidatedCapture, ValidatedSizing,
 };
 
 const TARGET_LOAD_SCHEMA: &str = "zaino-oram-typed-worker-target-load-v1";
@@ -152,22 +153,6 @@ fn validate_target_load(
         })
 }
 
-fn validate_source_lineage(
-    capture: &ValidatedCapture,
-    sizing: &ValidatedSizing,
-) -> Result<(), ArtifactError> {
-    sizing
-        .qualification()
-        .validate_against(capture.measurement())
-        .map_err(ArtifactError::Qualification)?;
-    if sizing.measurement_blake2s256() != capture.measurement_blake2s256() {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker target-load capture and sizing lineage mismatch",
-        });
-    }
-    Ok(())
-}
-
 /// Publishes a complete, read-back-validated typed-worker target-load run.
 pub(super) fn publish_target_load(
     output_dir: &Path,
@@ -176,7 +161,7 @@ pub(super) fn publish_target_load(
     target_load: &TypedWorkerTargetLoadReport,
     runner_version: &str,
 ) -> Result<(), ArtifactError> {
-    validate_source_lineage(capture, sizing)?;
+    validate_derived_source_lineage(capture, sizing)?;
     let artifact = TargetLoadArtifactV1::new(
         target_load,
         sizing.qualification(),
@@ -216,7 +201,7 @@ fn validate_staged_target_load(
 
     let artifact: TargetLoadArtifactV1 =
         serde_json::from_slice(&target_load_json).map_err(ArtifactError::Json)?;
-    validate_source_lineage(capture, sizing)?;
+    validate_derived_source_lineage(capture, sizing)?;
     artifact.validate(
         sizing.qualification(),
         capture.measurement_blake2s256(),

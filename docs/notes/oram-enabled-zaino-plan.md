@@ -176,6 +176,26 @@ ORAM recovery. The ROSTL buckets, recursive position maps, stash, table
 contents, and query-induced mutations remain volatile; no production
 freshness-witness or key owner is wired, no cold-rebuild RTO is measured, and
 the recovery directory remains a trusted, exclusive-writer boundary.
+The next source-bound rebuild slice adds a listener-free mainnet qualification
+runner for one fresh volatile worker. It validates the capture/sizing lineage,
+freezes a non-finalized source snapshot, preverifies the capture checkpoint
+before allocation, and feeds every genesis-forward block to both the typed
+projection owner and a fresh corpus scanner. A report is accepted only when the
+recomputed measurement exactly equals the capture, the worker reaches the exact
+checkpoint and semantic root, and shutdown is clean. Session drop also shuts
+down and discards an unfinished candidate.
+
+Its declared rebuild budget intentionally measures only worker allocation
+through source-matched readiness. Source-service startup, snapshot selection,
+checkpoint preverification, shutdown, and artifact publication are recorded or
+performed outside the pass/fail window; this is not labeled a full-service RTO.
+The atomic three-file artifact records the source backend, fixed snapshot,
+serviceable and verified checkpoint, and explicitly uncontrolled source-cache
+state. A budget miss is valid negative evidence: the artifact is published
+before the command returns failure. The slice therefore supplies source-bound
+fresh-worker replay plumbing and timing semantics, not controlled cold-cache,
+target-hardware, durable recovery, TDX, physical-trace, full-mainnet, or mainnet
+readiness evidence.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the

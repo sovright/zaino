@@ -1,5 +1,12 @@
 //! Crate-internal owner for one offline projection candidate and its atomic worker.
 
+mod cold_rebuild;
+
+pub use cold_rebuild::{
+    TypedWorkerColdRebuildError, TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport,
+    TypedWorkerColdRebuildSession,
+};
+
 use std::fmt;
 
 use zaino_state::IndexedBlock;

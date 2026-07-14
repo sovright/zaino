@@ -4,6 +4,8 @@
 #![forbid(unsafe_code)]
 
 use std::{error::Error, fmt, num::NonZeroU32, path::PathBuf, process::ExitCode};
+#[cfg(feature = "typed-qualification")]
+use std::{num::NonZeroU64, time::Duration};
 
 #[cfg(feature = "typed-qualification")]
 use clap::ValueEnum;
@@ -13,6 +15,7 @@ use zaino_common::Network;
 use zaino_oram::{
     run_typed_worker_full_map_saturation, run_typed_worker_qualification,
     run_typed_worker_stress_qualification, run_typed_worker_target_load,
+    TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport, TypedWorkerColdRebuildSession,
     TypedWorkerFullMapSaturationProfile, TypedWorkerStressProfile, TypedWorkerTargetLoadProfile,
 };
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
@@ -25,6 +28,8 @@ use zainodlib::{
     config::{load_config, BackendType},
 };
 
+#[cfg(feature = "typed-qualification")]
+use crate::cold_rebuild_artifact::{publish_cold_rebuild, ColdRebuildSourceSnapshotV1};
 use crate::corpus_artifact::{
     load_capture, load_sizing, publish_capture, publish_sizing, BackendKind, CaptureProvenance,
     SelectionMode, SnapshotMode, ValidatedSizing,
@@ -38,6 +43,8 @@ use crate::stress_qualification_artifact::publish_stress_qualification;
 #[cfg(feature = "typed-qualification")]
 use crate::target_load_artifact::publish_target_load;
 
+#[cfg(feature = "typed-qualification")]
+mod cold_rebuild_artifact;
 mod corpus_artifact;
 #[cfg(feature = "typed-qualification")]
 mod full_map_saturation_artifact;
@@ -86,6 +93,8 @@ enum QualificationSubcommand {
     Stress(QualificationStressArgs),
     /// Run a sizing-bound builder target-load profile and publish aggregate evidence.
     TargetLoad(QualificationTargetLoadArgs),
+    /// Rebuild a typed worker from a fixed canonical source snapshot.
+    ColdRebuild(QualificationColdRebuildArgs),
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -129,6 +138,38 @@ struct QualificationTargetLoadArgs {
 }
 
 #[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationColdRebuildArgs {
+    /// Versioned source-bound cold-rebuild profile to execute.
+    #[arg(long, value_enum)]
+    profile: ColdRebuildProfileArg,
+
+    /// Mainnet Zainod TOML config used to open the canonical indexed source.
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+
+    /// Complete three-file capture directory bound to the sizing input.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Complete three-file sizing directory to validate and consume.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+
+    /// Declared allocation-through-readiness rebuild budget in whole seconds.
+    #[arg(long)]
+    declared_rebuild_budget_seconds: NonZeroU64,
+
+    /// New directory that will receive the complete verified evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+
+    /// Emit aggregate progress every this many public block heights.
+    #[arg(long)]
+    progress_interval: NonZeroU32,
+}
+
+#[cfg(feature = "typed-qualification")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StressQualificationProfileArg {
     /// Fixed smoke-level stress qualification profile.
@@ -145,6 +186,14 @@ enum TargetLoadProfileArg {
     /// Fixed single-caller profile for the generic Linux x86_64 builder.
     #[value(name = "builder-foundation-v1")]
     BuilderFoundationV1,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ColdRebuildProfileArg {
+    /// Fixed source-bound single-caller profile for the generic builder.
+    #[value(name = "source-bound-builder-v1")]
+    SourceBoundBuilderV1,
 }
 
 #[derive(Debug, Args)]
@@ -293,6 +342,7 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             QualificationSubcommand::Run(args) => run_qualification(args),
             QualificationSubcommand::Stress(args) => run_stress_qualification(args),
             QualificationSubcommand::TargetLoad(args) => run_target_load(args),
+            QualificationSubcommand::ColdRebuild(args) => run_cold_rebuild(args).await,
         },
     }
 }
@@ -362,6 +412,149 @@ fn run_target_load(args: QualificationTargetLoadArgs) -> RunnerResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "typed-qualification")]
+async fn run_cold_rebuild(args: QualificationColdRebuildArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    let config = load_config(&args.config)?;
+    if config.network != Network::Mainnet {
+        return Err(RunnerError::MainnetRequired {
+            configured: config.network,
+        }
+        .into());
+    }
+
+    let profile = match args.profile {
+        ColdRebuildProfileArg::SourceBoundBuilderV1 => {
+            TypedWorkerColdRebuildProfile::SourceBoundBuilderV1
+        }
+    };
+    let declared_rebuild_budget = Duration::from_secs(args.declared_rebuild_budget_seconds.get());
+    let source_backend = backend_kind(config.backend);
+    let service_config = NodeBackedIndexerServiceConfig::try_from(config)?;
+    let mut service = NodeBackedIndexerService::spawn(service_config).await?;
+    let rebuild_result = rebuild_fixed_snapshot(
+        &service,
+        profile,
+        &capture,
+        &sizing,
+        declared_rebuild_budget,
+        source_backend,
+        args.progress_interval,
+    )
+    .await;
+    service.close();
+    let (report, source_snapshot) = rebuild_result?;
+
+    publish_cold_rebuild(
+        &args.output_dir,
+        &capture,
+        &sizing,
+        &report,
+        declared_rebuild_budget,
+        &source_snapshot,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!("cold_rebuild_artifact={}", args.output_dir.display());
+    if report.declared_rebuild_budget_passed() {
+        Ok(())
+    } else {
+        Err(RunnerError::DeclaredRebuildBudgetMiss {
+            declared_seconds: args.declared_rebuild_budget_seconds.get(),
+        }
+        .into())
+    }
+}
+
+#[cfg(feature = "typed-qualification")]
+async fn rebuild_fixed_snapshot(
+    service: &NodeBackedIndexerService,
+    profile: TypedWorkerColdRebuildProfile,
+    capture: &crate::corpus_artifact::ValidatedCapture,
+    sizing: &ValidatedSizing,
+    declared_rebuild_budget: Duration,
+    source_backend: BackendKind,
+    progress_interval: NonZeroU32,
+) -> RunnerResult<(TypedWorkerColdRebuildReport, ColdRebuildSourceSnapshotV1)> {
+    let subscriber = service.get_subscriber().inner();
+    let snapshot = subscriber.indexer.snapshot_nonfinalized_state().await?;
+    classify_snapshot(&snapshot)?;
+
+    let checkpoint = capture.measurement().checkpoint();
+    let checkpoint_height = checkpoint.height();
+    let serviceable_height = u32::from(*snapshot.max_serviceable_height());
+    if checkpoint_height > serviceable_height {
+        return Err(RunnerError::CaptureCheckpointAboveServiceable {
+            checkpoint: checkpoint_height,
+            serviceable: serviceable_height,
+        }
+        .into());
+    }
+    let typed_checkpoint_height =
+        Height::try_from(checkpoint_height).map_err(|_| RunnerError::HeightOutOfRange {
+            height: checkpoint_height,
+        })?;
+    let actual_checkpoint_hash = subscriber
+        .indexer
+        .get_block_hash(&snapshot, typed_checkpoint_height)
+        .await?
+        .ok_or(RunnerError::MissingCanonicalBlock {
+            height: checkpoint_height,
+        })?;
+    if !actual_checkpoint_hash
+        .to_rpc_hex()
+        .eq_ignore_ascii_case(checkpoint.hash())
+    {
+        return Err(RunnerError::CaptureCheckpointHashMismatch {
+            height: checkpoint_height,
+        }
+        .into());
+    }
+    let source_snapshot = ColdRebuildSourceSnapshotV1::new_verified(
+        source_backend,
+        serviceable_height,
+        capture.measurement(),
+    )?;
+
+    // Worker allocation begins only after the source snapshot has proven the
+    // exact public capture checkpoint above.
+    let mut session = TypedWorkerColdRebuildSession::start(
+        profile,
+        capture.measurement(),
+        sizing.qualification(),
+        capture.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+        declared_rebuild_budget,
+    )?;
+    eprintln!(
+        "cold_rebuild_start=mainnet,target_height:{checkpoint_height},serviceable_height:{serviceable_height}"
+    );
+    for raw_height in 0..=checkpoint_height {
+        let height = Height::try_from(raw_height)
+            .map_err(|_| RunnerError::HeightOutOfRange { height: raw_height })?;
+        let block = subscriber
+            .indexer
+            .get_indexed_block_by_height(&snapshot, &height)
+            .await?
+            .ok_or(RunnerError::MissingCanonicalBlock { height: raw_height })?;
+        session.push(&block)?;
+        if raw_height % progress_interval.get() == 0 || raw_height == checkpoint_height {
+            eprintln!(
+                "cold_rebuild_progress=mainnet,current_height:{raw_height},target_height:{checkpoint_height}"
+            );
+        }
+    }
+    let report = session.finish()?;
+    report.validate_against(
+        capture.measurement(),
+        sizing.qualification(),
+        capture.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+        declared_rebuild_budget,
+    )?;
+    Ok((report, source_snapshot))
+}
+
 fn run_corpus_size(args: CorpusSizeArgs) -> RunnerResult<()> {
     let capture = load_capture(&args.input_dir)?;
     let model = args.model()?;
@@ -409,10 +602,7 @@ async fn run_corpus_capture(args: CorpusCaptureArgs) -> RunnerResult<()> {
         }
         .into());
     }
-    let backend = match config.backend {
-        BackendType::Direct => BackendKind::Direct,
-        BackendType::Rpc => BackendKind::Rpc,
-    };
+    let backend = backend_kind(config.backend);
 
     // Spawn the chain-data service directly. Unlike zainod's Indexer wrapper,
     // this path creates no gRPC, JSON-RPC, metrics, or other network listener.
@@ -438,6 +628,13 @@ async fn run_corpus_capture(args: CorpusCaptureArgs) -> RunnerResult<()> {
     publish_capture(&args.output_dir, &scan.measurement, &provenance)?;
     println!("capture_artifact={}", args.output_dir.display());
     Ok(())
+}
+
+const fn backend_kind(backend: BackendType) -> BackendKind {
+    match backend {
+        BackendType::Direct => BackendKind::Direct,
+        BackendType::Rpc => BackendKind::Rpc,
+    }
 }
 
 async fn scan_fixed_snapshot(
@@ -553,13 +750,37 @@ struct CaptureScan {
 
 #[derive(Debug)]
 enum RunnerError {
-    MainnetRequired { configured: Network },
-    HeightOutOfRange { height: u32 },
-    MissingCanonicalBlock { height: u32 },
+    MainnetRequired {
+        configured: Network,
+    },
+    HeightOutOfRange {
+        height: u32,
+    },
+    MissingCanonicalBlock {
+        height: u32,
+    },
+    #[cfg(feature = "typed-qualification")]
+    CaptureCheckpointAboveServiceable {
+        checkpoint: u32,
+        serviceable: u32,
+    },
+    #[cfg(feature = "typed-qualification")]
+    CaptureCheckpointHashMismatch {
+        height: u32,
+    },
+    #[cfg(feature = "typed-qualification")]
+    DeclaredRebuildBudgetMiss {
+        declared_seconds: u64,
+    },
     IncompleteCheckpoint,
     InvalidCheckpointHash,
-    TargetAboveServiceable { target: u32, serviceable: u32 },
-    CheckpointHashMismatch { height: u32 },
+    TargetAboveServiceable {
+        target: u32,
+        serviceable: u32,
+    },
+    CheckpointHashMismatch {
+        height: u32,
+    },
     SnapshotStillSyncing,
     MeasuredCheckpointMismatch,
 }
@@ -580,6 +801,24 @@ impl fmt::Display for RunnerError {
             Self::MissingCanonicalBlock { height } => write!(
                 f,
                 "fixed canonical snapshot has no indexed block at public height {height}"
+            ),
+            #[cfg(feature = "typed-qualification")]
+            Self::CaptureCheckpointAboveServiceable {
+                checkpoint,
+                serviceable,
+            } => write!(
+                f,
+                "capture checkpoint height {checkpoint} exceeds fixed snapshot serviceable height {serviceable}"
+            ),
+            #[cfg(feature = "typed-qualification")]
+            Self::CaptureCheckpointHashMismatch { height } => write!(
+                f,
+                "fixed canonical snapshot does not match the capture checkpoint hash at height {height}"
+            ),
+            #[cfg(feature = "typed-qualification")]
+            Self::DeclaredRebuildBudgetMiss { declared_seconds } => write!(
+                f,
+                "fresh-worker rebuild exceeded the declared {declared_seconds}-second allocation-through-readiness budget; the valid negative artifact was published"
             ),
             Self::IncompleteCheckpoint => {
                 f.write_str("target height and target hash must be supplied together")
@@ -751,6 +990,29 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_cold_rebuild_args() -> [&'static str; 17] {
+        [
+            "zainod-oram",
+            "qualification",
+            "cold-rebuild",
+            "--profile",
+            "source-bound-builder-v1",
+            "--config",
+            "/tmp/zainod.toml",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--declared-rebuild-budget-seconds",
+            "3600",
+            "--output-dir",
+            "/tmp/oram-cold-rebuild",
+            "--progress-interval",
+            "5000",
+        ]
+    }
+
     fn parsed_corpus(cli: Cli) -> CorpusCommand {
         match cli.command {
             Command::Corpus(command) => command,
@@ -770,6 +1032,9 @@ mod tests {
                 QualificationSubcommand::TargetLoad(_) => {
                     panic!("target-load arguments parsed as stress")
                 }
+                QualificationSubcommand::ColdRebuild(_) => {
+                    panic!("cold-rebuild arguments parsed as stress")
+                }
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
         }
@@ -787,6 +1052,9 @@ mod tests {
                 }
                 QualificationSubcommand::TargetLoad(_) => {
                     panic!("target-load arguments parsed as fixed qualification")
+                }
+                QualificationSubcommand::ColdRebuild(_) => {
+                    panic!("cold-rebuild arguments parsed as fixed qualification")
                 }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
@@ -877,7 +1145,9 @@ mod tests {
         let args = match cli.command {
             Command::Qualification(command) => match command.command {
                 QualificationSubcommand::TargetLoad(args) => args,
-                QualificationSubcommand::Run(_) | QualificationSubcommand::Stress(_) => {
+                QualificationSubcommand::Run(_)
+                | QualificationSubcommand::Stress(_)
+                | QualificationSubcommand::ColdRebuild(_) => {
                     panic!("target-load arguments parsed as another qualification command")
                 }
             },
@@ -904,6 +1174,62 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn cold_rebuild_cli_requires_source_config_lineage_budget_output_and_progress(
+    ) -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_cold_rebuild_args())?;
+        let args = match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::ColdRebuild(args) => args,
+                QualificationSubcommand::Run(_)
+                | QualificationSubcommand::Stress(_)
+                | QualificationSubcommand::TargetLoad(_) => {
+                    panic!("cold-rebuild arguments parsed as another qualification command")
+                }
+            },
+            Command::Corpus(_) => panic!("cold-rebuild arguments parsed as corpus"),
+        };
+        assert_eq!(args.profile, ColdRebuildProfileArg::SourceBoundBuilderV1);
+        assert_eq!(args.config, PathBuf::from("/tmp/zainod.toml"));
+        assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
+        assert_eq!(args.declared_rebuild_budget_seconds.get(), 3_600);
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-cold-rebuild"));
+        assert_eq!(args.progress_interval.get(), 5_000);
+
+        for required in [
+            "--profile",
+            "--config",
+            "--capture-dir",
+            "--sizing-dir",
+            "--declared-rebuild-budget-seconds",
+            "--output-dir",
+            "--progress-interval",
+        ] {
+            let mut missing = valid_cold_rebuild_args().to_vec();
+            let Some(index) = missing.iter().position(|value| *value == required) else {
+                panic!("valid cold-rebuild fixture must contain {required}");
+            };
+            missing.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(missing).is_err());
+        }
+
+        for zero_option in ["--declared-rebuild-budget-seconds", "--progress-interval"] {
+            let mut zero = valid_cold_rebuild_args();
+            let Some(index) = zero.iter().position(|value| *value == zero_option) else {
+                panic!("valid cold-rebuild fixture must contain {zero_option}");
+            };
+            zero[index + 1] = "0";
+            assert!(Cli::try_parse_from(zero).is_err());
+        }
+
+        let mut unknown_profile = valid_cold_rebuild_args();
+        unknown_profile[4] = "custom";
+        assert!(Cli::try_parse_from(unknown_profile).is_err());
+        Ok(())
+    }
+
     #[cfg(not(feature = "typed-qualification"))]
     #[test]
     fn target_load_cli_is_absent_without_typed_qualification() {
@@ -919,6 +1245,31 @@ mod tests {
             "/tmp/oram-sizing",
             "--output-dir",
             "/tmp/oram-target-load",
+        ])
+        .is_err());
+    }
+
+    #[cfg(not(feature = "typed-qualification"))]
+    #[test]
+    fn cold_rebuild_cli_is_absent_without_typed_qualification() {
+        assert!(Cli::try_parse_from([
+            "zainod-oram",
+            "qualification",
+            "cold-rebuild",
+            "--profile",
+            "source-bound-builder-v1",
+            "--config",
+            "/tmp/zainod.toml",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--declared-rebuild-budget-seconds",
+            "3600",
+            "--output-dir",
+            "/tmp/oram-cold-rebuild",
+            "--progress-interval",
+            "5000",
         ])
         .is_err());
     }

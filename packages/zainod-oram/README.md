@@ -134,6 +134,58 @@ result, or mainnet gate.
 The bundle is unsigned and self-reported; it binds no source revision, lockfile,
 toolchain, release binary, or execution attestation.
 
+## Source-bound fresh-worker rebuild qualification
+
+The `typed-qualification` feature exposes a listener-free mainnet rebuild
+foundation for a fresh volatile typed worker:
+
+```console
+cargo run -p zainod-oram --features typed-qualification -- \
+  qualification cold-rebuild \
+  --profile source-bound-builder-v1 \
+  --config <MAINNET_ZAINOD_TOML> \
+  --capture-dir <CAPTURE_DIR> \
+  --sizing-dir <SIZING_DIR> \
+  --declared-rebuild-budget-seconds <SECONDS> \
+  --output-dir <NEW_DIR> \
+  --progress-interval <BLOCKS>
+```
+
+The runner revalidates the complete capture and sizing lineage, opens one fixed
+non-finalized mainnet snapshot, and verifies the capture checkpoint height and
+hash against that source before allocating the worker. It then streams the same
+genesis-forward `IndexedBlock` sequence into both a fresh corpus scanner and the
+fresh typed projection owner. Readiness is accepted only if the recomputed
+measurement exactly equals the loaded capture, the worker reaches the exact
+checkpoint, the semantic publication is available, and the worker shuts down
+cleanly. A source, scanner, worker, memory-sampling, or validation failure drops
+the identifier-bearing scanner state, shuts down the candidate worker, and
+publishes no output.
+
+The declared budget has a deliberately narrow boundary: it starts immediately
+before worker allocation and ends after source-measurement equality and typed
+worker readiness are validated. Source-service startup, snapshot selection and
+checkpoint preverification happen before this timer. Shutdown and total
+lifecycle time are recorded separately and cannot change the budget result.
+When the validated rebuild misses the budget, the command first publishes the
+valid negative artifact and then exits unsuccessfully.
+
+The new output directory contains `cold-rebuild.json`, `cold-rebuild.txt`, and
+`provenance.json`. The typed JSON binds the capture and sizing digests, declared
+budget, fresh-worker report, and source snapshot evidence: backend kind, fixed
+snapshot mode, serviceable height, preverified checkpoint, and the explicit
+`uncontrolled` source-cache mode. Provenance binds the compact typed wrapper to
+the runner version and Linux x86_64 target labels. Staged files are bounded,
+read back, semantically revalidated against both input directories, and
+atomically published without replacing an existing output.
+
+This is fresh-worker replay evidence on the executing host, not a full-service
+recovery-time objective or a controlled cold-cache benchmark. It does not
+establish durable ORAM state, authenticated state restoration, production key
+or freshness ownership, target hardware or TDX behavior, physical access-trace
+obliviousness, attestation, signed provenance, full-mainnet feasibility, or
+mainnet readiness.
+
 ## Corpus capture
 
 `corpus capture` produces an identifier-free measurement of the transparent
