@@ -898,8 +898,8 @@ mod tests {
         target_arch = "x86_64"
     ))]
     use zaino_state::{
-        BlockContext, BlockData, BlockHash, ChainWork, CommitmentTreeData, CommitmentTreeRoots,
-        CommitmentTreeSizes, CompactDifficulty, EquihashSolution, Height,
+        chain_index::types::EquihashSolution, BlockContext, BlockData, BlockHash, ChainWork,
+        CommitmentTreeData, CommitmentTreeRoots, CommitmentTreeSizes, CompactDifficulty, Height,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
