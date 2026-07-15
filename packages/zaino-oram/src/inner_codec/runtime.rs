@@ -827,11 +827,11 @@ mod tests {
         slots: [RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
         lineage: RecentSnapshotLineage,
     ) -> TestRecentSnapshot {
-        FrozenRecentSnapshot::new(lineage, slots)
+        FrozenRecentSnapshot::from_parts_for_tests(lineage, slots)
     }
 
     fn recent_snapshot_lineage(identity: RecentSnapshotIdentity) -> RecentSnapshotLineage {
-        RecentSnapshotLineage::new(
+        RecentSnapshotLineage::from_parts_for_tests(
             1,
             identity,
             identity
@@ -1143,7 +1143,7 @@ mod tests {
         let current = runtime.recent_snapshot.lineage();
         runtime
             .recent_snapshot
-            .replace_lineage(RecentSnapshotLineage::new(
+            .replace_lineage(RecentSnapshotLineage::from_parts_for_tests(
                 current
                     .generation()
                     .checked_add(1)
@@ -1240,7 +1240,7 @@ mod tests {
             .expect("capped issuer page carries a continuation");
 
         let current = issuer.recent_snapshot.lineage();
-        let next_lineage = RecentSnapshotLineage::new(
+        let next_lineage = RecentSnapshotLineage::from_parts_for_tests(
             current
                 .generation()
                 .checked_add(1)
@@ -1731,7 +1731,7 @@ mod tests {
         let shape = CompiledQueryShape::new(profile)?;
         let shape_mismatch = ThreeSlotRuntime::new(
             store(4, &[])?,
-            FrozenRecentSnapshot::new(
+            FrozenRecentSnapshot::from_parts_for_tests(
                 recent_snapshot_lineage(recent_snapshot_identity(&checkpoint())),
                 [RecentSnapshotSlot::dummy(); 3],
             ),
@@ -1810,7 +1810,7 @@ mod tests {
             )?;
             let identity_mismatch = TestRuntime::new(
                 store(4, &[])?,
-                FrozenRecentSnapshot::new(
+                FrozenRecentSnapshot::from_parts_for_tests(
                     recent_snapshot_lineage(mismatched_identity),
                     [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
                 ),

@@ -76,21 +76,28 @@ latch readiness. Query-derived `source_calls` remain modeled at zero. This
 closes only the mock-constructed logical scan/merge slice. A private in-memory
 single-writer publication model now retires the active generation before
 refresh, admits only its opaque outstanding build ticket, and lets pinned leases
-check whether they remain current. It is not connected to the runtime or a live
-source, and it does not validate the caller-supplied tip, ancestry, or slot
-provenance. The lineage commitment is not an authenticated canonical/live Zaino
-snapshot root. A default-off `corpus-zaino` slice now supplies a private
-conversion candidate that consumes `CanonicalRecentChainSnapshot` plus an
-immutable, identity-pinned finalized-outpoint classifier, preserves dense
-standard-event slots in canonical order, and tracks nonstandard states. It has
-no production resolver or runtime wiring and does not construct
-`FrozenRecentSnapshot`, assign or publish a generation, or atomically capture a
-whole serving epoch. Live NFS acquisition, canonical and reorg-safe snapshot
-publication, authenticated provenance, durable rollback authority, physical
-obliviousness, allocator and timing equivalence, TDX, mainnet, and target-load
-evidence remain open. Production AEAD, trusted clock and nonce ownership,
-durable replay storage, private protobuf/transport framing, and a service
-lifecycle also remain integration gates.
+check whether they remain current. A default-off `corpus-zaino` slice supplies a
+private, generation-free conversion candidate that consumes
+`CanonicalRecentChainSnapshot` plus an immutable, identity-pinned
+finalized-outpoint classifier, preserves dense standard-event slots in canonical
+order, and tracks nonstandard states. The private publication owner remains the
+sole generation authority: it accepts that candidate only through its current
+outstanding ticket, requires exact finalized identity and recent tip height/hash,
+and moves the candidate's slots into `FrozenRecentSnapshot`. Direct raw-slot
+activation is test-only. The intended refresh flow requires `begin_update`
+before conversion, but the candidate type does not encode that ticket lineage
+and no live controller enforces the ordering. This closes only private in-memory
+owner-mediated construction, not a race-free refresh controller or
+whole-serving-epoch orchestration. It is not connected to the runtime or a live
+DB/NFS source, has no production resolver or caller, and does not authenticate
+the tip, ancestry, or slot provenance. The lineage
+commitment is not an authenticated canonical/live Zaino snapshot root. Live NFS
+acquisition, canonical and reorg-safe service publication, authenticated
+provenance, durable rollback authority, physical obliviousness, allocator and
+timing equivalence, TDX, mainnet, and target-load evidence remain open.
+Production AEAD, trusted clock and nonce ownership, durable replay storage,
+private protobuf/transport framing, and a service lifecycle also remain
+integration gates.
 
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
@@ -100,12 +107,15 @@ identity, and parent continuity, ignores side blocks, and returns cloned blocks
 strictly above the seam oldest-first without DB/source fallback. The private
 `corpus-zaino` conversion candidate can consume this value together with an
 immutable, identity-pinned finalized-outpoint classifier, preserve dense
-standard-event slots, and track nonstandard states. No production resolver or
-runtime caller uses it, and it does not construct `FrozenRecentSnapshot`. The
-seam and candidate are not an atomic finalized-plus-NFS capture and do not
-provide an authenticated root, generation assignment or publication,
-reorg-safe whole-serving-epoch publication, durability, service integration,
-production cryptography, physical or TDX evidence, or mainnet evidence.
+standard-event slots, and track nonstandard states without assigning a
+generation. The private publication owner can consume that candidate only
+through the matching outstanding ticket, verify its exact finalized/tip metadata,
+and construct the owner-generated `FrozenRecentSnapshot`; direct raw-slot
+activation remains test-only. No production resolver, caller, runtime, or live
+source uses this path. The seam and owner handoff are not an atomic
+finalized-plus-NFS capture and do not provide an authenticated root, reorg-safe
+whole-serving-epoch publication, durability, service integration, production
+cryptography, physical or TDX evidence, or mainnet evidence.
 
 At exact conversion code head
 `32084cd8e047c64b34fcfae5fd0283533fe21793`, a detached worktree on the
@@ -380,8 +390,10 @@ or backing source. A complete projection feed still needs finalized block
 application plus a race-free serving-epoch snapshot/watermark. The private
 `corpus-zaino` conversion candidate preserves dense standard-event slots from
 this value-bound seam when paired with an immutable identity-pinned finalized
-outpoint classifier, but it is not wired to a production resolver and does not
-atomically capture finalized state with NFS.
+outpoint classifier. The private publication owner can validate that
+generation-free candidate against its current ticket and move its slots into an
+owner-generated frozen snapshot, but no production resolver or caller wires the
+handoff and it does not atomically capture finalized state with NFS.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
@@ -670,10 +682,12 @@ Deliverables:
 
 - narrow public-chain projection feed from `zaino-state`;
 - finalised checkpoint/watermark protocol and catch-up replay;
-- supply the production finalized-outpoint resolver, wire the private
-  `corpus-zaino` conversion candidate into `FrozenRecentSnapshot` construction,
-  and bind that result into a generation-bound, race-free whole serving epoch
-  that executes the complete fixed-work recent-chain scan;
+- supply the production finalized-outpoint resolver, implement a live refresh
+  controller that begins the update before conversion, wire live source/NFS
+  acquisition into the existing owner-mediated converted-candidate activation,
+  and bind the owner-generated `FrozenRecentSnapshot` into a generation-bound,
+  race-free whole serving epoch that executes the complete fixed-work
+  recent-chain scan;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;
 - production ownership of manifest authentication keys and the external
   freshness witness, with a measured rebuild RTO or composite durable ORAM

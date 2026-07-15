@@ -10,9 +10,239 @@ use std::{fmt, sync::Arc};
 
 use arc_swap::ArcSwapOption;
 
+#[cfg(feature = "corpus-zaino")]
+use super::zaino::ConvertedRecentSnapshot;
 use super::{
-    FrozenRecentSnapshot, RecentSnapshotIdentity, RecentSnapshotLineage, RecentSnapshotSlot,
+    content_digest, lineage_binding_digest, RecentSnapshotIdentity, RecentSnapshotReadError,
+    RecentSnapshotSlot,
 };
+
+/// Lineage that distinguishes every immutable recent snapshot generation.
+///
+/// The finalized identity defines the exact seam with the protected projection.
+/// The recent tip binds canonical chain freshness even when two generations have
+/// identical transparent effects. Generations are monotonic within one owner
+/// lifecycle and therefore prevent continuation-token ABA across an advance,
+/// same-height reorg, or shortening reorg. A durable rebuild must roll the
+/// projection epoch because this in-memory generation is not rollback proof.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecentSnapshotLineage {
+    generation: u64,
+    finalized: RecentSnapshotIdentity,
+    recent_tip_height: u32,
+    recent_tip_hash_display: [u8; 32],
+}
+
+impl RecentSnapshotLineage {
+    fn new(
+        generation: u64,
+        finalized: RecentSnapshotIdentity,
+        recent_tip_height: u32,
+        recent_tip_hash_display: [u8; 32],
+    ) -> Result<Self, RecentSnapshotLineageError> {
+        if generation == 0 {
+            return Err(RecentSnapshotLineageError::ZeroGeneration);
+        }
+        if recent_tip_height < finalized.finalized_height() {
+            return Err(RecentSnapshotLineageError::RecentTipBelowFinalized);
+        }
+        if recent_tip_height == finalized.finalized_height()
+            && recent_tip_hash_display != *finalized.finalized_hash_display()
+        {
+            return Err(RecentSnapshotLineageError::SeamTipHashMismatch);
+        }
+        Ok(Self {
+            generation,
+            finalized,
+            recent_tip_height,
+            recent_tip_hash_display,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_tests(
+        generation: u64,
+        finalized: RecentSnapshotIdentity,
+        recent_tip_height: u32,
+        recent_tip_hash_display: [u8; 32],
+    ) -> Result<Self, RecentSnapshotLineageError> {
+        Self::new(
+            generation,
+            finalized,
+            recent_tip_height,
+            recent_tip_hash_display,
+        )
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) const fn finalized(&self) -> RecentSnapshotIdentity {
+        self.finalized
+    }
+
+    pub(crate) const fn recent_tip_height(&self) -> u32 {
+        self.recent_tip_height
+    }
+
+    pub(crate) const fn recent_tip_hash_display(&self) -> &[u8; 32] {
+        &self.recent_tip_hash_display
+    }
+}
+
+impl fmt::Debug for RecentSnapshotLineage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecentSnapshotLineage { ..REDACTED.. }")
+    }
+}
+
+/// A public recent-snapshot lineage is internally inconsistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecentSnapshotLineageError {
+    ZeroGeneration,
+    RecentTipBelowFinalized,
+    SeamTipHashMismatch,
+}
+
+impl fmt::Display for RecentSnapshotLineageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroGeneration => f.write_str("recent snapshot generation is zero"),
+            Self::RecentTipBelowFinalized => {
+                f.write_str("recent snapshot tip is below the finalized seam")
+            }
+            Self::SeamTipHashMismatch => {
+                f.write_str("empty recent snapshot tip does not match the finalized seam")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecentSnapshotLineageError {}
+
+/// Fixed, oldest-to-newest snapshot owned by one private runtime lifecycle.
+pub(crate) struct FrozenRecentSnapshot<const N: usize> {
+    lineage: RecentSnapshotLineage,
+    slots: [RecentSnapshotSlot; N],
+    content_digest: [u8; 32],
+    binding_digest: [u8; 32],
+    #[cfg(test)]
+    failing_ordinal: Option<usize>,
+    #[cfg(test)]
+    read_calls: usize,
+}
+
+impl<const N: usize> FrozenRecentSnapshot<N> {
+    fn new(lineage: RecentSnapshotLineage, slots: [RecentSnapshotSlot; N]) -> Self {
+        let content_digest = content_digest(&slots);
+        let binding_digest = lineage_binding_digest(lineage, content_digest);
+        Self {
+            lineage,
+            slots,
+            content_digest,
+            binding_digest,
+            #[cfg(test)]
+            failing_ordinal: None,
+            #[cfg(test)]
+            read_calls: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_tests(
+        lineage: RecentSnapshotLineage,
+        slots: [RecentSnapshotSlot; N],
+    ) -> Self {
+        Self::new(lineage, slots)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failing(
+        lineage: RecentSnapshotLineage,
+        slots: [RecentSnapshotSlot; N],
+        failing_ordinal: usize,
+    ) -> Self {
+        let content_digest = content_digest(&slots);
+        let binding_digest = lineage_binding_digest(lineage, content_digest);
+        Self {
+            lineage,
+            slots,
+            content_digest,
+            binding_digest,
+            failing_ordinal: Some(failing_ordinal),
+            read_calls: 0,
+        }
+    }
+
+    pub(crate) const fn slots(&self) -> usize {
+        N
+    }
+
+    pub(crate) const fn identity(&self) -> RecentSnapshotIdentity {
+        self.lineage.finalized
+    }
+
+    pub(crate) const fn lineage(&self) -> RecentSnapshotLineage {
+        self.lineage
+    }
+
+    pub(crate) const fn content_digest(&self) -> [u8; 32] {
+        self.content_digest
+    }
+
+    pub(crate) const fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+
+    /// Reads one public slot without accepting any query-derived identifier.
+    pub(crate) fn read_slot(
+        &mut self,
+        ordinal: usize,
+    ) -> Result<RecentSnapshotSlot, RecentSnapshotReadError> {
+        #[cfg(test)]
+        {
+            let calls = self.read_calls;
+            let expected = calls.checked_rem(N).ok_or(RecentSnapshotReadError)?;
+            if ordinal != expected || ordinal >= N {
+                return Err(RecentSnapshotReadError);
+            }
+            self.read_calls = calls.checked_add(1).ok_or(RecentSnapshotReadError)?;
+            if self.failing_ordinal == Some(ordinal) {
+                return Err(RecentSnapshotReadError);
+            }
+        }
+        self.slots
+            .get(ordinal)
+            .copied()
+            .ok_or(RecentSnapshotReadError)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn read_calls(&self) -> usize {
+        self.read_calls
+    }
+
+    /// Simulates post-construction corruption without changing the bound digest.
+    #[cfg(test)]
+    pub(crate) fn replace_slot(&mut self, ordinal: usize, slot: RecentSnapshotSlot) {
+        if let Some(destination) = self.slots.get_mut(ordinal) {
+            *destination = slot;
+        }
+    }
+
+    /// Simulates post-construction checkpoint-identity corruption.
+    #[cfg(test)]
+    pub(crate) fn replace_identity(&mut self, identity: RecentSnapshotIdentity) {
+        self.lineage.finalized = identity;
+    }
+
+    /// Simulates post-construction generation or recent-tip corruption.
+    #[cfg(test)]
+    pub(crate) fn replace_lineage(&mut self, lineage: RecentSnapshotLineage) {
+        self.lineage = lineage;
+    }
+}
 
 /// Models the active immutable recent snapshot and its single-writer lineage.
 struct RecentSnapshotPublicationOwner<const N: usize> {
@@ -68,17 +298,44 @@ impl<const N: usize> RecentSnapshotPublicationOwner<N> {
         Ok(RecentSnapshotUpdateTicket { seal })
     }
 
-    /// Publishes a completed build only when its opaque ticket is outstanding.
+    /// Publishes synthetic slots only for the feature-independent owner tests.
+    #[cfg(test)]
     fn activate(
         &mut self,
         ticket: RecentSnapshotUpdateTicket,
         slots: [RecentSnapshotSlot; N],
     ) -> Result<(), RecentSnapshotPublicationError> {
         let lineage = self.take_outstanding(&ticket)?;
+        self.publish_with_lineage(lineage, slots);
+        Ok(())
+    }
 
+    /// Publishes a converted candidate only when it matches the outstanding lineage.
+    #[cfg(feature = "corpus-zaino")]
+    fn activate_converted(
+        &mut self,
+        ticket: RecentSnapshotUpdateTicket,
+        converted: ConvertedRecentSnapshot<N>,
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let lineage = self.take_outstanding(&ticket)?;
+        if converted.finalized() != lineage.finalized()
+            || converted.recent_tip_height() != lineage.recent_tip_height()
+            || converted.recent_tip_hash_display() != lineage.recent_tip_hash_display()
+        {
+            return Err(RecentSnapshotPublicationError::InvalidUpdate);
+        }
+
+        self.publish_with_lineage(lineage, converted.into_slots());
+        Ok(())
+    }
+
+    fn publish_with_lineage(
+        &mut self,
+        lineage: RecentSnapshotLineage,
+        slots: [RecentSnapshotSlot; N],
+    ) {
         let snapshot = Arc::new(FrozenRecentSnapshot::new(lineage, slots));
         self.active.store(Some(snapshot));
-        Ok(())
     }
 
     /// Records a failed build and consumes its outstanding capability.
@@ -210,7 +467,11 @@ fn validate_finalized_transition(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "corpus-zaino")]
+    use super::super::zaino::ConvertedRecentSnapshot;
     use super::*;
+    #[cfg(feature = "corpus-zaino")]
+    use crate::records::{AddressKey, TransparentUtxo, ADDRESS_KEY_BYTES};
 
     const FINALIZED_HASH: [u8; 32] = [0x11; 32];
     const ADVANCED_FINALIZED_HASH: [u8; 32] = [0x12; 32];
@@ -242,6 +503,241 @@ mod tests {
         let ticket = owner.begin_update(identity(100, FINALIZED_HASH), 102, TIP_HASH_A)?;
         owner.activate(ticket, slots())?;
         Ok(owner)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn converted_candidate(
+        finalized: RecentSnapshotIdentity,
+        recent_tip_height: u32,
+        recent_tip_hash_display: [u8; 32],
+    ) -> ConvertedRecentSnapshot<SLOT_COUNT> {
+        converted_candidate_with_slots(
+            finalized,
+            recent_tip_height,
+            recent_tip_hash_display,
+            slots(),
+        )
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn converted_candidate_with_slots(
+        finalized: RecentSnapshotIdentity,
+        recent_tip_height: u32,
+        recent_tip_hash_display: [u8; 32],
+        slots: [RecentSnapshotSlot; SLOT_COUNT],
+    ) -> ConvertedRecentSnapshot<SLOT_COUNT> {
+        ConvertedRecentSnapshot::from_parts_for_tests(
+            finalized,
+            recent_tip_height,
+            recent_tip_hash_display,
+            slots,
+        )
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn occupied_slots() -> [RecentSnapshotSlot; SLOT_COUNT] {
+        let utxo = TransparentUtxo::new([0x41; 32], 3, 75, 101, &[0x51])
+            .expect("publication fixture script fits the fixed transparent record");
+        [
+            RecentSnapshotSlot::created(AddressKey::new([0x42; ADDRESS_KEY_BYTES]), utxo),
+            RecentSnapshotSlot::dummy(),
+        ]
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn converted_candidate_activates_with_owner_assigned_lineage(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let finalized = identity(100, FINALIZED_HASH);
+        let mut owner = TestOwner::new();
+        let ticket = owner.begin_update(finalized, 102, TIP_HASH_A)?;
+
+        owner.activate_converted(ticket, converted_candidate(finalized, 102, TIP_HASH_A))?;
+
+        let lease = owner
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+        let snapshot = lease.snapshot();
+        assert_eq!(snapshot.lineage().generation(), 1);
+        assert_eq!(snapshot.identity(), finalized);
+        assert_eq!(snapshot.lineage().recent_tip_height(), 102);
+        assert_eq!(snapshot.lineage().recent_tip_hash_display(), &TIP_HASH_A);
+        assert_eq!(
+            snapshot.content_digest(),
+            super::super::content_digest(&slots())
+        );
+        assert_eq!(
+            snapshot.binding_digest(),
+            super::super::lineage_binding_digest(snapshot.lineage(), snapshot.content_digest())
+        );
+        assert!(lease.is_current(&owner));
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn converted_candidate_must_match_every_ticket_lineage_field(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let finalized = identity(100, FINALIZED_HASH);
+        let mismatches = [
+            (
+                RecentSnapshotIdentity::new(1, 100, FINALIZED_HASH, 1, 7, 9),
+                102,
+                TIP_HASH_A,
+            ),
+            (identity(99, FINALIZED_HASH), 102, TIP_HASH_A),
+            (identity(100, ADVANCED_FINALIZED_HASH), 102, TIP_HASH_A),
+            (
+                RecentSnapshotIdentity::new(0, 100, FINALIZED_HASH, 2, 7, 9),
+                102,
+                TIP_HASH_A,
+            ),
+            (
+                RecentSnapshotIdentity::new(0, 100, FINALIZED_HASH, 1, 8, 9),
+                102,
+                TIP_HASH_A,
+            ),
+            (
+                RecentSnapshotIdentity::new(0, 100, FINALIZED_HASH, 1, 7, 10),
+                102,
+                TIP_HASH_A,
+            ),
+            (finalized, 103, TIP_HASH_A),
+            (finalized, 102, TIP_HASH_B),
+        ];
+
+        for (candidate_finalized, candidate_tip_height, candidate_tip_hash) in mismatches {
+            let mut owner = TestOwner::new();
+            let ticket = owner.begin_update(finalized, 102, TIP_HASH_A)?;
+            assert_eq!(
+                owner.activate_converted(
+                    ticket,
+                    converted_candidate(
+                        candidate_finalized,
+                        candidate_tip_height,
+                        candidate_tip_hash,
+                    ),
+                ),
+                Err(RecentSnapshotPublicationError::InvalidUpdate)
+            );
+            assert!(owner.pin().is_none());
+            assert!(owner.outstanding.is_none());
+
+            let retry = owner.begin_update(finalized, 102, TIP_HASH_A)?;
+            owner.activate_converted(retry, converted_candidate(finalized, 102, TIP_HASH_A))?;
+            let lease = owner
+                .pin()
+                .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+            assert_eq!(lease.snapshot().lineage().generation(), 2);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn stale_converted_candidate_preserves_newer_outstanding_update(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let finalized = identity(100, FINALIZED_HASH);
+        for (candidate_tip_height, candidate_tip_hash) in [(101, TIP_HASH_A), (102, TIP_HASH_B)] {
+            let mut owner = TestOwner::new();
+            let stale = owner.begin_update(finalized, 101, TIP_HASH_A)?;
+            let current = owner.begin_update(finalized, 102, TIP_HASH_B)?;
+
+            assert_eq!(
+                owner.activate_converted(
+                    stale,
+                    converted_candidate(finalized, candidate_tip_height, candidate_tip_hash),
+                ),
+                Err(RecentSnapshotPublicationError::ActivationRejected)
+            );
+            assert!(owner.pin().is_none());
+
+            owner.activate_converted(current, converted_candidate(finalized, 102, TIP_HASH_B))?;
+            let lease = owner
+                .pin()
+                .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+            assert_eq!(lease.snapshot().lineage().generation(), 2);
+            assert!(lease.is_current(&owner));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn converted_candidate_content_is_bound_under_identical_public_metadata(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let finalized = identity(100, FINALIZED_HASH);
+        let mut owner = TestOwner::new();
+        let first_ticket = owner.begin_update(finalized, 102, TIP_HASH_A)?;
+        owner.activate_converted(
+            first_ticket,
+            converted_candidate(finalized, 102, TIP_HASH_A),
+        )?;
+        let first = owner
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+
+        let second_ticket = owner.begin_update(finalized, 102, TIP_HASH_A)?;
+        owner.activate_converted(
+            second_ticket,
+            converted_candidate_with_slots(finalized, 102, TIP_HASH_A, occupied_slots()),
+        )?;
+        let second = owner
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+
+        assert_ne!(
+            first.snapshot().content_digest(),
+            second.snapshot().content_digest()
+        );
+        assert_ne!(
+            first.snapshot().binding_digest(),
+            second.snapshot().binding_digest()
+        );
+        assert!(!first.is_current(&owner));
+        assert!(second.is_current(&owner));
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn identical_converted_contents_receive_distinct_generation_bindings(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let finalized = identity(100, FINALIZED_HASH);
+        let mut owner = TestOwner::new();
+        let first_ticket = owner.begin_update(finalized, 102, TIP_HASH_A)?;
+        owner.activate_converted(
+            first_ticket,
+            converted_candidate(finalized, 102, TIP_HASH_A),
+        )?;
+        let first = owner
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+
+        let second_ticket = owner.begin_update(finalized, 102, TIP_HASH_A)?;
+        owner.activate_converted(
+            second_ticket,
+            converted_candidate(finalized, 102, TIP_HASH_A),
+        )?;
+        let second = owner
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+
+        assert_eq!(
+            first.snapshot().content_digest(),
+            second.snapshot().content_digest()
+        );
+        assert_ne!(
+            first.snapshot().lineage().generation(),
+            second.snapshot().lineage().generation()
+        );
+        assert_ne!(
+            first.snapshot().binding_digest(),
+            second.snapshot().binding_digest()
+        );
+        assert!(!first.is_current(&owner));
+        assert!(second.is_current(&owner));
+        Ok(())
     }
 
     #[test]

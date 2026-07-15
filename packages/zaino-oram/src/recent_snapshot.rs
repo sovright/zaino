@@ -14,6 +14,9 @@ use blake2::{Blake2s256, Digest};
 use crate::records::{AddressKey, TransparentUtxo, ADDRESS_KEY_BYTES};
 
 mod publication;
+#[cfg(test)]
+use publication::RecentSnapshotLineageError;
+pub(super) use publication::{FrozenRecentSnapshot, RecentSnapshotLineage};
 #[cfg(feature = "corpus-zaino")]
 mod zaino;
 
@@ -81,95 +84,6 @@ impl fmt::Debug for RecentSnapshotIdentity {
         f.write_str("RecentSnapshotIdentity { ..REDACTED.. }")
     }
 }
-
-/// Lineage that distinguishes every immutable recent snapshot generation.
-///
-/// The finalized identity defines the exact seam with the protected projection.
-/// The recent tip binds canonical chain freshness even when two generations have
-/// identical transparent effects. Generations are monotonic within one owner
-/// lifecycle and therefore prevent continuation-token ABA across an advance,
-/// same-height reorg, or shortening reorg. A durable rebuild must roll the
-/// projection epoch because this in-memory generation is not rollback proof.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct RecentSnapshotLineage {
-    generation: u64,
-    finalized: RecentSnapshotIdentity,
-    recent_tip_height: u32,
-    recent_tip_hash_display: [u8; 32],
-}
-
-impl RecentSnapshotLineage {
-    pub(super) fn new(
-        generation: u64,
-        finalized: RecentSnapshotIdentity,
-        recent_tip_height: u32,
-        recent_tip_hash_display: [u8; 32],
-    ) -> Result<Self, RecentSnapshotLineageError> {
-        if generation == 0 {
-            return Err(RecentSnapshotLineageError::ZeroGeneration);
-        }
-        if recent_tip_height < finalized.finalized_height {
-            return Err(RecentSnapshotLineageError::RecentTipBelowFinalized);
-        }
-        if recent_tip_height == finalized.finalized_height
-            && recent_tip_hash_display != finalized.finalized_hash_display
-        {
-            return Err(RecentSnapshotLineageError::SeamTipHashMismatch);
-        }
-        Ok(Self {
-            generation,
-            finalized,
-            recent_tip_height,
-            recent_tip_hash_display,
-        })
-    }
-
-    pub(super) const fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub(super) const fn finalized(&self) -> RecentSnapshotIdentity {
-        self.finalized
-    }
-
-    pub(super) const fn recent_tip_height(&self) -> u32 {
-        self.recent_tip_height
-    }
-
-    pub(super) const fn recent_tip_hash_display(&self) -> &[u8; 32] {
-        &self.recent_tip_hash_display
-    }
-}
-
-impl fmt::Debug for RecentSnapshotLineage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RecentSnapshotLineage { ..REDACTED.. }")
-    }
-}
-
-/// A public recent-snapshot lineage is internally inconsistent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RecentSnapshotLineageError {
-    ZeroGeneration,
-    RecentTipBelowFinalized,
-    SeamTipHashMismatch,
-}
-
-impl fmt::Display for RecentSnapshotLineageError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroGeneration => f.write_str("recent snapshot generation is zero"),
-            Self::RecentTipBelowFinalized => {
-                f.write_str("recent snapshot tip is below the finalized seam")
-            }
-            Self::SeamTipHashMismatch => {
-                f.write_str("empty recent snapshot tip does not match the finalized seam")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RecentSnapshotLineageError {}
 
 /// One public-chain change represented in a frozen recent snapshot.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -309,18 +223,18 @@ pub(super) fn lineage_binding_digest(
     lineage: RecentSnapshotLineage,
     snapshot_content_digest: [u8; 32],
 ) -> [u8; 32] {
-    let finalized = lineage.finalized;
+    let finalized = lineage.finalized();
     let mut hasher = Blake2s256::new();
     Digest::update(&mut hasher, LINEAGE_BINDING_DOMAIN);
-    Digest::update(&mut hasher, lineage.generation.to_be_bytes());
+    Digest::update(&mut hasher, lineage.generation().to_be_bytes());
     Digest::update(&mut hasher, [finalized.network_tag]);
     Digest::update(&mut hasher, finalized.finalized_height.to_be_bytes());
     Digest::update(&mut hasher, finalized.finalized_hash_display);
     Digest::update(&mut hasher, finalized.schema_version.to_be_bytes());
     Digest::update(&mut hasher, finalized.projection_epoch.to_be_bytes());
     Digest::update(&mut hasher, finalized.key_epoch.to_be_bytes());
-    Digest::update(&mut hasher, lineage.recent_tip_height.to_be_bytes());
-    Digest::update(&mut hasher, lineage.recent_tip_hash_display);
+    Digest::update(&mut hasher, lineage.recent_tip_height().to_be_bytes());
+    Digest::update(&mut hasher, lineage.recent_tip_hash_display());
     Digest::update(&mut hasher, snapshot_content_digest);
     finalize_digest(hasher)
 }
@@ -356,121 +270,6 @@ impl fmt::Display for RecentSnapshotReadError {
 
 impl std::error::Error for RecentSnapshotReadError {}
 
-/// Fixed, oldest-to-newest snapshot owned by one private runtime lifecycle.
-pub(super) struct FrozenRecentSnapshot<const N: usize> {
-    lineage: RecentSnapshotLineage,
-    slots: [RecentSnapshotSlot; N],
-    content_digest: [u8; 32],
-    binding_digest: [u8; 32],
-    #[cfg(test)]
-    failing_ordinal: Option<usize>,
-    #[cfg(test)]
-    read_calls: usize,
-}
-
-impl<const N: usize> FrozenRecentSnapshot<N> {
-    pub(super) fn new(lineage: RecentSnapshotLineage, slots: [RecentSnapshotSlot; N]) -> Self {
-        let content_digest = content_digest(&slots);
-        let binding_digest = lineage_binding_digest(lineage, content_digest);
-        Self {
-            lineage,
-            slots,
-            content_digest,
-            binding_digest,
-            #[cfg(test)]
-            failing_ordinal: None,
-            #[cfg(test)]
-            read_calls: 0,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn failing(
-        lineage: RecentSnapshotLineage,
-        slots: [RecentSnapshotSlot; N],
-        failing_ordinal: usize,
-    ) -> Self {
-        let content_digest = content_digest(&slots);
-        let binding_digest = lineage_binding_digest(lineage, content_digest);
-        Self {
-            lineage,
-            slots,
-            content_digest,
-            binding_digest,
-            failing_ordinal: Some(failing_ordinal),
-            read_calls: 0,
-        }
-    }
-
-    pub(super) const fn slots(&self) -> usize {
-        N
-    }
-
-    pub(super) const fn identity(&self) -> RecentSnapshotIdentity {
-        self.lineage.finalized
-    }
-
-    pub(super) const fn lineage(&self) -> RecentSnapshotLineage {
-        self.lineage
-    }
-
-    pub(super) const fn content_digest(&self) -> [u8; 32] {
-        self.content_digest
-    }
-
-    pub(super) const fn binding_digest(&self) -> [u8; 32] {
-        self.binding_digest
-    }
-
-    /// Reads one public slot without accepting any query-derived identifier.
-    pub(super) fn read_slot(
-        &mut self,
-        ordinal: usize,
-    ) -> Result<RecentSnapshotSlot, RecentSnapshotReadError> {
-        #[cfg(test)]
-        {
-            let calls = self.read_calls;
-            let expected = calls.checked_rem(N).ok_or(RecentSnapshotReadError)?;
-            if ordinal != expected || ordinal >= N {
-                return Err(RecentSnapshotReadError);
-            }
-            self.read_calls = calls.checked_add(1).ok_or(RecentSnapshotReadError)?;
-            if self.failing_ordinal == Some(ordinal) {
-                return Err(RecentSnapshotReadError);
-            }
-        }
-        self.slots
-            .get(ordinal)
-            .copied()
-            .ok_or(RecentSnapshotReadError)
-    }
-
-    #[cfg(test)]
-    pub(super) const fn read_calls(&self) -> usize {
-        self.read_calls
-    }
-
-    /// Simulates post-construction corruption without changing the bound digest.
-    #[cfg(test)]
-    pub(super) fn replace_slot(&mut self, ordinal: usize, slot: RecentSnapshotSlot) {
-        if let Some(destination) = self.slots.get_mut(ordinal) {
-            *destination = slot;
-        }
-    }
-
-    /// Simulates post-construction checkpoint-identity corruption.
-    #[cfg(test)]
-    pub(super) fn replace_identity(&mut self, identity: RecentSnapshotIdentity) {
-        self.lineage.finalized = identity;
-    }
-
-    /// Simulates post-construction generation or recent-tip corruption.
-    #[cfg(test)]
-    pub(super) fn replace_lineage(&mut self, lineage: RecentSnapshotLineage) {
-        self.lineage = lineage;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,7 +291,7 @@ mod tests {
         recent_tip_height: u32,
         recent_tip_hash_display: [u8; 32],
     ) -> RecentSnapshotLineage {
-        RecentSnapshotLineage::new(
+        RecentSnapshotLineage::from_parts_for_tests(
             generation,
             identity(),
             recent_tip_height,
@@ -582,8 +381,9 @@ mod tests {
             RecentSnapshotIdentity::new(0, 100, FINALIZED_HASH, 1, 7, 10),
         ];
         for finalized in finalized_variants {
-            let variant_lineage = RecentSnapshotLineage::new(1, finalized, 101, RECENT_TIP_HASH)
-                .expect("field-sensitivity lineage remains internally consistent");
+            let variant_lineage =
+                RecentSnapshotLineage::from_parts_for_tests(1, finalized, 101, RECENT_TIP_HASH)
+                    .expect("field-sensitivity lineage remains internally consistent");
             assert_ne!(
                 lineage_binding_digest(variant_lineage, snapshot_content),
                 base
@@ -594,18 +394,20 @@ mod tests {
     #[test]
     fn lineage_rejects_zero_generation_and_invalid_seam_bounds() {
         assert_eq!(
-            RecentSnapshotLineage::new(0, identity(), 101, RECENT_TIP_HASH),
+            RecentSnapshotLineage::from_parts_for_tests(0, identity(), 101, RECENT_TIP_HASH),
             Err(RecentSnapshotLineageError::ZeroGeneration)
         );
         assert_eq!(
-            RecentSnapshotLineage::new(1, identity(), 99, RECENT_TIP_HASH),
+            RecentSnapshotLineage::from_parts_for_tests(1, identity(), 99, RECENT_TIP_HASH),
             Err(RecentSnapshotLineageError::RecentTipBelowFinalized)
         );
         assert_eq!(
-            RecentSnapshotLineage::new(1, identity(), 100, RECENT_TIP_HASH),
+            RecentSnapshotLineage::from_parts_for_tests(1, identity(), 100, RECENT_TIP_HASH),
             Err(RecentSnapshotLineageError::SeamTipHashMismatch)
         );
-        assert!(RecentSnapshotLineage::new(1, identity(), 100, FINALIZED_HASH).is_ok());
+        assert!(
+            RecentSnapshotLineage::from_parts_for_tests(1, identity(), 100, FINALIZED_HASH).is_ok()
+        );
     }
 
     #[test]

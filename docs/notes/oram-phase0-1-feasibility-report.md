@@ -79,22 +79,31 @@ corpus accounting, logical schedules using a concrete runtime-owned
 to in-memory generation, exact finalized identity, and caller-supplied recent
 tip metadata. That lineage digest is bound to continuations and rechecked after
 every full scan. A private in-memory publication model retires an active
-generation before refresh and admits only its opaque outstanding build ticket,
-but has no runtime caller. The work also provides bounded generic-builder
-measurement plumbing and an authenticated public projection-manifest/rebuild
-contract around a pinned upstream experiment. The frozen-snapshot evidence uses
-mock-constructed contents; neither its recent tip nor slot provenance is
-authenticated, and its lineage digest is not a canonical/live Zaino snapshot
-root. An adjacent ORAM-agnostic `zaino-state` API now value-binds a
-caller-supplied finalized checkpoint to one immutable NFS snapshot and derives
-the structurally consistent canonical blocks above that seam without DB/source
-fallback. A private default-off `corpus-zaino` conversion candidate consumes
-that snapshot together with an immutable, identity-pinned finalized-outpoint
-classifier, preserves dense standard-event slots, and tracks nonstandard
-states. No production resolver or runtime wiring invokes it; it does not
-construct `FrozenRecentSnapshot`, assign or publish a generation, or atomically
-capture a whole serving epoch. The work therefore still does not establish live
-`zaino-oram` NFS acquisition,
+generation before refresh and admits only its opaque outstanding build ticket.
+Under the default-off `corpus-zaino` feature, a private generation-free
+conversion candidate consumes one canonical recent-chain snapshot together with
+an immutable, identity-pinned finalized-outpoint classifier, preserves dense
+standard-event slots, and tracks nonstandard states. The publication owner is
+the sole generation authority: it accepts that candidate only through its
+current outstanding ticket, checks exact finalized identity and recent tip
+height/hash, and moves the slots into `FrozenRecentSnapshot`; raw-slot activation
+is test-only. The intended refresh flow requires `begin_update` before
+conversion, but the candidate type does not encode the ticket lineage and no live
+controller enforces that ordering. This closes only private in-memory
+owner-mediated construction, not a race-free refresh controller or
+whole-serving-epoch orchestration, and it has no runtime caller. The
+listener-free runtime's frozen-snapshot fixtures remain
+mock-constructed; neither their recent tip nor slot provenance is authenticated,
+and their lineage digest is not a canonical/live Zaino snapshot root. The work
+also provides bounded generic-builder measurement plumbing and an authenticated
+public projection-manifest/rebuild contract around a pinned upstream experiment.
+An adjacent ORAM-agnostic `zaino-state` API value-binds a caller-supplied
+finalized checkpoint to one immutable NFS snapshot and derives the structurally
+consistent canonical blocks above that seam without DB/source fallback. No
+production resolver, caller, live DB/NFS acquisition, runtime, or service wiring
+uses the owner-mediated handoff, and it does not atomically capture a whole
+serving epoch. The work therefore still does not establish live `zaino-oram` NFS
+acquisition,
 authenticated canonical provenance, reorg-safe service publication, durable
 generation rollback protection, equal physical work, allocator or timing
 equivalence, production encryption, durable ORAM state, a measured recovery-time objective,
@@ -115,9 +124,14 @@ The evaluated worktree implements:
 - a private default-off `corpus-zaino` conversion candidate that consumes one
   `CanonicalRecentChainSnapshot` plus an immutable, identity-pinned finalized
   outpoint classifier, preserves dense standard-event slots in canonical
-  order, and tracks nonstandard states. It has no production resolver or
-  runtime wiring and does not construct or publish a frozen snapshot or whole
-  serving epoch;
+  order, and tracks nonstandard states without assigning a generation. The
+  private publication owner accepts it only through the current outstanding
+  ticket, validates exact finalized and recent-tip metadata, and moves its slots
+  into the owner-generated `FrozenRecentSnapshot`; raw-slot activation is
+  test-only. `begin_update` before conversion remains a control-flow obligation,
+  not a type-enforced candidate binding, and no live controller implements a
+  race-free refresh or whole-serving epoch. This path has no production resolver,
+  caller, live DB/NFS source, runtime, or service wiring;
 - fixed transparent UTXO shapes and named persistence-boundary conversions;
 - an exact 72-byte append-only `PersistentUtxoEvent` byte representation with
   named finalized create/spend constructors, storage-boundary state validation,
@@ -202,6 +216,11 @@ The evaluated worktree implements:
   active generation before refresh, accepts only its opaque outstanding build
   ticket, leaves newer work/publications intact when a stale ticket completes,
   and retains immutable pinned leases for a final current-generation check.
+  With `corpus-zaino`, converted-candidate activation requires exact finalized
+  and recent-tip metadata before moving the slots into an owner-generated
+  frozen snapshot; the direct raw-slot activation path is test-only.
+  Begin-before-conversion ordering is not type-enforced and has no live refresh
+  controller.
   Advances, same-height and shortening reorgs produce distinct lineage bindings
   even with identical slots. This model has no runtime caller, and owner
   recreation relies on the surrounding durable projection epoch being rolled;
@@ -210,9 +229,10 @@ The evaluated worktree implements:
   snapshot, verifies its declared tip, height-map segment from seam through tip,
   mapped payload identities, and parent continuity, ignores side blocks, and
   returns cloned blocks strictly above the seam oldest-first. The synchronous
-  snapshot-only path cannot fall back to finalized storage or a backing source. It is not an
-  atomic finalized-plus-NFS capture and has no `zaino-oram` conversion,
-  generation assignment, runtime caller, or whole-serving-epoch publication;
+  snapshot-only path cannot fall back to finalized storage or a backing source.
+  The seam itself is not an atomic finalized-plus-NFS capture and performs no
+  `zaino-oram` conversion, generation assignment, runtime call, or
+  whole-serving-epoch publication;
 - a redacted transparent-event extraction seam from `IndexedBlock`;
 - shared feature-gated address-history write/delete consumers of that seam,
   including legacy nonstandard-key preservation;
@@ -576,7 +596,7 @@ open the server gate.
 | Independent private proto | Missing | No `zainod-oram/proto` or `zaino.private.v1` generation exists |
 | Private service adapter | Missing | A listener-free module-private runtime adapter exists, but no private proto, gRPC service, transport, or real outer-status equivalence test exists |
 | Frame/byte/completion equivalence | Partial model | Every offline round models one fixed request and response application envelope, equal bytes, and unary completion; this is explicitly not protobuf, HTTP/2, TLS, packet-capture, or outer-status evidence |
-| NFS/source-call equivalence | Partial logical mock | The runtime owns a concrete `FrozenRecentSnapshot<N>` rather than a generic source, and the frozen type computes its content commitment internally from fixed slots and binds it to in-memory generation, exact finalized identity, and recent tip height/hash. Each round reads only public sequential ordinals, completes the nonzero profile-bound scan, rechecks exact checkpoint identity and recomputed content/lineage commitments, validates same-outpoint ownership/sequencing, and merges recent creates/spends before pagination. The lineage commitment is continuation-query-digest-bound across runtime lifecycles, and query-derived host/source calls remain modeled at zero. A private in-memory publication model rejects stale tickets without disturbing newer work, but it has no runtime caller and depends on a rolled projection epoch when recreated. This is not an authenticated canonical/live Zaino snapshot root; there is no live NFS acquisition, canonical ancestry validation, reorg-safe service publication, or integrated validator/LMDB/raw-transaction instrumentation |
+| NFS/source-call equivalence | Partial logical mock | The runtime owns a concrete `FrozenRecentSnapshot<N>` rather than a generic source, and the frozen type computes its content commitment internally from fixed slots and binds it to in-memory generation, exact finalized identity, and recent tip height/hash. Each round reads only public sequential ordinals, completes the nonzero profile-bound scan, rechecks exact checkpoint identity and recomputed content/lineage commitments, validates same-outpoint ownership/sequencing, and merges recent creates/spends before pagination. The lineage commitment is continuation-query-digest-bound across runtime lifecycles, and query-derived host/source calls remain modeled at zero. Under `corpus-zaino`, the private in-memory publication owner accepts a generation-free converted candidate only through its current ticket, checks exact finalized/tip metadata, and moves its slots into an owner-generated frozen snapshot; raw-slot activation is test-only. Begin-before-conversion ordering is not type-enforced, and no live refresh controller owns it. The owner still has no runtime caller and depends on a rolled projection epoch when recreated. This is not an authenticated canonical/live Zaino snapshot root; there is no live NFS acquisition, canonical ancestry validation, reorg-safe service publication, or integrated validator/LMDB/raw-transaction instrumentation |
 | Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior; static ordinary-source versus offline-oracle UTXO parity is committed, while live direct/RPC and finalised-database parity remain open |
 | Token fixed-work equivalence | Partial pass for logical schedule | Initial, valid, tampered, expired, query-mismatched, snapshot-content- or generation-mismatched across runtime lifecycles, replayed, and guard-unavailable paths perform one modeled token open, replay lookup/write-back, complete finalized-store and recent-snapshot scans, token issue, response encode, fixed frames/bytes, and completion. This is not instruction/allocation/memory/page/timing or production-crypto equivalence |
 | Test runtime discipline | Pass in this slice | Synchronous cases use `#[test]`; the shadow fixture's two tests alone use current-thread `#[tokio::test]` because they await the ordinary `BlockchainSource` query |
@@ -595,7 +615,7 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Single mutation worker and backend telemetry | Partial typed integration | A portable std-thread worker exclusively owns the exact two-table executor, validates a 1..=4096 research queue bound before allocation, bounds accepted-not-started whole business commands with a `sync_channel`, drains FIFO admissions before shutdown/join, removes raw read/insert bypasses, and separates lifecycle from terminal fault health. Its identifier-free counters are internal and not approved for export. The private owner validates exact network/schema/key-epoch and admission compatibility before allocation, owns the coordinator plus worker, and joins it on consuming shutdown without exporting snapshots. Generic native Linux CI binds the real typed stores to that owner and completes the full three-block/seven-event lifecycle. There is no stash metric, runtime projection lifecycle, or fixed-cadence suppression policy |
 | Volatile rebuild path | Partial pass | Portable and Linux-x86_64-gated typed-worker tests shut down, classify the authenticated prior manifest, allocate a fresh worker under a new projection epoch, replay genesis-forward, and reproduce the same semantic event-log root/checkpoint while advancing publication lineage. The source-bound runner additionally requires exact replayed corpus equality and exposes an allocation-through-readiness budget with fixed-snapshot provenance. No production owner, controlled cold-cache state, full-corpus artifact, target-hardware timing, or full-service RTO is measured |
 | Shadow comparison with ordinary Zaino | Pass for one static fixture checkpoint | A default-off test independently obtains ordinary UTXOs from `MockchainSource::get_address_utxos` over Zebra full blocks and projection UTXOs from `IndexedBlock` transparent events; it compares every standard address observed through immutable regtest-vector height 200 plus an absent address, at the same height/hash. Live direct/RPC, finalised-database, mainnet, and reorg shadow modes remain missing |
-| Canonical recent-chain seam and conversion candidate | Partial API/logical pass | `zaino-state` synchronously derives a structurally consistent segment from one immutable NFS snapshot after value-binding the caller's exact finalized height/hash. It checks the retained seam payload identity, declared tip, contiguous height-map segment from seam through tip, mapped payload identities, and parent links; excludes side blocks and any DB/source fallback. A private default-off `corpus-zaino` candidate consumes that value with an immutable identity-pinned finalized-outpoint classifier, preserves dense standard-event slots, and tracks nonstandard states. It does not atomically capture finalized storage with NFS and has no production resolver or runtime wiring, `FrozenRecentSnapshot` construction, generation/publication ownership, authenticated provenance, reorg-safe whole-serving epoch, service/cryptography, TDX, or mainnet claim |
+| Canonical recent-chain seam and owner-mediated conversion | Partial API/logical pass | `zaino-state` synchronously derives a structurally consistent segment from one immutable NFS snapshot after value-binding the caller's exact finalized height/hash. It checks the retained seam payload identity, declared tip, contiguous height-map segment from seam through tip, mapped payload identities, and parent links; excludes side blocks and any DB/source fallback. A private default-off `corpus-zaino` candidate consumes that value with an immutable identity-pinned finalized-outpoint classifier, preserves dense standard-event slots, and tracks nonstandard states without assigning a generation. The private publication owner accepts the candidate only through its current ticket, checks exact finalized/tip metadata, and moves its slots into an owner-generated `FrozenRecentSnapshot`; direct raw-slot activation is test-only. The intended `begin_update`-before-conversion order is not type-enforced and has no live controller. This owner-mediated construction does not atomically capture finalized storage with NFS and provides no production resolver, caller, live DB/NFS acquisition, runtime or service wiring, authenticated provenance, durability, reorg-safe whole-serving epoch, production cryptography, TDX, or mainnet claim |
 | Zero query-derived source calls | Pass for current logical type boundary | The recent-snapshot interface accepts only public ordinals, and the query engine has no validator/LMDB/raw-transaction dependency; `source_calls` remains modeled at zero. This is not an integrated live-readiness or call-trace result |
 | Long-run failure bound | Missing | No target-load mixed-operation soak or node-year analysis exists |
 
@@ -630,7 +650,7 @@ yet stakeholder-approved.
 | Address-directory lookup | Must hide | Directory and event-page lookup both protected | A module-private synchronous connector, bounded business-command worker, and private offline projection owner combine exact directory/page encodings, shared full-capacity sizing, keyed fixed-probe binding, and exact identity/admission validation; generic native CI executes the real typed stores and exact worker behind that boundary | Open: no runtime caller, content authentication, crash-safe commit, target-capacity run, or measured physical trace |
 | Query-derived allocation | Must hide | Fixed allocation/work budget | Offline recorder validates zero explicit modeled query allocations | Open: allocator/page/instruction measurement absent |
 | Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | The concrete frozen snapshot accepts only public sequential ordinals; there is no generic query-facing source interface, and query-derived `source_calls` remain modeled at zero | Open: no integrated source instrumentation or live readiness proof |
-| NFS scan work | Must hide | Complete profile-fixed scan on every query | Runtime fixtures execute a nonzero four-slot ordinal-only full scan and merge through a concrete `FrozenRecentSnapshot<4>` whose content commitment is computed internally and bound to in-memory generation, exact finalized identity, and recent tip height/hash. Each round completes the scan before rechecking checkpoint identity, recomputed content/lineage commitments, and same-outpoint semantics; faults, drift, malformed sequences, finalized-owner mismatches, and duplicate creates fail closed only after full work. Separately, `zaino-state` derives a value-bound, structurally consistent canonical recent segment from one immutable NFS snapshot without DB/source fallback, and a private `corpus-zaino` candidate converts that value plus an immutable identity-pinned finalized-outpoint classifier into dense standard-event slots while tracking nonstandard states | Open: no production resolver/runtime wiring, `FrozenRecentSnapshot` construction, generation/publication, atomic whole-serving epoch, or authenticated canonical/live provenance; no service/production cryptography, physical/allocator/timing equivalence, TDX, mainnet, or target-load evidence |
+| NFS scan work | Must hide | Complete profile-fixed scan on every query | Runtime fixtures execute a nonzero four-slot ordinal-only full scan and merge through a concrete `FrozenRecentSnapshot<4>` whose content commitment is computed internally and bound to in-memory generation, exact finalized identity, and recent tip height/hash. Each round completes the scan before rechecking checkpoint identity, recomputed content/lineage commitments, and same-outpoint semantics; faults, drift, malformed sequences, finalized-owner mismatches, and duplicate creates fail closed only after full work. Separately, `zaino-state` derives a value-bound, structurally consistent canonical recent segment from one immutable NFS snapshot without DB/source fallback, and a private `corpus-zaino` candidate converts that value plus an immutable identity-pinned finalized-outpoint classifier into dense standard-event slots while tracking nonstandard states. The private owner accepts only an exact-metadata match through its current ticket and moves the candidate slots into an owner-generated frozen snapshot; raw-slot activation is test-only | Open: begin-before-conversion ordering is not type-enforced and has no live refresh controller; no production resolver/caller, live DB/NFS acquisition, runtime/service wiring, atomic whole-serving epoch, durability, or authenticated canonical/live provenance; no production cryptography, physical/allocator/timing equivalence, TDX, mainnet, or target-load evidence |
 | Request/response application bytes | Fixed public class | Exactly the attested profile size | The listener-free profile/runtime trace binds equal fixed application-envelope bytes; the inner codec rejects undersized compiled shapes and emits one exact protected envelope in each direction | Open: no production AEAD, protobuf/TLS, transport trace, or packet capture |
 | Frame count and completion shape | Fixed public class | Same across protected outcomes | Offline trace models one request, one response, and unary completion | Open: no network or outer-status evidence |
 | Method class | Permitted only if contract exposes separate methods | Preferred single `QueryPage` hides it | No proto exists | Decision retained, unimplemented |
@@ -1040,10 +1060,11 @@ exposing a private server:
    genesis-forward rebuild protocol against a declared target-hardware RTO;
 7. resolve git-dependency and TDX/verifier licensing with an exact SBOM;
 8. extend the completed logical token/runtime and injected mock scan/merge model
-   by supplying the production finalized-outpoint resolver, wiring the private
-   conversion candidate into `FrozenRecentSnapshot` construction and
-   generation/publication ownership, and adding live source/NFS acquisition,
-   atomic canonical whole-serving epochs, private schema, transport, allocator,
+   by supplying the production finalized-outpoint resolver, implementing a live
+   refresh controller that begins the update before conversion, wiring live
+   source/NFS acquisition into the existing owner-mediated candidate activation,
+   binding the owner-generated `FrozenRecentSnapshot` into atomic canonical
+   whole-serving epochs, and adding private schema, transport, allocator,
    instruction/memory/page, timing, and outer-status evidence without opening a
    production listener prematurely;
    retain the legacy schema golden;

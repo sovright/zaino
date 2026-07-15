@@ -77,8 +77,13 @@ offline dependency experiment:
   active generation before refresh, uses an opaque ticket for exact activation,
   retains immutable pinned leases, and permits a final current-generation
   check. Deterministic tests cover advances, same-height and shortening reorgs,
-  failed builds, stale tickets, finalized rollback, and overflow. The model is
-  not connected to the listener-free runtime or a Zaino source;
+  failed builds, stale tickets, finalized rollback, and overflow. Under
+  `corpus-zaino`, the owner accepts a generation-free converted candidate only
+  through the current outstanding ticket, requires its finalized identity and
+  recent tip height/hash to match the ticket exactly, and moves its slots into
+  the owner-generated `FrozenRecentSnapshot`. Direct raw-slot activation exists
+  only for tests. The model is not connected to the listener-free runtime or a
+  Zaino source;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -131,17 +136,24 @@ above the seam without DB/source fallback. Under the default-off
 `corpus-zaino` feature, a private conversion candidate consumes that
 `CanonicalRecentChainSnapshot` together with an immutable, identity-pinned
 finalized-outpoint classifier. It preserves dense standard-event slots in
-canonical order while tracking nonstandard states separately. No production
-resolver or runtime wiring invokes the candidate, and it does not construct
-`FrozenRecentSnapshot`, assign or publish a generation, or atomically capture a
-whole serving epoch. The frozen snapshot's lineage digest binds caller-supplied
-generation/finalized/tip metadata to the internally computed deterministic slot
-commitment, but does not authenticate that metadata or prove its canonical
-ancestry. The private publication owner is an in-memory model with no runtime
-caller or durable rollback authority. Neither commitment is an authenticated
-canonical/live Zaino snapshot root, and this conversion slice supplies no
-service or production cryptography and establishes no physical-obliviousness,
-allocator, timing, TDX, mainnet, or target-load claim.
+canonical order while tracking nonstandard states separately, and it remains
+generation-free. The private publication owner reserves the generation and exact
+finalized/tip lineage in its outstanding ticket. Candidate activation consumes
+that current ticket, rejects any finalized-identity or recent-tip mismatch, and
+moves the candidate's slots into the resulting `FrozenRecentSnapshot`; the
+raw-slot activation seam is `#[cfg(test)]` only. The intended refresh flow still
+requires `begin_update` before conversion, but the candidate type is not bound to
+the ticket and no live controller enforces that ordering. This closes only the
+private in-memory owner/candidate construction handoff, not a race-free refresh
+controller or whole-serving-epoch orchestration. No production resolver, caller,
+live DB/NFS source, runtime, or service uses it, and it provides no durable
+rollback authority. The frozen snapshot's
+lineage digest binds owner-assigned generation and exact finalized/tip metadata
+to the internally computed deterministic slot commitment, but does not
+authenticate that metadata or prove its canonical ancestry. Neither commitment
+is an authenticated canonical/live Zaino snapshot root, and this slice supplies
+no production cryptography or physical-obliviousness, allocator, timing, TDX,
+mainnet, or target-load evidence.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline

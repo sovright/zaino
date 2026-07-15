@@ -13,9 +13,16 @@ and this library adheres to Rust's notion of
   conversion candidate that consumes a `CanonicalRecentChainSnapshot` together
   with an immutable, identity-pinned finalized-outpoint classifier. It preserves
   dense standard-event slots in canonical order while tracking nonstandard
-  states separately. This slice has no production resolver or runtime wiring,
-  generation assignment or publication, `FrozenRecentSnapshot` construction,
-  atomic whole-serving epoch, authenticated provenance, service or production
+  states separately and remains generation-free. The private single-writer
+  publication owner is the sole generation authority: through its current
+  outstanding ticket it requires exact candidate finalized and recent-tip
+  metadata, then moves the candidate's slots into `FrozenRecentSnapshot`. Direct
+  raw-slot activation is test-only. The intended begin-update-before-conversion
+  order remains a control-flow obligation rather than a type-enforced candidate
+  binding, and no live controller enforces it. This is owner-mediated construction,
+  not a race-free refresh controller or whole-serving-epoch orchestration. The
+  slice still has no production resolver, caller, live DB/NFS acquisition,
+  runtime or service wiring, durability, authenticated provenance, production
   cryptography, TDX, or mainnet claim.
 - `zaino-state`: add a synchronous immutable-snapshot API that verifies an
   exact finalized height/hash seam and returns only canonical recent
@@ -25,8 +32,9 @@ and this library adheres to Rust's notion of
   structurally preventing DB or validator fallback. It value-binds a
   caller-supplied checkpoint to one immutable NFS snapshot rather than
   atomically capturing finalized storage with NFS. It is an ORAM-agnostic
-  chain-data seam only; conversion, generation assignment, runtime wiring, and
-  service publication remain open.
+  chain-data seam only; production finalized-outpoint resolution, live DB/NFS
+  acquisition, runtime wiring, atomic serving-epoch capture, and service
+  publication remain open.
 - `zaino-oram`: frozen recent snapshots now bind an in-memory monotonic
   generation, exact finalized identity, recent tip height/hash, and the
   internally computed fixed-slot commitment into one lineage digest. The

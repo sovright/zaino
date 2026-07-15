@@ -12,11 +12,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   candidate that consumes one `CanonicalRecentChainSnapshot` and an immutable,
   identity-pinned finalized-outpoint classifier. It preserves dense
   standard-event slots in canonical order and tracks nonstandard states without
-  treating them as ordinary address events. No production resolver or runtime
-  wiring invokes it, and it does not assign a generation, publish a snapshot,
-  construct `FrozenRecentSnapshot`, atomically capture a whole serving epoch,
-  authenticate provenance, or establish service, production-cryptography, TDX,
-  or mainnet evidence.
+  treating them as ordinary address events, and the candidate remains
+  generation-free. The private single-writer publication owner remains the sole
+  generation authority: it accepts a candidate only through its current
+  outstanding ticket, requires exact finalized and recent-tip metadata, and
+  moves the candidate's slots into `FrozenRecentSnapshot`. Direct raw-slot
+  activation is test-only. The intended begin-update-before-conversion order is
+  a control-flow obligation, not a type-enforced candidate binding, and no live
+  controller enforces it. This is owner-mediated construction, not a race-free
+  refresh controller or whole-serving-epoch orchestration. No production
+  resolver, caller, live DB/NFS source, runtime, or service invokes this path,
+  and it provides no durability, authenticated provenance,
+  production-cryptography, TDX, or mainnet evidence.
 - Frozen recent snapshots now bind an in-memory monotonic generation, exact
   finalized identity, recent tip height/hash, and the internally computed
   fixed-slot commitment into one lineage digest. The listener-free runtime

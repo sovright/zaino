@@ -89,6 +89,21 @@ pub(super) struct ConvertedRecentSnapshot<const N: usize> {
 }
 
 impl<const N: usize> ConvertedRecentSnapshot<N> {
+    #[cfg(test)]
+    pub(super) const fn from_parts_for_tests(
+        finalized: RecentSnapshotIdentity,
+        recent_tip_height: u32,
+        recent_tip_hash_display: [u8; 32],
+        slots: [RecentSnapshotSlot; N],
+    ) -> Self {
+        Self {
+            finalized,
+            recent_tip_height,
+            recent_tip_hash_display,
+            slots,
+        }
+    }
+
     pub(super) const fn finalized(&self) -> RecentSnapshotIdentity {
         self.finalized
     }
@@ -103,6 +118,10 @@ impl<const N: usize> ConvertedRecentSnapshot<N> {
 
     pub(super) const fn slots(&self) -> &[RecentSnapshotSlot; N] {
         &self.slots
+    }
+
+    pub(super) fn into_slots(self) -> [RecentSnapshotSlot; N] {
+        self.slots
     }
 }
 
