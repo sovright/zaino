@@ -83,7 +83,208 @@ pub enum ChainIndexSnapshot {
     },
 }
 
+/// One structurally consistent, immutable canonical chain segment above a finalized checkpoint.
+///
+/// [`Self::blocks`] contains only blocks strictly above [`Self::finalized`], in
+/// ascending height order through [`Self::tip`]. The segment owns cloned block
+/// values so it cannot observe a later non-finalized-state publication. It is a
+/// value-bound join against one immutable non-finalized snapshot, not an atomic
+/// capture of finalized storage and non-finalized state.
+#[derive(Clone)]
+pub struct CanonicalRecentChainSnapshot {
+    finalized: BlockIndex,
+    tip: BlockIndex,
+    blocks: Arc<[IndexedBlock]>,
+}
+
+impl CanonicalRecentChainSnapshot {
+    /// Returns the finalized checkpoint that immediately precedes the recent blocks.
+    pub fn finalized(&self) -> BlockIndex {
+        self.finalized
+    }
+
+    /// Returns the canonical tip captured by this snapshot.
+    pub fn tip(&self) -> BlockIndex {
+        self.tip
+    }
+
+    /// Returns canonical blocks strictly above the finalized checkpoint, oldest first.
+    pub fn blocks(&self) -> &[IndexedBlock] {
+        &self.blocks
+    }
+}
+
+/// Why a canonical recent-chain segment could not be derived from one chain-index snapshot.
+///
+/// Errors carry public heights only. They intentionally omit hashes and block data so normal
+/// error formatting cannot disclose or accidentally retain full snapshot contents.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CanonicalRecentChainSnapshotError {
+    /// The chain index has not published a non-finalized snapshot yet.
+    #[error("canonical recent chain is unavailable while finalized state is still syncing")]
+    StillSyncing,
+    /// The requested finalized checkpoint is above the immutable snapshot tip.
+    #[error("finalized checkpoint height {finalized_height} is above snapshot tip {tip_height}")]
+    FinalizedAboveTip {
+        /// Requested finalized checkpoint height.
+        finalized_height: Height,
+        /// Immutable snapshot tip height.
+        tip_height: Height,
+    },
+    /// The canonical height map or block map does not retain the requested finalized checkpoint.
+    #[error("finalized checkpoint is missing at height {height}")]
+    FinalizedCheckpointMissing {
+        /// Missing finalized checkpoint height.
+        height: Height,
+    },
+    /// The canonical height map binds the finalized height to a different hash.
+    #[error("finalized checkpoint hash does not match at height {height}")]
+    FinalizedCheckpointHashMismatch {
+        /// Mismatched finalized checkpoint height.
+        height: Height,
+    },
+    /// The finalized block payload does not identify itself as the requested checkpoint.
+    #[error("finalized checkpoint payload identity does not match at height {height}")]
+    FinalizedCheckpointIdentityMismatch {
+        /// Mismatched finalized checkpoint height.
+        height: Height,
+    },
+    /// The declared best tip and canonical height map disagree.
+    #[error("canonical height map does not match the declared tip at height {height}")]
+    TipMismatch {
+        /// Declared tip height.
+        height: Height,
+    },
+    /// A height is absent between the finalized checkpoint and the declared tip.
+    #[error("canonical recent chain is not contiguous at height {height}")]
+    NonContiguousHeight {
+        /// First missing canonical height.
+        height: Height,
+    },
+    /// The height map points to a block hash that has no corresponding block payload.
+    #[error("canonical block payload is missing at height {height}")]
+    CanonicalBlockMissing {
+        /// Height whose canonical block payload is missing.
+        height: Height,
+    },
+    /// A mapped block payload's internal height or hash disagrees with the canonical map.
+    #[error("canonical block payload identity does not match at height {height}")]
+    CanonicalBlockIdentityMismatch {
+        /// Height whose canonical block payload has the wrong identity.
+        height: Height,
+    },
+    /// A canonical block does not name the preceding canonical block as its parent.
+    #[error("canonical parent link does not match at height {height}")]
+    ParentHashMismatch {
+        /// Height whose parent link is inconsistent.
+        height: Height,
+    },
+}
+
 impl ChainIndexSnapshot {
+    /// Derives the canonical recent chain above `finalized` from this immutable snapshot only.
+    ///
+    /// This method never consults finalized storage or a backing validator. It verifies the exact
+    /// finalized height/hash seam, the declared best tip, every canonical height and mapped block
+    /// payload identity, and parent-hash continuity before returning cloned blocks in ascending
+    /// height order. Blocks present only in the side-chain cache are ignored because canonical
+    /// membership comes solely from the snapshot's height-to-hash map. The caller-supplied
+    /// checkpoint is joined by value to one immutable non-finalized snapshot; finalized storage is
+    /// not captured atomically with it.
+    pub fn canonical_recent_chain(
+        &self,
+        finalized: BlockIndex,
+    ) -> Result<CanonicalRecentChainSnapshot, CanonicalRecentChainSnapshotError> {
+        let non_finalized_snapshot = match self {
+            Self::NonFinalizedStateExists {
+                non_finalized_snapshot,
+            } => non_finalized_snapshot,
+            Self::StillSyncingFinalizedState { .. } => {
+                return Err(CanonicalRecentChainSnapshotError::StillSyncing)
+            }
+        };
+        let tip = non_finalized_snapshot.best_tip;
+
+        if finalized.height > tip.height {
+            return Err(CanonicalRecentChainSnapshotError::FinalizedAboveTip {
+                finalized_height: finalized.height,
+                tip_height: tip.height,
+            });
+        }
+
+        let tip_hash = non_finalized_snapshot
+            .heights_to_hashes
+            .get(&tip.height)
+            .ok_or(CanonicalRecentChainSnapshotError::TipMismatch { height: tip.height })?;
+        if *tip_hash != tip.hash
+            || non_finalized_snapshot
+                .heights_to_hashes
+                .keys()
+                .any(|height| *height > tip.height)
+        {
+            return Err(CanonicalRecentChainSnapshotError::TipMismatch { height: tip.height });
+        }
+
+        let finalized_hash = non_finalized_snapshot
+            .heights_to_hashes
+            .get(&finalized.height)
+            .ok_or(
+                CanonicalRecentChainSnapshotError::FinalizedCheckpointMissing {
+                    height: finalized.height,
+                },
+            )?;
+        if *finalized_hash != finalized.hash {
+            return Err(
+                CanonicalRecentChainSnapshotError::FinalizedCheckpointHashMismatch {
+                    height: finalized.height,
+                },
+            );
+        }
+
+        let finalized_block = non_finalized_snapshot.blocks.get(&finalized.hash).ok_or(
+            CanonicalRecentChainSnapshotError::FinalizedCheckpointMissing {
+                height: finalized.height,
+            },
+        )?;
+        if finalized_block.height() != finalized.height || *finalized_block.hash() != finalized.hash
+        {
+            return Err(
+                CanonicalRecentChainSnapshotError::FinalizedCheckpointIdentityMismatch {
+                    height: finalized.height,
+                },
+            );
+        }
+
+        let mut previous_hash = finalized.hash;
+        let mut recent_blocks = Vec::new();
+        for height in Height::range_inclusive(finalized.height, tip.height).skip(1) {
+            let canonical_hash = non_finalized_snapshot
+                .heights_to_hashes
+                .get(&height)
+                .ok_or(CanonicalRecentChainSnapshotError::NonContiguousHeight { height })?;
+            let block = non_finalized_snapshot
+                .blocks
+                .get(canonical_hash)
+                .ok_or(CanonicalRecentChainSnapshotError::CanonicalBlockMissing { height })?;
+            if block.height() != height || block.hash() != canonical_hash {
+                return Err(
+                    CanonicalRecentChainSnapshotError::CanonicalBlockIdentityMismatch { height },
+                );
+            }
+            if *block.context.parent_hash() != previous_hash {
+                return Err(CanonicalRecentChainSnapshotError::ParentHashMismatch { height });
+            }
+            previous_hash = *canonical_hash;
+            recent_blocks.push(block.clone());
+        }
+
+        Ok(CanonicalRecentChainSnapshot {
+            finalized,
+            tip,
+            blocks: recent_blocks.into(),
+        })
+    }
+
     /// Convenience fn to go from ChainIndexSnapshot to Option<NonFinalizedBlockCacheSnapshot>,
     /// throwing away the validator_finalized_height in the None case. For ease of mapping, etc.
     pub(crate) fn get_nfs_snapshot(&self) -> Option<&NonfinalizedBlockCacheSnapshot> {

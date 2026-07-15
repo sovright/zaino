@@ -9,6 +9,16 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-state`: add a synchronous immutable-snapshot API that verifies an
+  exact finalized height/hash seam and returns only canonical recent
+  `IndexedBlock`s above it, oldest-to-newest. The API checks structural
+  consistency of the retained seam payload, declared tip, contiguous height
+  map, block identities, and parent links while excluding side branches and
+  structurally preventing DB or validator fallback. It value-binds a
+  caller-supplied checkpoint to one immutable NFS snapshot rather than
+  atomically capturing finalized storage with NFS. It is an ORAM-agnostic
+  chain-data seam only; conversion, generation assignment, runtime wiring, and
+  service publication remain open.
 - `zaino-oram`: frozen recent snapshots now bind an in-memory monotonic
   generation, exact finalized identity, recent tip height/hash, and the
   internally computed fixed-slot commitment into one lineage digest. The

@@ -122,14 +122,21 @@ protected outcome unless store or projection readiness takes precedence; it
 does not supply production AEAD, nonce uniqueness, trusted time, or durable
 replay protection.
 The concrete frozen-snapshot evidence uses mock-constructed contents, not live
-Zaino NFS acquisition or a canonical, reorg-safe publication seam. Its lineage
-digest binds caller-supplied generation/finalized/tip metadata to the internally
-computed deterministic slot commitment, but does not authenticate that metadata
-or prove its canonical ancestry. The private publication owner is an in-memory
-model with no runtime caller or durable rollback authority. Neither commitment
-is an authenticated canonical/live Zaino snapshot root, and the logical
-scan/merge tests do not establish physical obliviousness, allocator or timing
-equivalence, TDX, mainnet, or target-load behavior.
+Zaino NFS acquisition or a canonical, reorg-safe publication seam. The adjacent
+publishable `zaino-state` crate now exposes an ORAM-agnostic snapshot-only API
+that value-binds a caller-supplied finalized checkpoint to one immutable NFS
+snapshot, checks its declared tip, height-map segment from seam through tip,
+mapped payload identities, and parent continuity, then returns blocks strictly
+above the seam without DB/source fallback. No conversion or runtime caller
+feeds that result into `FrozenRecentSnapshot`; the API does not atomically capture finalized storage
+with NFS or assign a generation. The frozen snapshot's lineage digest binds
+caller-supplied generation/finalized/tip metadata to the internally computed
+deterministic slot commitment, but does not authenticate that metadata or prove
+its canonical ancestry. The private publication owner is an in-memory model
+with no runtime caller or durable rollback authority. Neither commitment is an
+authenticated canonical/live Zaino snapshot root, and the logical scan/merge
+tests do not establish whole-serving-epoch publication, physical obliviousness,
+allocator or timing equivalence, TDX, mainnet, or target-load behavior.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline

@@ -79,12 +79,24 @@ refresh, admits only its opaque outstanding build ticket, and lets pinned leases
 check whether they remain current. It is not connected to the runtime or a live
 source, and it does not validate the caller-supplied tip, ancestry, or slot
 provenance. The lineage commitment is not an authenticated canonical/live Zaino
-snapshot root; live NFS acquisition, canonical and reorg-safe snapshot
-publication, durable rollback authority, a whole serving-epoch swap, physical
-obliviousness, allocator and timing equivalence, TDX, mainnet, and target-load
-evidence remain open. Production AEAD, trusted clock and nonce ownership,
-durable replay storage, private protobuf/transport framing, and a service
-lifecycle also remain integration gates.
+snapshot root; `zaino-oram` conversion and live NFS acquisition, canonical and
+reorg-safe snapshot publication, durable rollback authority, a whole
+serving-epoch swap, physical obliviousness, allocator and timing equivalence,
+TDX, mainnet, and target-load evidence remain open. Production AEAD, trusted
+clock and nonce ownership, durable replay storage, private protobuf/transport
+framing, and a service lifecycle also remain integration gates.
+
+The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
+`ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
+caller-supplied finalized `BlockIndex` to one immutable NFS `Arc`, verifies the
+seam, declared tip, height-map segment from seam through tip, mapped payload
+identity, and parent continuity, ignores side blocks, and returns cloned blocks
+strictly above the seam oldest-first without DB/source fallback. No
+`zaino-oram` conversion or runtime caller uses it yet. It is not an atomic
+finalized-plus-NFS capture and does not provide an authenticated root,
+generation assignment, reorg-safe
+whole-serving-epoch publication, durability, service integration, physical or
+TDX evidence, or mainnet evidence.
 The typed-qualification slice added a listener-free qualification runner for the real
 typed worker. It executes one fixed nine-command correctness sequence covering
 empty reads, inserts, an exact replay, independent address histories, and clean
@@ -341,7 +353,13 @@ Intel's Data Operand Independent Timing mode covers only a documented instructio
 
 ### Component boundaries
 
-`zaino-state` remains authoritative for public chain snapshots and indexed blocks. It should expose one narrow, business-layer projection feed that cannot perform address/txid queries. The feed carries public chain events such as finalized block application and a race-free NFS snapshot/watermark.
+`zaino-state` remains authoritative for public chain snapshots and indexed
+blocks. Its implemented ORAM-agnostic
+`ChainIndexSnapshot::canonical_recent_chain` API is a narrow snapshot-only
+recent-chain seam that cannot perform address/txid queries or fall back to a DB
+or backing source. A complete projection feed still needs finalized block
+application plus a race-free serving-epoch snapshot/watermark; the current
+value-bound seam does not atomically capture finalized state with NFS.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
@@ -630,7 +648,9 @@ Deliverables:
 
 - narrow public-chain projection feed from `zaino-state`;
 - finalised checkpoint/watermark protocol and catch-up replay;
-- race-free NFS snapshot plus complete fixed-work recent-chain scan;
+- convert the implemented ORAM-agnostic, value-bound recent-chain seam into a
+  generation-bound, race-free whole serving epoch and execute the complete
+  fixed-work recent-chain scan;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;
 - production ownership of manifest authentication keys and the external
   freshness witness, with a measured rebuild RTO or composite durable ORAM

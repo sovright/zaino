@@ -8,6 +8,15 @@ and this library adheres to Rust's notion of
 ## [Unreleased]
 
 ### Added
+- `ChainIndexSnapshot::canonical_recent_chain` derives one structurally
+  consistent, snapshot-only canonical segment strictly above an exact
+  finalized height/hash seam. It returns cloned `IndexedBlock`s
+  oldest-to-newest and rejects syncing state, seam/tip disagreement, gaps,
+  missing or mismatched payloads, and broken parent links without falling
+  through to finalized storage or a backing validator. This value-binds a
+  caller-supplied checkpoint to one immutable NFS snapshot; it is not an atomic
+  capture of finalized storage and NFS. This is an ORAM-agnostic public-chain
+  seam; it does not perform projection conversion or service publication.
 - A pure `extract_transparent_events` business-layer seam for deterministic,
   checked transparent create/spend extraction from `IndexedBlock`, used by the
   ORAM research projection without adding an internal-runtime dependency to
