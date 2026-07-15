@@ -35,6 +35,10 @@ use crate::corpus_artifact::{
     SelectionMode, SnapshotMode, ValidatedSizing,
 };
 #[cfg(feature = "typed-qualification")]
+use crate::execution_identity::{
+    create_release_receipt, verify_release_receipt, ReleaseReceiptInputs,
+};
+#[cfg(feature = "typed-qualification")]
 use crate::full_map_saturation_artifact::publish_full_map_saturation;
 #[cfg(feature = "typed-qualification")]
 use crate::qualification_artifact::publish_qualification;
@@ -46,6 +50,8 @@ use crate::target_load_artifact::publish_target_load;
 #[cfg(feature = "typed-qualification")]
 mod cold_rebuild_artifact;
 mod corpus_artifact;
+#[cfg(feature = "typed-qualification")]
+mod execution_identity;
 #[cfg(feature = "typed-qualification")]
 mod full_map_saturation_artifact;
 #[cfg(feature = "typed-qualification")]
@@ -72,9 +78,72 @@ struct Cli {
 enum Command {
     /// Capture or inspect ORAM corpus evidence.
     Corpus(CorpusCommand),
+    /// Create or verify a self-reported local-integrity receipt without a listener.
+    #[cfg(feature = "typed-qualification")]
+    Release(ReleaseCommand),
     /// Exercise the fixed typed-worker correctness scenario without a listener.
     #[cfg(feature = "typed-qualification")]
     Qualification(QualificationCommand),
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct ReleaseCommand {
+    #[command(subcommand)]
+    command: ReleaseSubcommand,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Subcommand)]
+enum ReleaseSubcommand {
+    /// Record observed agreement between two fixed-procedure build artifacts.
+    CreateReceipt(ReleaseCreateReceiptArgs),
+    /// Check canonical receipt integrity and the running executable identity.
+    VerifyReceipt(ReleaseVerifyReceiptArgs),
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct ReleaseCreateReceiptArgs {
+    /// Exact full source revision reported for both build procedures.
+    #[arg(long)]
+    source_revision: String,
+
+    /// Git archive whose embedded commit and fixed inputs are checked locally.
+    #[arg(long, value_name = "FILE")]
+    source_archive: PathBuf,
+
+    /// Cargo.lock reported as consumed by both build procedures.
+    #[arg(long, value_name = "FILE")]
+    cargo_lock: PathBuf,
+
+    /// rust-toolchain.toml reported as consumed by both build procedures.
+    #[arg(long, value_name = "FILE")]
+    rust_toolchain: PathBuf,
+
+    /// Dockerfile.deterministic reported as consumed by both build procedures.
+    #[arg(long, value_name = "FILE")]
+    dockerfile: PathBuf,
+
+    /// Primary zainod-oram artifact, which must be this invoking executable.
+    #[arg(long, value_name = "FILE")]
+    binary: PathBuf,
+
+    /// Second no-cache build artifact that must have the same bytes.
+    #[arg(long, value_name = "FILE")]
+    reproducible_binary: PathBuf,
+
+    /// New path that will receive the canonical receipt JSON.
+    #[arg(long, value_name = "FILE")]
+    output: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct ReleaseVerifyReceiptArgs {
+    /// Canonical receipt to check against the running /proc/self/exe inode.
+    #[arg(long, value_name = "FILE")]
+    receipt: PathBuf,
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -338,6 +407,11 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             CorpusSubcommand::ValidateSizing(args) => run_corpus_validate_sizing(args),
         },
         #[cfg(feature = "typed-qualification")]
+        Command::Release(command) => match command.command {
+            ReleaseSubcommand::CreateReceipt(args) => run_release_create_receipt(args),
+            ReleaseSubcommand::VerifyReceipt(args) => run_release_verify_receipt(args),
+        },
+        #[cfg(feature = "typed-qualification")]
         Command::Qualification(command) => match command.command {
             QualificationSubcommand::Run(args) => run_qualification(args),
             QualificationSubcommand::Stress(args) => run_stress_qualification(args),
@@ -345,6 +419,30 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             QualificationSubcommand::ColdRebuild(args) => run_cold_rebuild(args).await,
         },
     }
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_release_create_receipt(args: ReleaseCreateReceiptArgs) -> RunnerResult<()> {
+    let output = args.output.clone();
+    create_release_receipt(ReleaseReceiptInputs {
+        source_revision: args.source_revision,
+        source_archive: args.source_archive,
+        cargo_lock: args.cargo_lock,
+        rust_toolchain: args.rust_toolchain,
+        dockerfile: args.dockerfile,
+        binary: args.binary,
+        reproducible_binary: args.reproducible_binary,
+        output: args.output,
+    })?;
+    println!("release_receipt={}", output.display());
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_release_verify_receipt(args: ReleaseVerifyReceiptArgs) -> RunnerResult<()> {
+    verify_release_receipt(&args.receipt)?;
+    println!("release_receipt_verified={}", args.receipt.display());
+    Ok(())
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -914,6 +1012,92 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_release_create_args() -> [&'static str; 19] {
+        [
+            "zainod-oram",
+            "release",
+            "create-receipt",
+            "--source-revision",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--source-archive",
+            "/tmp/source.tar",
+            "--cargo-lock",
+            "/tmp/Cargo.lock",
+            "--rust-toolchain",
+            "/tmp/rust-toolchain.toml",
+            "--dockerfile",
+            "/tmp/Dockerfile.deterministic",
+            "--binary",
+            "/tmp/build-a/zainod-oram",
+            "--reproducible-binary",
+            "/tmp/build-b/zainod-oram",
+            "--output",
+            "/tmp/release-receipt.json",
+        ]
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn release_cli_exposes_only_fixed_receipt_inputs() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_release_create_args())?;
+        let args = match cli.command {
+            Command::Release(command) => match command.command {
+                ReleaseSubcommand::CreateReceipt(args) => args,
+                ReleaseSubcommand::VerifyReceipt(_) => {
+                    panic!("create arguments parsed as receipt verification")
+                }
+            },
+            Command::Corpus(_) => panic!("release arguments parsed as corpus"),
+            #[cfg(feature = "typed-qualification")]
+            Command::Qualification(_) => panic!("release arguments parsed as qualification"),
+        };
+        assert_eq!(
+            args.source_revision,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(args.binary, PathBuf::from("/tmp/build-a/zainod-oram"));
+        assert_eq!(
+            args.reproducible_binary,
+            PathBuf::from("/tmp/build-b/zainod-oram")
+        );
+        assert_eq!(args.output, PathBuf::from("/tmp/release-receipt.json"));
+
+        for (rejected, value) in [
+            ("--target", "custom"),
+            ("--profile", "debug"),
+            ("--features", "custom"),
+            ("--rustflags", "custom"),
+            ("--source-date-epoch", "2"),
+        ] {
+            let mut command = valid_release_create_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+
+        let verify = Cli::try_parse_from([
+            "zainod-oram",
+            "release",
+            "verify-receipt",
+            "--receipt",
+            "/tmp/release-receipt.json",
+        ])?;
+        match verify.command {
+            Command::Release(command) => match command.command {
+                ReleaseSubcommand::VerifyReceipt(args) => {
+                    assert_eq!(args.receipt, PathBuf::from("/tmp/release-receipt.json"));
+                }
+                ReleaseSubcommand::CreateReceipt(_) => {
+                    panic!("verification arguments parsed as receipt creation")
+                }
+            },
+            Command::Corpus(_) => panic!("release arguments parsed as corpus"),
+            #[cfg(feature = "typed-qualification")]
+            Command::Qualification(_) => panic!("release arguments parsed as qualification"),
+        }
+        Ok(())
+    }
+
     fn snapshot_directory(directory: &Path) -> Result<BTreeMap<OsString, Vec<u8>>, std::io::Error> {
         fs::read_dir(directory)?
             .map(|entry| {
@@ -1017,6 +1201,8 @@ mod tests {
         match cli.command {
             Command::Corpus(command) => command,
             #[cfg(feature = "typed-qualification")]
+            Command::Release(_) => panic!("release arguments parsed as corpus"),
+            #[cfg(feature = "typed-qualification")]
             Command::Qualification(_) => panic!("qualification arguments parsed as corpus"),
         }
     }
@@ -1037,6 +1223,7 @@ mod tests {
                 }
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
+            Command::Release(_) => panic!("stress arguments parsed as release"),
         }
     }
 
@@ -1058,6 +1245,7 @@ mod tests {
                 }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
+            Command::Release(_) => panic!("qualification arguments parsed as release"),
         };
         assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-qualification"));
 
@@ -1152,6 +1340,7 @@ mod tests {
                 }
             },
             Command::Corpus(_) => panic!("target-load arguments parsed as corpus"),
+            Command::Release(_) => panic!("target-load arguments parsed as release"),
         };
         assert_eq!(args.profile, TargetLoadProfileArg::BuilderFoundationV1);
         assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
@@ -1189,6 +1378,7 @@ mod tests {
                 }
             },
             Command::Corpus(_) => panic!("cold-rebuild arguments parsed as corpus"),
+            Command::Release(_) => panic!("cold-rebuild arguments parsed as release"),
         };
         assert_eq!(args.profile, ColdRebuildProfileArg::SourceBoundBuilderV1);
         assert_eq!(args.config, PathBuf::from("/tmp/zainod.toml"));
