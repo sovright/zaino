@@ -9,6 +9,14 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-oram`: the default-off `corpus-zaino` path now contains a private
+  conversion candidate that consumes a `CanonicalRecentChainSnapshot` together
+  with an immutable, identity-pinned finalized-outpoint classifier. It preserves
+  dense standard-event slots in canonical order while tracking nonstandard
+  states separately. This slice has no production resolver or runtime wiring,
+  generation assignment or publication, `FrozenRecentSnapshot` construction,
+  atomic whole-serving epoch, authenticated provenance, service or production
+  cryptography, TDX, or mainnet claim.
 - `zaino-state`: add a synchronous immutable-snapshot API that verifies an
   exact finalized height/hash seam and returns only canonical recent
   `IndexedBlock`s above it, oldest-to-newest. The API checks structural

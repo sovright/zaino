@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- The default-off `corpus-zaino` integration now has a private conversion
+  candidate that consumes one `CanonicalRecentChainSnapshot` and an immutable,
+  identity-pinned finalized-outpoint classifier. It preserves dense
+  standard-event slots in canonical order and tracks nonstandard states without
+  treating them as ordinary address events. No production resolver or runtime
+  wiring invokes it, and it does not assign a generation, publish a snapshot,
+  construct `FrozenRecentSnapshot`, atomically capture a whole serving epoch,
+  authenticate provenance, or establish service, production-cryptography, TDX,
+  or mainnet evidence.
 - Frozen recent snapshots now bind an in-memory monotonic generation, exact
   finalized identity, recent tip height/hash, and the internally computed
   fixed-slot commitment into one lineage digest. The listener-free runtime

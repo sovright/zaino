@@ -127,16 +127,21 @@ publishable `zaino-state` crate now exposes an ORAM-agnostic snapshot-only API
 that value-binds a caller-supplied finalized checkpoint to one immutable NFS
 snapshot, checks its declared tip, height-map segment from seam through tip,
 mapped payload identities, and parent continuity, then returns blocks strictly
-above the seam without DB/source fallback. No conversion or runtime caller
-feeds that result into `FrozenRecentSnapshot`; the API does not atomically capture finalized storage
-with NFS or assign a generation. The frozen snapshot's lineage digest binds
-caller-supplied generation/finalized/tip metadata to the internally computed
-deterministic slot commitment, but does not authenticate that metadata or prove
-its canonical ancestry. The private publication owner is an in-memory model
-with no runtime caller or durable rollback authority. Neither commitment is an
-authenticated canonical/live Zaino snapshot root, and the logical scan/merge
-tests do not establish whole-serving-epoch publication, physical obliviousness,
-allocator or timing equivalence, TDX, mainnet, or target-load behavior.
+above the seam without DB/source fallback. Under the default-off
+`corpus-zaino` feature, a private conversion candidate consumes that
+`CanonicalRecentChainSnapshot` together with an immutable, identity-pinned
+finalized-outpoint classifier. It preserves dense standard-event slots in
+canonical order while tracking nonstandard states separately. No production
+resolver or runtime wiring invokes the candidate, and it does not construct
+`FrozenRecentSnapshot`, assign or publish a generation, or atomically capture a
+whole serving epoch. The frozen snapshot's lineage digest binds caller-supplied
+generation/finalized/tip metadata to the internally computed deterministic slot
+commitment, but does not authenticate that metadata or prove its canonical
+ancestry. The private publication owner is an in-memory model with no runtime
+caller or durable rollback authority. Neither commitment is an authenticated
+canonical/live Zaino snapshot root, and this conversion slice supplies no
+service or production cryptography and establishes no physical-obliviousness,
+allocator, timing, TDX, mainnet, or target-load claim.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline

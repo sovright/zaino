@@ -106,6 +106,25 @@ impl StandardScriptKind {
     }
 }
 
+/// Derives the canonical layout key for one standard transparent address.
+pub(super) fn derive_standard_address_key(
+    network: LayoutNetwork,
+    schema_version: u32,
+    address: StandardAddress,
+) -> AddressKey {
+    let mut hasher = Blake2s256::new();
+    Digest::update(&mut hasher, ADDRESS_KEY_DOMAIN);
+    Digest::update(&mut hasher, [LAYOUT_FORMAT_VERSION]);
+    Digest::update(&mut hasher, [network.tag()]);
+    Digest::update(&mut hasher, schema_version.to_le_bytes());
+    Digest::update(&mut hasher, [address.kind.tag()]);
+    Digest::update(&mut hasher, address.hash);
+    let digest = Digest::finalize(hasher);
+    let mut bytes = [0; ADDRESS_KEY_BYTES];
+    bytes.copy_from_slice(&digest);
+    AddressKey::new(bytes)
+}
+
 /// Secret probe seed injected by a future lifecycle owner.
 struct ProbeSeed([u8; 32]);
 
@@ -896,17 +915,7 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
     }
 
     fn address_key(&self, address: StandardAddress) -> AddressKey {
-        let mut hasher = Blake2s256::new();
-        Digest::update(&mut hasher, ADDRESS_KEY_DOMAIN);
-        Digest::update(&mut hasher, [LAYOUT_FORMAT_VERSION]);
-        Digest::update(&mut hasher, [self.identity.network.tag()]);
-        Digest::update(&mut hasher, self.identity.schema_version.to_le_bytes());
-        Digest::update(&mut hasher, [address.kind.tag()]);
-        Digest::update(&mut hasher, address.hash);
-        let digest = Digest::finalize(hasher);
-        let mut bytes = [0; ADDRESS_KEY_BYTES];
-        bytes.copy_from_slice(&digest);
-        AddressKey::new(bytes)
+        derive_standard_address_key(self.identity.network, self.identity.schema_version, address)
     }
 
     fn directory_plan(&self, address: StandardAddress) -> DirectoryProbePlan<DIRECTORY_PROBES> {

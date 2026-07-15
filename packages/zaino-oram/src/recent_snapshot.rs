@@ -14,6 +14,8 @@ use blake2::{Blake2s256, Digest};
 use crate::records::{AddressKey, TransparentUtxo, ADDRESS_KEY_BYTES};
 
 mod publication;
+#[cfg(feature = "corpus-zaino")]
+mod zaino;
 
 const CONTENT_DIGEST_DOMAIN: &[u8] = b"zaino-oram-recent-snapshot-content-v1";
 const LINEAGE_BINDING_DOMAIN: &[u8] = b"zaino-oram-recent-snapshot-lineage-v1";
@@ -239,18 +241,15 @@ impl RecentSnapshotSlot {
     }
 
     /// Builds one occupied recent output-creation slot.
-    #[cfg(test)]
     pub(super) const fn created(address_key: AddressKey, utxo: TransparentUtxo) -> Self {
         Self::occupied(RecentUtxoChangeKind::Created, address_key, utxo)
     }
 
     /// Builds one occupied recent output-spend slot.
-    #[cfg(test)]
     pub(super) const fn spent(address_key: AddressKey, utxo: TransparentUtxo) -> Self {
         Self::occupied(RecentUtxoChangeKind::Spent, address_key, utxo)
     }
 
-    #[cfg(test)]
     const fn occupied(
         kind: RecentUtxoChangeKind,
         address_key: AddressKey,
