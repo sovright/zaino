@@ -106,6 +106,16 @@ seam and candidate are not an atomic finalized-plus-NFS capture and do not
 provide an authenticated root, generation assignment or publication,
 reorg-safe whole-serving-epoch publication, durability, service integration,
 production cryptography, physical or TDX evidence, or mainnet evidence.
+
+At exact conversion code head
+`32084cd8e047c64b34fcfae5fd0283533fe21793`, a detached worktree on the
+dedicated Ubuntu 24.04 x86_64 GCP builder passed all 294 all-feature
+`zaino-oram` tests, strict all-target Clippy with `clippy::unwrap_used` denied,
+and rustfmt. This is cache-preserving generic-builder correctness evidence for
+the conversion candidate only; it is not production-resolver, runtime,
+generation/publication, atomic whole-serving-epoch, service/cryptography,
+target-load, physical-obliviousness, TDX, or mainnet evidence.
+
 The typed-qualification slice added a listener-free qualification runner for the real
 typed worker. It executes one fixed nine-command correctness sequence covering
 empty reads, inserts, an exact replay, independent address histories, and clean
