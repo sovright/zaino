@@ -38,8 +38,9 @@ offline dependency experiment:
 - compiled privacy-profile-v3 validation that binds the logical store and
   recent-snapshot budgets, padded inputs, fixed response/envelope shapes,
   cover/token lifetime, timeout bucket, and a single-worker FIFO
-  queue/overload policy. Current runtime fixtures deliberately bind zero
-  recent-snapshot reads; they do not claim NFS scan or merge execution;
+  queue/overload policy. Runtime fixtures bind a nonzero recent-snapshot shape
+  and execute its complete ordinal-only scan through a concrete runtime-owned
+  `FrozenRecentSnapshot<N>`;
 - a crate-internal versioned request/response codec that seals one
   complete-budget-derived profile ID, fixed checkpoint, prepared query,
   optional opaque 128-byte continuation field, session binding, protected
@@ -49,14 +50,25 @@ offline dependency experiment:
   whole nonce/body/tag envelope before canonical decoding;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
-  replay access, readiness selection, complete store scanning, fixed result
-  normalization, token issue, response protection, and completion. It uses
-  absolute logical store-slot continuation cursors and returns one protected
-  fixed `InvalidContinuation` shape for invalid, expired, mismatched, or
-  replayed tokens when no higher-priority store or projection-readiness failure
-  applies. Token protection binds the checkpoint and codec session; each path
-  models one replay lookup and write-back, while cover writes use a separate
-  non-durable slot rather than the real-token namespace;
+  replay access, readiness selection, complete recent-snapshot and finalized
+  store scanning, fixed result normalization, token issue, response protection,
+  and completion. It owns a concrete `FrozenRecentSnapshot<N>` whose fixed-slot
+  content commitment is computed internally rather than supplied by a generic
+  source. Fault and post-construction corruption hooks are `#[cfg(test)]` only
+  and absent from the production API. The runtime binds the commitment into the
+  continuation query digest; each round completes the configured scan before
+  rechecking exact checkpoint identity and the recomputed commitment. It merges
+  recent creates and spends before pagination and uses one combined
+  finalized-plus-recent continuation cursor domain. Malformed same-outpoint
+  sequences, owner mismatches against finalized outputs, and duplicate creates
+  become a protected all-dummy `ProjectionNotReady` result only after the full
+  modeled work and latch readiness. Query-derived `source_calls` remain modeled
+  at zero. Invalid, expired, mismatched, and replayed tokens return one protected
+  fixed `InvalidContinuation` shape when no higher-priority store or
+  projection-readiness failure applies. Token protection binds the checkpoint
+  and codec session; each path models one replay lookup and write-back, while
+  cover writes use a separate non-durable slot rather than the real-token
+  namespace;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -99,6 +111,12 @@ interfaces before engine use and collapses their semantic failures to one
 protected outcome unless store or projection readiness takes precedence; it
 does not supply production AEAD, nonce uniqueness, trusted time, or durable
 replay protection.
+The concrete frozen-snapshot evidence uses mock-constructed contents, not live
+Zaino NFS acquisition or a canonical, reorg-safe publication seam. Its
+internally computed deterministic commitment is not an authenticated
+canonical/live Zaino snapshot root, and the logical scan/merge tests do not
+establish physical obliviousness, allocator or timing equivalence, TDX,
+mainnet, or target-load behavior.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline

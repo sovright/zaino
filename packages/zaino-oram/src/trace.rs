@@ -275,6 +275,7 @@ pub(super) struct TraceRecorder {
     response_bytes: usize,
     next_read_ordinal: usize,
     next_recent_snapshot_read_ordinal: usize,
+    recent_snapshot_scan_complete: bool,
     next_runtime_phase: usize,
     completion: Option<CompletionShape>,
 }
@@ -296,6 +297,7 @@ impl TraceRecorder {
             response_bytes: 0,
             next_read_ordinal: 0,
             next_recent_snapshot_read_ordinal: 0,
+            recent_snapshot_scan_complete: false,
             next_runtime_phase: 0,
             completion: None,
         }
@@ -309,6 +311,9 @@ impl TraceRecorder {
                 expected: self.next_runtime_phase,
                 actual,
             });
+        }
+        if phase == RuntimePhase::ResultNormalization && !self.recent_snapshot_scan_complete {
+            return Err(TraceError::RecentSnapshotScanIncomplete);
         }
         self.next_runtime_phase =
             increment(self.next_runtime_phase, TraceDimension::RuntimePhases)?;
@@ -324,6 +329,10 @@ impl TraceRecorder {
 
     /// Records the next public, sequential logical store-read ordinal.
     pub(super) fn record_store_read(&mut self, ordinal: usize) -> Result<(), TraceError> {
+        self.validate_engine_execution_open(TraceDimension::StoreReads)?;
+        if !self.recent_snapshot_scan_complete {
+            return Err(TraceError::RecentSnapshotScanIncomplete);
+        }
         if ordinal != self.next_read_ordinal {
             return Err(TraceError::StoreReadOrdinal {
                 expected: self.next_read_ordinal,
@@ -342,6 +351,10 @@ impl TraceRecorder {
     /// It is deliberately separate from query-derived validator, LMDB, raw
     /// transaction, or backfill calls, whose source-call budget remains zero.
     pub(super) fn record_recent_snapshot_read(&mut self, ordinal: usize) -> Result<(), TraceError> {
+        self.validate_engine_execution_open(TraceDimension::RecentSnapshotReads)?;
+        if self.recent_snapshot_scan_complete {
+            return Err(TraceError::RecentSnapshotScanAlreadyCompleted);
+        }
         if ordinal != self.next_recent_snapshot_read_ordinal {
             return Err(TraceError::RecentSnapshotReadOrdinal {
                 expected: self.next_recent_snapshot_read_ordinal,
@@ -356,6 +369,35 @@ impl TraceRecorder {
             self.next_recent_snapshot_read_ordinal,
             TraceDimension::RecentSnapshotReadOrdinal,
         )?;
+        Ok(())
+    }
+
+    /// Seals the complete recent-snapshot scan before finalized-store work.
+    pub(super) fn complete_recent_snapshot_scan(
+        &mut self,
+        expected_reads: usize,
+    ) -> Result<(), TraceError> {
+        self.validate_engine_execution_open(TraceDimension::RecentSnapshotReads)?;
+        if self.recent_snapshot_scan_complete {
+            return Err(TraceError::RecentSnapshotScanAlreadyCompleted);
+        }
+        validate_dimension(
+            TraceDimension::RecentSnapshotReads,
+            expected_reads,
+            self.recent_snapshot_reads,
+        )?;
+        self.recent_snapshot_scan_complete = true;
+        Ok(())
+    }
+
+    fn validate_engine_execution_open(&self, dimension: TraceDimension) -> Result<(), TraceError> {
+        let execution_next_phase = RuntimePhase::ResultNormalization.ordinal();
+        if self.next_runtime_phase != execution_next_phase {
+            return Err(TraceError::EngineWorkOutsideExecution {
+                dimension,
+                next_runtime_phase: self.next_runtime_phase,
+            });
+        }
         Ok(())
     }
 
@@ -409,6 +451,9 @@ impl TraceRecorder {
 
     /// Validates every modeled dimension and returns the completed trace.
     pub(super) fn finish(self, expected: QueryAccessBudget) -> Result<AccessTrace, TraceError> {
+        if !self.recent_snapshot_scan_complete {
+            return Err(TraceError::RecentSnapshotScanIncomplete);
+        }
         validate_dimension(
             TraceDimension::StoreReads,
             expected.store_reads(),
@@ -513,6 +558,8 @@ pub(super) enum TraceDimension {
     RecentSnapshotReads,
     /// Sequential recent-snapshot read ordinal.
     RecentSnapshotReadOrdinal,
+    /// Combined finalized-store then recent-snapshot continuation cursor.
+    CombinedCursor,
     /// Logical replay-state lookups.
     ReplayReads,
     /// Logical real-or-cover replay-state write-backs.
@@ -539,6 +586,7 @@ impl fmt::Display for TraceDimension {
             Self::SourceCalls => "source calls",
             Self::RecentSnapshotReads => "recent-snapshot reads",
             Self::RecentSnapshotReadOrdinal => "recent-snapshot read ordinal",
+            Self::CombinedCursor => "combined continuation cursor",
             Self::ReplayReads => "replay reads",
             Self::ReplayWrites => "replay writes",
             Self::RequestFrames => "modeled request frames",
@@ -568,6 +616,17 @@ pub(super) enum TraceError {
         /// Ordinal the runtime attempted.
         actual: usize,
     },
+    /// Engine work was recorded outside the open execution phase.
+    EngineWorkOutsideExecution {
+        /// Work dimension attempted.
+        dimension: TraceDimension,
+        /// Next runtime phase expected by the recorder.
+        next_runtime_phase: usize,
+    },
+    /// Finalized-store work or normalization began before the snapshot sealed.
+    RecentSnapshotScanIncomplete,
+    /// Snapshot work was attempted after the scan had already sealed.
+    RecentSnapshotScanAlreadyCompleted,
     /// Runtime phases were recorded out of their fixed public order.
     RuntimePhaseOrder {
         /// Next required phase ordinal.
@@ -613,6 +672,19 @@ impl fmt::Display for TraceError {
                 f,
                 "logical recent-snapshot read ordinal {actual} does not match next public ordinal {expected}"
             ),
+            Self::EngineWorkOutsideExecution {
+                dimension,
+                next_runtime_phase,
+            } => write!(
+                f,
+                "logical {dimension} work occurred outside engine execution; next phase is {next_runtime_phase}"
+            ),
+            Self::RecentSnapshotScanIncomplete => {
+                f.write_str("logical recent-snapshot scan is not complete")
+            }
+            Self::RecentSnapshotScanAlreadyCompleted => {
+                f.write_str("logical recent-snapshot scan was already completed")
+            }
             Self::RuntimePhaseOrder { expected, actual } => write!(
                 f,
                 "logical runtime phase {actual} does not match next public phase {expected}"
@@ -701,10 +773,11 @@ mod tests {
     }
 
     fn record_fixed_reads(recorder: &mut TraceRecorder) -> Result<(), TraceError> {
-        recorder.record_store_read(0)?;
-        recorder.record_store_read(1)?;
         recorder.record_recent_snapshot_read(0)?;
-        recorder.record_recent_snapshot_read(1)
+        recorder.record_recent_snapshot_read(1)?;
+        recorder.complete_recent_snapshot_scan(RECENT_SNAPSHOT_READS)?;
+        recorder.record_store_read(0)?;
+        recorder.record_store_read(1)
     }
 
     fn completed_trace() -> Result<AccessTrace, TraceError> {
@@ -727,11 +800,12 @@ mod tests {
         let mut recorder = TraceRecorder::new();
         recorder.record_request_frame(ENVELOPE_BYTES)?;
         record_prefix(&mut recorder)?;
-        recorder.record_store_read(0)?;
-        recorder.record_store_read(1)?;
         for ordinal in 0..recent_snapshot_reads {
             recorder.record_recent_snapshot_read(ordinal)?;
         }
+        recorder.complete_recent_snapshot_scan(RECENT_SNAPSHOT_READS)?;
+        recorder.record_store_read(0)?;
+        recorder.record_store_read(1)?;
         record_suffix(&mut recorder)?;
         recorder.record_response_frame(ENVELOPE_BYTES)?;
         recorder.record_completion(CompletionShape::UnaryFixedEnvelope)?;
@@ -760,6 +834,8 @@ mod tests {
     #[test]
     fn recorder_rejects_nonsequential_reads_and_incomplete_budgets() -> Result<(), TraceError> {
         let mut wrong_ordinal = TraceRecorder::new();
+        record_prefix(&mut wrong_ordinal)?;
+        wrong_ordinal.complete_recent_snapshot_scan(0)?;
         assert_eq!(
             wrong_ordinal.record_store_read(1),
             Err(TraceError::StoreReadOrdinal {
@@ -769,6 +845,7 @@ mod tests {
         );
 
         let mut wrong_recent_ordinal = TraceRecorder::new();
+        record_prefix(&mut wrong_recent_ordinal)?;
         assert_eq!(
             wrong_recent_ordinal.record_recent_snapshot_read(1),
             Err(TraceError::RecentSnapshotReadOrdinal {
@@ -779,6 +856,10 @@ mod tests {
 
         let mut incomplete = TraceRecorder::new();
         incomplete.record_request_frame(ENVELOPE_BYTES)?;
+        record_prefix(&mut incomplete)?;
+        incomplete.record_recent_snapshot_read(0)?;
+        incomplete.record_recent_snapshot_read(1)?;
+        incomplete.complete_recent_snapshot_scan(RECENT_SNAPSHOT_READS)?;
         incomplete.record_store_read(0)?;
         incomplete.record_response_frame(ENVELOPE_BYTES)?;
         incomplete.record_completion(CompletionShape::UnaryFixedEnvelope)?;
@@ -788,6 +869,46 @@ mod tests {
                 dimension: TraceDimension::StoreReads,
                 expected: 2,
                 actual: 1,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recorder_binds_snapshot_and_store_work_to_engine_execution() -> Result<(), TraceError> {
+        let mut outside = TraceRecorder::new();
+        assert_eq!(
+            outside.record_recent_snapshot_read(0),
+            Err(TraceError::EngineWorkOutsideExecution {
+                dimension: TraceDimension::RecentSnapshotReads,
+                next_runtime_phase: 0,
+            })
+        );
+
+        let mut incomplete = TraceRecorder::new();
+        record_prefix(&mut incomplete)?;
+        assert_eq!(
+            incomplete.record_store_read(0),
+            Err(TraceError::RecentSnapshotScanIncomplete)
+        );
+        assert_eq!(
+            incomplete.record_runtime_phase(RuntimePhase::ResultNormalization),
+            Err(TraceError::RecentSnapshotScanIncomplete)
+        );
+
+        incomplete.record_recent_snapshot_read(0)?;
+        incomplete.record_recent_snapshot_read(1)?;
+        incomplete.complete_recent_snapshot_scan(RECENT_SNAPSHOT_READS)?;
+        assert_eq!(
+            incomplete.record_recent_snapshot_read(2),
+            Err(TraceError::RecentSnapshotScanAlreadyCompleted)
+        );
+        incomplete.record_runtime_phase(RuntimePhase::ResultNormalization)?;
+        assert_eq!(
+            incomplete.record_store_read(0),
+            Err(TraceError::EngineWorkOutsideExecution {
+                dimension: TraceDimension::StoreReads,
+                next_runtime_phase: 7,
             })
         );
         Ok(())

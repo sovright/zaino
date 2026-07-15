@@ -49,22 +49,35 @@ fields, direction separation, canonical decoding, and an injected
 whole-envelope protection interface. Its deterministic protector is a
 non-cryptographic test fixture. A private listener-free child runtime now owns
 the modeled decode/token/replay/full-scan/issuance/encode sequence. It validates
-absolute store-slot cursors, preserves token expiry across pages, maps semantic
-token failures to one protected fixed `InvalidContinuation` page when no
-higher-priority store or projection-readiness failure applies, and records the
-same ordered ten-phase logical trace for successful protected outcomes. Token
-protector context binds the checkpoint and codec session, and every replay path
-models one lookup plus one write-back while cover writes stay outside the
-real-token namespace.
+combined finalized-plus-recent cursors, preserves token expiry across pages,
+maps semantic token failures to one protected fixed `InvalidContinuation` page
+when no higher-priority store or projection-readiness failure applies, and
+records the same ordered ten-phase logical trace for successful protected
+outcomes. Token protector context binds the checkpoint and codec session, and
+every replay path models one lookup plus one write-back while cover writes stay
+outside the real-token namespace.
 The profile-v3 ID binds that schedule, the continuation lifetime, padded input
 and response shapes, the recent-snapshot scan budget, the timeout bucket, and
 an explicit single-worker FIFO execution/queue/reject-at-capacity policy. The
-listener-free runtime still uses a test-only profile that binds zero
-recent-snapshot reads; the next slice must inject a frozen snapshot and execute
-the nonzero fixed ordinal scan and merge before any NFS claim is made.
-Production AEAD, trusted clock and nonce ownership, durable replay storage,
-instruction/memory/timing equivalence, private protobuf/transport framing, and
-a service lifecycle remain integration gates.
+listener-free runtime now executes a nonzero, profile-bound, ordinal-only full
+scan through a concrete runtime-owned `FrozenRecentSnapshot<N>`. The frozen type
+computes its fixed-slot content commitment internally rather than accepting a
+generic source-reported digest; its fault and post-construction corruption hooks
+are `#[cfg(test)]` only and absent from the production API. The runtime binds the
+commitment into the continuation query digest, and each round completes the
+configured scan before rechecking both exact checkpoint identity and recomputed
+content commitment. It merges recent creates and spends before paginating
+across the combined cursor domain. Malformed same-outpoint sequences, owner
+mismatches against finalized outputs, and duplicate creates fail closed as a
+protected all-dummy `ProjectionNotReady` result only after full modeled work and
+latch readiness. Query-derived `source_calls` remain modeled at zero. This
+closes only the mock-constructed logical scan/merge slice: the commitment is not
+an authenticated canonical/live Zaino snapshot root, and live NFS acquisition,
+canonical and reorg-safe snapshot publication, physical obliviousness,
+allocator and timing equivalence, TDX, mainnet, and target-load evidence remain
+open. Production AEAD, trusted clock and nonce ownership, durable replay
+storage, private protobuf/transport framing, and a service lifecycle also remain
+integration gates.
 The typed-qualification slice added a listener-free qualification runner for the real
 typed worker. It executes one fixed nine-command correctness sequence covering
 empty reads, inserts, an exact replay, independent address histories, and clean

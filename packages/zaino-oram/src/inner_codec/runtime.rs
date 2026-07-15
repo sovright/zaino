@@ -14,6 +14,10 @@ use crate::{
     engine::PrivateQueryEngine,
     envelope::FixedEnvelope,
     profile::CompiledQueryShape,
+    recent_snapshot::{
+        bind_query_digest, content_digest, FrozenRecentSnapshot, RecentSnapshotIdentity,
+        RecentSnapshotSlot,
+    },
     records::{QueryOutcome, UtxoResultPage},
     store::ObliviousStore,
     trace::{AccessTrace, CompletionShape, RuntimePhase, TraceRecorder},
@@ -103,10 +107,20 @@ impl<E, T, R, N> RuntimeDependencies<E, T, R, N> {
 }
 
 /// Private synchronous adapter for one compiled logical research profile.
-struct PrivateQueryRuntime<S, E, T, R, N, const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
-{
+struct PrivateQueryRuntime<
+    S,
+    E,
+    T,
+    R,
+    N,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+> {
     codec: PrivateQueryCodec<RESPONSE_SLOTS, ENVELOPE_BYTES>,
     engine: PrivateQueryEngine<S, RESPONSE_SLOTS, ENVELOPE_BYTES>,
+    recent_snapshot: FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>,
+    recent_snapshot_digest: [u8; 32],
     envelope_protector: E,
     token_protector: T,
     replay_guard: R,
@@ -115,8 +129,16 @@ struct PrivateQueryRuntime<S, E, T, R, N, const RESPONSE_SLOTS: usize, const ENV
     healthy: bool,
 }
 
-impl<S, E, T, R, N, const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
-    PrivateQueryRuntime<S, E, T, R, N, RESPONSE_SLOTS, ENVELOPE_BYTES>
+impl<
+        S,
+        E,
+        T,
+        R,
+        N,
+        const RESPONSE_SLOTS: usize,
+        const ENVELOPE_BYTES: usize,
+        const RECENT_SNAPSHOT_SLOTS: usize,
+    > PrivateQueryRuntime<S, E, T, R, N, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>
 where
     S: ObliviousStore,
     E: EnvelopeProtector,
@@ -126,17 +148,35 @@ where
 {
     fn new(
         store: S,
+        recent_snapshot: FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>,
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
         session_binding: [u8; 32],
         checkpoint: PrivateQueryCheckpoint,
         dependencies: RuntimeDependencies<E, T, R, N>,
     ) -> Result<Self, UniformExternalFailure> {
+        shape
+            .profile()
+            .validate_recent_snapshot_slots::<RECENT_SNAPSHOT_SLOTS>()
+            .map_err(|_| UniformExternalFailure)?;
+        if recent_snapshot.slots() != RECENT_SNAPSHOT_SLOTS
+            || recent_snapshot.identity() != recent_snapshot_identity(&checkpoint)
+        {
+            return Err(UniformExternalFailure);
+        }
+        let recent_snapshot_digest = recent_snapshot.content_digest();
+        let combined_scan_slots = shape
+            .profile()
+            .combined_scan_slots()
+            .map_err(|_| UniformExternalFailure)?;
+        u64::try_from(combined_scan_slots).map_err(|_| UniformExternalFailure)?;
         let codec = PrivateQueryCodec::new(&shape, session_binding)
             .map_err(InnerCodecError::into_uniform_external_failure)?;
         let engine = PrivateQueryEngine::new(store, shape).map_err(|_| UniformExternalFailure)?;
         Ok(Self {
             codec,
             engine,
+            recent_snapshot,
+            recent_snapshot_digest,
             envelope_protector: dependencies.envelope_protector,
             token_protector: dependencies.token_protector,
             replay_guard: dependencies.replay_guard,
@@ -173,9 +213,13 @@ where
             .record_runtime_phase(RuntimePhase::NonceAcquisition)
             .map_err(|_| self.latch_failure())?;
 
-        let query_digest = self.codec.query_digest(request.query());
-        let cursor_limit =
-            u64::try_from(profile.store_reads()).map_err(|_| self.latch_failure())?;
+        let query_digest = self.continuation_query_digest(request.query());
+        let cursor_limit = u64::try_from(
+            profile
+                .combined_scan_slots()
+                .map_err(|_| self.latch_failure())?,
+        )
+        .map_err(|_| self.latch_failure())?;
         let initial_expiry = material
             .now_unix_seconds
             .checked_add(profile.continuation_ttl_seconds())
@@ -241,21 +285,51 @@ where
             .record_runtime_phase(RuntimePhase::EngineExecution)
             .map_err(|_| self.latch_failure())?;
 
+        let mut recent_snapshot = [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS];
+        let mut recent_snapshot_failed = false;
+        for (ordinal, destination) in recent_snapshot.iter_mut().enumerate() {
+            trace
+                .record_recent_snapshot_read(ordinal)
+                .map_err(|_| self.latch_failure())?;
+            match self.recent_snapshot.read_slot(ordinal) {
+                Ok(slot) => *destination = slot,
+                Err(_) => recent_snapshot_failed = true,
+            }
+        }
+        trace
+            .complete_recent_snapshot_scan(RECENT_SNAPSHOT_SLOTS)
+            .map_err(|_| self.latch_failure())?;
+        if self.recent_snapshot.slots() != RECENT_SNAPSHOT_SLOTS
+            || self.recent_snapshot.identity() != recent_snapshot_identity(&self.checkpoint)
+            || content_digest(&recent_snapshot) != self.recent_snapshot_digest
+        {
+            recent_snapshot_failed = true;
+        }
+
         let execution = self
             .engine
-            .execute_from(request.query(), cursor, &mut trace)
+            .execute_from(request.query(), cursor, &recent_snapshot, &mut trace)
             .map_err(|_| self.latch_failure())?;
         trace
             .record_runtime_phase(RuntimePhase::ResultNormalization)
             .map_err(|_| self.latch_failure())?;
 
         let engine_outcome = execution.page().outcome();
-        if engine_outcome == QueryOutcome::StoreFailure {
+        if matches!(
+            engine_outcome,
+            QueryOutcome::StoreFailure | QueryOutcome::ProjectionNotReady
+        ) || recent_snapshot_failed
+        {
             self.healthy = false;
         }
         let protected_outcome = if engine_outcome == QueryOutcome::StoreFailure {
             QueryOutcome::StoreFailure
-        } else if !was_healthy || !checkpoint_matches || replay_unavailable {
+        } else if engine_outcome == QueryOutcome::ProjectionNotReady
+            || recent_snapshot_failed
+            || !was_healthy
+            || !checkpoint_matches
+            || replay_unavailable
+        {
             QueryOutcome::ProjectionNotReady
         } else if invalid_continuation {
             QueryOutcome::InvalidContinuation
@@ -325,6 +399,21 @@ where
         self.healthy = false;
         UniformExternalFailure
     }
+
+    fn continuation_query_digest(&self, query: &crate::records::UtxoQuery) -> [u8; 32] {
+        bind_query_digest(self.codec.query_digest(query), self.recent_snapshot_digest)
+    }
+}
+
+fn recent_snapshot_identity(checkpoint: &PrivateQueryCheckpoint) -> RecentSnapshotIdentity {
+    RecentSnapshotIdentity::new(
+        checkpoint.network.tag(),
+        checkpoint.height,
+        checkpoint.block_hash_display,
+        checkpoint.schema_version,
+        checkpoint.projection_epoch,
+        checkpoint.key_epoch,
+    )
 }
 
 #[cfg(test)]
@@ -334,7 +423,8 @@ mod tests {
     use super::*;
     use crate::{
         continuation_token::{ContinuationProtectionContext, ReplayBinding, ReplayGuardError},
-        profile::test_profile_without_recent_snapshot,
+        profile::test_profile_with_recent_snapshot,
+        recent_snapshot::{FrozenRecentSnapshot, RecentSnapshotSlot},
         records::{AddressKey, TransparentUtxo, UtxoQuery, ADDRESS_KEY_BYTES, TXID_BYTES},
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
@@ -345,6 +435,9 @@ mod tests {
     const SESSION_BINDING: [u8; 32] = [0x22; 32];
     const TOKEN_TTL_SECONDS: u64 = 60;
     const BLOCK_HASH_DISPLAY: [u8; 32] = [0x31; 32];
+    const RECENT_SNAPSHOT_SLOTS: usize = 4;
+
+    type TestRecentSnapshot = FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>;
 
     type TestRuntime = PrivateQueryRuntime<
         PlaintextMockStore,
@@ -354,6 +447,7 @@ mod tests {
         DeterministicMaterialSource,
         RESPONSE_SLOTS,
         ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
     >;
 
     fn folded_authentication<'a>(key: [u8; 16], bytes: impl Iterator<Item = &'a u8>) -> [u8; 16] {
@@ -665,9 +759,28 @@ mod tests {
         replay_guard: CountingReplayGuard,
         material_source: DeterministicMaterialSource,
     ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
-        let profile = test_profile_without_recent_snapshot(
+        runtime_with_snapshot_components(
+            store,
+            store_reads,
+            empty_recent_snapshot(),
+            session_binding,
+            replay_guard,
+            material_source,
+        )
+    }
+
+    fn runtime_with_snapshot_components(
+        store: PlaintextMockStore,
+        store_reads: usize,
+        recent_snapshot: TestRecentSnapshot,
+        session_binding: [u8; 32],
+        replay_guard: CountingReplayGuard,
+        material_source: DeterministicMaterialSource,
+    ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
+        let profile = test_profile_with_recent_snapshot(
             "runtime-test-v1",
             store_reads,
+            RECENT_SNAPSHOT_SLOTS,
             RESPONSE_SLOTS,
             ENVELOPE_BYTES,
             3,
@@ -676,6 +789,7 @@ mod tests {
         let shape = CompiledQueryShape::new(profile)?;
         Ok(TestRuntime::new(
             store,
+            recent_snapshot,
             shape,
             session_binding,
             checkpoint(),
@@ -686,6 +800,29 @@ mod tests {
                 material_source,
             ),
         )?)
+    }
+
+    fn empty_recent_snapshot() -> TestRecentSnapshot {
+        recent_snapshot([RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS])
+    }
+
+    fn recent_snapshot(slots: [RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS]) -> TestRecentSnapshot {
+        FrozenRecentSnapshot::new(recent_snapshot_identity(&checkpoint()), slots)
+    }
+
+    fn runtime_with_recent(
+        store_reads: usize,
+        entries: &[(usize, TransparentUtxo)],
+        recent_slots: [RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
+    ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
+        runtime_with_snapshot_components(
+            store(store_reads, entries)?,
+            store_reads,
+            recent_snapshot(recent_slots),
+            SESSION_BINDING,
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
+        )
     }
 
     fn request_envelope(
@@ -715,6 +852,7 @@ mod tests {
         let replay_reads = runtime.replay_guard.logical_reads;
         let replay_writes = runtime.replay_guard.logical_writes;
         let material_calls = runtime.material_source.calls;
+        let recent_snapshot_reads = runtime.recent_snapshot.read_calls();
         let round = runtime.handle(request)?;
         assert_eq!(runtime.envelope_protector.opens.get() - envelope_opens, 1);
         assert_eq!(runtime.envelope_protector.seals.get() - envelope_seals, 1);
@@ -728,8 +866,13 @@ mod tests {
         assert_eq!(runtime.replay_guard.logical_reads - replay_reads, 1);
         assert_eq!(runtime.replay_guard.logical_writes - replay_writes, 1);
         assert_eq!(runtime.material_source.calls - material_calls, 1);
+        assert_eq!(
+            runtime.recent_snapshot.read_calls() - recent_snapshot_reads,
+            RECENT_SNAPSHOT_SLOTS
+        );
         assert_eq!(trace.runtime_phases(), RuntimePhase::COUNT);
         assert_eq!(trace.store_reads(), runtime.engine.profile().store_reads());
+        assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_SLOTS);
         assert_eq!(trace.replay_reads(), 1);
         assert_eq!(trace.replay_writes(), 1);
         assert_eq!(trace.request_frames(), 1);
@@ -787,11 +930,243 @@ mod tests {
             assert_eq!(*trace, baseline);
             assert_eq!(response.page.outcome(), expected_outcome);
         }
+
+        let mut recent_hit = runtime_with_recent(
+            4,
+            &[],
+            [
+                RecentSnapshotSlot::created(key, utxo(5, 14)),
+                RecentSnapshotSlot::dummy(),
+                RecentSnapshotSlot::dummy(),
+                RecentSnapshotSlot::dummy(),
+            ],
+        )?;
+        let request = request_envelope(&recent_hit, checkpoint(), UtxoQuery::new(key, 0), None, 7)?;
+        let (recent_trace, recent_response) = handle_and_decode(&mut recent_hit, &request)?;
+        assert_eq!(recent_trace, baseline);
+        assert_eq!(recent_response.page.outcome(), QueryOutcome::Complete);
+        assert_eq!(recent_response.page.real_count(), 1);
         Ok(())
     }
 
     #[test]
-    fn continuation_pages_use_absolute_store_cursors_without_duplicates(
+    fn combined_store_and_recent_cursor_pages_without_duplicates(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let entries = [(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))];
+        let mut runtime = runtime_with_recent(
+            4,
+            &entries,
+            [
+                RecentSnapshotSlot::created(key, utxo(4, 13)),
+                RecentSnapshotSlot::created(key, utxo(5, 14)),
+                RecentSnapshotSlot::dummy(),
+                RecentSnapshotSlot::dummy(),
+            ],
+        )?;
+        let query = UtxoQuery::new(key, 0);
+
+        let first_request = request_envelope(&runtime, checkpoint(), query, None, 1)?;
+        let (first_trace, first) = handle_and_decode(&mut runtime, &first_request)?;
+        let first_token = first
+            .continuation
+            .clone()
+            .expect("first mixed-layer page carries a token");
+
+        let second_request = request_envelope(&runtime, checkpoint(), query, Some(first_token), 2)?;
+        let (second_trace, second) = handle_and_decode(&mut runtime, &second_request)?;
+        let second_token = second
+            .continuation
+            .clone()
+            .expect("second mixed-layer page carries a token");
+
+        let token_context = runtime
+            .codec
+            .continuation_protection_context(&checkpoint())?;
+        let profile = *runtime.engine.profile();
+        let expectation = ContinuationExpectation::new(
+            CONTINUATION_VERSION,
+            *profile.profile_id(),
+            runtime.continuation_query_digest(&query),
+            checkpoint().projection_epoch,
+            102,
+            8,
+        );
+        let inspection = ContinuationToken::inspect_optional(
+            Some(&second_token),
+            &CountingTokenProtector::default(),
+            &token_context,
+            &expectation,
+            [0; ENVELOPE_NONCE_BYTES],
+        );
+        assert_eq!(
+            inspection.claim_or_cover(&mut CountingReplayGuard::available()),
+            ContinuationUse::Continue {
+                cursor: 5,
+                expires_at_unix_seconds: 160,
+            }
+        );
+
+        let third_request = request_envelope(&runtime, checkpoint(), query, Some(second_token), 3)?;
+        let (third_trace, third) = handle_and_decode(&mut runtime, &third_request)?;
+        assert_eq!(first_trace, second_trace);
+        assert_eq!(first_trace, third_trace);
+        assert_eq!(first.page.outcome(), QueryOutcome::ResultBudgetExceeded);
+        assert_eq!(second.page.outcome(), QueryOutcome::ResultBudgetExceeded);
+        assert_eq!(third.page.outcome(), QueryOutcome::Complete);
+
+        let returned_txids: Vec<[u8; TXID_BYTES]> = first
+            .page
+            .slots()
+            .iter()
+            .chain(second.page.slots())
+            .chain(third.page.slots())
+            .filter(|slot| slot.is_occupied())
+            .map(|slot| *slot.padded_utxo().txid())
+            .collect();
+        assert_eq!(
+            returned_txids,
+            vec![
+                [1; TXID_BYTES],
+                [2; TXID_BYTES],
+                [3; TXID_BYTES],
+                [4; TXID_BYTES],
+                [5; TXID_BYTES]
+            ]
+        );
+        assert_eq!(
+            runtime.recent_snapshot.read_calls(),
+            3 * RECENT_SNAPSHOT_SLOTS
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_content_drift_completes_fixed_work_and_latches_readiness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let entries = [(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))];
+        let mut runtime = runtime(4, &entries)?;
+        let query = UtxoQuery::new(key, 0);
+
+        let first_request = request_envelope(&runtime, checkpoint(), query, None, 1)?;
+        let (baseline, first) = handle_and_decode(&mut runtime, &first_request)?;
+        let token = first
+            .continuation
+            .expect("capped first page carries a continuation");
+        runtime
+            .recent_snapshot
+            .replace_slot(0, RecentSnapshotSlot::created(key, utxo(4, 13)));
+
+        let second_request = request_envelope(&runtime, checkpoint(), query, Some(token), 2)?;
+        let (drift_trace, drift_response) = handle_and_decode(&mut runtime, &second_request)?;
+        assert_eq!(drift_trace, baseline);
+        assert_eq!(
+            drift_response.page.outcome(),
+            QueryOutcome::ProjectionNotReady
+        );
+        assert!(drift_response.page.is_all_dummy());
+        assert!(!runtime.healthy);
+        assert_eq!(
+            runtime.recent_snapshot.read_calls(),
+            2 * RECENT_SNAPSHOT_SLOTS
+        );
+        assert_eq!(runtime.engine.store().read_slots().len(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_identity_drift_completes_fixed_work_and_latches_readiness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let mut runtime = runtime(4, &[(0, utxo(1, 10))])?;
+        let current = checkpoint();
+        runtime
+            .recent_snapshot
+            .replace_identity(RecentSnapshotIdentity::new(
+                current.network.tag(),
+                current.height + 1,
+                current.block_hash_display,
+                current.schema_version,
+                current.projection_epoch,
+                current.key_epoch,
+            ));
+
+        let request = request_envelope(&runtime, checkpoint(), UtxoQuery::new(key, 0), None, 1)?;
+        let (trace, response) = handle_and_decode(&mut runtime, &request)?;
+        assert_eq!(trace.store_reads(), 4);
+        assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_SLOTS);
+        assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
+        assert!(response.page.is_all_dummy());
+        assert!(!runtime.healthy);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_snapshot_completes_fixed_work_and_latches_readiness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let output = utxo(4, 13);
+        let mut runtime = runtime_with_recent(
+            4,
+            &[],
+            [
+                RecentSnapshotSlot::created(key, output),
+                RecentSnapshotSlot::created(key, output),
+                RecentSnapshotSlot::dummy(),
+                RecentSnapshotSlot::dummy(),
+            ],
+        )?;
+        let query = UtxoQuery::new(key, 0);
+        let request = request_envelope(&runtime, checkpoint(), query, None, 1)?;
+        let (trace, response) = handle_and_decode(&mut runtime, &request)?;
+
+        assert_eq!(trace.store_reads(), 4);
+        assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_SLOTS);
+        assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
+        assert!(response.page.is_all_dummy());
+        assert!(!runtime.healthy);
+        assert_eq!(runtime.recent_snapshot.read_calls(), RECENT_SNAPSHOT_SLOTS);
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_rejects_different_snapshot_contents_across_runtime_lifecycles(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let entries = [(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))];
+        let query = UtxoQuery::new(key, 0);
+        let mut issuer = runtime(4, &entries)?;
+        let initial_request = request_envelope(&issuer, checkpoint(), query, None, 1)?;
+        let (baseline, initial_response) = handle_and_decode(&mut issuer, &initial_request)?;
+        let token = initial_response
+            .continuation
+            .expect("capped issuer page carries a continuation");
+
+        let mut changed = runtime_with_recent(
+            4,
+            &entries,
+            [
+                RecentSnapshotSlot::created(key, utxo(4, 13)),
+                RecentSnapshotSlot::dummy(),
+                RecentSnapshotSlot::dummy(),
+                RecentSnapshotSlot::dummy(),
+            ],
+        )?;
+        let continued_request = request_envelope(&changed, checkpoint(), query, Some(token), 2)?;
+        let (changed_trace, changed_response) =
+            handle_and_decode(&mut changed, &continued_request)?;
+        assert_eq!(changed_trace, baseline);
+        assert_eq!(
+            changed_response.page.outcome(),
+            QueryOutcome::InvalidContinuation
+        );
+        assert!(changed_response.page.is_all_dummy());
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_pages_use_absolute_combined_cursors_without_duplicates(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let entries = [
             (0, utxo(1, 10)),
@@ -826,10 +1201,10 @@ mod tests {
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
             *profile.profile_id(),
-            runtime.codec.query_digest(&query),
+            runtime.continuation_query_digest(&query),
             checkpoint().projection_epoch,
             102,
-            10,
+            14,
         );
         let inspection = ContinuationToken::inspect_optional(
             Some(&second_token),
@@ -945,7 +1320,7 @@ mod tests {
         let cursor_state = ContinuationState::new(
             CONTINUATION_VERSION,
             *cursor_profile.profile_id(),
-            cursor_runtime.codec.query_digest(&query),
+            cursor_runtime.continuation_query_digest(&query),
             checkpoint().projection_epoch,
             0,
             160,
@@ -976,7 +1351,7 @@ mod tests {
             let binding_state = ContinuationState::new(
                 CONTINUATION_VERSION,
                 profile_id,
-                binding_runtime.codec.query_digest(&query),
+                binding_runtime.continuation_query_digest(&query),
                 projection_epoch,
                 2,
                 160,
@@ -1155,6 +1530,191 @@ mod tests {
             assert_eq!(response.page.outcome(), QueryOutcome::StoreFailure);
             assert!(response.page.is_all_dummy());
             assert!(!failing_runtime.healthy);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn each_recent_snapshot_failure_completes_fixed_work_and_latches_readiness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let query = UtxoQuery::new(address(1), 0);
+        let entries = [(0, utxo(1, 10))];
+        let (baseline, _) = run_initial(&entries, query)?;
+        let recent_slots = [
+            RecentSnapshotSlot::created(address(1), utxo(2, 11)),
+            RecentSnapshotSlot::dummy(),
+            RecentSnapshotSlot::dummy(),
+            RecentSnapshotSlot::dummy(),
+        ];
+
+        for failing_ordinal in 0..RECENT_SNAPSHOT_SLOTS {
+            let recent_snapshot = FrozenRecentSnapshot::failing(
+                recent_snapshot_identity(&checkpoint()),
+                recent_slots,
+                failing_ordinal,
+            );
+            let mut runtime = runtime_with_snapshot_components(
+                store(4, &entries)?,
+                4,
+                recent_snapshot,
+                SESSION_BINDING,
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            )?;
+
+            for nonce in [1_u8, 2_u8] {
+                let request = request_envelope(&runtime, checkpoint(), query, None, nonce)?;
+                let (trace, response) = handle_and_decode(&mut runtime, &request)?;
+                assert_eq!(trace, baseline);
+                assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
+                assert!(response.page.is_all_dummy());
+                assert!(!runtime.healthy);
+            }
+            assert_eq!(
+                runtime.recent_snapshot.read_calls(),
+                2 * RECENT_SNAPSHOT_SLOTS
+            );
+            assert_eq!(runtime.engine.store().read_slots().len(), 8);
+        }
+
+        let recent_snapshot =
+            FrozenRecentSnapshot::failing(recent_snapshot_identity(&checkpoint()), recent_slots, 0);
+        let mut both_fail = runtime_with_snapshot_components(
+            store(4, &entries)?.with_failure_on_read(1),
+            4,
+            recent_snapshot,
+            SESSION_BINDING,
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
+        )?;
+        let request = request_envelope(&both_fail, checkpoint(), query, None, 3)?;
+        let (trace, response) = handle_and_decode(&mut both_fail, &request)?;
+        assert_eq!(trace, baseline);
+        assert_eq!(response.page.outcome(), QueryOutcome::StoreFailure);
+        assert!(response.page.is_all_dummy());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_rejects_snapshot_shape_and_checkpoint_identity_mismatches(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        type ThreeSlotRuntime = PrivateQueryRuntime<
+            PlaintextMockStore,
+            DeterministicEnvelopeProtector,
+            CountingTokenProtector,
+            CountingReplayGuard,
+            DeterministicMaterialSource,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            3,
+        >;
+
+        let profile = test_profile_with_recent_snapshot(
+            "runtime-test-v1",
+            4,
+            RECENT_SNAPSHOT_SLOTS,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            3,
+            TOKEN_TTL_SECONDS,
+        )?;
+        let shape = CompiledQueryShape::new(profile)?;
+        let shape_mismatch = ThreeSlotRuntime::new(
+            store(4, &[])?,
+            FrozenRecentSnapshot::new(
+                recent_snapshot_identity(&checkpoint()),
+                [RecentSnapshotSlot::dummy(); 3],
+            ),
+            shape,
+            SESSION_BINDING,
+            checkpoint(),
+            RuntimeDependencies::new(
+                DeterministicEnvelopeProtector::default(),
+                CountingTokenProtector::default(),
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        );
+        assert!(matches!(shape_mismatch, Err(UniformExternalFailure)));
+
+        let current = checkpoint();
+        let mismatched_identities = [
+            RecentSnapshotIdentity::new(
+                current.network.tag() ^ 1,
+                current.height,
+                current.block_hash_display,
+                current.schema_version,
+                current.projection_epoch,
+                current.key_epoch,
+            ),
+            RecentSnapshotIdentity::new(
+                current.network.tag(),
+                current.height + 1,
+                current.block_hash_display,
+                current.schema_version,
+                current.projection_epoch,
+                current.key_epoch,
+            ),
+            RecentSnapshotIdentity::new(
+                current.network.tag(),
+                current.height,
+                [0x32; 32],
+                current.schema_version,
+                current.projection_epoch,
+                current.key_epoch,
+            ),
+            RecentSnapshotIdentity::new(
+                current.network.tag(),
+                current.height,
+                current.block_hash_display,
+                current.schema_version + 1,
+                current.projection_epoch,
+                current.key_epoch,
+            ),
+            RecentSnapshotIdentity::new(
+                current.network.tag(),
+                current.height,
+                current.block_hash_display,
+                current.schema_version,
+                current.projection_epoch + 1,
+                current.key_epoch,
+            ),
+            RecentSnapshotIdentity::new(
+                current.network.tag(),
+                current.height,
+                current.block_hash_display,
+                current.schema_version,
+                current.projection_epoch,
+                current.key_epoch + 1,
+            ),
+        ];
+        for mismatched_identity in mismatched_identities {
+            let profile = test_profile_with_recent_snapshot(
+                "runtime-test-v1",
+                4,
+                RECENT_SNAPSHOT_SLOTS,
+                RESPONSE_SLOTS,
+                ENVELOPE_BYTES,
+                3,
+                TOKEN_TTL_SECONDS,
+            )?;
+            let identity_mismatch = TestRuntime::new(
+                store(4, &[])?,
+                FrozenRecentSnapshot::new(
+                    mismatched_identity,
+                    [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
+                ),
+                CompiledQueryShape::new(profile)?,
+                SESSION_BINDING,
+                current,
+                RuntimeDependencies::new(
+                    DeterministicEnvelopeProtector::default(),
+                    CountingTokenProtector::default(),
+                    CountingReplayGuard::available(),
+                    DeterministicMaterialSource::at(100),
+                ),
+            );
+            assert!(matches!(identity_mismatch, Err(UniformExternalFailure)));
         }
         Ok(())
     }

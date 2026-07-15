@@ -124,6 +124,10 @@ impl PrivacyProfile {
             definition.recent_snapshot_scan_slots,
             definition.envelope_bytes,
         );
+        definition
+            .store_reads
+            .checked_add(definition.recent_snapshot_scan_slots)
+            .ok_or(PrivacyProfileError::DimensionTooLarge)?;
         let profile_id = derive_profile_id(
             &access_budget,
             definition.padded_input_slots,
@@ -164,6 +168,13 @@ impl PrivacyProfile {
     /// Returns the complete modeled logical-access budget.
     pub(super) const fn access_budget(&self) -> QueryAccessBudget {
         self.access_budget
+    }
+
+    /// Returns the combined finalized-store then recent-snapshot cursor domain.
+    pub(super) fn combined_scan_slots(&self) -> Result<usize, PrivacyProfileError> {
+        self.store_reads()
+            .checked_add(self.access_budget.recent_snapshot_reads())
+            .ok_or(PrivacyProfileError::DimensionTooLarge)
     }
 
     /// Returns the exact padded request-input count.
@@ -220,6 +231,20 @@ impl PrivacyProfile {
         }
         Ok(())
     }
+
+    /// Validates the compiled recent-snapshot source width against the profile.
+    pub(super) const fn validate_recent_snapshot_slots<const N: usize>(
+        &self,
+    ) -> Result<(), PrivacyProfileError> {
+        let required = self.access_budget.recent_snapshot_reads();
+        if required != N {
+            return Err(PrivacyProfileError::RecentSnapshotShapeMismatch {
+                required,
+                available: N,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A compiled privacy profile is internally inconsistent with its fixed shape.
@@ -266,6 +291,13 @@ pub(super) enum PrivacyProfileError {
         /// Slots exposed by the store.
         available: usize,
     },
+    /// The compiled recent-snapshot domain differs from the profile budget.
+    RecentSnapshotShapeMismatch {
+        /// Slots the profile promises to scan.
+        required: usize,
+        /// Slots exposed by the compiled source.
+        available: usize,
+    },
 }
 
 impl fmt::Display for PrivacyProfileError {
@@ -309,6 +341,13 @@ impl fmt::Display for PrivacyProfileError {
             } => write!(
                 f,
                 "privacy profile requires a complete {required}-slot store domain; store has {available}"
+            ),
+            Self::RecentSnapshotShapeMismatch {
+                required,
+                available,
+            } => write!(
+                f,
+                "privacy profile requires a complete {required}-slot recent snapshot; source has {available}"
             ),
         }
     }
@@ -385,11 +424,55 @@ pub(super) fn test_profile_without_recent_snapshot(
     cover_rounds: usize,
     continuation_ttl_seconds: u64,
 ) -> Result<PrivacyProfile, PrivacyProfileError> {
+    test_profile(
+        label,
+        store_reads,
+        0,
+        response_slots,
+        envelope_bytes,
+        cover_rounds,
+        continuation_ttl_seconds,
+    )
+}
+
+/// Builds an explicitly listener-free test profile with a fixed
+/// recent-snapshot scan budget supplied by the caller.
+#[cfg(test)]
+pub(super) fn test_profile_with_recent_snapshot(
+    label: &'static str,
+    store_reads: usize,
+    recent_snapshot_scan_slots: usize,
+    response_slots: usize,
+    envelope_bytes: usize,
+    cover_rounds: usize,
+    continuation_ttl_seconds: u64,
+) -> Result<PrivacyProfile, PrivacyProfileError> {
+    test_profile(
+        label,
+        store_reads,
+        recent_snapshot_scan_slots,
+        response_slots,
+        envelope_bytes,
+        cover_rounds,
+        continuation_ttl_seconds,
+    )
+}
+
+#[cfg(test)]
+fn test_profile(
+    label: &'static str,
+    store_reads: usize,
+    recent_snapshot_scan_slots: usize,
+    response_slots: usize,
+    envelope_bytes: usize,
+    cover_rounds: usize,
+    continuation_ttl_seconds: u64,
+) -> Result<PrivacyProfile, PrivacyProfileError> {
     PrivacyProfile::new(PrivacyProfileDefinition {
         label,
         store_reads,
         padded_input_slots: 1,
-        recent_snapshot_scan_slots: 0,
+        recent_snapshot_scan_slots,
         response_slots,
         envelope_bytes,
         cover_rounds,
@@ -480,6 +563,7 @@ mod tests {
         let profile = profile();
         assert_eq!(profile.label(), "test-v1");
         assert_eq!(profile.store_reads(), 4);
+        assert_eq!(profile.combined_scan_slots(), Ok(4));
         assert_eq!(profile.access_budget().store_writes(), 0);
         assert_eq!(profile.access_budget().allocations(), 0);
         assert_eq!(profile.access_budget().source_calls(), 0);
@@ -579,6 +663,14 @@ mod tests {
             PrivacyProfile::new(changed),
             Err(PrivacyProfileError::DimensionTooLarge)
         );
+
+        let mut changed = definition();
+        changed.store_reads = usize::MAX;
+        changed.recent_snapshot_scan_slots = 1;
+        assert_eq!(
+            PrivacyProfile::new(changed),
+            Err(PrivacyProfileError::DimensionTooLarge)
+        );
     }
 
     #[test]
@@ -640,6 +732,13 @@ mod tests {
                 available: 1,
             })
         ));
+        assert_eq!(
+            profile().validate_recent_snapshot_slots::<1>(),
+            Err(PrivacyProfileError::RecentSnapshotShapeMismatch {
+                required: 0,
+                available: 1,
+            })
+        );
         assert!(matches!(
             CompiledQueryShape::<3, 128>::new(profile()),
             Err(PrivacyProfileError::ResponseShapeMismatch {

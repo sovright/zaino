@@ -12,9 +12,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   budget, a fixed timeout bucket, and the explicit single-worker FIFO
   execution/queue/reject-at-capacity policy. The allocation-free recorder
   separately validates sequential recent-snapshot scan ordinals while keeping
-  forbidden query-derived source calls at zero. Existing listener-free
-  fixtures explicitly bind no recent-snapshot integration; this is profile and
-  recorder schema evidence, not an NFS scan or merge claim.
+  forbidden query-derived source calls at zero. The listener-free runtime now
+  executes a nonzero, profile-bound, ordinal-only full scan over a concrete
+  runtime-owned `FrozenRecentSnapshot<N>`, merges its create/spend changes before
+  pagination, and addresses the finalized store plus recent snapshot through
+  one combined cursor domain. The frozen type computes its fixed-slot content
+  commitment internally rather than accepting a generic source-reported digest;
+  fault and post-construction corruption hooks exist only under `#[cfg(test)]`
+  and are absent from the production API. The commitment is bound into the
+  continuation query digest, and every round completes the scan before
+  rechecking both exact checkpoint identity and recomputed content commitment.
+  Malformed same-outpoint sequences, owner mismatches against finalized outputs,
+  and duplicate creates fail closed as protected `ProjectionNotReady` only after
+  the full modeled work, while query-derived source calls remain zero. This is
+  logical mock evidence only: the commitment is not an authenticated
+  canonical/live Zaino snapshot root, and the slice does not supply live NFS
+  acquisition, canonical or reorg-safe snapshot publication, physical
+  obliviousness, allocator or timing equivalence, TDX, mainnet, or target-load
+  evidence.
 - A crate-internal recovery foundation for the volatile projection worker: a
   fixed 160-byte public manifest payload plus 32-byte authenticator binds
   monotonic publication and predecessor digests, projection identity/epoch,
@@ -53,11 +68,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - A module-private listener-free runtime adapter that validates opaque tokens
   before engine use, performs one real-or-cover replay operation and token
   issue per completed protected round after server-material acquisition, scans
-  the complete store domain, paginates with absolute logical store-slot cursors,
-  and records an ordered ten-phase logical schedule. Token failures collapse to
-  a protected fixed
-  `InvalidContinuation` response after the same modeled work when no
-  higher-priority store or projection-readiness failure applies. Token
+  the complete finalized-store and runtime-owned frozen-snapshot domains,
+  paginates with absolute logical cursors in their combined domain, and records
+  an ordered ten-phase logical schedule. Token failures collapse to a
+  protected fixed `InvalidContinuation` response after the same modeled work
+  when no higher-priority store or projection-readiness failure applies. Token
   protection binds the checkpoint and codec session; every replay path models
   one lookup and one write-back, with cover writes isolated from the real-token
   namespace. Test profiles bind the runtime schedule version, replay budget,

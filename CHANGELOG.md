@@ -13,8 +13,23 @@ and this library adheres to Rust's notion of
   recent-snapshot scan budget, timeout bucket, and explicit single-worker FIFO
   execution/queue/reject-at-capacity policy. The logical recorder validates
   ordered recent-snapshot scan ordinals separately from forbidden
-  query-derived source calls. Existing fixtures still bind zero snapshot work,
-  so this does not claim an implemented NFS scan or merge.
+  query-derived source calls. The listener-free runtime now executes a nonzero,
+  profile-bound, ordinal-only full scan over a concrete runtime-owned
+  `FrozenRecentSnapshot<N>` and merges its create/spend changes before
+  paginating across one combined finalized-plus-recent cursor domain. The
+  frozen type computes its fixed-slot content commitment internally rather than
+  accepting a generic source-reported digest; fault and post-construction
+  corruption hooks exist only under `#[cfg(test)]` and are absent from the
+  production API. The commitment is bound into the continuation query digest,
+  and every round completes the scan before rechecking both exact checkpoint
+  identity and recomputed content commitment. Malformed same-outpoint
+  sequences, owner mismatches against finalized outputs, and duplicate creates
+  fail closed as protected `ProjectionNotReady` only after the full modeled
+  work, while query-derived source calls remain zero. This is logical mock
+  evidence only: the commitment is not an authenticated canonical/live Zaino
+  snapshot root, and the slice does not supply live NFS acquisition, canonical
+  or reorg-safe snapshot publication, physical obliviousness, allocator or
+  timing equivalence, TDX, mainnet, or target-load evidence.
 - `zaino-oram`: a crate-internal authenticated public-manifest and volatile
   rebuild foundation now binds publication lineage, projection identity/epoch,
   finalized checkpoint, event count, and a deterministic semantic event-log
@@ -46,10 +61,11 @@ and this library adheres to Rust's notion of
   no production AEAD, nonce lifecycle, listener, or physical fixed-work claim.
 - `zaino-oram`: a private listener-free runtime adapter now composes canonical
   request decode, one server-material acquisition, real-or-cover token open and
-  replay access, a complete store-domain scan, fixed result normalization, one
-  real-or-cover token issue, and protected response encode into a versioned
-  ten-phase logical trace. Absolute store-slot cursors paginate without skips
-  or duplicates; invalid, expired, mismatched, and replayed tokens complete the
+  replay access, complete finalized-store and runtime-owned frozen-snapshot
+  scans, fixed result normalization, one real-or-cover token issue, and
+  protected response encode into a versioned ten-phase logical trace. Absolute
+  cursors in the combined finalized-plus-recent domain paginate without skips or
+  duplicates; invalid, expired, mismatched, and replayed tokens complete the
   same modeled schedule and return one protected `InvalidContinuation` shape
   when no higher-priority store or projection-readiness failure applies.
   Token protection binds the checkpoint and codec session, and each completed

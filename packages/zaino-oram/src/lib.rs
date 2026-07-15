@@ -38,6 +38,7 @@ mod projection;
 mod projection_owner;
 #[cfg(feature = "corpus-zaino")]
 mod qualification;
+mod recent_snapshot;
 mod records;
 mod sizing;
 mod store;

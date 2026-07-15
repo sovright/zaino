@@ -54,11 +54,17 @@ mainnet/host-oblivious privacy claim.**
 
 **Offline research may continue** in the non-published `zaino-oram` package.
 The implemented work is useful evidence for API shape, fixed records, aggregate
-corpus accounting, logical schedules, bounded generic-builder measurement
-plumbing, and an authenticated public projection-manifest/rebuild contract
-around a pinned upstream experiment. It does not establish equal physical work,
-production encryption, durable ORAM state, a measured recovery-time objective,
-TDX isolation, attestation, wire-shape equivalence, or mainnet capacity.
+corpus accounting, logical schedules using a concrete runtime-owned
+`FrozenRecentSnapshot<N>` with an internally computed content commitment bound
+to continuations and rechecked after every full scan, bounded generic-builder
+measurement plumbing, and an authenticated public projection-manifest/rebuild
+contract around a pinned upstream experiment. The frozen-snapshot evidence uses
+mock-constructed contents, and its commitment is not an authenticated
+canonical/live Zaino snapshot root. The work does not establish live NFS
+acquisition, canonical or reorg-safe snapshot publication, equal physical work,
+allocator or timing equivalence, production encryption, durable ORAM state, a
+measured recovery-time objective, TDX isolation, attestation, wire-shape
+equivalence, mainnet capacity, or target-load behavior.
 
 This is a gate decision, not a conclusion that ORAM is infeasible. Server work
 must remain closed until the Phase 0 blockers in this report have measured,
@@ -102,8 +108,9 @@ The evaluated worktree implements:
   with a canonical 16-byte identifier derived from the current logical-access
   budget, padded inputs, response/envelope shape, cover/token lifetime,
   timeout bucket, and explicit single-worker FIFO queue/overload policy. The
-  test-only profile binds a zero recent-snapshot scan until the next injected
-  snapshot slice supplies real fixed scan work;
+  listener-free runtime fixtures bind and execute a nonzero, fixed four-slot
+  recent-snapshot scan through a concrete runtime-owned
+  `FrozenRecentSnapshot<4>`; no production profile constants are selected;
 - a crate-internal versioned inner request/response codec that binds the
   compiled profile, direction, fixed public-chain/projection checkpoint,
   prepared query, optional fixed continuation field, session binding,
@@ -118,22 +125,33 @@ The evaluated worktree implements:
   recent-snapshot scan dimension, one replay lookup and write-back, one
   request/response application envelope, fixed application bytes, one public
   completion shape, and a versioned ordered ten-phase runtime schedule. Unit
-  tests enforce nonzero recent-snapshot scan budgets, while the existing
-  listener-free runtime remains explicitly bound to zero until it owns an
-  injected frozen snapshot;
+  tests and the listener-free runtime enforce a nonzero profile-bound,
+  ordinal-only full recent-snapshot scan. The concrete frozen type computes its
+  commitment internally, and each runtime round completes the configured scan
+  before rechecking checkpoint identity and recomputed content commitment.
+  Test-injected read failure or corruption still completes every configured
+  ordinal, while modeled query-derived source calls remain zero;
 - a bounded plaintext mock and equal complete modeled traces across selected
-  hit, miss, filtered, full, cap-hit, early/late, invalid-domain, and
-  injected-store-failure cases;
+  hit, miss, filtered, full, cap-hit, early/late, invalid-domain,
+  injected-store-failure, recent-change, and recent-snapshot-failure cases;
 - a fixed 128-byte continuation-token format with injected protection and
   replay-guard interfaces whose associated data binds checkpoint and codec
-  session, plus tamper, expiry, binding, reserved-byte, replay, and guard-failure
-  tests;
+  session and whose query digest binds the internally computed fixed
+  recent-snapshot content commitment, plus tamper, expiry, binding,
+  reserved-byte, replay,
+  cross-runtime snapshot-content mismatch, and guard-failure tests;
 - a module-private listener-free runtime adapter that acquires its clock and
   output nonces before any real token claim, performs one real-or-cover token
   open, replay access, and token issue per completed protected round after that
-  material acquisition, scans every configured store slot, paginates by
-  absolute store-slot ordinal, preserves absolute expiry, and protects semantic
-  token failures as one
+  material acquisition, owns a concrete `FrozenRecentSnapshot<N>` for its
+  lifecycle, scans every configured recent-snapshot and finalized-store slot,
+  then rechecks its exact checkpoint identity and recomputed full-scan content
+  commitment. It latches readiness if those checks fail, merges recent creates
+  and spends before pagination, rejects malformed same-outpoint sequences,
+  owner mismatches against finalized outputs, and duplicate creates as
+  protected `ProjectionNotReady` only after full work, paginates over one
+  combined finalized-plus-recent ordinal domain, preserves absolute expiry, and
+  protects semantic token failures as one
   fixed `InvalidContinuation` response after the complete modeled schedule when
   no higher-priority store or projection-readiness failure applies;
 - a redacted transparent-event extraction seam from `IndexedBlock`;
@@ -347,13 +365,18 @@ The following statements are **not** established by that evidence:
   owner;
 - codec/runtime tests prove exact/canonical bytes, protection-interface
   plumbing, and equality of a source-level logical decode/token/replay/
-  full-store/issuance/encode phase schedule. They do not prove cryptographic
-  authentication or equal instructions, branches, allocator activity,
-  memory/page accesses, timing, transport frames, or packets. The runtime's
-  clock, nonce source, replay guard, protectors, and store are research
-  fixtures with no production lifecycle;
-- no private protobuf, gRPC adapter, NFS merge, attestation provider, TLS
-  identity, readiness path, or private-service lifecycle exists;
+  full-finalized-store/full-recent-snapshot/issuance/encode phase schedule. They
+  do not prove cryptographic authentication or equal instructions, branches,
+  allocator activity, memory/page accesses, timing, transport frames, or
+  packets. The runtime's clock, nonce source, replay guard, protectors, store,
+  and concrete frozen snapshot are research fixtures with no production
+  lifecycle. The frozen type computes its commitment from its owned slots, not
+  from a generic source-reported digest, and its fault/corruption hooks are
+  test-only. That deterministic commitment is neither externally authenticated
+  nor a canonical/live Zaino snapshot root;
+- no private protobuf, gRPC adapter, live Zaino NFS acquisition or canonical
+  snapshot-publication seam, attestation provider, TLS identity, readiness
+  path, or private-service lifecycle exists;
   `zainod-oram` contains listener-free corpus, fixed qualification,
   target-load, and fresh-worker rebuild research runners, not a serving
   lifecycle;
@@ -486,17 +509,17 @@ open the server gate.
 |---|---|---|
 | Business and persistent records | Partial pass | Fixed UTXO and 72-byte event types exist with named conversions and adjacent tests; finalized create/spend states are enforced, and an in-memory offline checkpoint/projection model exists; persistent page/directory/checkpoint representations remain incomplete |
 | Fixed envelope codec | Partial pass | A crate-internal versioned codec binds direction, derived profile ID, fixed checkpoint, prepared query, opaque optional token, session binding, outcome/`has_more`, and canonical fixed result slots inside one exact envelope. Version/profile/session/direction are explicit protection context. Checked arithmetic rejects undersized shapes; a non-cryptographic deterministic fixture rejects one single-bit mutation at every byte offset, reseals malformed plaintext to exercise protected canonical rejection, and pins exact request/response digests. All pre-runtime decode failures map to one external failure class. There is no production AEAD/nonce owner or protobuf framing |
-| Compiled profile table | Partial pass | Profile ID v3 binds query-store reads, zero query-store writes/allocations/source calls, the recent-snapshot scan budget, padded input slots, one replay lookup/write-back, one request/response application frame, fixed bytes, unary completion, response slots, cover rounds, runtime schedule version/count, continuation lifetime, timeout bucket, and a typed single-worker FIFO execution/queue/reject-at-capacity policy. Regression tests prove every selectable authoritative dimension changes the ID while the diagnostic label does not. Existing fixtures explicitly bind a zero recent-snapshot budget; no production profile constants are guessed or accepted |
-| Continuation tokens | Partial pass for the logical model | The fixed token is opened and semantically validated before engine use; full checkpoint plus codec-session bytes are protector context, cursors are bounded absolute store ordinals, expiry does not slide, and valid uses are atomically claimed through the injected guard. Invalid/expired/mismatched/replayed tokens become one protected all-dummy outcome after the same modeled schedule when no higher-priority store or projection-readiness failure applies. Initial/invalid paths write back to a dedicated non-durable cover slot without mutating the real-token namespace, and every completed protected round after server-material acquisition issues one real-or-cover token. No reviewed AEAD, trusted clock/nonce lifecycle, durable replay store, service integration, or instruction/memory/timing result exists |
+| Compiled profile table | Partial pass | Profile ID v3 binds query-store reads, zero query-store writes/allocations/source calls, the recent-snapshot scan budget, padded input slots, one replay lookup/write-back, one request/response application frame, fixed bytes, unary completion, response slots, cover rounds, runtime schedule version/count, continuation lifetime, timeout bucket, and a typed single-worker FIFO execution/queue/reject-at-capacity policy. Regression tests prove every selectable authoritative dimension changes the ID while the diagnostic label does not. Listener-free runtime fixtures bind a nonzero four-slot recent-snapshot budget; no production profile constants are guessed or accepted |
+| Continuation tokens | Partial pass for the logical model | The fixed token is opened and semantically validated before engine use; full checkpoint plus codec-session bytes are protector context, and the continuation query digest binds the commitment computed internally from every slot owned by the concrete `FrozenRecentSnapshot<N>`. Cursors are bounded absolute ordinals in the combined finalized-plus-recent domain, expiry does not slide, and valid uses are atomically claimed through the injected guard. A continuation issued by one runtime lifecycle is rejected by another with different mock snapshot contents. Invalid/expired/mismatched/replayed tokens become one protected all-dummy outcome after the same modeled schedule when no higher-priority store or projection-readiness failure applies. Initial/invalid paths write back to a dedicated non-durable cover slot without mutating the real-token namespace, and every completed protected round after server-material acquisition issues one real-or-cover token. No reviewed AEAD, trusted clock/nonce lifecycle, durable replay store, service integration, or instruction/memory/timing result exists |
 | Deterministic mock store | Pass for logical modeling | Bounded plaintext mock rejects duplicate/out-of-range/capacity errors |
-| Logical store trace | Partial pass for the offline model | Allocation-free recorder validates sequential query-store reads, a separately ordered recent-snapshot scan budget, zero query-store writes/allocations/source calls, one replay lookup/write-back, modeled application frames/bytes, completion, and the exact ordered ten-phase decode/token/replay/read/issue/encode schedule. Unit tests reject missing, extra, and reordered recent-snapshot reads and still reject any forbidden host/source call. The listener-free runtime has not yet been given a frozen snapshot and therefore executes the explicit zero-scan test profile; NFS merge, physical, allocator, instruction, timing, and transport evidence remain open |
-| Failure completion schedule | Partial pass | Every injected mock read failure still completes all configured logical reads; physical failure behavior is not equivalent or measured |
+| Logical store trace | Partial pass for the offline model | Allocation-free recorder validates sequential query-store reads, a separately ordered recent-snapshot scan budget, zero query-store writes/allocations/source calls, one replay lookup/write-back, modeled application frames/bytes, completion, and the exact ordered ten-phase decode/token/replay/read/issue/encode schedule. The listener-free runtime executes the nonzero profile-bound ordinal scan through its concrete `FrozenRecentSnapshot<N>` and, only after completing the scan, rechecks exact checkpoint identity and the content commitment recomputed from all scanned slots. It merges changes before pagination and rejects missing, extra, or reordered reads while keeping query-derived source calls at zero. Live NFS acquisition, physical, allocator, instruction, timing, and transport evidence remain open |
+| Failure completion schedule | Partial pass | Every test-injected finalized-store or recent-snapshot read fault still completes all configured logical reads. A read fault, checkpoint/content-commitment mismatch, malformed same-outpoint sequence, owner mismatch against a finalized output, or duplicate create produces a protected all-dummy `ProjectionNotReady` result and latches readiness only after the full modeled work. Fault and post-construction corruption hooks are `#[cfg(test)]` only and absent from the production API; physical failure behavior is not equivalent or measured |
 | Independent private proto | Missing | No `zainod-oram/proto` or `zaino.private.v1` generation exists |
 | Private service adapter | Missing | A listener-free module-private runtime adapter exists, but no private proto, gRPC service, transport, or real outer-status equivalence test exists |
 | Frame/byte/completion equivalence | Partial model | Every offline round models one fixed request and response application envelope, equal bytes, and unary completion; this is explicitly not protobuf, HTTP/2, TLS, packet-capture, or outer-status evidence |
-| NFS/source-call equivalence | Partial model | The profile and recorder now distinguish in-trust-domain recent-snapshot scan ordinals from query-derived host/source calls, which remain fixed at zero. The engine has no frozen-snapshot dependency yet, so existing runtime fixtures bind zero scan slots; no NFS scan/merge or integrated validator/LMDB/raw-transaction instrumentation exists |
+| NFS/source-call equivalence | Partial logical mock | The runtime owns a concrete `FrozenRecentSnapshot<N>` rather than a generic source, and the frozen type computes its commitment internally from its fixed slots. Each round reads only public sequential ordinals, completes the nonzero profile-bound scan, rechecks exact checkpoint identity and the recomputed commitment, validates same-outpoint ownership/sequencing, and merges recent creates/spends before pagination. The commitment is continuation-query-digest-bound across runtime lifecycles, and query-derived host/source calls remain modeled at zero. This is not an authenticated canonical/live Zaino snapshot root; there is no live NFS acquisition, canonical or reorg-safe snapshot publication, or integrated validator/LMDB/raw-transaction instrumentation |
 | Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior; static ordinary-source versus offline-oracle UTXO parity is committed, while live direct/RPC and finalised-database parity remain open |
-| Token fixed-work equivalence | Partial pass for logical schedule | Initial, valid, tampered, expired, query-mismatched, replayed, and guard-unavailable paths perform one modeled token open, replay lookup/write-back, complete store scan, token issue, response encode, fixed frames/bytes, and completion. This is not instruction/allocation/memory/page/timing or production-crypto equivalence |
+| Token fixed-work equivalence | Partial pass for logical schedule | Initial, valid, tampered, expired, query-mismatched, snapshot-content-mismatched across runtime lifecycles, replayed, and guard-unavailable paths perform one modeled token open, replay lookup/write-back, complete finalized-store and recent-snapshot scans, token issue, response encode, fixed frames/bytes, and completion. This is not instruction/allocation/memory/page/timing or production-crypto equivalence |
 | Test runtime discipline | Pass in this slice | Synchronous cases use `#[test]`; the shadow fixture's two tests alone use current-thread `#[tokio::test]` because they await the ordinary `BlockchainSource` query |
 
 Phase 1 is a useful skeleton, not an accepted private contract.
@@ -513,7 +536,7 @@ Phase 1 is a useful skeleton, not an accepted private contract.
 | Single mutation worker and backend telemetry | Partial typed integration | A portable std-thread worker exclusively owns the exact two-table executor, validates a 1..=4096 research queue bound before allocation, bounds accepted-not-started whole business commands with a `sync_channel`, drains FIFO admissions before shutdown/join, removes raw read/insert bypasses, and separates lifecycle from terminal fault health. Its identifier-free counters are internal and not approved for export. The private owner validates exact network/schema/key-epoch and admission compatibility before allocation, owns the coordinator plus worker, and joins it on consuming shutdown without exporting snapshots. Generic native Linux CI binds the real typed stores to that owner and completes the full three-block/seven-event lifecycle. There is no stash metric, runtime projection lifecycle, or fixed-cadence suppression policy |
 | Volatile rebuild path | Partial pass | Portable and Linux-x86_64-gated typed-worker tests shut down, classify the authenticated prior manifest, allocate a fresh worker under a new projection epoch, replay genesis-forward, and reproduce the same semantic event-log root/checkpoint while advancing publication lineage. The source-bound runner additionally requires exact replayed corpus equality and exposes an allocation-through-readiness budget with fixed-snapshot provenance. No production owner, controlled cold-cache state, full-corpus artifact, target-hardware timing, or full-service RTO is measured |
 | Shadow comparison with ordinary Zaino | Pass for one static fixture checkpoint | A default-off test independently obtains ordinary UTXOs from `MockchainSource::get_address_utxos` over Zebra full blocks and projection UTXOs from `IndexedBlock` transparent events; it compares every standard address observed through immutable regtest-vector height 200 plus an absent address, at the same height/hash. Live direct/RPC, finalised-database, mainnet, and reorg shadow modes remain missing |
-| Zero query-derived source calls | Pass for current type boundary | The query engine has no validator/LMDB/raw-transaction dependency; this is not yet an integrated readiness or call-trace result |
+| Zero query-derived source calls | Pass for current logical type boundary | The recent-snapshot interface accepts only public ordinals, and the query engine has no validator/LMDB/raw-transaction dependency; `source_calls` remains modeled at zero. This is not an integrated live-readiness or call-trace result |
 | Long-run failure bound | Missing | No target-load mixed-operation soak or node-year analysis exists |
 
 Phase 2 now has a deterministic plaintext oracle, one static ordinary-source
@@ -534,20 +557,20 @@ yet stakeholder-approved.
 |---|---|---|---|---|
 | Queried address/script | Must hide | Never appears outside the protected workload or in host-keyed storage access | Sensitive Rust `Debug` output is redacted; no private transport or TDX exists | Open |
 | Queried txid/outpoint | Must hide | No logs, errors, source calls, tokens, or physical locations expose it | Event/corpus debug output is redacted; query service is absent | Open |
-| Continuation cursor/query digest/nonce | Must hide | Fixed authenticated encryption and no visible remaining count | The listener-free runtime validates a fixed 128-byte token, uses bounded absolute store-slot cursors, preserves expiry, and keeps token/query/replay diagnostics redacted; protectors and replay storage remain injected test interfaces | Open: production crypto/key/nonce/replay lifecycle missing |
-| Hit versus miss | Must hide | Same work, outer status, bytes, frames, and completion | Equal complete listener-free logical runtime traces, full store schedules, fixed application bytes/frames, and one protected response class are tested | Open: physical, transport, timing, and real outer-status equivalence missing |
-| Invalid-domain versus valid query | Must hide after authenticated decode | Full profile work and protected outcome | Listener-free runtime tests complete the same ordered logical trace, full store schedule, fixed envelope bytes/frames, and protected outcome | Open: instruction/memory/timing and real wire/transport behavior not measured |
-| Store failure versus ordinary outcome | Must hide per completed-query policy and fail readiness safely | Uniform outer behavior; detailed fault remains internal | Every mock failure ordinal completes the same modeled trace. The native backend has only coarse local fail-closed tests; its internal worker reply still distinguishes success, rejection, and failed-closed state and is not service-integrated | Open: target-load readiness and service-level equivalence missing |
+| Continuation cursor/query digest/nonce | Must hide | Fixed authenticated encryption and no visible remaining count | The listener-free runtime validates a fixed 128-byte token and binds the content commitment computed internally from its concrete frozen snapshot into the continuation query digest across runtime lifecycles. It uses bounded absolute cursors in one combined finalized-plus-recent domain, preserves expiry, and keeps token/query/replay diagnostics redacted; protectors and replay storage remain injected test interfaces | Open: production crypto/key/nonce/replay lifecycle and authenticated canonical snapshot root missing |
+| Hit versus miss | Must hide | Same work, outer status, bytes, frames, and completion | Equal complete listener-free logical runtime traces, full finalized-store and concrete frozen-snapshot schedules, fixed application bytes/frames, and one protected response class are tested | Open: physical, transport, timing, and real outer-status equivalence missing |
+| Invalid-domain versus valid query | Must hide after authenticated decode | Full profile work and protected outcome | Listener-free runtime tests complete the same ordered logical trace, full finalized-store and recent-snapshot schedules, fixed envelope bytes/frames, and protected outcome | Open: instruction/memory/timing and real wire/transport behavior not measured |
+| Store, frozen-snapshot, or snapshot-semantic failure versus ordinary outcome | Must hide per completed-query policy and fail readiness safely | Uniform outer behavior; detailed fault remains internal | Every test-injected fault, identity/commitment drift, malformed same-outpoint sequence, finalized-owner mismatch, or duplicate create completes the configured logical work before a protected all-dummy `ProjectionNotReady` result and readiness latch. Fault/corruption hooks do not exist in the production API. The native backend has only coarse local fail-closed tests; its internal worker reply still distinguishes success, rejection, and failed-closed state and is not service-integrated | Open: target-load readiness and service-level equivalence missing |
 | Exact result count | Must hide | Fixed response slots and encrypted dummy occupancy | The runtime always normalizes and protects the complete configured slot array and performs a real-or-cover token issue; deterministic fixtures canonically encode dummy/real occupancy | Open: no production encryption or transport/physical evidence |
-| Last real page / `has_more` | Must hide | Fixed page and cover-round behavior | The listener-free runtime owns absolute store-slot pagination, preserves expiry, emits a fixed token only for `ResultBudgetExceeded`, and still issues/discards one cover token on terminal/error pages. Client cover-round execution is absent | Open |
+| Last real page / `has_more` | Must hide | Fixed page and cover-round behavior | The listener-free runtime owns pagination over the combined finalized-plus-recent ordinal domain, preserves expiry, emits a fixed token only for `ResultBudgetExceeded`, and still issues/discards one cover token on terminal/error pages. Client cover-round execution is absent | Open |
 | Client continuation count | Permitted only for weak profiles | Strong profile requires fixed cover rounds | No client or service exists | Unset budget |
 | Logical ORAM key | Must hide | No query-derived host address or fallback | Mock receives the key; this is explicitly plaintext test code | Open |
 | Physical ORAM location/path | Must hide | Secret cases must be indistinguishable under accepted trace test | Pinned adapter executes functionally on generic Linux x86_64 CI; no physical trace was captured | Open |
 | Worker queue depth, in-flight state, and aggregate counters | Permitted operational load only | Fixed public capacity and fixed-schema aggregates; never identifiers, command/result kinds, hit/miss, or per-command timing | The internal snapshot separates queue/lifecycle, completion/failure, admission-rejection, and reply-delivery counters. They are identifier-free but are not approved for export; no fixed-cadence aggregation or suppression policy exists | Open: budget and fixed-interval export policy unset; no native-load trace |
 | Address-directory lookup | Must hide | Directory and event-page lookup both protected | A module-private synchronous connector, bounded business-command worker, and private offline projection owner combine exact directory/page encodings, shared full-capacity sizing, keyed fixed-probe binding, and exact identity/admission validation; generic native CI executes the real typed stores and exact worker behind that boundary | Open: no runtime caller, content authentication, crash-safe commit, target-capacity run, or measured physical trace |
 | Query-derived allocation | Must hide | Fixed allocation/work budget | Offline recorder validates zero explicit modeled query allocations | Open: allocator/page/instruction measurement absent |
-| Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | Engine has no source dependency and validates zero modeled source calls | Open: no integrated source instrumentation or readiness proof |
-| NFS scan work | Must hide | Complete profile-fixed scan on every query | No NFS merge implementation | Open |
+| Validator, LMDB, raw-transaction, or backfill calls | Must hide | Zero private-keyed source calls after readiness | The concrete frozen snapshot accepts only public sequential ordinals; there is no generic query-facing source interface, and query-derived `source_calls` remain modeled at zero | Open: no integrated source instrumentation or live readiness proof |
+| NFS scan work | Must hide | Complete profile-fixed scan on every query | Runtime fixtures execute a nonzero four-slot ordinal-only full scan and merge through a concrete `FrozenRecentSnapshot<4>` whose commitment is computed internally. Each round completes the scan before rechecking checkpoint identity, recomputed commitment, and same-outpoint semantics; faults, drift, malformed sequences, finalized-owner mismatches, and duplicate creates fail closed only after full work | Open: the commitment is not an authenticated canonical/live Zaino snapshot root; no live NFS acquisition, canonical/reorg-safe publication, physical/allocator/timing equivalence, TDX, mainnet, or target-load evidence |
 | Request/response application bytes | Fixed public class | Exactly the attested profile size | The listener-free profile/runtime trace binds equal fixed application-envelope bytes; the inner codec rejects undersized compiled shapes and emits one exact protected envelope in each direction | Open: no production AEAD, protobuf/TLS, transport trace, or packet capture |
 | Frame count and completion shape | Fixed public class | Same across protected outcomes | Offline trace models one request, one response, and unary completion | Open: no network or outer-status evidence |
 | Method class | Permitted only if contract exposes separate methods | Preferred single `QueryPage` hides it | No proto exists | Decision retained, unimplemented |
@@ -643,9 +666,9 @@ the explicitly named predecessor head.
 | `cargo check -p zaino-oram --all-targets --features corpus-zaino` | Pass | Optional Zaino corpus adapter compiles |
 | `cargo check -p zaino-oram --lib --features shadow-parity` | Pass | The production library graph compiles without exposing the test fixture API; `cargo tree --edges normal` contains no `test_dependencies` feature |
 | `cargo check -p zaino-oram --all-targets --features rostl-experimental` | Pass on macOS aarch64 | Exact record constraints, portable production insertion helper, and unsupported-target path compile; this local command does not execute the real ORAM path |
-| `cargo nextest run -p zaino-oram --locked --no-tests fail --status-level fail` | 145 passed locally at the profile-v3 slice | Adds padded-input/timeout/concurrency/recent-snapshot identity binding, distinct ordered recent-snapshot trace validation, and refreshed exact codec/profile goldens. The runtime test profile still binds zero recent-snapshot reads and this is not NFS execution evidence |
+| `cargo nextest run -p zaino-oram --locked --no-tests fail --status-level fail` | Historical predecessor evidence: 145 passed locally at the profile-v3 slice | Added padded-input/timeout/concurrency/recent-snapshot identity binding, distinct ordered recent-snapshot trace validation, and refreshed exact codec/profile goldens. At that predecessor slice the runtime profile still bound zero recent-snapshot reads; this row is not evidence for the later injected scan/merge slice |
 | `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 245 passed, 0 skipped locally on macOS aarch64 at profile-v3 code head `0a3acb24`; nextest run `b54d30f2-0eec-42b0-9280-7f9e24552300` | Rechecks every portable feature combination and unsupported-host backend branch for the complete profile-budget and recorder slice; it is not native backend evidence |
-| Native `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 249 passed, 0 skipped on the dedicated Ubuntu 24.04 x86_64 builder at exact profile-v3 code head `0a3acb24`; nextest run `e2e1a343-9cd7-47b6-bc20-2668c6105ffc` | Executes the complete generic native suite, including four Linux-only real-backend cases. It validates the profile/recorder slice but does not implement or prove an NFS scan, target load, hardware qualification, TDX, or side-channel equivalence |
+| Native `cargo nextest run -p zaino-oram --all-features --locked --no-tests fail --status-level fail` | 249 passed, 0 skipped on the dedicated Ubuntu 24.04 x86_64 builder at exact profile-v3 code head `0a3acb24`; nextest run `e2e1a343-9cd7-47b6-bc20-2668c6105ffc` | At that exact predecessor head, the complete generic native suite included four Linux-only real-backend cases and validated only the profile/recorder slice; it did not implement or prove the later concrete frozen-snapshot scan/merge, target load, hardware qualification, TDX, or side-channel equivalence |
 | Native `cargo clippy -p zaino-oram --all-features --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` | Pass in 2m48s on the dedicated Ubuntu 24.04 x86_64 builder at exact profile-v3 code head `0a3acb24` | The complete all-feature/all-target library graph is warning-free with no disallowed production `unwrap`; this is a developer gate, not GitHub CI or execution attestation evidence |
 | `cargo nextest run -p zaino-oram --features corpus-zaino --status-level fail` | 194 passed | Adds canonical-cursor hardening, measured/sizing separation, deterministic measurement JSON and semantic rejection, source-bound sizing recomputation, corpus provenance/retry, deterministic projection/coordinator/owner coverage, exact seven-event sink ordering, failure/panic containment, projection-to-worker adapter tests, owner lifecycle/configuration/fail-closed cases, typed qualification, typed worker-error seam tests, and portable `SmokeV1` plan/report/negative-evidence plus exact in-memory worker/probe-set checks |
 | `cargo nextest run -p zaino-oram --features rostl-experimental --status-level fail` | 150 passed | Adds directory/page `Pod`/`Cmov` semantics, power-of-two capacity rejection, equal healthy miss/duplicate two-access schedules against the production helper, found-parity/occupancy rejection, and exact typed unsupported-host construction rejection |
@@ -943,9 +966,10 @@ exposing a private server:
    durable upstream recovery behavior or qualify the authenticated
    genesis-forward rebuild protocol against a declared target-hardware RTO;
 7. resolve git-dependency and TDX/verifier licensing with an exact SBOM;
-8. extend the completed logical token/runtime phase model into private schema,
-   real source/NFS, transport, allocator, instruction/memory/page, timing, and
-   outer-status evidence without opening a production listener prematurely;
+8. extend the completed logical token/runtime and injected mock scan/merge model
+   into private schema, live source/NFS acquisition and canonical publication,
+   transport, allocator, instruction/memory/page, timing, and outer-status
+   evidence without opening a production listener prematurely;
    retain the legacy schema golden;
 9. obtain independent security review of the evidence and then revisit this
    decision.
