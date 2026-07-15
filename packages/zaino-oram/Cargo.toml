@@ -21,6 +21,7 @@ rostl-experimental = [
 ]
 
 [dependencies]
+arc-swap.workspace = true
 blake2 = { workspace = true }
 bytemuck = { version = "1.25.1", features = ["derive", "min_const_generics"], optional = true }
 rand = { version = "0.9.4", optional = true }

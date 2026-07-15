@@ -40,7 +40,9 @@ offline dependency experiment:
   cover/token lifetime, timeout bucket, and a single-worker FIFO
   queue/overload policy. Runtime fixtures bind a nonzero recent-snapshot shape
   and execute its complete ordinal-only scan through a concrete runtime-owned
-  `FrozenRecentSnapshot<N>`;
+  `FrozenRecentSnapshot<N>`. Each frozen snapshot binds an in-memory generation,
+  exact finalized identity, recent tip height/hash, and its internally computed
+  fixed-slot commitment;
 - a crate-internal versioned request/response codec that seals one
   complete-budget-derived profile ID, fixed checkpoint, prepared query,
   optional opaque 128-byte continuation field, session binding, protected
@@ -54,11 +56,13 @@ offline dependency experiment:
   store scanning, fixed result normalization, token issue, response protection,
   and completion. It owns a concrete `FrozenRecentSnapshot<N>` whose fixed-slot
   content commitment is computed internally rather than supplied by a generic
-  source. Fault and post-construction corruption hooks are `#[cfg(test)]` only
-  and absent from the production API. The runtime binds the commitment into the
-  continuation query digest; each round completes the configured scan before
-  rechecking exact checkpoint identity and the recomputed commitment. It merges
-  recent creates and spends before pagination and uses one combined
+  source. The snapshot's lineage digest additionally binds its generation,
+  exact finalized identity, and recent tip height/hash. Fault and
+  post-construction corruption hooks are `#[cfg(test)]` only and absent from the
+  production API. The runtime binds that lineage digest into the continuation
+  query digest; each round completes the configured scan before rechecking exact
+  checkpoint identity and recomputing both the content and lineage commitments.
+  It merges recent creates and spends before pagination and uses one combined
   finalized-plus-recent continuation cursor domain. Malformed same-outpoint
   sequences, owner mismatches against finalized outputs, and duplicate creates
   become a protected all-dummy `ProjectionNotReady` result only after the full
@@ -69,6 +73,12 @@ offline dependency experiment:
   and codec session; each path models one replay lookup and write-back, while
   cover writes use a separate non-durable slot rather than the real-token
   namespace;
+- a private single-writer recent-snapshot publication model that clears an
+  active generation before refresh, uses an opaque ticket for exact activation,
+  retains immutable pinned leases, and permits a final current-generation
+  check. Deterministic tests cover advances, same-height and shortening reorgs,
+  failed builds, stale tickets, finalized rollback, and overflow. The model is
+  not connected to the listener-free runtime or a Zaino source;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -112,11 +122,14 @@ protected outcome unless store or projection readiness takes precedence; it
 does not supply production AEAD, nonce uniqueness, trusted time, or durable
 replay protection.
 The concrete frozen-snapshot evidence uses mock-constructed contents, not live
-Zaino NFS acquisition or a canonical, reorg-safe publication seam. Its
-internally computed deterministic commitment is not an authenticated
-canonical/live Zaino snapshot root, and the logical scan/merge tests do not
-establish physical obliviousness, allocator or timing equivalence, TDX,
-mainnet, or target-load behavior.
+Zaino NFS acquisition or a canonical, reorg-safe publication seam. Its lineage
+digest binds caller-supplied generation/finalized/tip metadata to the internally
+computed deterministic slot commitment, but does not authenticate that metadata
+or prove its canonical ancestry. The private publication owner is an in-memory
+model with no runtime caller or durable rollback authority. Neither commitment
+is an authenticated canonical/live Zaino snapshot root, and the logical
+scan/merge tests do not establish physical obliviousness, allocator or timing
+equivalence, TDX, mainnet, or target-load behavior.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline

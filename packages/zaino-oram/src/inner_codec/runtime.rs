@@ -15,8 +15,8 @@ use crate::{
     envelope::FixedEnvelope,
     profile::CompiledQueryShape,
     recent_snapshot::{
-        bind_query_digest, content_digest, FrozenRecentSnapshot, RecentSnapshotIdentity,
-        RecentSnapshotSlot,
+        bind_query_digest, content_digest, lineage_binding_digest, FrozenRecentSnapshot,
+        RecentSnapshotIdentity, RecentSnapshotSlot,
     },
     records::{QueryOutcome, UtxoResultPage},
     store::ObliviousStore,
@@ -120,7 +120,8 @@ struct PrivateQueryRuntime<
     codec: PrivateQueryCodec<RESPONSE_SLOTS, ENVELOPE_BYTES>,
     engine: PrivateQueryEngine<S, RESPONSE_SLOTS, ENVELOPE_BYTES>,
     recent_snapshot: FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>,
-    recent_snapshot_digest: [u8; 32],
+    recent_snapshot_content_digest: [u8; 32],
+    recent_snapshot_binding_digest: [u8; 32],
     envelope_protector: E,
     token_protector: T,
     replay_guard: R,
@@ -163,7 +164,8 @@ where
         {
             return Err(UniformExternalFailure);
         }
-        let recent_snapshot_digest = recent_snapshot.content_digest();
+        let recent_snapshot_content_digest = recent_snapshot.content_digest();
+        let recent_snapshot_binding_digest = recent_snapshot.binding_digest();
         let combined_scan_slots = shape
             .profile()
             .combined_scan_slots()
@@ -176,7 +178,8 @@ where
             codec,
             engine,
             recent_snapshot,
-            recent_snapshot_digest,
+            recent_snapshot_content_digest,
+            recent_snapshot_binding_digest,
             envelope_protector: dependencies.envelope_protector,
             token_protector: dependencies.token_protector,
             replay_guard: dependencies.replay_guard,
@@ -299,9 +302,12 @@ where
         trace
             .complete_recent_snapshot_scan(RECENT_SNAPSHOT_SLOTS)
             .map_err(|_| self.latch_failure())?;
+        let scanned_content_digest = content_digest(&recent_snapshot);
         if self.recent_snapshot.slots() != RECENT_SNAPSHOT_SLOTS
             || self.recent_snapshot.identity() != recent_snapshot_identity(&self.checkpoint)
-            || content_digest(&recent_snapshot) != self.recent_snapshot_digest
+            || scanned_content_digest != self.recent_snapshot_content_digest
+            || lineage_binding_digest(self.recent_snapshot.lineage(), scanned_content_digest)
+                != self.recent_snapshot_binding_digest
         {
             recent_snapshot_failed = true;
         }
@@ -401,7 +407,10 @@ where
     }
 
     fn continuation_query_digest(&self, query: &crate::records::UtxoQuery) -> [u8; 32] {
-        bind_query_digest(self.codec.query_digest(query), self.recent_snapshot_digest)
+        bind_query_digest(
+            self.codec.query_digest(query),
+            self.recent_snapshot_binding_digest,
+        )
     }
 }
 
@@ -424,7 +433,7 @@ mod tests {
     use crate::{
         continuation_token::{ContinuationProtectionContext, ReplayBinding, ReplayGuardError},
         profile::test_profile_with_recent_snapshot,
-        recent_snapshot::{FrozenRecentSnapshot, RecentSnapshotSlot},
+        recent_snapshot::{FrozenRecentSnapshot, RecentSnapshotLineage, RecentSnapshotSlot},
         records::{AddressKey, TransparentUtxo, UtxoQuery, ADDRESS_KEY_BYTES, TXID_BYTES},
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
@@ -435,6 +444,7 @@ mod tests {
     const SESSION_BINDING: [u8; 32] = [0x22; 32];
     const TOKEN_TTL_SECONDS: u64 = 60;
     const BLOCK_HASH_DISPLAY: [u8; 32] = [0x31; 32];
+    const RECENT_TIP_HASH_DISPLAY: [u8; 32] = [0x32; 32];
     const RECENT_SNAPSHOT_SLOTS: usize = 4;
 
     type TestRecentSnapshot = FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>;
@@ -807,7 +817,30 @@ mod tests {
     }
 
     fn recent_snapshot(slots: [RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS]) -> TestRecentSnapshot {
-        FrozenRecentSnapshot::new(recent_snapshot_identity(&checkpoint()), slots)
+        recent_snapshot_with_lineage(
+            slots,
+            recent_snapshot_lineage(recent_snapshot_identity(&checkpoint())),
+        )
+    }
+
+    fn recent_snapshot_with_lineage(
+        slots: [RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
+        lineage: RecentSnapshotLineage,
+    ) -> TestRecentSnapshot {
+        FrozenRecentSnapshot::new(lineage, slots)
+    }
+
+    fn recent_snapshot_lineage(identity: RecentSnapshotIdentity) -> RecentSnapshotLineage {
+        RecentSnapshotLineage::new(
+            1,
+            identity,
+            identity
+                .finalized_height()
+                .checked_add(1)
+                .expect("runtime fixture finalized height leaves room for a recent tip"),
+            RECENT_TIP_HASH_DISPLAY,
+        )
+        .expect("runtime fixture lineage is internally consistent")
     }
 
     fn runtime_with_recent(
@@ -1103,6 +1136,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_lineage_drift_completes_fixed_work_and_latches_readiness(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let mut runtime = runtime(4, &[(0, utxo(1, 10))])?;
+        let current = runtime.recent_snapshot.lineage();
+        runtime
+            .recent_snapshot
+            .replace_lineage(RecentSnapshotLineage::new(
+                current
+                    .generation()
+                    .checked_add(1)
+                    .expect("runtime fixture generation leaves successor room"),
+                current.finalized(),
+                current.recent_tip_height(),
+                *current.recent_tip_hash_display(),
+            )?);
+
+        let request = request_envelope(&runtime, checkpoint(), UtxoQuery::new(key, 0), None, 1)?;
+        let (trace, response) = handle_and_decode(&mut runtime, &request)?;
+        assert_eq!(trace.store_reads(), 4);
+        assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_SLOTS);
+        assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
+        assert!(response.page.is_all_dummy());
+        assert!(!runtime.healthy);
+        Ok(())
+    }
+
+    #[test]
     fn malformed_snapshot_completes_fixed_work_and_latches_readiness(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let key = address(1);
@@ -1152,6 +1213,52 @@ mod tests {
                 RecentSnapshotSlot::dummy(),
                 RecentSnapshotSlot::dummy(),
             ],
+        )?;
+        let continued_request = request_envelope(&changed, checkpoint(), query, Some(token), 2)?;
+        let (changed_trace, changed_response) =
+            handle_and_decode(&mut changed, &continued_request)?;
+        assert_eq!(changed_trace, baseline);
+        assert_eq!(
+            changed_response.page.outcome(),
+            QueryOutcome::InvalidContinuation
+        );
+        assert!(changed_response.page.is_all_dummy());
+        Ok(())
+    }
+
+    #[test]
+    fn continuation_rejects_new_generation_with_identical_snapshot_contents(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let entries = [(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))];
+        let query = UtxoQuery::new(key, 0);
+        let mut issuer = runtime(4, &entries)?;
+        let initial_request = request_envelope(&issuer, checkpoint(), query, None, 1)?;
+        let (baseline, initial_response) = handle_and_decode(&mut issuer, &initial_request)?;
+        let token = initial_response
+            .continuation
+            .expect("capped issuer page carries a continuation");
+
+        let current = issuer.recent_snapshot.lineage();
+        let next_lineage = RecentSnapshotLineage::new(
+            current
+                .generation()
+                .checked_add(1)
+                .expect("runtime fixture generation leaves successor room"),
+            current.finalized(),
+            current.recent_tip_height(),
+            *current.recent_tip_hash_display(),
+        )?;
+        let mut changed = runtime_with_snapshot_components(
+            store(4, &entries)?,
+            4,
+            recent_snapshot_with_lineage(
+                [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
+                next_lineage,
+            ),
+            SESSION_BINDING,
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(101),
         )?;
         let continued_request = request_envelope(&changed, checkpoint(), query, Some(token), 2)?;
         let (changed_trace, changed_response) =
@@ -1549,7 +1656,7 @@ mod tests {
 
         for failing_ordinal in 0..RECENT_SNAPSHOT_SLOTS {
             let recent_snapshot = FrozenRecentSnapshot::failing(
-                recent_snapshot_identity(&checkpoint()),
+                recent_snapshot_lineage(recent_snapshot_identity(&checkpoint())),
                 recent_slots,
                 failing_ordinal,
             );
@@ -1577,8 +1684,11 @@ mod tests {
             assert_eq!(runtime.engine.store().read_slots().len(), 8);
         }
 
-        let recent_snapshot =
-            FrozenRecentSnapshot::failing(recent_snapshot_identity(&checkpoint()), recent_slots, 0);
+        let recent_snapshot = FrozenRecentSnapshot::failing(
+            recent_snapshot_lineage(recent_snapshot_identity(&checkpoint())),
+            recent_slots,
+            0,
+        );
         let mut both_fail = runtime_with_snapshot_components(
             store(4, &entries)?.with_failure_on_read(1),
             4,
@@ -1622,7 +1732,7 @@ mod tests {
         let shape_mismatch = ThreeSlotRuntime::new(
             store(4, &[])?,
             FrozenRecentSnapshot::new(
-                recent_snapshot_identity(&checkpoint()),
+                recent_snapshot_lineage(recent_snapshot_identity(&checkpoint())),
                 [RecentSnapshotSlot::dummy(); 3],
             ),
             shape,
@@ -1701,7 +1811,7 @@ mod tests {
             let identity_mismatch = TestRuntime::new(
                 store(4, &[])?,
                 FrozenRecentSnapshot::new(
-                    mismatched_identity,
+                    recent_snapshot_lineage(mismatched_identity),
                     [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
                 ),
                 CompiledQueryShape::new(profile)?,

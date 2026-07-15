@@ -9,6 +9,23 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-oram`: frozen recent snapshots now bind an in-memory monotonic
+  generation, exact finalized identity, recent tip height/hash, and the
+  internally computed fixed-slot commitment into one lineage digest. The
+  listener-free runtime recomputes that binding after every complete scan and
+  continuation query binding v2 rejects a token from any other lineage even
+  when its transparent slot contents are identical. A private single-writer
+  publication model clears the active generation before a refresh, admits only
+  the opaque outstanding build ticket, retains immutable leases, and supports a
+  final current-generation check. Its tests cover advances, same-height and
+  shortening reorgs, stale tickets, failed builds, finalized rollback, and
+  generation overflow. A replacement owner must roll the durable projection
+  epoch because its in-memory generation restarts at one. This is a mock
+  contract with no runtime caller: it does not authenticate the caller-supplied
+  tip or slot provenance,
+  acquire live Zaino NFS state, validate canonical ancestry, durably prevent
+  rollback, publish a service epoch, or establish physical, TDX, mainnet, or
+  production-readiness evidence.
 - `zaino-oram`: profile ID v3 now binds padded input slots, a distinct
   recent-snapshot scan budget, timeout bucket, and explicit single-worker FIFO
   execution/queue/reject-at-capacity policy. The logical recorder validates

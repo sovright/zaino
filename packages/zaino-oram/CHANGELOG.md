@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Frozen recent snapshots now bind an in-memory monotonic generation, exact
+  finalized identity, recent tip height/hash, and the internally computed
+  fixed-slot commitment into one lineage digest. The listener-free runtime
+  recomputes that binding after every complete scan and continuation query
+  binding v2 rejects a token from any other lineage even when its transparent
+  slot contents are identical. A private single-writer publication model clears
+  the active generation before refresh, admits only the opaque outstanding
+  build ticket, retains immutable leases, and supports a final
+  current-generation check. Its tests cover advances, same-height and
+  shortening reorgs, stale tickets, failed builds, finalized rollback, and
+  generation overflow. A replacement owner must roll the durable projection
+  epoch because its in-memory generation restarts at one. This is a mock
+  contract with no runtime caller: it does not authenticate the caller-supplied
+  tip or slot provenance,
+  acquire live Zaino NFS state, validate canonical ancestry, durably prevent
+  rollback, publish a service epoch, or establish physical, TDX, mainnet, or
+  production-readiness evidence.
 - Profile ID v3 now binds padded input slots, a distinct recent-snapshot scan
   budget, a fixed timeout bucket, and the explicit single-worker FIFO
   execution/queue/reject-at-capacity policy. The allocation-free recorder

@@ -64,20 +64,27 @@ scan through a concrete runtime-owned `FrozenRecentSnapshot<N>`. The frozen type
 computes its fixed-slot content commitment internally rather than accepting a
 generic source-reported digest; its fault and post-construction corruption hooks
 are `#[cfg(test)]` only and absent from the production API. The runtime binds the
-commitment into the continuation query digest, and each round completes the
-configured scan before rechecking both exact checkpoint identity and recomputed
-content commitment. It merges recent creates and spends before paginating
+snapshot's in-memory generation, exact finalized identity, recent tip
+height/hash, and content commitment into one lineage digest. Continuation query
+binding v2 uses that digest, and each round completes the configured scan before
+rechecking exact checkpoint identity and recomputing both content and lineage
+commitments. It merges recent creates and spends before paginating
 across the combined cursor domain. Malformed same-outpoint sequences, owner
 mismatches against finalized outputs, and duplicate creates fail closed as a
 protected all-dummy `ProjectionNotReady` result only after full modeled work and
 latch readiness. Query-derived `source_calls` remain modeled at zero. This
-closes only the mock-constructed logical scan/merge slice: the commitment is not
-an authenticated canonical/live Zaino snapshot root, and live NFS acquisition,
-canonical and reorg-safe snapshot publication, physical obliviousness,
-allocator and timing equivalence, TDX, mainnet, and target-load evidence remain
-open. Production AEAD, trusted clock and nonce ownership, durable replay
-storage, private protobuf/transport framing, and a service lifecycle also remain
-integration gates.
+closes only the mock-constructed logical scan/merge slice. A private in-memory
+single-writer publication model now retires the active generation before
+refresh, admits only its opaque outstanding build ticket, and lets pinned leases
+check whether they remain current. It is not connected to the runtime or a live
+source, and it does not validate the caller-supplied tip, ancestry, or slot
+provenance. The lineage commitment is not an authenticated canonical/live Zaino
+snapshot root; live NFS acquisition, canonical and reorg-safe snapshot
+publication, durable rollback authority, a whole serving-epoch swap, physical
+obliviousness, allocator and timing equivalence, TDX, mainnet, and target-load
+evidence remain open. Production AEAD, trusted clock and nonce ownership,
+durable replay storage, private protobuf/transport framing, and a service
+lifecycle also remain integration gates.
 The typed-qualification slice added a listener-free qualification runner for the real
 typed worker. It executes one fixed nine-command correctness sequence covering
 empty reads, inserts, an exact replay, independent address histories, and clean
