@@ -126,6 +126,20 @@ the conversion candidate only; it is not production-resolver, runtime,
 generation/publication, atomic whole-serving-epoch, service/cryptography,
 target-load, physical-obliviousness, TDX, or mainnet evidence.
 
+At exact owner-handoff code head
+`a55728308ff4e3cf5189079b923b84345dd3069f`, a detached worktree on the
+same builder passed all 299 all-feature `zaino-oram` tests, including four
+Linux-only real-backend cases; nextest run
+`d665131d-1a08-4248-a308-c92e1cc5bd0b`. Strict all-target Clippy with
+`clippy::unwrap_used` denied passed in 16.81 seconds, and rustfmt passed. This
+covers exact ticket/candidate metadata matching, capability consumption,
+stale-ticket preservation, owner-only production lineage/frozen construction,
+and content/generation binding. It remains generic-builder correctness evidence,
+not a production resolver or caller, live DB/NFS acquisition, race-free refresh
+controller, atomic whole-serving epoch, durability, authenticated provenance,
+service/cryptography, target-load, physical-obliviousness, TDX, or mainnet
+evidence.
+
 The typed-qualification slice added a listener-free qualification runner for the real
 typed worker. It executes one fixed nine-command correctness sequence covering
 empty reads, inserts, an exact replay, independent address histories, and clean
