@@ -4,7 +4,7 @@
   for server integration** pending the measured blockers in
   [the feasibility report](oram-phase0-1-feasibility-report.md).
 - Prepared: 2026-07-12.
-- Updated: 2026-07-14.
+- Updated: 2026-07-15.
 - Target fork point: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d), the live `origin/dev` head inspected for this plan.
 - Design seed: [TEE-backed lightwalletd / Zaino with `rostl` and `oblivious_node`](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3).
 
@@ -56,10 +56,15 @@ same ordered ten-phase logical trace for successful protected outcomes. Token
 protector context binds the checkpoint and codec session, and every replay path
 models one lookup plus one write-back while cover writes stay outside the
 real-token namespace.
-The profile ID binds that schedule and the continuation lifetime. Production
-AEAD, trusted clock and nonce ownership, durable replay storage, instruction/
-memory/timing equivalence, private protobuf/transport framing, and a service
-lifecycle remain integration gates.
+The profile-v3 ID binds that schedule, the continuation lifetime, padded input
+and response shapes, the recent-snapshot scan budget, the timeout bucket, and
+an explicit single-worker FIFO execution/queue/reject-at-capacity policy. The
+listener-free runtime still uses a test-only profile that binds zero
+recent-snapshot reads; the next slice must inject a frozen snapshot and execute
+the nonzero fixed ordinal scan and merge before any NFS claim is made.
+Production AEAD, trusted clock and nonce ownership, durable replay storage,
+instruction/memory/timing equivalence, private protobuf/transport framing, and
+a service lifecycle remain integration gates.
 The typed-qualification slice added a listener-free qualification runner for the real
 typed worker. It executes one fixed nine-command correctness sequence covering
 empty reads, inserts, an exact replay, independent address histories, and clean

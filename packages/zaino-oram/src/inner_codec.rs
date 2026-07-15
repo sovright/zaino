@@ -1012,7 +1012,10 @@ mod tests {
     use blake2::{Blake2s256, Digest};
 
     use super::*;
-    use crate::{profile::PrivacyProfile, records::UtxoResultPage};
+    use crate::{
+        profile::{test_profile_without_recent_snapshot, PrivacyProfile},
+        records::UtxoResultPage,
+    };
 
     const RESPONSE_SLOTS: usize = 2;
     const ENVELOPE_BYTES: usize = 512;
@@ -1099,7 +1102,7 @@ mod tests {
     }
 
     fn profile<const SLOTS: usize, const BYTES: usize>() -> PrivacyProfile {
-        PrivacyProfile::new("codec-test-v1", 4, SLOTS, BYTES, 2, 60)
+        test_profile_without_recent_snapshot("codec-test-v1", 4, SLOTS, BYTES, 2, 60)
             .expect("test profile inputs are nonzero")
     }
 
@@ -1117,7 +1120,7 @@ mod tests {
         cover_rounds: usize,
         session_binding: [u8; SESSION_BINDING_BYTES],
     ) -> TestCodec {
-        let profile = PrivacyProfile::new(
+        let profile = test_profile_without_recent_snapshot(
             "codec-test-v1",
             store_reads,
             RESPONSE_SLOTS,
@@ -1217,8 +1220,8 @@ mod tests {
         assert_eq!(
             digest(&envelope),
             [
-                58, 218, 14, 250, 254, 79, 227, 179, 92, 73, 1, 166, 80, 85, 231, 206, 249, 183,
-                251, 248, 185, 70, 180, 248, 109, 96, 3, 199, 0, 136, 78, 1,
+                40, 33, 40, 241, 165, 121, 243, 36, 5, 16, 109, 11, 129, 147, 59, 254, 199, 235,
+                173, 184, 193, 187, 20, 0, 98, 88, 215, 186, 110, 57, 211, 6,
             ]
         );
         Ok(())
@@ -1306,8 +1309,8 @@ mod tests {
         assert_eq!(
             digest(&envelope),
             [
-                236, 152, 200, 74, 186, 79, 54, 80, 95, 110, 49, 158, 110, 76, 8, 14, 214, 239, 44,
-                249, 243, 159, 35, 207, 203, 186, 163, 169, 41, 1, 42, 220,
+                107, 201, 81, 162, 168, 81, 155, 208, 251, 123, 55, 162, 165, 105, 47, 232, 199,
+                212, 168, 64, 90, 195, 129, 214, 126, 208, 177, 70, 29, 43, 86, 200,
             ]
         );
         Ok(())

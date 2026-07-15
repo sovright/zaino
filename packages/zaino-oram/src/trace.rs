@@ -69,6 +69,7 @@ impl RuntimePhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct QueryAccessBudget {
     store_reads: usize,
+    recent_snapshot_reads: usize,
     envelope_bytes: usize,
 }
 
@@ -80,10 +81,12 @@ impl QueryAccessBudget {
     /// response application envelope.
     pub(super) const fn read_only_unary_fixed_envelope(
         store_reads: usize,
+        recent_snapshot_reads: usize,
         envelope_bytes: usize,
     ) -> Self {
         Self {
             store_reads,
+            recent_snapshot_reads,
             envelope_bytes,
         }
     }
@@ -106,6 +109,11 @@ impl QueryAccessBudget {
     /// Returns the exact query-derived source-call count.
     pub(super) const fn source_calls(&self) -> usize {
         0
+    }
+
+    /// Returns the exact in-trust-domain recent-snapshot scan count.
+    pub(super) const fn recent_snapshot_reads(&self) -> usize {
+        self.recent_snapshot_reads
     }
 
     /// Returns the exact logical replay-state lookup count.
@@ -160,6 +168,7 @@ pub(super) struct AccessTrace {
     store_writes: usize,
     allocations: usize,
     source_calls: usize,
+    recent_snapshot_reads: usize,
     replay_reads: usize,
     replay_writes: usize,
     request_frames: usize,
@@ -193,6 +202,12 @@ impl AccessTrace {
     #[cfg(test)]
     pub(super) const fn source_calls(&self) -> usize {
         self.source_calls
+    }
+
+    /// Returns the completed in-trust-domain recent-snapshot scan count.
+    #[cfg(test)]
+    pub(super) const fn recent_snapshot_reads(&self) -> usize {
+        self.recent_snapshot_reads
     }
 
     /// Returns the completed logical replay-state lookup count.
@@ -251,6 +266,7 @@ pub(super) struct TraceRecorder {
     store_writes: usize,
     allocations: usize,
     source_calls: usize,
+    recent_snapshot_reads: usize,
     replay_reads: usize,
     replay_writes: usize,
     request_frames: usize,
@@ -258,6 +274,7 @@ pub(super) struct TraceRecorder {
     request_bytes: usize,
     response_bytes: usize,
     next_read_ordinal: usize,
+    next_recent_snapshot_read_ordinal: usize,
     next_runtime_phase: usize,
     completion: Option<CompletionShape>,
 }
@@ -270,6 +287,7 @@ impl TraceRecorder {
             store_writes: 0,
             allocations: 0,
             source_calls: 0,
+            recent_snapshot_reads: 0,
             replay_reads: 0,
             replay_writes: 0,
             request_frames: 0,
@@ -277,6 +295,7 @@ impl TraceRecorder {
             request_bytes: 0,
             response_bytes: 0,
             next_read_ordinal: 0,
+            next_recent_snapshot_read_ordinal: 0,
             next_runtime_phase: 0,
             completion: None,
         }
@@ -314,6 +333,29 @@ impl TraceRecorder {
         self.store_reads = increment(self.store_reads, TraceDimension::StoreReads)?;
         self.next_read_ordinal =
             increment(self.next_read_ordinal, TraceDimension::StoreReadOrdinal)?;
+        Ok(())
+    }
+
+    /// Records the next public ordinal in the complete recent-snapshot scan.
+    ///
+    /// This models an in-trust-domain scan over a proactively frozen snapshot.
+    /// It is deliberately separate from query-derived validator, LMDB, raw
+    /// transaction, or backfill calls, whose source-call budget remains zero.
+    pub(super) fn record_recent_snapshot_read(&mut self, ordinal: usize) -> Result<(), TraceError> {
+        if ordinal != self.next_recent_snapshot_read_ordinal {
+            return Err(TraceError::RecentSnapshotReadOrdinal {
+                expected: self.next_recent_snapshot_read_ordinal,
+                actual: ordinal,
+            });
+        }
+        self.recent_snapshot_reads = increment(
+            self.recent_snapshot_reads,
+            TraceDimension::RecentSnapshotReads,
+        )?;
+        self.next_recent_snapshot_read_ordinal = increment(
+            self.next_recent_snapshot_read_ordinal,
+            TraceDimension::RecentSnapshotReadOrdinal,
+        )?;
         Ok(())
     }
 
@@ -388,6 +430,11 @@ impl TraceRecorder {
             self.source_calls,
         )?;
         validate_dimension(
+            TraceDimension::RecentSnapshotReads,
+            expected.recent_snapshot_reads(),
+            self.recent_snapshot_reads,
+        )?;
+        validate_dimension(
             TraceDimension::ReplayReads,
             expected.replay_reads(),
             self.replay_reads,
@@ -436,6 +483,7 @@ impl TraceRecorder {
             store_writes: self.store_writes,
             allocations: self.allocations,
             source_calls: self.source_calls,
+            recent_snapshot_reads: self.recent_snapshot_reads,
             replay_reads: self.replay_reads,
             replay_writes: self.replay_writes,
             request_frames: self.request_frames,
@@ -461,6 +509,10 @@ pub(super) enum TraceDimension {
     Allocations,
     /// Query-derived source calls.
     SourceCalls,
+    /// In-trust-domain recent-snapshot reads.
+    RecentSnapshotReads,
+    /// Sequential recent-snapshot read ordinal.
+    RecentSnapshotReadOrdinal,
     /// Logical replay-state lookups.
     ReplayReads,
     /// Logical real-or-cover replay-state write-backs.
@@ -485,6 +537,8 @@ impl fmt::Display for TraceDimension {
             Self::StoreReadOrdinal => "store-read ordinal",
             Self::Allocations => "modeled allocations",
             Self::SourceCalls => "source calls",
+            Self::RecentSnapshotReads => "recent-snapshot reads",
+            Self::RecentSnapshotReadOrdinal => "recent-snapshot read ordinal",
             Self::ReplayReads => "replay reads",
             Self::ReplayWrites => "replay writes",
             Self::RequestFrames => "modeled request frames",
@@ -505,6 +559,13 @@ pub(super) enum TraceError {
         /// Next required ordinal.
         expected: usize,
         /// Ordinal the engine attempted.
+        actual: usize,
+    },
+    /// Recent-snapshot reads did not use the complete sequential public domain.
+    RecentSnapshotReadOrdinal {
+        /// Next required ordinal.
+        expected: usize,
+        /// Ordinal the runtime attempted.
         actual: usize,
     },
     /// Runtime phases were recorded out of their fixed public order.
@@ -547,6 +608,10 @@ impl fmt::Display for TraceError {
             Self::StoreReadOrdinal { expected, actual } => write!(
                 f,
                 "logical store read ordinal {actual} does not match next public ordinal {expected}"
+            ),
+            Self::RecentSnapshotReadOrdinal { expected, actual } => write!(
+                f,
+                "logical recent-snapshot read ordinal {actual} does not match next public ordinal {expected}"
             ),
             Self::RuntimePhaseOrder { expected, actual } => write!(
                 f,
@@ -607,9 +672,15 @@ mod tests {
     use super::*;
 
     const ENVELOPE_BYTES: usize = 128;
+    const STORE_READS: usize = 2;
+    const RECENT_SNAPSHOT_READS: usize = 2;
 
     const fn budget() -> QueryAccessBudget {
-        QueryAccessBudget::read_only_unary_fixed_envelope(2, ENVELOPE_BYTES)
+        QueryAccessBudget::read_only_unary_fixed_envelope(
+            STORE_READS,
+            RECENT_SNAPSHOT_READS,
+            ENVELOPE_BYTES,
+        )
     }
 
     fn record_prefix(recorder: &mut TraceRecorder) -> Result<(), TraceError> {
@@ -629,17 +700,40 @@ mod tests {
         recorder.record_runtime_phase(RuntimePhase::Completion)
     }
 
+    fn record_fixed_reads(recorder: &mut TraceRecorder) -> Result<(), TraceError> {
+        recorder.record_store_read(0)?;
+        recorder.record_store_read(1)?;
+        recorder.record_recent_snapshot_read(0)?;
+        recorder.record_recent_snapshot_read(1)
+    }
+
     fn completed_trace() -> Result<AccessTrace, TraceError> {
         let mut recorder = TraceRecorder::new();
         recorder.record_request_frame(ENVELOPE_BYTES)?;
         record_prefix(&mut recorder)?;
-        recorder.record_store_read(0)?;
-        recorder.record_store_read(1)?;
+        record_fixed_reads(&mut recorder)?;
         recorder.record_runtime_phase(RuntimePhase::ResultNormalization)?;
         recorder.record_runtime_phase(RuntimePhase::TokenIssue)?;
         recorder.record_runtime_phase(RuntimePhase::ResponseEncode)?;
         recorder.record_response_frame(ENVELOPE_BYTES)?;
         recorder.record_runtime_phase(RuntimePhase::Completion)?;
+        recorder.record_completion(CompletionShape::UnaryFixedEnvelope)?;
+        recorder.finish(budget())
+    }
+
+    fn finish_with_recent_snapshot_reads(
+        recent_snapshot_reads: usize,
+    ) -> Result<AccessTrace, TraceError> {
+        let mut recorder = TraceRecorder::new();
+        recorder.record_request_frame(ENVELOPE_BYTES)?;
+        record_prefix(&mut recorder)?;
+        recorder.record_store_read(0)?;
+        recorder.record_store_read(1)?;
+        for ordinal in 0..recent_snapshot_reads {
+            recorder.record_recent_snapshot_read(ordinal)?;
+        }
+        record_suffix(&mut recorder)?;
+        recorder.record_response_frame(ENVELOPE_BYTES)?;
         recorder.record_completion(CompletionShape::UnaryFixedEnvelope)?;
         recorder.finish(budget())
     }
@@ -651,6 +745,7 @@ mod tests {
         assert_eq!(trace.store_writes(), 0);
         assert_eq!(trace.allocations(), 0);
         assert_eq!(trace.source_calls(), 0);
+        assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_READS);
         assert_eq!(trace.replay_reads(), 1);
         assert_eq!(trace.replay_writes(), 1);
         assert_eq!(trace.request_frames(), 1);
@@ -673,6 +768,15 @@ mod tests {
             })
         );
 
+        let mut wrong_recent_ordinal = TraceRecorder::new();
+        assert_eq!(
+            wrong_recent_ordinal.record_recent_snapshot_read(1),
+            Err(TraceError::RecentSnapshotReadOrdinal {
+                expected: 0,
+                actual: 1,
+            })
+        );
+
         let mut incomplete = TraceRecorder::new();
         incomplete.record_request_frame(ENVELOPE_BYTES)?;
         incomplete.record_store_read(0)?;
@@ -690,6 +794,26 @@ mod tests {
     }
 
     #[test]
+    fn recorder_rejects_missing_and_extra_recent_snapshot_reads() {
+        assert_eq!(
+            finish_with_recent_snapshot_reads(RECENT_SNAPSHOT_READS - 1),
+            Err(TraceError::BudgetMismatch {
+                dimension: TraceDimension::RecentSnapshotReads,
+                expected: RECENT_SNAPSHOT_READS,
+                actual: RECENT_SNAPSHOT_READS - 1,
+            })
+        );
+        assert_eq!(
+            finish_with_recent_snapshot_reads(RECENT_SNAPSHOT_READS + 1),
+            Err(TraceError::BudgetMismatch {
+                dimension: TraceDimension::RecentSnapshotReads,
+                expected: RECENT_SNAPSHOT_READS,
+                actual: RECENT_SNAPSHOT_READS + 1,
+            })
+        );
+    }
+
+    #[test]
     fn recorder_validates_zero_write_allocation_and_source_budgets() -> Result<(), TraceError> {
         for record_extra in [
             TraceRecorder::record_store_write,
@@ -699,8 +823,7 @@ mod tests {
             let mut recorder = TraceRecorder::new();
             recorder.record_request_frame(ENVELOPE_BYTES)?;
             record_prefix(&mut recorder)?;
-            recorder.record_store_read(0)?;
-            recorder.record_store_read(1)?;
+            record_fixed_reads(&mut recorder)?;
             record_extra(&mut recorder)?;
             record_suffix(&mut recorder)?;
             recorder.record_response_frame(ENVELOPE_BYTES)?;
@@ -714,8 +837,7 @@ mod tests {
         let mut duplicate_replay = TraceRecorder::new();
         duplicate_replay.record_request_frame(ENVELOPE_BYTES)?;
         record_prefix(&mut duplicate_replay)?;
-        duplicate_replay.record_store_read(0)?;
-        duplicate_replay.record_store_read(1)?;
+        record_fixed_reads(&mut duplicate_replay)?;
         duplicate_replay.record_replay_access()?;
         record_suffix(&mut duplicate_replay)?;
         duplicate_replay.record_response_frame(ENVELOPE_BYTES)?;
@@ -737,8 +859,7 @@ mod tests {
         let mut wrong_bytes = TraceRecorder::new();
         wrong_bytes.record_request_frame(ENVELOPE_BYTES - 1)?;
         record_prefix(&mut wrong_bytes)?;
-        wrong_bytes.record_store_read(0)?;
-        wrong_bytes.record_store_read(1)?;
+        record_fixed_reads(&mut wrong_bytes)?;
         record_suffix(&mut wrong_bytes)?;
         wrong_bytes.record_response_frame(ENVELOPE_BYTES)?;
         wrong_bytes.record_completion(CompletionShape::UnaryFixedEnvelope)?;
@@ -761,8 +882,7 @@ mod tests {
         let mut missing = TraceRecorder::new();
         missing.record_request_frame(ENVELOPE_BYTES)?;
         record_prefix(&mut missing)?;
-        missing.record_store_read(0)?;
-        missing.record_store_read(1)?;
+        record_fixed_reads(&mut missing)?;
         record_suffix(&mut missing)?;
         missing.record_response_frame(ENVELOPE_BYTES)?;
         assert_eq!(missing.finish(budget()), Err(TraceError::MissingCompletion));

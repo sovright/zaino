@@ -123,6 +123,7 @@ where
 mod tests {
     use super::*;
     use crate::{
+        profile::test_profile_without_recent_snapshot,
         records::{AddressKey, ADDRESS_KEY_BYTES, TXID_BYTES},
         store::{PlaintextMockStore, PlaintextMockStoreError},
     };
@@ -133,8 +134,15 @@ mod tests {
     type TestEngine = PrivateQueryEngine<PlaintextMockStore, RESPONSE_SLOTS, ENVELOPE_BYTES>;
 
     fn profile() -> PrivacyProfile {
-        PrivacyProfile::new("unit-test-v1", 4, RESPONSE_SLOTS, ENVELOPE_BYTES, 2, 60)
-            .expect("unit-test privacy profile constants are valid")
+        test_profile_without_recent_snapshot(
+            "unit-test-v1",
+            4,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            2,
+            60,
+        )
+        .expect("unit-test privacy profile constants are valid")
     }
 
     fn shape() -> CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES> {

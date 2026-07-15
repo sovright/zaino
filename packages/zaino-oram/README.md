@@ -35,7 +35,11 @@ offline dependency experiment:
   boundary correctness only—not physical table exhaustion, random or
   adversarial target-load behavior, performance, recovery, TDX, or mainnet
   readiness;
-- compiled privacy-profile validation;
+- compiled privacy-profile-v3 validation that binds the logical store and
+  recent-snapshot budgets, padded inputs, fixed response/envelope shapes,
+  cover/token lifetime, timeout bucket, and a single-worker FIFO
+  queue/overload policy. Current runtime fixtures deliberately bind zero
+  recent-snapshot reads; they do not claim NFS scan or merge execution;
 - a crate-internal versioned request/response codec that seals one
   complete-budget-derived profile ID, fixed checkpoint, prepared query,
   optional opaque 128-byte continuation field, session binding, protected

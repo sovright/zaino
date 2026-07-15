@@ -334,7 +334,7 @@ mod tests {
     use super::*;
     use crate::{
         continuation_token::{ContinuationProtectionContext, ReplayBinding, ReplayGuardError},
-        profile::PrivacyProfile,
+        profile::test_profile_without_recent_snapshot,
         records::{AddressKey, TransparentUtxo, UtxoQuery, ADDRESS_KEY_BYTES, TXID_BYTES},
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
@@ -665,7 +665,7 @@ mod tests {
         replay_guard: CountingReplayGuard,
         material_source: DeterministicMaterialSource,
     ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
-        let profile = PrivacyProfile::new(
+        let profile = test_profile_without_recent_snapshot(
             "runtime-test-v1",
             store_reads,
             RESPONSE_SLOTS,

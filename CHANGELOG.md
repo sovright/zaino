@@ -9,6 +9,12 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-oram`: profile ID v3 now binds padded input slots, a distinct
+  recent-snapshot scan budget, timeout bucket, and explicit single-worker FIFO
+  execution/queue/reject-at-capacity policy. The logical recorder validates
+  ordered recent-snapshot scan ordinals separately from forbidden
+  query-derived source calls. Existing fixtures still bind zero snapshot work,
+  so this does not claim an implemented NFS scan or merge.
 - `zaino-oram`: a crate-internal authenticated public-manifest and volatile
   rebuild foundation now binds publication lineage, projection identity/epoch,
   finalized checkpoint, event count, and a deterministic semantic event-log

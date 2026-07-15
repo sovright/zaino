@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Profile ID v3 now binds padded input slots, a distinct recent-snapshot scan
+  budget, a fixed timeout bucket, and the explicit single-worker FIFO
+  execution/queue/reject-at-capacity policy. The allocation-free recorder
+  separately validates sequential recent-snapshot scan ordinals while keeping
+  forbidden query-derived source calls at zero. Existing listener-free
+  fixtures explicitly bind no recent-snapshot integration; this is profile and
+  recorder schema evidence, not an NFS scan or merge claim.
 - A crate-internal recovery foundation for the volatile projection worker: a
   fixed 160-byte public manifest payload plus 32-byte authenticator binds
   monotonic publication and predecessor digests, projection identity/epoch,
