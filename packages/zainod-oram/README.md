@@ -3,6 +3,44 @@
 `zainod-oram` is a non-published application package for Zaino ORAM research.
 It is not part of the workspace's default members.
 
+## Release-bound deterministic-build receipt
+
+From a completely clean checkout at an exact full source revision, the
+workbench can build and publish the fixed ORAM release product with Podman:
+
+```console
+CONTAINER_ENGINE=podman cargo run --locked --release --manifest-path tools/workbench/Cargo.toml --bin build-deterministic -- --product zainod-oram
+```
+
+The ORAM path accepts no forwarded container arguments. It archives the exact
+HEAD into a detached build context and performs two no-cache builds from that
+same source archive. Both builds use target `x86_64-unknown-linux-musl`, profile
+`release`, feature `typed-qualification`, and the fixed deterministic build
+flags. Their output files must have distinct inodes and identical bytes before
+the first binary creates a receipt and the second binary verifies it.
+
+Receipt creation checks that the archive's embedded source revision matches
+the requested revision and that its `Cargo.lock`, `rust-toolchain.toml`, and
+`Dockerfile.deterministic` bytes exactly match the separately hashed build
+inputs. The staged release is read back and verified before it is atomically
+published without replacing an existing destination. A successful run creates:
+
+- `build/oram-release/zainod-oram`
+- `build/oram-release/release-receipt.json`
+
+The published binary can reverify its canonical receipt and its own executable
+identity:
+
+```console
+./build/oram-release/zainod-oram release verify-receipt \
+  --receipt build/oram-release/release-receipt.json
+```
+
+The receipt is self-reported procedure, local-integrity, and binary-identity
+evidence only. It is unsigned and provides no execution attestation,
+source-derivation attestation, physical-access trace, TDX result, mainnet
+result, or claim that the two same-source builds were independently executed.
+
 ## Typed-worker correctness qualification
 
 The default-off `typed-qualification` feature exposes one fixed, listener-free

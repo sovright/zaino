@@ -1,6 +1,6 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
-- Date: 2026-07-14
+- Date: 2026-07-15
 - Evaluated fresh-worker rebuild code head:
   `feat/oram-source-bound-cold-rebuild` at
   `15f60d3014428e04e7a42779c9a8c2c7cc7a583d`, stacked on recovery evidence
@@ -32,6 +32,15 @@
   warning-denied rustdoc. This is generic-builder correctness evidence only:
   source-cache state was uncontrolled, and no full-service RTO, full-mainnet,
   target-CPU, TDX, durability, signed execution, or attestation claim follows.
+- The exact release-bound code head
+  `a7172384dc97b4cdd0ffe9ff94358608e338ae64` preserved the legacy `zainod`
+  export binary byte-for-byte and completed two matching no-cache
+  `zainod-oram` builds with rootless Podman 4.9.3 on the dedicated GCP builder.
+  The published binary and receipt independently passed the final receipt
+  verification step. This establishes only self-reported local procedure
+  integrity and artifact identity; the receipt is unsigned and supplies no
+  execution attestation, physical-trace, source-derivation, independent-host,
+  mainnet, target-CPU, or TDX evidence.
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
 - Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
@@ -262,6 +271,22 @@ The evaluated worktree implements:
   digests, report, source backend, fixed snapshot mode, serviceable and verified
   checkpoint, and explicitly `uncontrolled` source-cache state. It is not a
   full-service RTO or controlled cold-cache result;
+- a default-off release-receipt surface that fixes the ORAM binary name,
+  Linux-musl target, release profile, `typed-qualification` feature set,
+  Rust flags, and source-date epoch; binds the exact source revision, source
+  archive, embedded and side-file `Cargo.lock`, `rust-toolchain.toml`, and
+  deterministic Dockerfile, plus the running and staged binary identity; and
+  records two distinct-inode artifacts only after their byte digests agree.
+  Creation and verification reject unbounded, non-regular, symlinked,
+  path-confused, mutated, or noncanonical inputs, and receipt publication is
+  no-replace and read-back verified;
+- a deterministic-workbench `zainod-oram` product that requires an exact clean
+  40-hex revision, builds twice from an archive-extracted context with rootless
+  Podman `--no-cache`, compares the outputs, creates the receipt with the first
+  binary, verifies it with the second, and re-verifies the staged and published
+  binary/receipt pair. The receipt explicitly reports itself unsigned,
+  execution-unattested, physical-trace-unmeasured, and
+  source-derivation-unattested;
 - separate pinned, volatile `rostl` tables for the exact 38-byte directory and
   82-byte event-page records. Their private offline Linux-x86_64 constructor
   creates distinct `CircuitORAM` and recursive-position-map instances and
@@ -337,9 +362,13 @@ The following statements are **not** established by that evidence:
   nine commands establish only deterministic typed-worker semantics; they do
   not establish latency, RSS, a physical access trace, crash consistency, or a
   host-oblivious service;
-- the qualification artifact does not bind a source revision, lockfile,
-  toolchain, binary, CI run, or execution attestation. Trusted CI provenance or
-  a later signed/attested mechanism must establish those facts;
+- the ordinary qualification artifacts do not bind a source revision,
+  lockfile, toolchain, binary, CI run, or execution attestation. The separate
+  release receipt now binds those local inputs and the matching binary identity
+  at exact release-bound head `a7172384`, but remains an unsigned self-report
+  from one builder procedure. It does not attest execution, derive the source
+  independently, prove an independent rebuild, or replace trusted CI or a
+  later signed/attested mechanism;
 - the finalized-event coordinator's private sink seam is implemented by the
   business-command worker and a crate-internal offline owner composes them with
   the typed `rostl` constructor after exact identity/admission validation. A
@@ -426,7 +455,8 @@ The following statements are **not** established by that evidence:
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov`; generic native Linux CI constructs separate real 38/82-byte backend monomorphizations and exercises both | Measure the target-capacity profile on the selected CPU/TDX platform |
 | Fixed-probe table layout | Partial real integration | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, a complete bounded-history preflight, and a bounded worker with no raw storage bypass. A private offline owner validates exact projection/layout identity and admission limits before composing the coordinator and worker; generic native Linux CI runs 8/16-entry typed stores and the worker-owned exact executor | Add authenticated generation ownership and crash-safe commit/rebuild; select measured capacities/probe counts and trace the backend on target hardware |
 | Full-capacity logical sizing | Partial pass | Version-2 reports bind compiled 38/82-byte cells to shared directory/event allocation validation, charge both full table and position-map domains, keep modeled bytes fixed across occupancy/growth, and expose load/admission/hot-address/modeled-memory flags plus explicit negative evidence markers. Offline `corpus size` consumes a complete validated capture, recomputes every row, and atomically binds measurement/model/result digests. Read-only `corpus validate-sizing` can reopen the existing bundles and require the same source-bound recomputation without emitting another artifact | Calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and runtime working set on target hardware; select an accepted mainnet profile |
-| Compiler pin | Pass | Repository pins Rust 1.96.0 | Pin release flags, LLVM behavior, and reproducible Linux build inputs |
+| Compiler pin | Pass for the current ORAM release procedure | Repository pins Rust 1.96.0; the receipt fixes the Linux-musl release profile, feature set, Rust flags, and source-date epoch | Independently pin and verify the complete builder image, LLVM behavior, and native-tool closure |
+| Release artifact identity/repeatability | Partial generic-builder pass | At exact head `a7172384`, two rootless-Podman no-cache builds matched and the published binary/receipt pair passed final verification; the receipt binds local source and build inputs plus binary identity | Repeat on an independent builder, add trusted CI and signed/attested provenance, and keep physical-trace, mainnet, target-CPU, and TDX gates separate |
 | CPU/target/TDX pin | Partial target-class gate | An Ubuntu 24.04 x86_64 CI lane with immutable action pins executes the real adapter; the hosted image, CPU generation, TDX instance, firmware/TCB, DOIT, and memory remain unset | Select CPU generations, exact target/release flags, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
 | Pinned ORAM dependency | Partial | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock` | Resolve API/failure/recovery concerns and decide upstream, fork, or replacement |
 | Dependency/license inventory | Blocked | Manifest declarations recorded below; `rostl` checkout has no root license text | Obtain authoritative license files/confirmation and complete automated transitive audit |
@@ -544,7 +574,8 @@ yet stakeholder-approved.
 | DOIT enablement/self-check policy | Not selected or tested | Blocker |
 | TDX platform/instance/memory | Not selected | Blocker |
 | Firmware, microcode, TCB and quote policy | Not selected | Blocker |
-| Release flags and reproducible image | Not pinned | Blocker for assembly/attestation evidence |
+| ORAM release target and flags | `x86_64-unknown-linux-musl`, release, `typed-qualification`, fixed Rust flags and source-date epoch | Bound by the receipt and exercised twice on one generic builder; not an approved privacy profile or target-CPU policy |
+| Reproducible image and provenance | Partial procedure only | Digest-bound deterministic Dockerfile and matching local no-cache outputs exist; the receipt is unsigned, self-reported, execution-unattested, and source-derivation-unattested |
 
 Successful compilation of `rostl-experimental` on macOS aarch64 proves only
 that the trait-level candidate and unsupported-platform stub compile. It does
@@ -580,7 +611,7 @@ the intended redistribution decision.
 
 ## Verification evidence
 
-Commands below were run through 2026-07-14 against the evaluated worktree or
+Commands below were run through 2026-07-15 against the evaluated worktree or
 the explicitly named predecessor head.
 
 | Command | Result | Interpretation |
@@ -640,6 +671,11 @@ the explicitly named predecessor head.
 | Native `cargo nextest run --locked -p zainod-oram --features typed-qualification --status-level fail` at exact fresh-worker code head `15f60d3014428e04e7a42779c9a8c2c7cc7a583d` | 65 passed, 0 skipped; nextest run `a3405f88-9b82-4763-ad0e-7c0736bd883c` | Rechecks the complete listener-free daemon runner/artifact surface and adds Linux publication for the source-bound rebuild bundle, source snapshot/lineage binding, tamper rejection, and valid negative-budget evidence. The unsigned artifact remains self-reported generic-builder correctness evidence |
 | Native strict Clippy for `zaino-oram` with `corpus-zaino,rostl-experimental` and for `zainod-oram` with `typed-qualification`, both `--all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used`, at exact fresh-worker code head `15f60d30` | Both pass on the dedicated generic Ubuntu 24.04 x86_64 builder with Rust 1.96.0 | The complete changed feature/target surfaces are warning-free and contain no disallowed production `unwrap`; this is a developer gate, not release, TDX, or attestation evidence |
 | Native `cargo fmt --all -- --check` and `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps -p zaino-oram -p zainod-oram --features zainod-oram/typed-qualification` at exact fresh-worker code head `15f60d30` | Both pass on the dedicated generic Linux builder | The exact source is formatted and both changed crate documentation surfaces are warning-free |
+| Rootless Podman 4.9.3 legacy `zainod` export-stage comparison at exact release-bound head `a7172384dc97b4cdd0ffe9ff94358608e338ae64` | The pre-slice baseline and post-change binaries were both 32,908,552 bytes with SHA-256 `0a30c658e4bb215ae16bd2c1916d105de7b33e94a2abf083409e44f7f8edbc28`; direct byte comparison passed | The release-bound slice preserved the default legacy export binary on this builder. This is not an independent rebuild, immutable-image proof, or attestation |
+| `CONTAINER_ENGINE=podman cargo run --locked --release --manifest-path tools/workbench/Cargo.toml --bin build-deterministic -- --product zainod-oram` at exact head `a7172384dc97b4cdd0ffe9ff94358608e338ae64` | Two `--no-cache` ORAM builds completed in 5m44s and 5m40s and matched. Published `zainod-oram`: 28,066,328 bytes, SHA-256 `a46efebe45008604e9a93261ff54a91766d4b8de67582620abc203af6434f67e`; source archive SHA-256 `7b67ed2702a838198d03f00fd683d4a2f1246df45b787c22ce94f3c889073577` | Establishes same-host, same-procedure output agreement and source/input/binary identity only. The rootless builder retained 146 GB free after the run; no independent host, mainnet corpus, target CPU, TDX, or physical trace was involved |
+| Separate final `zainod-oram release verify-receipt` invocation against the published exact-head artifact | Pass; receipt SHA-256 `15770167ce397b71bbd4a5266f4d4a0edea94170e4d554d59fa46c0848544983` and bound binary SHA-256 `a46efebe45008604e9a93261ff54a91766d4b8de67582620abc203af6434f67e` | Confirms canonical receipt and local artifact-identity verification after publication. The receipt's trust class is self-reported procedure-local integrity and identity only; it is unsigned and does not attest execution, physical traces, source derivation, or builder independence |
+| Native `cargo nextest run --locked -p zainod-oram --features typed-qualification -E 'test(execution_identity)'` at exact release-bound head `a7172384dc97b4cdd0ffe9ff94358608e338ae64` | 13 passed, 66 skipped; nextest run `872d77c5-aced-495c-a932-2831b33ced94` on the dedicated generic Ubuntu 24.04 x86_64 builder | Exercises the receipt's Linux no-follow file handling, archive validation, mutation detection, creator/binary binding, canonical parsing, compile-identity rejection, and no-replace publication. It is focused unit evidence, not release reproducibility, attestation, or privacy evidence |
+| Native `cargo clippy --locked -p zainod-oram --features typed-qualification --all-targets --no-deps -- -D warnings -D clippy::unwrap_used` at exact release-bound head `a7172384dc97b4cdd0ffe9ff94358608e338ae64` | Pass in 2m42s on the dedicated generic Ubuntu 24.04 x86_64 builder | The exact receipt and CLI surface is warning-free and has no disallowed `unwrap`; this developer lint gate does not extend the receipt's trust boundary |
 | Native `zainod-oram qualification stress --profile full-map-saturation-v1 --output-dir <NEW_DIR>` | Pass; canonical wrapper BLAKE2s-256 `2dfbd24e45662e6f112ab7c738dd780c0916d253636a47b739e15425e0932854` | Publishes exactly `full-map-saturation.json`, `full-map-saturation.txt`, and digest-bound `provenance.json`; this synthetic artifact validates runner plumbing only and is not a benchmark or hardware/mainnet result |
 | `cargo +stable clippy -p zaino-oram --lib --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu --no-deps -- -D warnings -D clippy::unwrap_used` | Pass with local Rust 1.96.1 | Compile-only precursor for the exact directory/event stores, fixed two-access insertion path, and private offline worker constructor; the exact pinned native CI run above supersedes its execution limitation |
 | `cargo +stable check -p zaino-oram --all-targets --no-default-features --features rostl-experimental --target x86_64-unknown-linux-gnu` | Environment-blocked before local Linux test checking | The macOS host lacks `x86_64-linux-gnu-gcc`/`g++`, required by transitive native dev dependencies including `aws-lc-sys`, `lmdb-sys`, and `libzcash_script`; the pinned native CI run now covers this host limitation |
@@ -680,8 +716,11 @@ worktree's local 201-test `zaino-oram`, 29-test default `zainod-oram`, and
 full-map-saturation worktree has 207 portable library tests and 29 default
 daemon tests locally; its exact checksum-matched native-builder totals are 210
 and 53. The exact fresh-worker code head has native-builder totals of 247 and
-65. GitHub CI remains the merge gate, and the builder evidence is not
-target-hardware, TDX, controlled cold-cache, or attestation evidence.
+65. The exact release-bound head additionally has the same-host legacy-binary
+comparison, two matching no-cache ORAM outputs, and final published-receipt
+verification recorded in the table. GitHub CI remains the merge gate, and the
+builder evidence is not target-hardware, TDX, controlled cold-cache,
+independent-rebuild, signed, or attestation evidence.
 
 Two broader `zaino-state` gates remain baseline-blocked outside this slice.
 Warning-denied Clippy with `clippy::unwrap_used` reports four existing
@@ -691,8 +730,9 @@ production unwraps in `node_backed_indexer.rs`, `finalised_state/entry.rs`, and
 complete no-default `zaino-state` suite now passes under `cargo nextest`, and
 warning-denied `zaino-oram` rustdoc passes with all features.
 
-These are compile/unit-model results. They are not benchmark, mainnet, TDX,
-network, recovery, or side-channel results.
+The test rows are compile/unit-model results. The release rows establish only
+same-host procedure-local integrity and artifact identity. None of these rows
+is benchmark, mainnet, TDX, network, recovery, or side-channel evidence.
 
 ## Mainnet corpus and capacity blocker
 
@@ -811,10 +851,11 @@ this is not recovery. Upstream open work includes Circuit ORAM stash recovery
 
 ## Assembly and trace blocker
 
-No release-binary assembly or physical trace experiment exists. Before a
-privacy claim, the exact Linux x86_64 release artifact must be examined under
-the pinned compiler and target CPU policy for contrasting secret cases. At
-minimum, record and compare:
+An exact Linux x86_64-musl release artifact and its unsigned self-reported
+receipt now exist at head `a7172384`, but no release-binary assembly or
+physical trace experiment exists. Before a privacy claim, that exact artifact
+must be examined under the pinned compiler and target CPU policy for
+contrasting secret cases. At minimum, record and compare:
 
 - relevant instructions and secret-dependent branches;
 - memory addresses, page accesses/page faults, and allocations;
@@ -880,9 +921,10 @@ exposing a private server:
 2. produce and review the full-mainnet distribution and calibrated sizing
    artifact;
 3. execute the fixed source-bound `BuilderFoundationV1` profile on the generic
-   Linux x86_64 builder, retain its three-file artifact, and extend that gate
-   toward a reproducible release artifact without calling either result a
-   target-hardware or privacy qualification;
+   Linux x86_64 builder, retain its three-file artifact, and harden the new
+   same-host release procedure with an independent rebuild, immutable builder
+   inputs, and signed or attested provenance without calling any intermediate
+   result a target-hardware or privacy qualification;
 4. select target CPU/TDX instances and measure random full-map performance,
    stash/queue behavior, RSS, swapping, and rebuild time;
 5. extend the logical trace into release-binary source, allocator, physical
