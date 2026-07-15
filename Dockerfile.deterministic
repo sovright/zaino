@@ -54,6 +54,8 @@ ENV TARGET_ARCH="x86_64-unknown-linux-musl"
 ############################
 FROM build-base AS builder
 
+ARG NO_TLS=false
+
 COPY . .
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
