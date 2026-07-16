@@ -12,8 +12,9 @@ use crate::chain_index::{
     tests::finalised_state::v1::load_vectors_v1db_and_reader,
     tests::vectors::indexed_block_chain,
     types::{extract_transparent_events, FinalizedOutpointState, Outpoint, TransparentBlockEvent},
+    CanonicalTransparentProjectionInputError,
 };
-use crate::{CompactSize, Height, TxLocation, TxidList, ZainoVersionedSerde};
+use crate::{CompactSize, Height, StatusType, TxLocation, TxidList, ZainoVersionedSerde};
 use zaino_common::network::ActivationHeights;
 
 /// multi_thread required: the persistent-v1 fixture transitively uses `block_in_place`.
@@ -33,10 +34,17 @@ async fn captures_value_coherent_transparent_projection_input(
         &ActivationHeights::default().to_regtest_network()
     );
     assert_eq!(input.recent().finalized().height, expected_finalized_height);
-    assert_eq!(
-        input.finalized_outpoints().checkpoint(),
-        input.recent().finalized()
-    );
+    assert_eq!(input.finalized_checkpoint(), input.recent().finalized());
+    assert_eq!(input.boundary().network(), input.network());
+    assert_eq!(input.boundary().finalized(), input.recent().finalized());
+    assert_eq!(input.boundary().tip(), input.recent().tip());
+    let current = subscriber.current_canonical_transparent_projection_boundary()?;
+    assert!(input.boundary().same_capture(&current));
+    subscriber.status.store(StatusType::Syncing);
+    assert!(matches!(
+        subscriber.current_canonical_transparent_projection_boundary(),
+        Err(CanonicalTransparentProjectionInputError::ChainIndexNotReady)
+    ));
 
     let mut referenced = BTreeSet::<Outpoint>::new();
     let mut created = BTreeSet::<Outpoint>::new();
@@ -54,11 +62,11 @@ async fn captures_value_coherent_transparent_projection_input(
         }
     }
 
-    assert_eq!(input.finalized_outpoints().len(), referenced.len());
+    assert_eq!(input.finalized_outpoint_count(), referenced.len());
     let mut never_seen = 0usize;
     let mut live = 0usize;
     for outpoint in &referenced {
-        match input.finalized_outpoints().classify(outpoint) {
+        match input.classify_finalized_outpoint(outpoint) {
             Some(FinalizedOutpointState::NeverSeen) => never_seen += 1,
             Some(FinalizedOutpointState::LiveStandard { .. })
             | Some(FinalizedOutpointState::LiveNonStandard { .. }) => live += 1,
@@ -71,7 +79,7 @@ async fn captures_value_coherent_transparent_projection_input(
 
     for outpoint in created {
         assert_eq!(
-            input.finalized_outpoints().classify(&outpoint),
+            input.classify_finalized_outpoint(&outpoint),
             Some(FinalizedOutpointState::NeverSeen)
         );
     }

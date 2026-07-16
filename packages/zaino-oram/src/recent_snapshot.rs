@@ -4,8 +4,10 @@
 //! cannot receive an address, transaction identifier, or query-derived key.
 //! Occupied transitions use canonical oldest-to-newest ordinal order; larger
 //! ordinals are later effects when the same outpoint appears twice.
-//! This is an injected in-trust-domain research seam, not a live Zaino NFS
-//! adapter or evidence of race-free snapshot acquisition.
+//! The optional Zaino adapter builds from one value-coherent chain-index
+//! capture and rechecks its opaque non-finalized revision before publication.
+//! This remains a research seam, not evidence of a whole-serving-epoch lease
+//! or race-free response release.
 
 use std::fmt;
 

@@ -16,6 +16,8 @@ use super::{
     content_digest, lineage_binding_digest, RecentSnapshotIdentity, RecentSnapshotReadError,
     RecentSnapshotSlot,
 };
+#[cfg(feature = "corpus-zaino")]
+mod controller;
 
 /// Lineage that distinguishes every immutable recent snapshot generation.
 ///
