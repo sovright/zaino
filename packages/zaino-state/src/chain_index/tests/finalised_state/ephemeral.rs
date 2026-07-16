@@ -24,8 +24,9 @@ use crate::chain_index::tests::init_tracing;
 use crate::chain_index::tests::vectors::{
     build_mockchain_source, indexed_block_chain, load_test_vectors,
 };
+use crate::chain_index::types::BlockIndex;
 use crate::error::FinalisedStateError;
-use crate::{ChainIndexConfig, Height, StatusType};
+use crate::{BlockHash, ChainIndexConfig, Height, StatusType};
 
 /// Spawns a `FinalisedState` in ephemeral mode over `source`. The database path
 /// is a throwaway tempdir that is never opened (ephemeral mode opens no DB).
@@ -81,6 +82,34 @@ async fn db_height_reports_zero() {
     let (_db_dir, finalised_state) = spawn_ephemeral_finalised_state(source).await.unwrap();
 
     assert_eq!(finalised_state.db_height().await.unwrap(), Some(Height(0)));
+}
+
+#[tokio::test]
+async fn finalized_outpoint_materialization_is_unavailable() {
+    init_tracing();
+
+    let source = build_mockchain_source(load_test_vectors().unwrap().blocks);
+    let (_db_dir, finalised_state) = spawn_ephemeral_finalised_state(source).await.unwrap();
+    let finalised_state = Arc::new(finalised_state);
+    finalised_state.wait_until_ready().await;
+
+    let error = finalised_state
+        .to_reader()
+        .materialize_finalized_outpoints(
+            BlockIndex {
+                height: Height(0),
+                hash: BlockHash([0; 32]),
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("ephemeral state must not advertise finalized outpoint materialization");
+
+    assert!(matches!(
+        error,
+        FinalisedStateError::FeatureUnavailable("TRANSPARENT_HIST_EXT")
+    ));
 }
 
 #[tokio::test]

@@ -85,6 +85,7 @@ pub(crate) mod block_shielded;
 pub(crate) mod block_transparent;
 
 pub(crate) mod compact_block;
+mod finalised_outpoints;
 pub(crate) mod indexed_block;
 
 pub(crate) mod transparent_address_history;

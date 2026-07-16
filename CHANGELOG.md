@@ -9,6 +9,20 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-state`: add a crate-private, ORAM-agnostic transparent-projection input
+  that joins one immutable canonical recent-chain snapshot to finalized
+  outpoint classifications at its exact retained height/hash seam. The
+  finalized materializer deduplicates requests and executes metadata,
+  checkpoint, creator, spender, reverse-index, and verified forward-row reads
+  in one LMDB read transaction; checksum, row-length, Merkle-root, location,
+  spend-input, and ordering mismatches fail closed rather than becoming
+  `NeverSeen`. Acquisition reads only the already-published NFS value and never
+  falls through to the validator. This is a staged chain-data foundation with
+  no production caller or public API; the following controller slice must own
+  projection/key epochs, begin publication before conversion, bind freshness
+  to a whole serving epoch, and handle retries. It does not establish atomic
+  live-state capture, ORAM persistence, physical obliviousness, TDX, target-load,
+  or mainnet evidence.
 - `zaino-oram`: the default-off `corpus-zaino` path now contains a private
   conversion candidate that consumes a `CanonicalRecentChainSnapshot` together
   with an immutable, identity-pinned finalized-outpoint classifier. It preserves
@@ -21,9 +35,11 @@ and this library adheres to Rust's notion of
   order remains a control-flow obligation rather than a type-enforced candidate
   binding, and no live controller enforces it. This is owner-mediated construction,
   not a race-free refresh controller or whole-serving-epoch orchestration. The
-  slice still has no production resolver, caller, live DB/NFS acquisition,
-  runtime or service wiring, durability, authenticated provenance, production
-  cryptography, TDX, or mainnet claim.
+  conversion slice still has no production caller, refresh controller, runtime
+  or service wiring, durability, authenticated provenance, production
+  cryptography, TDX, or mainnet claim. The separately described `zaino-state`
+  input supplies its staged chain-data acquisition foundation without changing
+  those controller or runtime limitations.
 - `zaino-state`: add a synchronous immutable-snapshot API that verifies an
   exact finalized height/hash seam and returns only canonical recent
   `IndexedBlock`s above it, oldest-to-newest. The API checks structural

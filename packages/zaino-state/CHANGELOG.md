@@ -8,6 +8,20 @@ and this library adheres to Rust's notion of
 ## [Unreleased]
 
 ### Added
+- A crate-private `CanonicalTransparentProjectionInput` acquisition seam joins
+  one immutable canonical recent-chain value to transparent outpoint states at
+  its exact retained finalized checkpoint. The V1 materializer executes one
+  LMDB read transaction across current metadata, tip identity, spent and txid
+  location indices, and checksum/Merkle-verified header, txid, and transparent
+  rows. It rematerializes creators and spenders, rejects impossible ordering or
+  index disagreement, and deduplicates requests deterministically. Outpoints
+  proven newly created by the recent segment may resolve to `NeverSeen` at the
+  checkpoint; cross-seam references must exist and fail closed when their
+  reverse-index or output row is absent. The subscriber reads only published
+  NFS state, with no validator fallback. This
+  remains a staged crate-private input with no production caller; projection
+  epochs, publication control, serving-epoch freshness, and ORAM conversion
+  remain outside `zaino-state` and follow in the stacked consumer change.
 - `ChainIndexSnapshot::canonical_recent_chain` derives one structurally
   consistent, snapshot-only canonical segment strictly above an exact
   finalized height/hash seam. It returns cloned `IndexedBlock`s
