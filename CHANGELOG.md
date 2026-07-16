@@ -226,6 +226,26 @@ and this library adheres to Rust's notion of
   fixed 60s).
 
 ### Fixed
+- `zaino-state`: finalised-database startup now classifies exact supported
+  schema versions and rejects incomplete, unknown, or newer V1 metadata before
+  constructing the request router. Existing databases must match a known
+  version/hash pair and contain that version's required named tables before any
+  create-on-open call can mutate the environment; the current version also
+  requires an empty migration status. Each completed migration now records the
+  canonical hash for its target version, keeping crash-resume admission valid.
+  Builds with experimental transparent address history reject historical
+  migrations until a correct address-history backfill exists. Cross-process
+  admission uses one
+  process-lifetime exclusive lease scoped to each network namespace, preventing
+  concurrent normal Zaino writers from opening the same LMDB environment.
+  Failed or panicked migrations close read and write routing while retaining
+  ownership until the router is dropped; shutdown waits for its owned migration
+  task before closing the backends. Data-only LMDB restores are still discovered
+  and migrated. The lock sidecars are operational coordination state, not
+  database tables or a schema revision; the migration-only target-version helper
+  applies the same fail-closed rule. The first rollout requires a quiescent
+  cutover because older binaries do not honor the lease. This changes no schema
+  bytes or version.
 - Zaino no longer OOM-crashes during the txout-set accumulator rebuild when it
   reaches mainnet chain tip on memory-constrained hosts; the rebuild auto-shards
   its in-memory spent set to fit the configured `sync_write_batch_size` budget.

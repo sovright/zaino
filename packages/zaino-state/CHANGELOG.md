@@ -67,6 +67,26 @@ and this library adheres to Rust's notion of
 ### Deprecated
 ### Removed
 ### Fixed
+- Finalised-database startup now maps capabilities by exact supported schema
+  version and rejects incomplete, unknown, or newer V1 metadata before
+  constructing the request router. Existing databases must match a known
+  version/hash pair and contain that version's required named tables before any
+  create-on-open call can mutate the environment; the current version also
+  requires an empty migration status. Each completed migration now records the
+  canonical hash for its target version, keeping crash-resume admission valid.
+  Builds with experimental transparent address history reject historical
+  migrations until a correct address-history backfill exists. Cross-process
+  admission uses one
+  process-lifetime exclusive lease scoped to each network namespace, preventing
+  concurrent normal Zaino writers from opening the same LMDB environment.
+  Failed or panicked migrations close read and write routing while retaining
+  ownership until the router is dropped; shutdown waits for its owned migration
+  task before closing the backends. Data-only LMDB restores are still discovered
+  and migrated. The lock sidecars are operational coordination state, not
+  database tables or a schema revision; the migration-only target-version helper
+  enforces the same fail-closed rule. The first rollout requires a quiescent
+  cutover because older binaries do not honor the lease. No schema bytes or
+  version change in this fix.
 - The finalised-state txout-set accumulator rebuild at chain tip no longer
   OOM-crashes on memory-constrained hosts. It auto-shards its in-memory spent set
   by creating-txid prefix and now enforces the per-shard budget *strictly*: each
