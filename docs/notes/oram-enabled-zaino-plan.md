@@ -96,16 +96,19 @@ scans an immutable copy of the pinned recent generation, executes and protects
 the complete fixed-work response, then re-observes the exact finalized identity
 and source boundary. Any mismatch, unavailable observation, or in-flight epoch
 replacement latches readiness and discards the encoded envelope as one uniform
-external failure. The controller publication and runtime consumption paths are
-compatible but tested separately; no non-test path composes the two private
-  types. A private Ready-only adapter now consumes the exact finalized projection
-  worker into an identity-bound, non-cloneable serving store. Every successful
-  in-profile read, absent a backend or worker failure, executes a complete
-  key-addressed fixed-history worker command and folds the full padded event
-  history into dense creation-order live outputs without caching. Decreasing
-  event heights and events above the exact owner-bound checkpoint are rejected.
-  This is not a process-wide service owner or transport-write guard, has
-  no non-test finalized-store caller, and does not authenticate
+external failure. A default-off, crate-internal non-test factory now consumes
+one already-pinned serving-epoch lease specialized to the concrete finalized
+store and constructs that runtime. It derives all six protected checkpoint
+fields from the lease identity rather than accepting an independent checkpoint,
+store, or currentness observer. It does not pin from the refresh controller,
+choose a runtime replacement policy, or own process lifecycle. A private
+Ready-only adapter now consumes the exact finalized projection worker into an
+identity-bound, non-cloneable serving store. Every successful in-profile read,
+absent a backend or worker failure, executes a complete key-addressed
+fixed-history worker command and folds the full padded event history into dense
+creation-order live outputs without caching. Decreasing event heights and events
+above the exact owner-bound checkpoint are rejected. This is not a process-wide
+service owner or transport-write guard and does not authenticate
 the tip, ancestry, or slot provenance. The lineage
 commitment is not an authenticated canonical/live Zaino snapshot root. Live NFS
 service routing, authenticated provenance, durable rollback authority, physical
@@ -128,12 +131,13 @@ generation. The private publication owner can consume that candidate only
 through the matching outstanding ticket, verify its exact finalized/tip metadata,
 and construct the owner-generated `FrozenRecentSnapshot`; direct raw-slot
 activation remains test-only. The controller publication contract and the
-listener-free runtime consumption contract separately exercise the same
-generation-bound epoch-lease shape, including the owner-issued finalized store,
-opaque NFS Arc identity, and bound release-time currentness capability. No
-  non-test path composes those private types. The private concrete finalized
-  store is not yet consumed by a runtime factory, process owner, listener, or
-  transport; this path does not provide an
+listener-free runtime consumption contract exercise the same generation-bound
+epoch-lease shape, including the owner-issued finalized store, opaque NFS Arc
+identity, and bound release-time currentness capability. The exact-lease factory
+provides a non-test store-to-runtime construction path only after a caller has
+already pinned that lease. No non-test path pins the controller into the factory,
+and there is no process owner, listener, or transport integration. This path does
+not provide an
 authenticated root, durable rollback authority, production cryptography,
 physical or TDX evidence, or mainnet service evidence.
 
@@ -427,13 +431,15 @@ blocks. Its implemented ORAM-agnostic
 recent-chain seam that cannot perform address/txid queries or fall back to a DB
 or backing source. The private `corpus-zaino` controller can consume the newer
 coherent transparent-projection input, convert under the publication ticket,
-and publish a generation-bound serving epoch last. A separately tested runtime
-contract consumes the same lease shape and performs the final currentness gate.
-There is no non-test path composing those private contracts. A complete
-production projection feed therefore still needs finalized block application,
-a finalized checkpoint/watermark and catch-up protocol, a process-wide owner
-that composes controller and runtime, and service-lifetime epoch ownership
-through the transport-write boundary.
+and publish a generation-bound serving epoch last. A crate-internal factory can
+consume an already-pinned lease specialized to the concrete finalized serving
+store, derive its protected checkpoint internally, and construct the
+listener-free runtime that performs the final currentness gate. The factory does
+not pin from the controller or retain a release guard beyond the runtime return.
+A complete production projection feed therefore still needs finalized block
+application, a finalized checkpoint/watermark and catch-up protocol, a
+process-wide owner that pins, retains, replaces, and retires runtimes, and
+service-lifetime epoch ownership through the transport-write boundary.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
@@ -725,10 +731,14 @@ Deliverables:
 - consume a Ready finalized projection owner into the exact identity-bound,
   read-only fixed-history serving-store generation (logical adapter complete;
   production composition and physical-obliviousness evidence remain open);
-- add a non-test composition path for the private coherent refresh controller,
-  generation-bound whole-serving-epoch lease, and listener-free runtime, then
-  connect it to the production finalized projection owner, listener routing,
-  and actual transport-write boundary;
+- consume one already-pinned, generation-bound whole-serving-epoch lease through
+  a default-off crate-internal factory specialized to the concrete finalized
+  store, deriving the runtime checkpoint solely from that lease (exact-lease
+  factory complete; controller pinning and process ownership remain open);
+- add the process-wide owner that pins from the coherent refresh controller,
+  retains and replaces the listener-free runtime without resetting replay,
+  material, or readiness policy, then connect it to the production finalized
+  projection owner, listener routing, and actual transport-write boundary;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;
 - production ownership of manifest authentication keys and the external
   freshness witness, with a measured rebuild RTO or composite durable ORAM

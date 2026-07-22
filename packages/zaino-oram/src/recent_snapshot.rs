@@ -95,7 +95,7 @@ impl RecentSnapshotIdentity {
         }
     }
 
-    const fn network_tag(&self) -> u8 {
+    pub(super) const fn network_tag(&self) -> u8 {
         self.network_tag
     }
 
@@ -107,15 +107,15 @@ impl RecentSnapshotIdentity {
         &self.finalized_hash_display
     }
 
-    const fn schema_version(&self) -> u32 {
+    pub(super) const fn schema_version(&self) -> u32 {
         self.schema_version
     }
 
-    const fn projection_epoch(&self) -> u64 {
+    pub(super) const fn projection_epoch(&self) -> u64 {
         self.projection_epoch
     }
 
-    const fn key_epoch(&self) -> u64 {
+    pub(super) const fn key_epoch(&self) -> u64 {
         self.key_epoch
     }
 }

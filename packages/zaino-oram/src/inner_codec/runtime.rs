@@ -26,6 +26,9 @@ use crate::{
     trace::{AccessTrace, CompletionShape, RuntimePhase, TraceRecorder},
 };
 
+#[cfg(feature = "corpus-zaino")]
+use crate::projection_owner::FinalizedProjectionServingStore;
+
 #[cfg(test)]
 use crate::recent_snapshot::{ServingEpochObservation, ServingEpochUnavailable};
 
@@ -33,6 +36,9 @@ use super::{
     EnvelopeProtector, InnerCodecError, PrivateQueryCheckpoint, PrivateQueryCodec,
     PrivateQueryResponse, UniformExternalFailure, ENVELOPE_NONCE_BYTES,
 };
+
+#[cfg(feature = "corpus-zaino")]
+use super::{PrivateNetwork, SESSION_BINDING_BYTES};
 
 /// Server-owned material acquired once before any real continuation claim.
 #[derive(Clone, Copy)]
@@ -437,6 +443,108 @@ where
     }
 }
 
+#[cfg(feature = "corpus-zaino")]
+impl PrivateQueryCheckpoint {
+    fn try_from_serving_identity(
+        identity: RecentSnapshotIdentity,
+    ) -> Result<Self, FinalizedRuntimeBuildError> {
+        let network = PrivateNetwork::try_from_tag(identity.network_tag())
+            .map_err(|_| FinalizedRuntimeBuildError)?;
+        Ok(Self::new(
+            network,
+            identity.finalized_height(),
+            *identity.finalized_hash_display(),
+            identity.schema_version(),
+            identity.projection_epoch(),
+            identity.key_epoch(),
+        ))
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<
+        E,
+        T,
+        R,
+        N,
+        C,
+        B,
+        const RESPONSE_SLOTS: usize,
+        const ENVELOPE_BYTES: usize,
+        const RECENT_SNAPSHOT_SLOTS: usize,
+    >
+    PrivateQueryRuntime<
+        FinalizedProjectionServingStore,
+        E,
+        T,
+        R,
+        N,
+        C,
+        B,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >
+where
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+    C: ServingEpochCurrentness<B>,
+    B: ServingEpochBoundary,
+{
+    /// Consumes one coherent finalized serving epoch into one stateful runtime.
+    ///
+    /// The checkpoint is derived from the epoch identity. Callers cannot pair
+    /// an independently supplied checkpoint or store with the retained lease.
+    /// The returned runtime must be retained across rounds because its replay,
+    /// material-source, and fail-closed health state are runtime-local.
+    fn from_finalized_serving_epoch(
+        serving_epoch: ServingEpochLease<
+            RECENT_SNAPSHOT_SLOTS,
+            B,
+            FinalizedProjectionServingStore,
+            C,
+        >,
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        session_binding: [u8; SESSION_BINDING_BYTES],
+        dependencies: RuntimeDependencies<E, T, R, N>,
+    ) -> Result<Self, FinalizedRuntimeBuildError> {
+        let checkpoint =
+            PrivateQueryCheckpoint::try_from_serving_identity(serving_epoch.identity())?;
+        Self::new(
+            serving_epoch,
+            shape,
+            session_binding,
+            checkpoint,
+            dependencies,
+        )
+        .map_err(|_| FinalizedRuntimeBuildError)
+    }
+}
+
+/// Coarsened finalized-runtime construction failure without epoch identifiers.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FinalizedRuntimeBuildError;
+
+#[cfg(feature = "corpus-zaino")]
+impl std::fmt::Debug for FinalizedRuntimeBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FinalizedRuntimeBuildError { ..REDACTED.. }")
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::fmt::Display for FinalizedRuntimeBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("finalized private-query runtime unavailable")
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::error::Error for FinalizedRuntimeBuildError {}
+
 fn recent_snapshot_identity(checkpoint: &PrivateQueryCheckpoint) -> RecentSnapshotIdentity {
     RecentSnapshotIdentity::new(
         checkpoint.network.tag(),
@@ -463,6 +571,12 @@ mod tests {
         records::{AddressKey, TransparentUtxo, UtxoQuery, ADDRESS_KEY_BYTES, TXID_BYTES},
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
+    };
+
+    #[cfg(feature = "corpus-zaino")]
+    use crate::{
+        projection_owner::finalized_serving_store_for_runtime_tests,
+        recent_snapshot::FinalizedServingStore,
     };
 
     const RESPONSE_SLOTS: usize = 2;
@@ -554,6 +668,28 @@ mod tests {
         RECENT_SNAPSHOT_SLOTS,
     >;
 
+    #[cfg(feature = "corpus-zaino")]
+    type FinalizedTestRuntime = PrivateQueryRuntime<
+        FinalizedProjectionServingStore,
+        DeterministicEnvelopeProtector,
+        CountingTokenProtector,
+        CountingReplayGuard,
+        DeterministicMaterialSource,
+        DeterministicServingEpochCurrentness,
+        TestBoundary,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >;
+
+    #[cfg(feature = "corpus-zaino")]
+    type FinalizedTestEpoch = ServingEpochLease<
+        RECENT_SNAPSHOT_SLOTS,
+        TestBoundary,
+        FinalizedProjectionServingStore,
+        DeterministicServingEpochCurrentness,
+    >;
+
     fn finalized_store_reads(runtime: &TestRuntime) -> usize {
         runtime
             .engine
@@ -580,6 +716,16 @@ mod tests {
         snapshot: FrozenRecentSnapshot<N>,
         store: PlaintextMockStore,
     ) -> ServingEpochLease<N, TestBoundary, PlaintextMockStore, DeterministicServingEpochCurrentness>
+    {
+        serving_epoch_with_store(snapshot, store)
+    }
+
+    fn serving_epoch_with_store<const N: usize, S>(
+        snapshot: FrozenRecentSnapshot<N>,
+        store: S,
+    ) -> ServingEpochLease<N, TestBoundary, S, DeterministicServingEpochCurrentness>
+    where
+        S: ObliviousStore,
     {
         let boundary = TestBoundary::new();
         let currentness =
@@ -914,29 +1060,56 @@ mod tests {
         replay_guard: CountingReplayGuard,
         material_source: DeterministicMaterialSource,
     ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
-        let profile = test_profile_with_recent_snapshot(
-            "runtime-test-v1",
-            store_reads,
-            RECENT_SNAPSHOT_SLOTS,
-            RESPONSE_SLOTS,
-            ENVELOPE_BYTES,
-            3,
-            TOKEN_TTL_SECONDS,
-        )?;
-        let shape = CompiledQueryShape::new(profile)?;
+        let shape = runtime_shape(store_reads)?;
         let serving_epoch = serving_epoch(recent_snapshot, store);
         Ok(TestRuntime::new(
             serving_epoch,
             shape,
             session_binding,
             checkpoint(),
-            RuntimeDependencies::new(
-                DeterministicEnvelopeProtector::default(),
-                CountingTokenProtector::default(),
-                replay_guard,
-                material_source,
-            ),
+            runtime_dependencies(replay_guard, material_source),
         )?)
+    }
+
+    fn runtime_shape(
+        store_reads: usize,
+    ) -> Result<CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>, Box<dyn std::error::Error>>
+    {
+        runtime_shape_with_recent_snapshot_slots(store_reads, RECENT_SNAPSHOT_SLOTS)
+    }
+
+    fn runtime_shape_with_recent_snapshot_slots(
+        store_reads: usize,
+        recent_snapshot_slots: usize,
+    ) -> Result<CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>, Box<dyn std::error::Error>>
+    {
+        let profile = test_profile_with_recent_snapshot(
+            "runtime-test-v1",
+            store_reads,
+            recent_snapshot_slots,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            3,
+            TOKEN_TTL_SECONDS,
+        )?;
+        Ok(CompiledQueryShape::new(profile)?)
+    }
+
+    fn runtime_dependencies(
+        replay_guard: CountingReplayGuard,
+        material_source: DeterministicMaterialSource,
+    ) -> RuntimeDependencies<
+        DeterministicEnvelopeProtector,
+        CountingTokenProtector,
+        CountingReplayGuard,
+        DeterministicMaterialSource,
+    > {
+        RuntimeDependencies::new(
+            DeterministicEnvelopeProtector::default(),
+            CountingTokenProtector::default(),
+            replay_guard,
+            material_source,
+        )
     }
 
     fn empty_recent_snapshot() -> TestRecentSnapshot {
@@ -968,6 +1141,26 @@ mod tests {
             RECENT_TIP_HASH_DISPLAY,
         )
         .expect("runtime fixture lineage is internally consistent")
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn finalized_test_epoch(
+        map_identity: impl FnOnce(RecentSnapshotIdentity) -> RecentSnapshotIdentity,
+    ) -> Result<(FinalizedTestEpoch, RecentSnapshotIdentity, usize), Box<dyn std::error::Error>>
+    {
+        let store = finalized_serving_store_for_runtime_tests()?;
+        let owner_identity = store.serving_identity();
+        let store_reads = store.slots_per_key();
+        let snapshot_identity = map_identity(owner_identity);
+        let snapshot = recent_snapshot_with_lineage(
+            [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
+            recent_snapshot_lineage(snapshot_identity),
+        );
+        Ok((
+            serving_epoch_with_store(snapshot, store),
+            owner_identity,
+            store_reads,
+        ))
     }
 
     fn runtime_with_recent(
@@ -1108,6 +1301,141 @@ mod tests {
         let mut runtime = runtime(4, entries)?;
         let request = request_envelope(&runtime, checkpoint(), query, None, 1)?;
         handle_and_decode(&mut runtime, &request)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn finalized_epoch_factory_derives_checkpoint_and_retains_runtime_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (serving_epoch, identity, store_reads) = finalized_test_epoch(|identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            serving_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+
+        assert_eq!(runtime.checkpoint.network.tag(), identity.network_tag());
+        assert_eq!(runtime.checkpoint.height, identity.finalized_height());
+        assert_eq!(
+            runtime.checkpoint.block_hash_display,
+            *identity.finalized_hash_display()
+        );
+        assert_eq!(runtime.checkpoint.schema_version, identity.schema_version());
+        assert_eq!(
+            runtime.checkpoint.projection_epoch,
+            identity.projection_epoch()
+        );
+        assert_eq!(runtime.checkpoint.key_epoch, identity.key_epoch());
+
+        for nonce_byte in [1, 2] {
+            let request = runtime.codec.encode_request(
+                &super::super::PrivateQueryRequest::new(
+                    runtime.checkpoint,
+                    UtxoQuery::new(address(0xee), 0),
+                    None,
+                ),
+                [nonce_byte; ENVELOPE_NONCE_BYTES],
+                &runtime.envelope_protector,
+            )?;
+            let round = runtime.handle(&request)?;
+            let response = runtime
+                .codec
+                .decode_response(round.envelope(), &runtime.envelope_protector)?;
+            assert_eq!(response.page.outcome(), QueryOutcome::Complete);
+        }
+        assert_eq!(runtime.material_source.calls, 2);
+        assert!(runtime.healthy);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn finalized_epoch_factory_rejects_unknown_network_without_identifiers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (serving_epoch, _, store_reads) = finalized_test_epoch(|identity| {
+            RecentSnapshotIdentity::new(
+                u8::MAX,
+                identity.finalized_height(),
+                *identity.finalized_hash_display(),
+                identity.schema_version(),
+                identity.projection_epoch(),
+                identity.key_epoch(),
+            )
+        })?;
+        let result = FinalizedTestRuntime::from_finalized_serving_epoch(
+            serving_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        );
+        let Err(error) = result else {
+            return Err("unknown internal network tag must reject runtime construction".into());
+        };
+        assert_eq!(error, FinalizedRuntimeBuildError);
+        assert_eq!(
+            format!("{error:?}"),
+            "FinalizedRuntimeBuildError { ..REDACTED.. }"
+        );
+        assert_eq!(
+            error.to_string(),
+            "finalized private-query runtime unavailable"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn finalized_epoch_factory_coarsens_store_shape_mismatch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (serving_epoch, _, store_reads) = finalized_test_epoch(|identity| identity)?;
+        let mismatched_reads = store_reads
+            .checked_sub(1)
+            .ok_or("finalized store fixture must expose at least one slot")?;
+        let result = FinalizedTestRuntime::from_finalized_serving_epoch(
+            serving_epoch,
+            runtime_shape(mismatched_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        );
+        let Err(error) = result else {
+            return Err("store/profile mismatch must reject runtime construction".into());
+        };
+        assert_eq!(error, FinalizedRuntimeBuildError);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn finalized_epoch_factory_coarsens_recent_snapshot_shape_mismatch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (serving_epoch, _, store_reads) = finalized_test_epoch(|identity| identity)?;
+        let mismatched_slots = RECENT_SNAPSHOT_SLOTS
+            .checked_sub(1)
+            .ok_or("recent-snapshot fixture must expose at least one slot")?;
+        let result = FinalizedTestRuntime::from_finalized_serving_epoch(
+            serving_epoch,
+            runtime_shape_with_recent_snapshot_slots(store_reads, mismatched_slots)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        );
+        let Err(error) = result else {
+            return Err("recent-snapshot shape mismatch must reject runtime construction".into());
+        };
+        assert_eq!(error, FinalizedRuntimeBuildError);
+        Ok(())
     }
 
     #[test]

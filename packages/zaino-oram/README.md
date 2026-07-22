@@ -94,9 +94,12 @@ offline dependency experiment:
   rechecks the opaque source boundary, and publishes one serving-epoch Arc
   last. That epoch binds an owner-issued finalized store with matching identity,
   the exact recent generation, the opaque NFS revision, and a query-independent
-  currentness capability. Controller publication and runtime consumption are
-  separately tested compatible contracts; there is no non-test path composing
-  the private controller with the private runtime;
+  currentness capability. A default-off, crate-internal non-test factory consumes
+  one already-pinned lease specialized to the concrete finalized serving store
+  and constructs the listener-free runtime. It derives all six protected
+  checkpoint fields from the lease identity and accepts no independent
+  checkpoint, store, or currentness observer. The factory does not pin the
+  controller, choose runtime replacement policy, or own process lifecycle;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -132,7 +135,8 @@ offline dependency experiment:
   directory and 82-byte event-page records on Linux x86_64. A private offline
   construction path places those stores behind the same business-command
   worker for the offline projection owner and its Ready-only serving-store
-  handoff; it has no runtime/service caller, and unsupported hosts reject
+  handoff. The exact-lease factory is its only non-test runtime construction
+  seam; there is no process or service caller, and unsupported hosts reject
   construction before creating upstream state.
 
 It does **not** contain a production envelope protector or nonce owner,
@@ -161,17 +165,22 @@ that input, an immutable identity-pinned finalized-outpoint classifier, and the
 ticketed publication owner to build and publish a serving epoch. Publication is
 last and binds the owner-issued finalized store, owner-assigned recent
 generation, opaque NFS Arc identity, and query-independent release-time
-currentness capability. Separately, the listener-free runtime contract accepts
-that lease shape, derives its store and observer only from the lease, completes
-the fixed-work response, and performs the final fail-closed observation before
-returning it.
+currentness capability. The crate-internal exact-lease factory can consume an
+already-pinned epoch containing the concrete finalized serving store and build
+the listener-free runtime. The runtime derives its store, observer, and
+protected checkpoint only from that lease, completes the fixed-work response,
+and performs the final fail-closed observation before returning it.
 
-The controller and runtime are tested separately and have no non-test
-composition path. The finalized projection now has a private concrete
-serving-store adapter, but no non-test runtime/controller caller consumes it;
-there is no process-wide service owner, listener, or guard retained through a
-transport write. The private controller has a live-subscriber entry point, but
-no non-test caller invokes it. The frozen snapshot's
+The factory does not pin the private controller, and no non-test caller invokes
+the controller's live-subscriber entry point. Each factory invocation consumes
+one lease, but there is no process-wide owner enforcing unique construction,
+retaining and replacing runtimes, sharing or durably storing replay state,
+owning trusted time and globally unique nonces, or enforcing the compiled
+query-level concurrency and overload policy. Runtime health, injected replay
+and material dependencies, and the epoch lease remain owned by the returned
+runtime. There is no listener or guard retained through a transport write, so
+the final currentness check does not close the race between runtime return and
+transport completion. The frozen snapshot's
 lineage digest binds owner-assigned generation and exact finalized/tip metadata
 to the internally computed deterministic slot commitment, but does not
 authenticate that metadata or prove its canonical ancestry. Neither commitment

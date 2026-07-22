@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- A default-off crate-internal exact-lease runtime factory. It consumes one
+  already-pinned serving-epoch lease specialized to
+  `FinalizedProjectionServingStore`, derives all six protected
+  `PrivateQueryCheckpoint` fields from the lease identity, and constructs the
+  existing listener-free `PrivateQueryRuntime` without accepting an independent
+  checkpoint, store, or currentness observer. This is a non-test typed
+  store-to-runtime construction seam only: it does not pin from the refresh
+  controller, enforce unique runtime construction or the query-level
+  concurrency policy, own replacement or shutdown, supply production replay,
+  trusted-time, nonce, session, or protection dependencies, retain a guard
+  through a transport write, or establish service, physical-obliviousness, TDX,
+  target-load, or mainnet readiness.
 - A private Ready-only finalized serving-store adapter. Consuming an
   `OfflineProjectionOwner` now transfers its exact `AtomicWorker` into a
   non-cloneable read-only facade, derives the finalized serving identity within
@@ -18,11 +30,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   append-only history into dense creation-order live UTXOs, and uses no
   cross-call cache or query-derived fallback. Decreasing event heights and
   events above the owner-bound committed checkpoint fail closed. This is a
-  concrete logical adapter
-  for the existing serving-epoch contract, but it still has no non-test
-  controller/runtime caller and establishes neither persistence nor physical or
-  timing obliviousness, production cryptography, TDX, target-load, or mainnet
-  readiness.
+  concrete logical adapter for the existing serving-epoch contract and is
+  consumed only by the exact-lease runtime factory above; it still has no
+  controller, process, or service caller and establishes neither persistence nor
+  physical or timing obliviousness, production cryptography, TDX, target-load,
+  or mainnet readiness.
 - A private generation-bound serving-epoch contract. The refresh controller
   invalidates before its sole await, validates a coherent transparent-projection
   capture, activates the owner-generated recent generation, and publishes one
@@ -32,11 +44,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   listener-free runtime contract accepts the same lease shape, derives its
   finalized store and currentness observer from that lease, completes and
   protects the fixed-work response, and then discards it on a failed final
-  observation or double currentness check. These remain separately tested
-  compatible private contracts: there is no non-test controller-to-runtime
-  composition path, process-wide service owner, finalized-store caller,
-  listener, or transport-write guard. The concrete private adapter above
-  supersedes only the then-current lack of an implementation.
+  observation or double currentness check. The exact-lease factory above now
+  provides a non-test construction path after a caller has already pinned the
+  epoch. There remains no controller-to-factory pinning path, process-wide
+  service owner, listener, or transport-write guard. The concrete private
+  adapter above supersedes only the then-current lack of an implementation.
 - The default-off `corpus-zaino` integration now has a private conversion
   candidate that consumes one `CanonicalRecentChainSnapshot` and an immutable,
   identity-pinned finalized-outpoint classifier. It preserves dense

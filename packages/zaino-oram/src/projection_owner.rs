@@ -3,6 +3,10 @@
 mod cold_rebuild;
 mod serving_store;
 
+pub(crate) use serving_store::FinalizedProjectionServingStore;
+#[cfg(test)]
+pub(crate) use tests::finalized_serving_store_for_runtime_tests;
+
 pub use cold_rebuild::{
     TypedWorkerColdRebuildError, TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport,
     TypedWorkerColdRebuildSession,
@@ -623,6 +627,14 @@ mod tests {
         ))
     }
 
+    pub(crate) fn finalized_serving_store_for_runtime_tests(
+    ) -> FixtureResult<FinalizedProjectionServingStore> {
+        let blocks = projection_chain()?;
+        let (owner, _, _) = fake_owner(None)?;
+        let (owner, _) = finish_owner(owner, &blocks)?;
+        Ok(owner.into_serving_store()?)
+    }
+
     fn fake_worker(
         projection: ProjectionConfig,
         fail_on_event_write: Option<usize>,
@@ -658,9 +670,26 @@ mod tests {
     }
 
     fn run_owner_to_ready<P>(
-        mut owner: OfflineProjectionOwner<P>,
+        owner: OfflineProjectionOwner<P>,
         blocks: &[IndexedBlock],
     ) -> FixtureResult<PublicChainCheckpoint>
+    where
+        P: ProjectionCheckpointPublisher,
+    {
+        let (owner, target) = finish_owner(owner, blocks)?;
+        assert!(matches!(
+            owner.shutdown(),
+            ProjectionOwnerShutdownOutcome::Stopped {
+                readiness: ProjectionOwnerReadiness::Ready { checkpoint },
+            } if checkpoint == target
+        ));
+        Ok(target)
+    }
+
+    fn finish_owner<P>(
+        mut owner: OfflineProjectionOwner<P>,
+        blocks: &[IndexedBlock],
+    ) -> FixtureResult<(OfflineProjectionOwner<P>, PublicChainCheckpoint)>
     where
         P: ProjectionCheckpointPublisher,
     {
@@ -670,13 +699,7 @@ mod tests {
         }
         let target = target.ok_or("fixture chain must be nonempty")?;
         assert_eq!(owner.finish(target)?, target);
-        assert!(matches!(
-            owner.shutdown(),
-            ProjectionOwnerShutdownOutcome::Stopped {
-                readiness: ProjectionOwnerReadiness::Ready { checkpoint },
-            } if checkpoint == target
-        ));
-        Ok(target)
+        Ok((owner, target))
     }
 
     #[test]
