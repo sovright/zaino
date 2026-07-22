@@ -5,9 +5,12 @@
 //! Occupied transitions use canonical oldest-to-newest ordinal order; larger
 //! ordinals are later effects when the same outpoint appears twice.
 //! The optional Zaino adapter builds from one value-coherent chain-index
-//! capture and rechecks its opaque non-finalized revision before publication.
-//! This remains a research seam, not evidence of a whole-serving-epoch lease
-//! or race-free response release.
+//! capture and binds its opaque non-finalized revision into a whole-serving-
+//! epoch lease. The listener-free runtime returns a response only after
+//! re-observing that exact boundary and passing the lease's final double
+//! currentness check.
+//! This remains a listener-free research model; it does not supply a
+//! process-wide service owner or keep the lease through a transport write.
 
 use std::fmt;
 
@@ -17,8 +20,15 @@ use crate::records::{AddressKey, TransparentUtxo, ADDRESS_KEY_BYTES};
 
 mod publication;
 #[cfg(test)]
+pub(crate) use publication::serving_epoch_for_tests;
+#[cfg(test)]
 use publication::RecentSnapshotLineageError;
 pub(super) use publication::{FrozenRecentSnapshot, RecentSnapshotLineage};
+pub(super) use publication::{
+    ServingEpochBoundary, ServingEpochCurrentness, ServingEpochLease, ServingEpochStore,
+};
+#[cfg(test)]
+pub(crate) use publication::{ServingEpochObservation, ServingEpochUnavailable};
 #[cfg(feature = "corpus-zaino")]
 mod zaino;
 

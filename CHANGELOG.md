@@ -9,6 +9,21 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-oram` / `zaino-state`: add a private generation-bound serving-epoch
+  contract. The refresh controller invalidates publication before its sole
+  await, validates one coherent transparent-projection capture, activates the
+  owner-generated recent generation, and publishes one serving-epoch `Arc`
+  last. That epoch binds an owner-issued finalized store whose identity must
+  match, the exact recent generation, the opaque NFS revision, and a
+  query-independent currentness capability. A separately tested listener-free
+  runtime contract accepts the same lease shape, derives both its finalized
+  store and currentness observer from it, completes the fixed-work response,
+  and then fails closed if the final observation or double currentness check
+  fails. These are separately tested compatible private contracts: there is no
+  non-test controller-to-runtime composition path, process-wide service owner,
+  production finalized-store implementation or caller, listener, or
+  transport-write guard. This slice therefore makes no production service,
+  physical-obliviousness, TDX, target-load, or mainnet claim.
 - `zaino-state`: add a crate-private, ORAM-agnostic transparent-projection input
   that joins one immutable canonical recent-chain snapshot to finalized
   outpoint classifications at its exact retained height/hash seam. The
@@ -17,12 +32,12 @@ and this library adheres to Rust's notion of
   in one LMDB read transaction; checksum, row-length, Merkle-root, location,
   spend-input, and ordering mismatches fail closed rather than becoming
   `NeverSeen`. Acquisition reads only the already-published NFS value and never
-  falls through to the validator. This is a staged chain-data foundation with
-  no production caller or public API; the following controller slice must own
-  projection/key epochs, begin publication before conversion, bind freshness
-  to a whole serving epoch, and handle retries. It does not establish atomic
-  live-state capture, ORAM persistence, physical obliviousness, TDX, target-load,
-  or mainnet evidence.
+  falls through to the validator. At the time of this staged chain-data slice,
+  projection/key-epoch ownership and whole-serving-epoch freshness binding were
+  follow-on work. The private controller and lease contracts described above
+  supersede that then-current implementation limitation; production ownership,
+  retry policy, ORAM persistence, physical obliviousness, TDX, target-load, and
+  mainnet evidence remain open.
 - `zaino-oram`: the default-off `corpus-zaino` path now contains a private
   conversion candidate that consumes a `CanonicalRecentChainSnapshot` together
   with an immutable, identity-pinned finalized-outpoint classifier. It preserves
@@ -31,15 +46,13 @@ and this library adheres to Rust's notion of
   publication owner is the sole generation authority: through its current
   outstanding ticket it requires exact candidate finalized and recent-tip
   metadata, then moves the candidate's slots into `FrozenRecentSnapshot`. Direct
-  raw-slot activation is test-only. The intended begin-update-before-conversion
-  order remains a control-flow obligation rather than a type-enforced candidate
-  binding, and no live controller enforces it. This is owner-mediated construction,
-  not a race-free refresh controller or whole-serving-epoch orchestration. The
-  conversion slice still has no production caller, refresh controller, runtime
-  or service wiring, durability, authenticated provenance, production
-  cryptography, TDX, or mainnet claim. The separately described `zaino-state`
-  input supplies its staged chain-data acquisition foundation without changing
-  those controller or runtime limitations.
+  raw-slot activation is test-only. This entry records the earlier
+  conversion-only slice: at that head, begin-update-before-conversion remained
+  a control-flow obligation and no refresh controller or serving epoch enforced
+  it. The private controller and serving-epoch contracts described above
+  supersede those then-current controller/runtime limitations, but not the lack
+  of non-test composition, durability, authenticated provenance, production
+  cryptography, TDX, or mainnet evidence.
 - `zaino-state`: add a synchronous immutable-snapshot API that verifies an
   exact finalized height/hash seam and returns only canonical recent
   `IndexedBlock`s above it, oldest-to-newest. The API checks structural
@@ -47,10 +60,11 @@ and this library adheres to Rust's notion of
   map, block identities, and parent links while excluding side branches and
   structurally preventing DB or validator fallback. It value-binds a
   caller-supplied checkpoint to one immutable NFS snapshot rather than
-  atomically capturing finalized storage with NFS. It is an ORAM-agnostic
-  chain-data seam only; production finalized-outpoint resolution, live DB/NFS
-  acquisition, runtime wiring, atomic serving-epoch capture, and service
-  publication remain open.
+  atomically capturing finalized storage with NFS. At that slice, production
+  finalized-outpoint resolution, live DB/NFS acquisition, runtime wiring, and
+  serving-epoch publication remained open. The current private controller/lease
+  contracts build on this seam, but still provide no non-test composition path
+  or production service publication.
 - `zaino-oram`: frozen recent snapshots now bind an in-memory monotonic
   generation, exact finalized identity, recent tip height/hash, and the
   internally computed fixed-slot commitment into one lineage digest. The
@@ -62,11 +76,12 @@ and this library adheres to Rust's notion of
   final current-generation check. Its tests cover advances, same-height and
   shortening reorgs, stale tickets, failed builds, finalized rollback, and
   generation overflow. A replacement owner must roll the durable projection
-  epoch because its in-memory generation restarts at one. This is a mock
-  contract with no runtime caller: it does not authenticate the caller-supplied
-  tip or slot provenance,
-  acquire live Zaino NFS state, validate canonical ancestry, durably prevent
-  rollback, publish a service epoch, or establish physical, TDX, mainnet, or
+  epoch because its in-memory generation restarts at one. This entry records
+  the earlier snapshot-owner contract, which then had no runtime consumer or
+  serving epoch. The private serving-epoch and runtime contracts above
+  supersede that implementation-status limitation; they still do not
+  authenticate tip or slot provenance, durably prevent rollback, establish a
+  non-test composition path, or provide physical, TDX, mainnet, or
   production-readiness evidence.
 - `zaino-oram`: profile ID v3 now binds padded input slots, a distinct
   recent-snapshot scan budget, timeout bucket, and explicit single-worker FIFO

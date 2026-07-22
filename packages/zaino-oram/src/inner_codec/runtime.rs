@@ -2,9 +2,11 @@
 //! logical phase recorder.
 //!
 //! This module proves only a deterministic source-level logical schedule for
-//! the injected research fixtures. It does not provide a production nonce
-//! source, trusted clock, replay database, AEAD, listener, transport, physical
-//! ORAM trace, timing result, or TDX claim.
+//! the injected research fixtures and withholds a completed envelope unless
+//! its pinned serving epoch is still current after response encoding. It does
+//! not provide a production nonce source, trusted clock, replay database,
+//! AEAD, listener, transport-write guard, physical ORAM trace, timing result,
+//! or TDX claim.
 
 use crate::{
     continuation_token::{
@@ -16,12 +18,16 @@ use crate::{
     profile::CompiledQueryShape,
     recent_snapshot::{
         bind_query_digest, content_digest, lineage_binding_digest, FrozenRecentSnapshot,
-        RecentSnapshotIdentity, RecentSnapshotSlot,
+        RecentSnapshotIdentity, RecentSnapshotSlot, ServingEpochBoundary, ServingEpochCurrentness,
+        ServingEpochLease, ServingEpochStore,
     },
     records::{QueryOutcome, UtxoResultPage},
     store::ObliviousStore,
     trace::{AccessTrace, CompletionShape, RuntimePhase, TraceRecorder},
 };
+
+#[cfg(test)]
+use crate::recent_snapshot::{ServingEpochObservation, ServingEpochUnavailable};
 
 use super::{
     EnvelopeProtector, InnerCodecError, PrivateQueryCheckpoint, PrivateQueryCodec,
@@ -113,12 +119,14 @@ struct PrivateQueryRuntime<
     T,
     R,
     N,
+    C,
+    B,
     const RESPONSE_SLOTS: usize,
     const ENVELOPE_BYTES: usize,
     const RECENT_SNAPSHOT_SLOTS: usize,
 > {
     codec: PrivateQueryCodec<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-    engine: PrivateQueryEngine<S, RESPONSE_SLOTS, ENVELOPE_BYTES>,
+    engine: PrivateQueryEngine<ServingEpochStore<S>, RESPONSE_SLOTS, ENVELOPE_BYTES>,
     recent_snapshot: FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>,
     recent_snapshot_content_digest: [u8; 32],
     recent_snapshot_binding_digest: [u8; 32],
@@ -126,6 +134,7 @@ struct PrivateQueryRuntime<
     token_protector: T,
     replay_guard: R,
     material_source: N,
+    serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
     checkpoint: PrivateQueryCheckpoint,
     healthy: bool,
 }
@@ -136,25 +145,30 @@ impl<
         T,
         R,
         N,
+        C,
+        B,
         const RESPONSE_SLOTS: usize,
         const ENVELOPE_BYTES: usize,
         const RECENT_SNAPSHOT_SLOTS: usize,
-    > PrivateQueryRuntime<S, E, T, R, N, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>
+    >
+    PrivateQueryRuntime<S, E, T, R, N, C, B, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>
 where
     S: ObliviousStore,
     E: EnvelopeProtector,
     T: ContinuationTokenProtector,
     R: ContinuationReplayGuard,
     N: RoundMaterialSource,
+    C: ServingEpochCurrentness<B>,
+    B: ServingEpochBoundary,
 {
     fn new(
-        store: S,
-        recent_snapshot: FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>,
+        serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
         session_binding: [u8; 32],
         checkpoint: PrivateQueryCheckpoint,
         dependencies: RuntimeDependencies<E, T, R, N>,
     ) -> Result<Self, UniformExternalFailure> {
+        let recent_snapshot = serving_epoch.snapshot().clone();
         shape
             .profile()
             .validate_recent_snapshot_slots::<RECENT_SNAPSHOT_SLOTS>()
@@ -173,7 +187,8 @@ where
         u64::try_from(combined_scan_slots).map_err(|_| UniformExternalFailure)?;
         let codec = PrivateQueryCodec::new(&shape, session_binding)
             .map_err(InnerCodecError::into_uniform_external_failure)?;
-        let engine = PrivateQueryEngine::new(store, shape).map_err(|_| UniformExternalFailure)?;
+        let engine = PrivateQueryEngine::new(serving_epoch.finalized_store(), shape)
+            .map_err(|_| UniformExternalFailure)?;
         Ok(Self {
             codec,
             engine,
@@ -184,6 +199,7 @@ where
             token_protector: dependencies.token_protector,
             replay_guard: dependencies.replay_guard,
             material_source: dependencies.material_source,
+            serving_epoch,
             checkpoint,
             healthy: true,
         })
@@ -398,6 +414,13 @@ where
         let trace = trace
             .finish(profile.access_budget())
             .map_err(|_| self.latch_failure())?;
+        let observation = match self.serving_epoch.observe_current() {
+            Ok(observation) => observation,
+            Err(_) => return Err(self.latch_failure()),
+        };
+        if !self.serving_epoch.is_current(&observation) {
+            return Err(self.latch_failure());
+        }
         Ok(RuntimeRound { envelope, trace })
     }
 
@@ -427,13 +450,16 @@ fn recent_snapshot_identity(checkpoint: &PrivateQueryCheckpoint) -> RecentSnapsh
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, rc::Rc, sync::Arc};
 
     use super::*;
     use crate::{
         continuation_token::{ContinuationProtectionContext, ReplayBinding, ReplayGuardError},
         profile::test_profile_with_recent_snapshot,
-        recent_snapshot::{FrozenRecentSnapshot, RecentSnapshotLineage, RecentSnapshotSlot},
+        recent_snapshot::{
+            serving_epoch_for_tests, FrozenRecentSnapshot, RecentSnapshotLineage,
+            RecentSnapshotSlot,
+        },
         records::{AddressKey, TransparentUtxo, UtxoQuery, ADDRESS_KEY_BYTES, TXID_BYTES},
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
@@ -449,16 +475,117 @@ mod tests {
 
     type TestRecentSnapshot = FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>;
 
+    #[derive(Clone)]
+    struct TestBoundary {
+        revision: Arc<()>,
+    }
+
+    impl TestBoundary {
+        fn new() -> Self {
+            Self {
+                revision: Arc::new(()),
+            }
+        }
+
+        fn replacement(&self) -> Self {
+            Self::new()
+        }
+    }
+
+    impl ServingEpochBoundary for TestBoundary {
+        fn same_capture(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.revision, &other.revision)
+        }
+    }
+
+    struct DeterministicServingEpochCurrentness {
+        identity: RecentSnapshotIdentity,
+        boundary: TestBoundary,
+        available: bool,
+        calls: usize,
+        after_comparison: Option<Rc<dyn Fn()>>,
+    }
+
+    impl DeterministicServingEpochCurrentness {
+        fn available(identity: RecentSnapshotIdentity, boundary: TestBoundary) -> Self {
+            Self {
+                identity,
+                boundary,
+                available: true,
+                calls: 0,
+                after_comparison: None,
+            }
+        }
+    }
+
+    impl ServingEpochCurrentness<TestBoundary> for DeterministicServingEpochCurrentness {
+        fn binding(&self) -> Option<(RecentSnapshotIdentity, &TestBoundary)> {
+            Some((self.identity, &self.boundary))
+        }
+
+        fn observe(
+            &mut self,
+        ) -> Result<ServingEpochObservation<TestBoundary>, ServingEpochUnavailable> {
+            self.calls = self.calls.checked_add(1).ok_or(ServingEpochUnavailable)?;
+            if !self.available {
+                return Err(ServingEpochUnavailable);
+            }
+            let observation = ServingEpochObservation::new(self.identity, self.boundary.clone());
+            Ok(
+                if let Some(hook) = self.after_comparison.as_ref().map(Rc::clone) {
+                    observation.with_after_comparison_for_tests(move || hook())
+                } else {
+                    observation
+                },
+            )
+        }
+    }
+
     type TestRuntime = PrivateQueryRuntime<
         PlaintextMockStore,
         DeterministicEnvelopeProtector,
         CountingTokenProtector,
         CountingReplayGuard,
         DeterministicMaterialSource,
+        DeterministicServingEpochCurrentness,
+        TestBoundary,
         RESPONSE_SLOTS,
         ENVELOPE_BYTES,
         RECENT_SNAPSHOT_SLOTS,
     >;
+
+    fn finalized_store_reads(runtime: &TestRuntime) -> usize {
+        runtime
+            .engine
+            .store()
+            .inspect_for_tests(|store| store.read_slots().len())
+            .expect("serving-epoch test store mutex is not poisoned")
+    }
+
+    fn with_serving_epoch_currentness<T>(
+        runtime: &TestRuntime,
+        inspect: impl FnOnce(&mut DeterministicServingEpochCurrentness) -> T,
+    ) -> T {
+        runtime
+            .serving_epoch
+            .with_currentness_for_tests(inspect)
+            .expect("serving-epoch test currentness mutex is not poisoned")
+    }
+
+    fn serving_epoch_observations(runtime: &TestRuntime) -> usize {
+        with_serving_epoch_currentness(runtime, |currentness| currentness.calls)
+    }
+
+    fn serving_epoch<const N: usize>(
+        snapshot: FrozenRecentSnapshot<N>,
+        store: PlaintextMockStore,
+    ) -> ServingEpochLease<N, TestBoundary, PlaintextMockStore, DeterministicServingEpochCurrentness>
+    {
+        let boundary = TestBoundary::new();
+        let currentness =
+            DeterministicServingEpochCurrentness::available(snapshot.identity(), boundary.clone());
+        serving_epoch_for_tests(snapshot, boundary, store, currentness)
+    }
 
     fn folded_authentication<'a>(key: [u8; 16], bytes: impl Iterator<Item = &'a u8>) -> [u8; 16] {
         let mut authentication = key;
@@ -797,9 +924,9 @@ mod tests {
             TOKEN_TTL_SECONDS,
         )?;
         let shape = CompiledQueryShape::new(profile)?;
+        let serving_epoch = serving_epoch(recent_snapshot, store);
         Ok(TestRuntime::new(
-            store,
-            recent_snapshot,
+            serving_epoch,
             shape,
             session_binding,
             checkpoint(),
@@ -872,37 +999,79 @@ mod tests {
         )
     }
 
+    struct RuntimeCounters {
+        envelope_opens: usize,
+        envelope_seals: usize,
+        token_opens: usize,
+        token_seals: usize,
+        replay_calls: usize,
+        replay_reads: usize,
+        replay_writes: usize,
+        material_calls: usize,
+        serving_epoch_observations: usize,
+        recent_snapshot_reads: usize,
+        store_reads: usize,
+    }
+
+    impl RuntimeCounters {
+        fn capture(runtime: &TestRuntime) -> Self {
+            Self {
+                envelope_opens: runtime.envelope_protector.opens.get(),
+                envelope_seals: runtime.envelope_protector.seals.get(),
+                token_opens: runtime.token_protector.opens.get(),
+                token_seals: runtime.token_protector.seals.get(),
+                replay_calls: runtime.replay_guard.calls,
+                replay_reads: runtime.replay_guard.logical_reads,
+                replay_writes: runtime.replay_guard.logical_writes,
+                material_calls: runtime.material_source.calls,
+                serving_epoch_observations: serving_epoch_observations(runtime),
+                recent_snapshot_reads: runtime.recent_snapshot.read_calls(),
+                store_reads: finalized_store_reads(runtime),
+            }
+        }
+
+        fn assert_complete_round(&self, runtime: &TestRuntime) {
+            assert_eq!(
+                runtime.envelope_protector.opens.get() - self.envelope_opens,
+                1
+            );
+            assert_eq!(
+                runtime.envelope_protector.seals.get() - self.envelope_seals,
+                1
+            );
+            assert_eq!(runtime.token_protector.opens.get() - self.token_opens, 1);
+            assert_eq!(runtime.token_protector.seals.get() - self.token_seals, 1);
+            assert_eq!(runtime.replay_guard.calls - self.replay_calls, 1);
+            assert_eq!(runtime.replay_guard.logical_reads - self.replay_reads, 1);
+            assert_eq!(runtime.replay_guard.logical_writes - self.replay_writes, 1);
+            assert_eq!(runtime.material_source.calls - self.material_calls, 1);
+            assert_eq!(
+                serving_epoch_observations(runtime) - self.serving_epoch_observations,
+                1
+            );
+            assert_eq!(
+                runtime.recent_snapshot.read_calls() - self.recent_snapshot_reads,
+                RECENT_SNAPSHOT_SLOTS
+            );
+            assert_eq!(
+                finalized_store_reads(runtime) - self.store_reads,
+                runtime.engine.profile().store_reads()
+            );
+        }
+    }
+
     fn handle_and_decode(
         runtime: &mut TestRuntime,
         request: &FixedEnvelope<ENVELOPE_BYTES>,
     ) -> Result<(AccessTrace, PrivateQueryResponse<RESPONSE_SLOTS>), Box<dyn std::error::Error>>
     {
-        let envelope_opens = runtime.envelope_protector.opens.get();
-        let envelope_seals = runtime.envelope_protector.seals.get();
-        let token_opens = runtime.token_protector.opens.get();
-        let token_seals = runtime.token_protector.seals.get();
-        let replay_calls = runtime.replay_guard.calls;
-        let replay_reads = runtime.replay_guard.logical_reads;
-        let replay_writes = runtime.replay_guard.logical_writes;
-        let material_calls = runtime.material_source.calls;
-        let recent_snapshot_reads = runtime.recent_snapshot.read_calls();
+        let counters = RuntimeCounters::capture(runtime);
         let round = runtime.handle(request)?;
-        assert_eq!(runtime.envelope_protector.opens.get() - envelope_opens, 1);
-        assert_eq!(runtime.envelope_protector.seals.get() - envelope_seals, 1);
+        counters.assert_complete_round(runtime);
         let trace = *round.trace();
         let response = runtime
             .codec
             .decode_response(round.envelope(), &runtime.envelope_protector)?;
-        assert_eq!(runtime.token_protector.opens.get() - token_opens, 1);
-        assert_eq!(runtime.token_protector.seals.get() - token_seals, 1);
-        assert_eq!(runtime.replay_guard.calls - replay_calls, 1);
-        assert_eq!(runtime.replay_guard.logical_reads - replay_reads, 1);
-        assert_eq!(runtime.replay_guard.logical_writes - replay_writes, 1);
-        assert_eq!(runtime.material_source.calls - material_calls, 1);
-        assert_eq!(
-            runtime.recent_snapshot.read_calls() - recent_snapshot_reads,
-            RECENT_SNAPSHOT_SLOTS
-        );
         assert_eq!(trace.runtime_phases(), RuntimePhase::COUNT);
         assert_eq!(trace.store_reads(), runtime.engine.profile().store_reads());
         assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_SLOTS);
@@ -916,6 +1085,21 @@ mod tests {
         Ok((trace, response))
     }
 
+    fn assert_late_serving_epoch_failure_completes_fixed_work(
+        runtime: &mut TestRuntime,
+        request: &FixedEnvelope<ENVELOPE_BYTES>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let counters = RuntimeCounters::capture(runtime);
+
+        assert!(matches!(
+            runtime.handle(request),
+            Err(UniformExternalFailure)
+        ));
+        counters.assert_complete_round(runtime);
+        assert!(!runtime.healthy);
+        Ok(())
+    }
+
     fn run_initial(
         entries: &[(usize, TransparentUtxo)],
         query: UtxoQuery,
@@ -924,6 +1108,59 @@ mod tests {
         let mut runtime = runtime(4, entries)?;
         let request = request_envelope(&runtime, checkpoint(), query, None, 1)?;
         handle_and_decode(&mut runtime, &request)
+    }
+
+    #[test]
+    fn stale_serving_epoch_discards_the_encoded_response_after_complete_fixed_work(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let query = UtxoQuery::new(address(1), 0);
+
+        let mut finalized_advanced = runtime(4, &[(0, utxo(1, 10))])?;
+        let request = request_envelope(&finalized_advanced, checkpoint(), query, None, 1)?;
+        let current = checkpoint();
+        with_serving_epoch_currentness(&finalized_advanced, |currentness| {
+            currentness.identity = RecentSnapshotIdentity::new(
+                current.network.tag(),
+                current.height + 1,
+                current.block_hash_display,
+                current.schema_version,
+                current.projection_epoch,
+                current.key_epoch,
+            );
+        });
+        assert_late_serving_epoch_failure_completes_fixed_work(&mut finalized_advanced, &request)?;
+
+        let mut equal_value_boundary_replacement = runtime(4, &[(0, utxo(1, 10))])?;
+        let request = request_envelope(
+            &equal_value_boundary_replacement,
+            checkpoint(),
+            query,
+            None,
+            2,
+        )?;
+        with_serving_epoch_currentness(&equal_value_boundary_replacement, |currentness| {
+            currentness.boundary = currentness.boundary.replacement();
+        });
+        assert_late_serving_epoch_failure_completes_fixed_work(
+            &mut equal_value_boundary_replacement,
+            &request,
+        )?;
+
+        let mut unavailable = runtime(4, &[(0, utxo(1, 10))])?;
+        let request = request_envelope(&unavailable, checkpoint(), query, None, 3)?;
+        with_serving_epoch_currentness(&unavailable, |currentness| {
+            currentness.available = false;
+        });
+        assert_late_serving_epoch_failure_completes_fixed_work(&mut unavailable, &request)?;
+
+        let mut in_flight_refresh = runtime(4, &[(0, utxo(1, 10))])?;
+        let request = request_envelope(&in_flight_refresh, checkpoint(), query, None, 4)?;
+        let invalidator = in_flight_refresh.serving_epoch.invalidator_for_tests();
+        with_serving_epoch_currentness(&in_flight_refresh, |currentness| {
+            currentness.after_comparison = Some(Rc::new(move || invalidator.clear_epoch()));
+        });
+        assert_late_serving_epoch_failure_completes_fixed_work(&mut in_flight_refresh, &request)?;
+        Ok(())
     }
 
     #[test]
@@ -1104,7 +1341,7 @@ mod tests {
             runtime.recent_snapshot.read_calls(),
             2 * RECENT_SNAPSHOT_SLOTS
         );
-        assert_eq!(runtime.engine.store().read_slots().len(), 8);
+        assert_eq!(finalized_store_reads(&runtime), 8);
         Ok(())
     }
 
@@ -1681,7 +1918,7 @@ mod tests {
                 runtime.recent_snapshot.read_calls(),
                 2 * RECENT_SNAPSHOT_SLOTS
             );
-            assert_eq!(runtime.engine.store().read_slots().len(), 8);
+            assert_eq!(finalized_store_reads(&runtime), 8);
         }
 
         let recent_snapshot = FrozenRecentSnapshot::failing(
@@ -1714,6 +1951,8 @@ mod tests {
             CountingTokenProtector,
             CountingReplayGuard,
             DeterministicMaterialSource,
+            DeterministicServingEpochCurrentness,
+            TestBoundary,
             RESPONSE_SLOTS,
             ENVELOPE_BYTES,
             3,
@@ -1729,12 +1968,15 @@ mod tests {
             TOKEN_TTL_SECONDS,
         )?;
         let shape = CompiledQueryShape::new(profile)?;
-        let shape_mismatch = ThreeSlotRuntime::new(
-            store(4, &[])?,
+        let shape_mismatch_epoch = serving_epoch(
             FrozenRecentSnapshot::from_parts_for_tests(
                 recent_snapshot_lineage(recent_snapshot_identity(&checkpoint())),
                 [RecentSnapshotSlot::dummy(); 3],
             ),
+            store(4, &[])?,
+        );
+        let shape_mismatch = ThreeSlotRuntime::new(
+            shape_mismatch_epoch,
             shape,
             SESSION_BINDING,
             checkpoint(),
@@ -1808,12 +2050,15 @@ mod tests {
                 3,
                 TOKEN_TTL_SECONDS,
             )?;
-            let identity_mismatch = TestRuntime::new(
-                store(4, &[])?,
+            let identity_mismatch_epoch = serving_epoch(
                 FrozenRecentSnapshot::from_parts_for_tests(
                     recent_snapshot_lineage(mismatched_identity),
                     [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
                 ),
+                store(4, &[])?,
+            );
+            let identity_mismatch = TestRuntime::new(
+                identity_mismatch_epoch,
                 CompiledQueryShape::new(profile)?,
                 SESSION_BINDING,
                 current,

@@ -54,10 +54,12 @@ offline dependency experiment:
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
   store scanning, fixed result normalization, token issue, response protection,
-  and completion. It owns a concrete `FrozenRecentSnapshot<N>` whose fixed-slot
-  content commitment is computed internally rather than supplied by a generic
-  source. The snapshot's lineage digest additionally binds its generation,
-  exact finalized identity, and recent tip height/hash. Fault and
+  and completion. Its serving-epoch contract accepts one generation-bound
+  lease and derives both the finalized store and currentness observer from that
+  lease. It scans an immutable clone of the pinned `FrozenRecentSnapshot<N>`;
+  the snapshot's fixed-slot content commitment is computed internally, and its
+  lineage digest additionally binds its generation, exact finalized identity,
+  and recent tip height/hash. Fault and
   post-construction corruption hooks are `#[cfg(test)]` only and absent from the
   production API. The runtime binds that lineage digest into the continuation
   query digest; each round completes the configured scan before rechecking exact
@@ -72,7 +74,10 @@ offline dependency experiment:
   projection-readiness failure applies. Token protection binds the checkpoint
   and codec session; each path models one replay lookup and write-back, while
   cover writes use a separate non-durable slot rather than the real-token
-  namespace;
+  namespace. After the complete response is protected and the logical trace is
+  finished, the runtime observes the lease-bound currentness capability and
+  double-checks the epoch and recent-generation Arcs; a stale or unavailable
+  observation discards the encoded envelope as one uniform external failure;
 - a private single-writer recent-snapshot publication model that clears an
   active generation before refresh, uses an opaque ticket for exact activation,
   retains immutable pinned leases, and permits a final current-generation
@@ -82,8 +87,15 @@ offline dependency experiment:
   through the current outstanding ticket, requires its finalized identity and
   recent tip height/hash to match the ticket exactly, and moves its slots into
   the owner-generated `FrozenRecentSnapshot`. Direct raw-slot activation exists
-  only for tests. The model is not connected to the listener-free runtime or a
-  Zaino source;
+  only for tests. Under the same feature, a private refresh controller
+  invalidates publication before its sole await, captures and validates the
+  Zaino transparent-projection input, converts under the outstanding ticket,
+  rechecks the opaque source boundary, and publishes one serving-epoch Arc
+  last. That epoch binds an owner-issued finalized store with matching identity,
+  the exact recent generation, the opaque NFS revision, and a query-independent
+  currentness capability. Controller publication and runtime consumption are
+  separately tested compatible contracts; there is no non-test path composing
+  the private controller with the private runtime;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -126,28 +138,28 @@ interfaces before engine use and collapses their semantic failures to one
 protected outcome unless store or projection readiness takes precedence; it
 does not supply production AEAD, nonce uniqueness, trusted time, or durable
 replay protection.
-The concrete frozen-snapshot evidence uses mock-constructed contents, not live
-Zaino NFS acquisition or a canonical, reorg-safe publication seam. The adjacent
-publishable `zaino-state` crate now exposes an ORAM-agnostic snapshot-only API
+The earliest frozen-snapshot evidence used mock-constructed contents. The
+adjacent publishable `zaino-state` crate exposes an ORAM-agnostic snapshot API
 that value-binds a caller-supplied finalized checkpoint to one immutable NFS
 snapshot, checks its declared tip, height-map segment from seam through tip,
 mapped payload identities, and parent continuity, then returns blocks strictly
-above the seam without DB/source fallback. Under the default-off
-`corpus-zaino` feature, a private conversion candidate consumes that
-`CanonicalRecentChainSnapshot` together with an immutable, identity-pinned
-finalized-outpoint classifier. It preserves dense standard-event slots in
-canonical order while tracking nonstandard states separately, and it remains
-generation-free. The private publication owner reserves the generation and exact
-finalized/tip lineage in its outstanding ticket. Candidate activation consumes
-that current ticket, rejects any finalized-identity or recent-tip mismatch, and
-moves the candidate's slots into the resulting `FrozenRecentSnapshot`; the
-raw-slot activation seam is `#[cfg(test)]` only. The intended refresh flow still
-requires `begin_update` before conversion, but the candidate type is not bound to
-the ticket and no live controller enforces that ordering. This closes only the
-private in-memory owner/candidate construction handoff, not a race-free refresh
-controller or whole-serving-epoch orchestration. No production resolver, caller,
-live DB/NFS source, runtime, or service uses it, and it provides no durable
-rollback authority. The frozen snapshot's
+above the seam without DB/source fallback. Its current-boundary read rechecks
+canonical-component readiness and opaque NFS Arc identity before returning.
+Under the default-off `corpus-zaino` feature, a private refresh controller uses
+that input, an immutable identity-pinned finalized-outpoint classifier, and the
+ticketed publication owner to build and publish a serving epoch. Publication is
+last and binds the owner-issued finalized store, owner-assigned recent
+generation, opaque NFS Arc identity, and query-independent release-time
+currentness capability. Separately, the listener-free runtime contract accepts
+that lease shape, derives its store and observer only from the lease, completes
+the fixed-work response, and performs the final fail-closed observation before
+returning it.
+
+The controller and runtime are tested separately and have no non-test
+composition path. There is also no production finalized-store implementation or
+caller, process-wide service owner, listener, or guard retained through a
+transport write. The private controller has a live-subscriber entry point, but
+no non-test caller invokes it. The frozen snapshot's
 lineage digest binds owner-assigned generation and exact finalized/tip metadata
 to the internally computed deterministic slot commitment, but does not
 authenticate that metadata or prove its canonical ancestry. Neither commitment

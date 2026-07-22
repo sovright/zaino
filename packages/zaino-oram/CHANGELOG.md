@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- A private generation-bound serving-epoch contract. The refresh controller
+  invalidates before its sole await, validates a coherent transparent-projection
+  capture, activates the owner-generated recent generation, and publishes one
+  serving-epoch `Arc` last. The epoch binds an owner-issued finalized store with
+  matching identity, the exact recent generation, the opaque NFS revision, and
+  a query-independent currentness capability. A separately tested
+  listener-free runtime contract accepts the same lease shape, derives its
+  finalized store and currentness observer from that lease, completes and
+  protects the fixed-work response, and then discards it on a failed final
+  observation or double currentness check. These remain separately tested
+  compatible private contracts: there is no non-test controller-to-runtime
+  composition path, process-wide service owner, production finalized-store
+  implementation or caller, listener, or transport-write guard.
 - The default-off `corpus-zaino` integration now has a private conversion
   candidate that consumes one `CanonicalRecentChainSnapshot` and an immutable,
   identity-pinned finalized-outpoint classifier. It preserves dense
@@ -17,13 +30,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   generation authority: it accepts a candidate only through its current
   outstanding ticket, requires exact finalized and recent-tip metadata, and
   moves the candidate's slots into `FrozenRecentSnapshot`. Direct raw-slot
-  activation is test-only. The intended begin-update-before-conversion order is
-  a control-flow obligation, not a type-enforced candidate binding, and no live
-  controller enforces it. This is owner-mediated construction, not a race-free
-  refresh controller or whole-serving-epoch orchestration. No production
-  resolver, caller, live DB/NFS source, runtime, or service invokes this path,
-  and it provides no durability, authenticated provenance,
-  production-cryptography, TDX, or mainnet evidence.
+  activation is test-only. This entry records the earlier conversion-only
+  slice: at that head, begin-update-before-conversion was a control-flow
+  obligation and no refresh controller or serving epoch enforced it. The
+  private controller and serving-epoch contracts above supersede those
+  then-current implementation limitations, but not the lack of non-test
+  composition, durability, authenticated provenance, production cryptography,
+  TDX, or mainnet evidence.
 - Frozen recent snapshots now bind an in-memory monotonic generation, exact
   finalized identity, recent tip height/hash, and the internally computed
   fixed-slot commitment into one lineage digest. The listener-free runtime
@@ -35,11 +48,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   current-generation check. Its tests cover advances, same-height and
   shortening reorgs, stale tickets, failed builds, finalized rollback, and
   generation overflow. A replacement owner must roll the durable projection
-  epoch because its in-memory generation restarts at one. This is a mock
-  contract with no runtime caller: it does not authenticate the caller-supplied
-  tip or slot provenance,
-  acquire live Zaino NFS state, validate canonical ancestry, durably prevent
-  rollback, publish a service epoch, or establish physical, TDX, mainnet, or
+  epoch because its in-memory generation restarts at one. This entry records
+  the earlier snapshot-owner contract, which then had no runtime consumer or
+  serving epoch. The private serving-epoch and runtime contracts above
+  supersede that implementation-status limitation; they still do not
+  authenticate tip or slot provenance, durably prevent rollback, establish a
+  non-test composition path, or provide physical, TDX, mainnet, or
   production-readiness evidence.
 - Profile ID v3 now binds padded input slots, a distinct recent-snapshot scan
   budget, a fixed timeout bucket, and the explicit single-worker FIFO

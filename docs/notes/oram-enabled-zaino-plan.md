@@ -4,7 +4,7 @@
   for server integration** pending the measured blockers in
   [the feasibility report](oram-phase0-1-feasibility-report.md).
 - Prepared: 2026-07-12.
-- Updated: 2026-07-15.
+- Updated: 2026-07-22.
 - Target fork point: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d), the live `origin/dev` head inspected for this plan.
 - Design seed: [TEE-backed lightwalletd / Zaino with `rostl` and `oblivious_node`](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3).
 
@@ -84,17 +84,27 @@ order, and tracks nonstandard states. The private publication owner remains the
 sole generation authority: it accepts that candidate only through its current
 outstanding ticket, requires exact finalized identity and recent tip height/hash,
 and moves the candidate's slots into `FrozenRecentSnapshot`. Direct raw-slot
-activation is test-only. The intended refresh flow requires `begin_update`
-before conversion, but the candidate type does not encode that ticket lineage
-and no live controller enforces the ordering. This closes only private in-memory
-owner-mediated construction, not a race-free refresh controller or
-whole-serving-epoch orchestration. It is not connected to the runtime or a live
-DB/NFS source, has no production resolver or caller, and does not authenticate
+activation is test-only. A private refresh controller now invalidates before its
+only await, consumes one coherent finalized-plus-NFS capture, performs conversion
+under the outstanding ticket, rechecks the opaque source boundary, and publishes
+one atomic serving-epoch Arc last. That Arc binds an owner-issued finalized
+store generation whose identity must match, the owner-assigned recent
+generation, the opaque NFS revision, and the release-time currentness
+capability. A separately tested listener-free runtime contract accepts the same
+lease shape, derives both its finalized store and observer from that lease,
+scans an immutable copy of the pinned recent generation, executes and protects
+the complete fixed-work response, then re-observes the exact finalized identity
+and source boundary. Any mismatch, unavailable observation, or in-flight epoch
+replacement latches readiness and discards the encoded envelope as one uniform
+external failure. The controller publication and runtime consumption paths are
+compatible but tested separately; no non-test path composes the two private
+types. This is not a process-wide service owner or transport-write guard, has no
+production finalized-store implementation or caller, and does not authenticate
 the tip, ancestry, or slot provenance. The lineage
 commitment is not an authenticated canonical/live Zaino snapshot root. Live NFS
-acquisition, canonical and reorg-safe service publication, authenticated
-provenance, durable rollback authority, physical obliviousness, allocator and
-timing equivalence, TDX, mainnet, and target-load evidence remain open.
+service routing, authenticated provenance, durable rollback authority, physical
+obliviousness, allocator and timing equivalence, TDX, mainnet, and target-load
+evidence remain open.
 Production AEAD, trusted clock and nonce ownership, durable replay storage,
 private protobuf/transport framing, and a service lifecycle also remain
 integration gates.
@@ -111,11 +121,20 @@ standard-event slots, and track nonstandard states without assigning a
 generation. The private publication owner can consume that candidate only
 through the matching outstanding ticket, verify its exact finalized/tip metadata,
 and construct the owner-generated `FrozenRecentSnapshot`; direct raw-slot
-activation remains test-only. No production resolver, caller, runtime, or live
-source uses this path. The seam and owner handoff are not an atomic
-finalized-plus-NFS capture and do not provide an authenticated root, reorg-safe
-whole-serving-epoch publication, durability, service integration, production
-cryptography, physical or TDX evidence, or mainnet evidence.
+activation remains test-only. The controller publication contract and the
+listener-free runtime consumption contract separately exercise the same
+generation-bound epoch-lease shape, including the owner-issued finalized store,
+opaque NFS Arc identity, and bound release-time currentness capability. No
+non-test path composes those private types, and no production finalized-store
+implementation, process owner, listener, or transport uses the path yet; it
+does not provide an
+authenticated root, durable rollback authority, production cryptography,
+physical or TDX evidence, or mainnet service evidence.
+
+The following two paragraphs preserve the evidence boundaries of earlier
+slices; their then-current controller and epoch limitations are superseded only
+by the private, separately tested contracts above, not by production service
+integration.
 
 At exact conversion code head
 `32084cd8e047c64b34fcfae5fd0283533fe21793`, a detached worktree on the
@@ -400,14 +419,15 @@ Intel's Data Operand Independent Timing mode covers only a documented instructio
 blocks. Its implemented ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` API is a narrow snapshot-only
 recent-chain seam that cannot perform address/txid queries or fall back to a DB
-or backing source. A complete projection feed still needs finalized block
-application plus a race-free serving-epoch snapshot/watermark. The private
-`corpus-zaino` conversion candidate preserves dense standard-event slots from
-this value-bound seam when paired with an immutable identity-pinned finalized
-outpoint classifier. The private publication owner can validate that
-generation-free candidate against its current ticket and move its slots into an
-owner-generated frozen snapshot, but no production resolver or caller wires the
-handoff and it does not atomically capture finalized state with NFS.
+or backing source. The private `corpus-zaino` controller can consume the newer
+coherent transparent-projection input, convert under the publication ticket,
+and publish a generation-bound serving epoch last. A separately tested runtime
+contract consumes the same lease shape and performs the final currentness gate.
+There is no non-test path composing those private contracts. A complete
+production projection feed therefore still needs finalized block application,
+a finalized checkpoint/watermark and catch-up protocol, a process-wide owner
+that composes controller and runtime, and service-lifetime epoch ownership
+through the transport-write boundary.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
@@ -696,12 +716,10 @@ Deliverables:
 
 - narrow public-chain projection feed from `zaino-state`;
 - finalised checkpoint/watermark protocol and catch-up replay;
-- supply the production finalized-outpoint resolver, implement a live refresh
-  controller that begins the update before conversion, wire live source/NFS
-  acquisition into the existing owner-mediated converted-candidate activation,
-  and bind the owner-generated `FrozenRecentSnapshot` into a generation-bound,
-  race-free whole serving epoch that executes the complete fixed-work
-  recent-chain scan;
+- add a non-test composition path for the private coherent refresh controller,
+  generation-bound whole-serving-epoch lease, and listener-free runtime, then
+  connect it to the production finalized projection owner, listener routing,
+  and actual transport-write boundary;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;
 - production ownership of manifest authentication keys and the external
   freshness witness, with a measured rebuild RTO or composite durable ORAM
