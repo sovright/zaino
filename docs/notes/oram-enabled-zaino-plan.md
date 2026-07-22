@@ -98,8 +98,14 @@ and source boundary. Any mismatch, unavailable observation, or in-flight epoch
 replacement latches readiness and discards the encoded envelope as one uniform
 external failure. The controller publication and runtime consumption paths are
 compatible but tested separately; no non-test path composes the two private
-types. This is not a process-wide service owner or transport-write guard, has no
-production finalized-store implementation or caller, and does not authenticate
+  types. A private Ready-only adapter now consumes the exact finalized projection
+  worker into an identity-bound, non-cloneable serving store. Every successful
+  in-profile read, absent a backend or worker failure, executes a complete
+  key-addressed fixed-history worker command and folds the full padded event
+  history into dense creation-order live outputs without caching. Decreasing
+  event heights and events above the exact owner-bound checkpoint are rejected.
+  This is not a process-wide service owner or transport-write guard, has
+  no non-test finalized-store caller, and does not authenticate
 the tip, ancestry, or slot provenance. The lineage
 commitment is not an authenticated canonical/live Zaino snapshot root. Live NFS
 service routing, authenticated provenance, durable rollback authority, physical
@@ -125,9 +131,9 @@ activation remains test-only. The controller publication contract and the
 listener-free runtime consumption contract separately exercise the same
 generation-bound epoch-lease shape, including the owner-issued finalized store,
 opaque NFS Arc identity, and bound release-time currentness capability. No
-non-test path composes those private types, and no production finalized-store
-implementation, process owner, listener, or transport uses the path yet; it
-does not provide an
+  non-test path composes those private types. The private concrete finalized
+  store is not yet consumed by a runtime factory, process owner, listener, or
+  transport; this path does not provide an
 authenticated root, durable rollback authority, production cryptography,
 physical or TDX evidence, or mainnet service evidence.
 
@@ -716,6 +722,9 @@ Deliverables:
 
 - narrow public-chain projection feed from `zaino-state`;
 - finalised checkpoint/watermark protocol and catch-up replay;
+- consume a Ready finalized projection owner into the exact identity-bound,
+  read-only fixed-history serving-store generation (logical adapter complete;
+  production composition and physical-obliviousness evidence remain open);
 - add a non-test composition path for the private coherent refresh controller,
   generation-bound whole-serving-epoch lease, and listener-free runtime, then
   connect it to the production finalized projection owner, listener routing,

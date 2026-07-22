@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- A private Ready-only finalized serving-store adapter. Consuming an
+  `OfflineProjectionOwner` now transfers its exact `AtomicWorker` into a
+  non-cloneable read-only facade, derives the finalized serving identity within
+  the owner boundary, and rejects Building or failed-closed owners while
+  shutting their workers down. Each successful in-profile `AddressKey`/slot
+  read, absent a backend or worker failure, performs a complete fixed-profile
+  directory and padded event-history command, validates and folds the full
+  append-only history into dense creation-order live UTXOs, and uses no
+  cross-call cache or query-derived fallback. Decreasing event heights and
+  events above the owner-bound committed checkpoint fail closed. This is a
+  concrete logical adapter
+  for the existing serving-epoch contract, but it still has no non-test
+  controller/runtime caller and establishes neither persistence nor physical or
+  timing obliviousness, production cryptography, TDX, target-load, or mainnet
+  readiness.
 - A private generation-bound serving-epoch contract. The refresh controller
   invalidates before its sole await, validates a coherent transparent-projection
   capture, activates the owner-generated recent generation, and publishes one
@@ -19,8 +34,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   protects the fixed-work response, and then discards it on a failed final
   observation or double currentness check. These remain separately tested
   compatible private contracts: there is no non-test controller-to-runtime
-  composition path, process-wide service owner, production finalized-store
-  implementation or caller, listener, or transport-write guard.
+  composition path, process-wide service owner, finalized-store caller,
+  listener, or transport-write guard. The concrete private adapter above
+  supersedes only the then-current lack of an implementation.
 - The default-off `corpus-zaino` integration now has a private conversion
   candidate that consumes one `CanonicalRecentChainSnapshot` and an immutable,
   identity-pinned finalized-outpoint classifier. It preserves dense

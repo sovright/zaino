@@ -458,7 +458,7 @@ pub(crate) trait ServingEpochCurrentness<B> {
 ///
 /// Implementations are issued by the finalized projection owner and must keep
 /// the returned identity attached to the exact store generation they expose.
-trait FinalizedServingStore: ObliviousStore {
+pub(crate) trait FinalizedServingStore: ObliviousStore {
     fn serving_identity(&self) -> RecentSnapshotIdentity;
 }
 

@@ -446,22 +446,14 @@ const fn serving_identity(
     projection_epoch: u64,
     key_epoch: u64,
 ) -> RecentSnapshotIdentity {
-    RecentSnapshotIdentity::new(
-        recent_network_tag(network),
+    RecentSnapshotIdentity::from_finalized_projection(
+        network,
         finalized_height,
         finalized_hash_display,
         schema_version,
         projection_epoch,
         key_epoch,
     )
-}
-
-const fn recent_network_tag(network: CanonicalNetwork) -> u8 {
-    match network {
-        CanonicalNetwork::Mainnet => 0,
-        CanonicalNetwork::Testnet => 1,
-        CanonicalNetwork::Regtest => 2,
-    }
 }
 
 /// Coarsened controller failure without outpoint or checkpoint identifiers.
@@ -818,9 +810,16 @@ mod tests {
 
     #[test]
     fn network_and_committed_checkpoint_mapping_is_exact_and_redacted() {
-        assert_eq!(recent_network_tag(CanonicalNetwork::Mainnet), 0);
-        assert_eq!(recent_network_tag(CanonicalNetwork::Testnet), 1);
-        assert_eq!(recent_network_tag(CanonicalNetwork::Regtest), 2);
+        for (network, expected_tag) in [
+            (CanonicalNetwork::Mainnet, 0),
+            (CanonicalNetwork::Testnet, 1),
+            (CanonicalNetwork::Regtest, 2),
+        ] {
+            assert_eq!(
+                serving_identity(network, 1, [0x01; 32], 1, 1, 1).network_tag(),
+                expected_tag
+            );
+        }
         let checkpoint = BlockIndex {
             height: Height::try_from(100_u32)
                 .expect("fixture height is inside the supported chain range"),

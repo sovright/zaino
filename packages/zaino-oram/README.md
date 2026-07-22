@@ -15,8 +15,9 @@ offline dependency experiment:
   models one full-history append preflight without executor-command
   interleaving;
 - a bounded single-owner worker that moves that exact command core onto one
-  thread and admits only whole `read_history` and `append` business commands,
-  with no raw probe, key, record, read, or insert surface;
+  thread and admits only whole address-history, key-addressed live-slot, and
+  append business commands, with no caller-supplied probe, raw record, table,
+  or insert surface;
 - fixed listener-free typed-worker correctness and `SmokeV1` stress
   qualifications. The latter performs a deterministic 64-step mixed workload
   with reference-model verification, checks a healthy command rejection, and
@@ -115,14 +116,24 @@ offline dependency experiment:
 - a crate-internal offline projection owner that validates network, schema, key
   epoch, and all three projection/layout admission bounds before backend
   allocation, then exclusively owns the coordinator and worker through coarse
-  readiness and consuming shutdown outcomes;
+  readiness. A consuming Ready-only handoff now moves the exact worker into a
+  non-cloneable read-only finalized serving-store facade, derives its six-field
+  serving identity inside the owner boundary, and leaves no append-capable
+  handle behind. Every successful in-profile logical slot read, absent a
+  backend or worker failure, executes one complete fixed-profile
+  directory/event-history command and folds the full padded history into dense
+  creation-order live outputs without a cross-call cache. The fold rejects
+  decreasing event heights and any event above the owner-bound committed
+  checkpoint. Invalid histories and worker faults collapse to one unavailable
+  store error;
 - a fixed continuation-token codec with injected protection/replay interfaces;
 - `rostl-experimental`, pinned to `8c3a12d2`, which binds separate volatile
   `CircuitORAM` and recursive-position-map instances to the exact 38-byte
   directory and 82-byte event-page records on Linux x86_64. A private offline
   construction path places those stores behind the same business-command
-  worker for the offline projection owner; it has no runtime/service caller,
-  and unsupported hosts reject construction before creating upstream state.
+  worker for the offline projection owner and its Ready-only serving-store
+  handoff; it has no runtime/service caller, and unsupported hosts reject
+  construction before creating upstream state.
 
 It does **not** contain a production envelope protector or nonce owner,
 production encryption, durable ORAM persistence, TDX attestation, protobufs,
@@ -156,8 +167,9 @@ the fixed-work response, and performs the final fail-closed observation before
 returning it.
 
 The controller and runtime are tested separately and have no non-test
-composition path. There is also no production finalized-store implementation or
-caller, process-wide service owner, listener, or guard retained through a
+composition path. The finalized projection now has a private concrete
+serving-store adapter, but no non-test runtime/controller caller consumes it;
+there is no process-wide service owner, listener, or guard retained through a
 transport write. The private controller has a live-subscriber entry point, but
 no non-test caller invokes it. The frozen snapshot's
 lineage digest binds owner-assigned generation and exact finalized/tip metadata
