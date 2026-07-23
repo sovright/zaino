@@ -4,9 +4,9 @@
 //! This module proves only a deterministic source-level logical schedule for
 //! the injected research fixtures and withholds a completed envelope unless
 //! its pinned serving epoch is still current after response encoding. It does
-//! not provide a production nonce source, trusted clock, replay database,
-//! AEAD, listener, transport-write guard, physical ORAM trace, timing result,
-//! or TDX claim.
+//! not provide a production key/session owner, nonce source, trusted clock,
+//! replay database, listener, transport-write guard, physical ORAM trace,
+//! timing result, or TDX claim.
 
 use crate::{
     continuation_token::{
@@ -362,6 +362,23 @@ impl<E, T, R, N> RuntimeDependencies<E, T, R, N> {
             material_source,
         }
     }
+}
+
+/// Composes only the cryptographic provider objects; the caller still owns all
+/// key-separation, nonce, clock, replay, and session-lifecycle invariants.
+fn xchacha20_runtime_dependencies<R, N>(
+    request_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+    response_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+    token_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+    replay_guard: R,
+    material_source: N,
+) -> RuntimeDependencies<impl EnvelopeProtector, impl ContinuationTokenProtector, R, N> {
+    RuntimeDependencies::new(
+        super::xchacha20_envelope_protector(request_key, response_key),
+        crate::continuation_token::xchacha20_token_protector(token_key),
+        replay_guard,
+        material_source,
+    )
 }
 
 /// Epoch-scoped query state replaced only after one coherent controller refresh.
@@ -1507,6 +1524,12 @@ mod tests {
     const BLOCK_HASH_DISPLAY: [u8; 32] = [0x31; 32];
     const RECENT_TIP_HASH_DISPLAY: [u8; 32] = [0x32; 32];
     const RECENT_SNAPSHOT_SLOTS: usize = 4;
+    const XCHACHA_REQUEST_KEY: [u8; crate::xchacha20::KEY_BYTES] =
+        [0x91; crate::xchacha20::KEY_BYTES];
+    const XCHACHA_RESPONSE_KEY: [u8; crate::xchacha20::KEY_BYTES] =
+        [0x92; crate::xchacha20::KEY_BYTES];
+    const XCHACHA_TOKEN_KEY: [u8; crate::xchacha20::KEY_BYTES] =
+        [0x93; crate::xchacha20::KEY_BYTES];
 
     type TestRecentSnapshot = FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>;
 
@@ -2210,13 +2233,13 @@ mod tests {
         )
     }
 
-    fn request_envelope<S, C, B>(
+    fn request_envelope<S, E, T, R, N, C, B>(
         runtime: &PrivateQueryRuntime<
             S,
-            DeterministicEnvelopeProtector,
-            CountingTokenProtector,
-            CountingReplayGuard,
-            DeterministicMaterialSource,
+            E,
+            T,
+            R,
+            N,
             C,
             B,
             RESPONSE_SLOTS,
@@ -2230,6 +2253,7 @@ mod tests {
     ) -> Result<FixedEnvelope<ENVELOPE_BYTES>, InnerCodecError>
     where
         S: ObliviousStore,
+        E: EnvelopeProtector,
         C: ServingEpochCurrentness<B>,
         B: ServingEpochBoundary,
     {
@@ -2444,15 +2468,63 @@ mod tests {
         let counters = RuntimeCounters::capture(runtime);
         let round = runtime.handle(request)?;
         counters.assert_complete_round(runtime);
-        let trace = *round.trace();
-        let response = runtime
-            .codec
-            .decode_response(round.envelope(), &runtime.envelope_protector)?;
-        assert_eq!(trace.runtime_phases(), RuntimePhase::COUNT);
-        assert_eq!(
-            trace.store_reads(),
-            runtime.epoch_for_tests().engine.profile().store_reads()
+        let decoded = decode_runtime_round(&runtime.codec, &runtime.envelope_protector, &round)?;
+        assert_complete_runtime_trace(
+            &decoded.0,
+            runtime.epoch_for_tests().engine.profile().store_reads(),
         );
+        Ok(decoded)
+    }
+
+    fn handle_and_decode_protected<S, E, T, R, N, C, B>(
+        runtime: &mut PrivateQueryRuntime<
+            S,
+            E,
+            T,
+            R,
+            N,
+            C,
+            B,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            RECENT_SNAPSHOT_SLOTS,
+        >,
+        request: &FixedEnvelope<ENVELOPE_BYTES>,
+    ) -> Result<(AccessTrace, PrivateQueryResponse<RESPONSE_SLOTS>), Box<dyn std::error::Error>>
+    where
+        S: ObliviousStore,
+        E: EnvelopeProtector,
+        T: ContinuationTokenProtector,
+        R: ContinuationReplayGuard,
+        N: RoundMaterialSource,
+        C: ServingEpochCurrentness<B>,
+        B: ServingEpochBoundary,
+    {
+        let round = runtime.handle(request)?;
+        let decoded = decode_runtime_round(&runtime.codec, &runtime.envelope_protector, &round)?;
+        assert_complete_runtime_trace(
+            &decoded.0,
+            runtime.epoch_for_tests().engine.profile().store_reads(),
+        );
+        Ok(decoded)
+    }
+
+    fn decode_runtime_round<E>(
+        codec: &PrivateQueryCodec<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        envelope_protector: &E,
+        round: &RuntimeRound<ENVELOPE_BYTES>,
+    ) -> Result<(AccessTrace, PrivateQueryResponse<RESPONSE_SLOTS>), Box<dyn std::error::Error>>
+    where
+        E: EnvelopeProtector,
+    {
+        let trace = *round.trace();
+        let response = codec.decode_response(round.envelope(), envelope_protector)?;
+        Ok((trace, response))
+    }
+
+    fn assert_complete_runtime_trace(trace: &AccessTrace, expected_store_reads: usize) {
+        assert_eq!(trace.runtime_phases(), RuntimePhase::COUNT);
+        assert_eq!(trace.store_reads(), expected_store_reads);
         assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_SLOTS);
         assert_eq!(trace.replay_reads(), 1);
         assert_eq!(trace.replay_writes(), 1);
@@ -2461,7 +2533,6 @@ mod tests {
         assert_eq!(trace.request_bytes(), ENVELOPE_BYTES);
         assert_eq!(trace.response_bytes(), ENVELOPE_BYTES);
         assert_eq!(trace.completion(), CompletionShape::UnaryFixedEnvelope);
-        Ok((trace, response))
     }
 
     fn assert_late_serving_epoch_failure_completes_fixed_work(
@@ -2518,6 +2589,103 @@ mod tests {
         let mut runtime = runtime(4, entries)?;
         let request = request_envelope(&runtime, checkpoint(), query, None, 1)?;
         handle_and_decode(&mut runtime, &request)
+    }
+
+    #[test]
+    fn xchacha20_runtime_round_trips_continuations_and_rejects_tampering(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let entries = [(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))];
+        let serving_epoch = serving_epoch(empty_recent_snapshot(), store(4, &entries)?);
+        let dependencies = xchacha20_runtime_dependencies(
+            zeroize::Zeroizing::new(XCHACHA_REQUEST_KEY),
+            zeroize::Zeroizing::new(XCHACHA_RESPONSE_KEY),
+            zeroize::Zeroizing::new(XCHACHA_TOKEN_KEY),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
+        );
+        let mut runtime = PrivateQueryRuntime::new(
+            serving_epoch,
+            runtime_shape(4)?,
+            SESSION_BINDING,
+            checkpoint(),
+            dependencies,
+        )?;
+        let query = UtxoQuery::new(address(1), 0);
+
+        let wrong_request_protector = super::super::xchacha20_envelope_protector(
+            zeroize::Zeroizing::new([0xa1; crate::xchacha20::KEY_BYTES]),
+            zeroize::Zeroizing::new(XCHACHA_RESPONSE_KEY),
+        );
+        let wrong_key_request = runtime.codec.encode_request(
+            &super::super::PrivateQueryRequest::new(checkpoint(), query, None),
+            [0x11; ENVELOPE_NONCE_BYTES],
+            &wrong_request_protector,
+        )?;
+        let wrong_key_failure = uniform_failure(runtime.handle(&wrong_key_request));
+        assert_eq!(wrong_key_failure.to_string(), "private query failed");
+        assert_eq!(runtime.material_source.calls, 0);
+        assert_eq!(runtime.replay_guard.calls, 0);
+        assert!(runtime.healthy);
+
+        let initial_request = request_envelope(&runtime, checkpoint(), query, None, 0x12)?;
+        let (initial_trace, initial_response) =
+            handle_and_decode_protected(&mut runtime, &initial_request)?;
+        assert_eq!(
+            initial_response.page.outcome(),
+            QueryOutcome::ResultBudgetExceeded
+        );
+        let continuation = initial_response
+            .continuation
+            .clone()
+            .expect("capped XChaCha page carries one protected token");
+
+        let mut tampered_token_bytes = *continuation.opaque_bytes();
+        tampered_token_bytes[0] ^= 1;
+        let tampered_token = ContinuationToken::from_opaque_bytes(tampered_token_bytes);
+        let tampered_request =
+            request_envelope(&runtime, checkpoint(), query, Some(tampered_token), 0x13)?;
+        let (tampered_trace, tampered_response) =
+            handle_and_decode_protected(&mut runtime, &tampered_request)?;
+        assert_eq!(tampered_trace, initial_trace);
+        assert_eq!(
+            tampered_response.page.outcome(),
+            QueryOutcome::InvalidContinuation
+        );
+        assert!(tampered_response.page.is_all_dummy());
+        assert_eq!(runtime.replay_guard.real_claim_attempts, 0);
+
+        let continued_request = request_envelope(
+            &runtime,
+            checkpoint(),
+            query,
+            Some(continuation.clone()),
+            0x14,
+        )?;
+        let (continued_trace, continued_response) =
+            handle_and_decode_protected(&mut runtime, &continued_request)?;
+        assert_eq!(continued_trace, initial_trace);
+        assert_eq!(continued_response.page.outcome(), QueryOutcome::Complete);
+        assert_eq!(continued_response.page.real_count(), 1);
+        assert_eq!(
+            continued_response.page.slots()[0].padded_utxo().txid(),
+            &[3; TXID_BYTES]
+        );
+
+        let replay_request =
+            request_envelope(&runtime, checkpoint(), query, Some(continuation), 0x15)?;
+        let (replay_trace, replay_response) =
+            handle_and_decode_protected(&mut runtime, &replay_request)?;
+        assert_eq!(replay_trace, initial_trace);
+        assert_eq!(
+            replay_response.page.outcome(),
+            QueryOutcome::InvalidContinuation
+        );
+        assert!(replay_response.page.is_all_dummy());
+        assert_eq!(runtime.material_source.calls, 4);
+        assert_eq!(runtime.replay_guard.calls, 4);
+        assert_eq!(runtime.replay_guard.real_claim_attempts, 2);
+        assert_eq!(runtime.replay_guard.claimed.iter().flatten().count(), 1);
+        Ok(())
     }
 
     #[cfg(feature = "corpus-zaino")]

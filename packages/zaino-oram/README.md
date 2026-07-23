@@ -58,10 +58,14 @@ offline dependency experiment:
   protection-context field. Fixed vectors and exhaustive single-byte mutation
   tests over the shared primitive, plus cross-direction and
   continuation-context tests, pin the wrapper contract. This is a
-  cryptographic primitive only: no service/session handshake, key
-  derivation/provisioning/rotation, nonce source or uniqueness owner, trusted
-  clock, durable replay state, attestation binding, or KMS/TDX lifecycle is
-  selected;
+  cryptographic primitive only. A private opaque dependency composer is
+  exercised end to end by the listener-free runtime with deterministic
+  material and counting replay fixtures; it exercises real request/response
+  and continuation protection, wrong-key rejection, token-tamper rejection, and
+  replay rejection without exposing either concrete key-bearing type. No
+  service/session handshake, key derivation/provisioning/rotation, nonce source
+  or uniqueness owner, trusted clock, durable replay state, attestation
+  binding, or KMS/TDX lifecycle is selected;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -247,9 +251,10 @@ transport write. Neither release check establishes currentness at socket write,
 peer delivery, or transport completion; the canonical source may advance
 immediately afterward. Lifetime-safe cross-crate real-owner body integration
 remains open.
-Replay state is volatile. The available XChaCha20-Poly1305 protectors remain
-unwired to any runtime or production key/session owner, and the clock/material
-source and nonce/replay mechanisms are not production implementations. The
+Replay state is volatile. The available XChaCha20-Poly1305 protectors are
+wired only through a private fixture-backed runtime composition, not a
+production key/session owner; the clock/material source and nonce/replay
+mechanisms are not production implementations. The
 frozen snapshot's lineage digest binds owner-assigned generation and exact
 finalized/tip metadata to the internally computed deterministic slot
 commitment, but does not authenticate that metadata or prove its canonical

@@ -368,9 +368,9 @@ impl fmt::Debug for ContinuationUse {
 /// The token nonce remains visible but must be bound as the AEAD nonce or
 /// associated data. `seal` may encrypt the body in place and returns its fixed
 /// authentication field. `open` must authenticate before exposing plaintext
-/// and may decrypt in place only on success. The codec deliberately supplies no
-/// crate-internal XChaCha20-Poly1305 implementation still remains a primitive,
-/// not a production key, nonce, replay, or service owner.
+/// and may decrypt in place only on success. The crate-internal
+/// XChaCha20-Poly1305 implementation remains a primitive, not a production key,
+/// nonce, replay, or service owner.
 pub(super) trait ContinuationTokenProtector {
     /// Protects `body`, or reports that no token can be issued.
     fn seal(
@@ -388,6 +388,14 @@ pub(super) trait ContinuationTokenProtector {
         body: &mut [u8; PROTECTED_BODY_BYTES],
         authentication: &[u8; AUTHENTICATION_BYTES],
     ) -> Result<AuthenticationDecision, ProtectionUnavailable>;
+}
+
+/// Builds the crate-internal token protector without exposing its concrete
+/// key-bearing type outside this module.
+pub(super) fn xchacha20_token_protector(
+    key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+) -> impl ContinuationTokenProtector {
+    xchacha20::token_protector(key)
 }
 
 /// The complete authenticated identity of one token use.

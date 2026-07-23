@@ -241,6 +241,13 @@ trait EnvelopeProtector {
     ) -> Result<AuthenticationDecision, ProtectionUnavailable>;
 }
 
+fn xchacha20_envelope_protector(
+    request_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+    response_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+) -> impl EnvelopeProtector {
+    xchacha20::envelope_protector(request_key, response_key)
+}
+
 fn require_authentication(
     decision: Result<AuthenticationDecision, ProtectionUnavailable>,
 ) -> Result<(), InnerCodecError> {

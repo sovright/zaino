@@ -50,13 +50,17 @@ whole-envelope protection interface. Its deterministic protector is a
 non-cryptographic test fixture. A later provider slice adds crate-internal
 XChaCha20-Poly1305 implementations with separately owned zeroized request,
 response, and continuation role-key objects plus canonical domain-separated
-associated data. Those providers remain unwired primitives: session key
-establishment, key provisioning/rotation, trusted nonce and clock ownership,
-durable replay, and attestation binding are still open. A private listener-free
-child runtime now owns the modeled decode/token/replay/full-scan/issuance/encode
-sequence. It validates
-combined finalized-plus-recent cursors, preserves token expiry across pages,
-maps semantic token failures to one protected fixed `InvalidContinuation` page
+associated data. A private opaque dependency composer now exercises those
+providers end to end through the listener-free runtime: wrong request keys fail
+before material/replay work, while encrypted pagination, token tampering, a
+valid continuation claim, and replay rejection retain the complete modeled
+trace. The test still uses deterministic material and counting replay fixtures;
+session key establishment, key provisioning/rotation, trusted nonce and clock
+ownership, durable replay, and attestation binding are open. The private child
+runtime owns the modeled decode/token/replay/full-scan/issuance/encode sequence,
+validates combined finalized-plus-recent cursors, preserves token expiry across
+pages, maps semantic token failures to one protected fixed
+`InvalidContinuation` page
 when no higher-priority store or projection-readiness failure applies, and
 records the same ordered ten-phase logical trace for successful protected
 outcomes. Token protector context binds the checkpoint and codec session, and

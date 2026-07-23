@@ -22,6 +22,10 @@ const CONTINUATION_ASSOCIATED_DATA_BYTES: usize =
 const _: [(); NONCE_BYTES] = [(); XCHACHA_NONCE_BYTES];
 const _: [(); AUTHENTICATION_BYTES] = [(); XCHACHA_AUTHENTICATION_BYTES];
 
+pub(super) fn token_protector(key: Zeroizing<[u8; KEY_BYTES]>) -> impl ContinuationTokenProtector {
+    XChaCha20ContinuationTokenProtector::new(key)
+}
+
 /// Separately owned continuation-token role-key object.
 struct XChaCha20ContinuationTokenProtector {
     key: XChaCha20ProtectionKey,

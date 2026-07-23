@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Private opaque XChaCha20-Poly1305 dependency composition for the listener-free
+  runtime. An end-to-end test rejects a wrong request key before material or
+  replay work, then exercises real encrypted request/response pagination,
+  token-tamper rejection, a valid continuation claim, and replay rejection with
+  the same complete modeled trace. The composition retains deterministic
+  material and counting replay fixtures; it is not a production key/session,
+  nonce, clock, replay, owner, or service bundle.
 - Crate-internal XChaCha20-Poly1305 request-envelope, response-envelope, and
   continuation-token protectors backed by separately owned, zeroized 256-bit
   role-key objects. Distinct canonical associated-data domains authenticate all
