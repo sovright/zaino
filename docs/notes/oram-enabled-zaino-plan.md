@@ -56,7 +56,10 @@ before material/replay work, while encrypted pagination, token tampering, a
 valid continuation claim, and replay rejection retain the complete modeled
 trace. The test still uses deterministic material and counting replay fixtures;
 session key establishment, key provisioning/rotation, trusted nonce and clock
-ownership, durable replay, and attestation binding are open. The private child
+ownership, durable replay, and attestation binding are open. The required joint
+owner, rollback, lifecycle, and response-release invariants are now fixed by
+[ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md), while
+concrete provider selections and evidence remain open. The private child
 runtime owns the modeled decode/token/replay/full-scan/issuance/encode sequence,
 validates combined finalized-plus-recent cursors, preserves token expiry across
 pages, maps semantic token failures to one protected fixed
@@ -539,8 +542,10 @@ admission/FIFO/queue/wait/deadline/drain behavior, clean worker shutdown, and
 service-lifetime ownership through the actual transport-write boundary. A
 public opaque factory also remains deferred until non-test production
 key/session/nonce ownership plus durable replay and trusted-material providers
-exist; the crate-internal XChaCha20-Poly1305 primitives alone do not satisfy
-that ownership boundary.
+exist and satisfy
+[ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md); the
+crate-internal XChaCha20-Poly1305 primitives alone do not satisfy that ownership
+boundary.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 

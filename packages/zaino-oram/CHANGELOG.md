@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- ADR 0009's production gate for one opaque, rollback-resistant runtime
+  security-state owner spanning key/projection epochs, sessions and distinct
+  role keys, request/server nonce ownership, trusted time, real-or-cover replay
+  durability, external freshness, lifecycle rotation, and release-time
+  currentness. The ADR defines required invariants and fail-closed
+  qualification evidence requirements; it does not select or implement a
+  provider.
 - Private opaque XChaCha20-Poly1305 dependency composition for the listener-free
   runtime. An end-to-end test rejects a wrong request key before material or
   replay work, then exercises real encrypted request/response pagination,

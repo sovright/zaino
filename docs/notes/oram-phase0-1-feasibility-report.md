@@ -73,7 +73,12 @@
   target-load, physical-obliviousness, TDX, or mainnet evidence.
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
-- Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
+- Architecture and leakage authority:
+  [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
+- Protection-primitive authority:
+  [ADR-0008](../adr/0008-private-query-xchacha-protection-primitive.md)
+- Runtime security-state ownership authority:
+  [ADR-0009](../adr/0009-private-query-runtime-security-state-owner.md)
 - Delivery plan: [ORAM-enabled Zaino plan](oram-enabled-zaino-plan.md)
 - Design seed: [TEE-backed Zaino/lightwalletd sketch](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3)
 
@@ -456,7 +461,11 @@ The following statements are **not** established by that evidence:
   the listener-free runtime with deterministic material and counting replay
   fixtures. They are not wired into a service/session owner, and key
   establishment, provisioning, rotation, nonce generation/uniqueness, trusted
-  time, durable replay, attestation, and KMS/TDX ownership remain open;
+  time, durable replay, attestation, and KMS/TDX ownership remain open. The
+  required joint owner, rollback, lifecycle, real/cover durability, and
+  response-release contract is fixed by
+  [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md), but no
+  concrete provider or production evidence exists;
 - codec/runtime tests prove exact/canonical bytes, protection-interface
   plumbing, and equality of a source-level logical decode/token/replay/
   full-finalized-store/full-recent-snapshot/issuance/encode phase schedule. They

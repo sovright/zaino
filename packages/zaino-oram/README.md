@@ -65,7 +65,9 @@ offline dependency experiment:
   replay rejection without exposing either concrete key-bearing type. No
   service/session handshake, key derivation/provisioning/rotation, nonce source
   or uniqueness owner, trusted clock, durable replay state, attestation
-  binding, or KMS/TDX lifecycle is selected;
+  binding, or KMS/TDX lifecycle is selected. The required joint ownership,
+  rollback, and release contract is fixed by
+  [ADR 0009](../../docs/adr/0009-private-query-runtime-security-state-owner.md);
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -238,9 +240,9 @@ owner bytes or release permit, construct or route the concrete process owner,
 or implement a generated Tonic service or listener. The finalized-runtime
 witness is internal to this crate; tests exercise the exact helper delegated to
 by the owner, not a successfully refreshed ready-owner lifecycle. A public
-opaque factory remains deferred because the protection primitives have no
-production key/session/nonce owner and there is no durable replay or trusted
-material provider bundle. This does
+opaque factory remains deferred until concrete providers satisfy ADR 0009; the
+protection primitives still have no production key/session/nonce owner and
+there is no qualified durable replay or trusted-material bundle. This does
 not implement or prove concurrent
 query admission, FIFO execution, queue saturation, overload rejection,
 waiting, deadlines, draining, or clean shutdown of the underlying worker. Its
