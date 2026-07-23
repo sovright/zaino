@@ -4,7 +4,7 @@
   for server integration** pending the measured blockers in
   [the feasibility report](oram-phase0-1-feasibility-report.md).
 - Prepared: 2026-07-12.
-- Updated: 2026-07-22.
+- Updated: 2026-07-23.
 - Target fork point: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d), the live `origin/dev` head inspected for this plan.
 - Design seed: [TEE-backed lightwalletd / Zaino with `rostl` and `oblivious_node`](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3).
 
@@ -89,9 +89,10 @@ only await, consumes one coherent finalized-plus-NFS capture, performs conversio
 under the outstanding ticket, rechecks the opaque source boundary, and publishes
 one atomic serving-epoch Arc last. That Arc binds an owner-issued finalized
 store generation whose identity must match, the owner-assigned recent
-generation, the opaque NFS revision, and the release-time currentness
-capability. A separately tested listener-free runtime contract accepts the same
-lease shape, derives both its finalized store and observer from that lease,
+generation, the opaque NFS revision, and the post-work, runtime-return
+currentness capability. A separately tested listener-free runtime contract
+accepts the same lease shape, derives both its finalized store and observer from
+that lease,
 scans an immutable copy of the pinned recent generation, executes and protects
 the complete fixed-work response, then re-observes the exact finalized identity
 and source boundary. Any mismatch, unavailable observation, or in-flight epoch
@@ -109,17 +110,26 @@ that exact store-bound lease identity. Epoch replacement preserves the injected
 envelope/token protectors, replay guard, material source, codec session binding,
 compiled profile, and monotonic fail-closed health. Failed refresh, pinning, or
 epoch construction leaves no active epoch and never restores the stale one.
-Repeated logical stop is idempotent. A private Ready-only adapter now consumes
-the exact finalized projection worker into an identity-bound, non-cloneable
-serving store. Every successful in-profile read,
+Repeated logical stop is idempotent. A listener-free response-release gate now
+allows one completed response to retain a non-`Clone` outstanding permit.
+While held, that permit makes later handle, refresh, and explicit shutdown
+attempts reject before mutating retained owner or runtime state. Permit drop
+reopens the gate unless it is already closed; a successful stop or owner drop
+closes it permanently. Once refresh has retired the epoch, cancellation never
+restores it. A private Ready-only adapter now consumes the exact finalized
+projection worker into an
+identity-bound, non-cloneable serving store. Every successful in-profile read,
 absent a backend or worker failure, executes a complete key-addressed
 fixed-history worker command and folds the full padded event history into dense
 creation-order live outputs without caching. Decreasing event heights and events
 above the exact owner-bound checkpoint are rejected. The process-lifetime owner
-is not an enforced process singleton or service caller. It does not establish
-concurrent admission, FIFO execution, queue/overload handling, draining, a
-transport-write guard, or clean underlying-worker shutdown. The logical stop
-only retires the active epoch and rejects later handle/refresh attempts. This
+is not an enforced process singleton or service caller. The release gate is
+not a listener, transport-write, response-body, or currentness-at-write proof;
+the canonical source may advance independently while a permit is held. It does
+not establish concurrent admission, FIFO execution, queue/overload handling,
+waiting, deadlines, draining, or clean underlying-worker shutdown. Private
+protobuf and body integration remain open. The logical stop only retires the
+active epoch and rejects later handle/refresh attempts. This
 path does not authenticate the tip, ancestry, or slot provenance. The lineage
 commitment is not an authenticated canonical/live Zaino snapshot root. Live NFS
 service routing, authenticated provenance, durable rollback authority, physical
@@ -144,14 +154,21 @@ and construct the owner-generated `FrozenRecentSnapshot`; direct raw-slot
 activation remains test-only. The controller publication contract and the
 listener-free runtime consumption contract exercise the same generation-bound
 epoch-lease shape, including the owner-issued finalized store, opaque NFS Arc
-identity, and bound release-time currentness capability. The process-lifetime
-owner provides a non-test path that drives the controller refresh, pins its
-published lease, and replaces only the runtime's epoch-scoped
+identity, and bound post-work, runtime-return currentness capability. The
+process-lifetime owner provides a non-test path that drives the controller
+refresh, pins its published lease, and replaces only the runtime's epoch-scoped
 engine/snapshot/lease state while retaining its process-scoped dependencies,
 session/profile, replay state, and health latch. It retires before capture and
-offers no stale fallback after a failed refresh or build. No service or listener
-calls this owner, and no enforced process singleton, concurrent admission/queue
-policy, transport-write guard, or clean worker-shutdown proof exists. This path
+offers no stale fallback after a failed refresh or build; once refresh has
+retired the epoch, cancellation does not restore it.
+Its listener-free response gate permits one non-`Clone` completed response to
+remain outstanding and rejects handle/refresh/shutdown before mutating retained
+owner or runtime state until permit drop reopens it unless already closed;
+successful stop and owner drop close it permanently. No service or listener
+calls this owner, and no enforced process singleton, concurrent
+admission/FIFO/queue/wait/deadline/drain policy, transport-write or response-body
+integration, currentness-at-write proof, or clean worker-shutdown proof exists.
+The canonical source may advance independently while a permit is held. This path
 does not provide persistence, an authenticated root or provenance, durable
 rollback authority, production cryptography/clock/nonces/replay, physical or
 timing evidence, TDX, target-load, or mainnet service evidence.
@@ -453,11 +470,19 @@ finalized store checkpoint to capture, pins the controller-published lease, and
 derives its protected checkpoint internally before activating the replacement.
 Its protection, replay/material, session/profile, and monotonic health state
 survive epoch swaps; failed refresh or activation has no stale fallback. A
-complete production projection feed still needs finalized block application, a
-finalized checkpoint/watermark and catch-up protocol, an enforced process
-singleton and service caller, concurrent admission/queue/draining behavior,
-clean worker shutdown, and service-lifetime epoch ownership through the
-transport-write boundary.
+listener-free response-release gate retains one completed response behind a
+non-`Clone` permit and rejects handle, refresh, and explicit shutdown before
+mutating retained owner or runtime state while that permit is held. Permit drop
+reopens the gate unless it is already closed; a successful stop or owner drop
+closes it permanently. Once refresh has retired the epoch, cancellation cannot
+restore it. This is not a listener, transport-write,
+response-body, or currentness-at-write proof: the canonical source may advance
+independently while a permit is held. A complete production projection feed
+still needs finalized block application, a finalized checkpoint/watermark and
+catch-up protocol, an enforced process singleton and service caller, private
+protobuf/body integration, concurrent admission/FIFO/queue/wait/deadline/drain
+behavior, clean worker shutdown, and service-lifetime ownership through the
+actual transport-write boundary.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
@@ -759,6 +784,14 @@ Deliverables:
   replacements without a stale fallback (crate-internal process-lifetime owner
   complete; enforced singleton, concurrent admission/queue/draining policy,
   clean worker shutdown, and a service caller remain open);
+- retain one completed listener-free response behind a non-`Clone` permit so
+  handle, refresh, and explicit shutdown reject before mutating retained owner
+  or runtime state while it is outstanding; reopen on permit drop unless
+  already closed, close permanently on successful stop or owner drop, and,
+  once refresh has retired the epoch, never restore it after cancellation
+  (response-release gate complete; no service/listener, private protobuf/body,
+  transport-write, currentness-at-write, FIFO/queue/wait/deadline/drain, or
+  worker-shutdown proof);
 - connect that owner to the production finalized projection owner, listener
   routing, and actual transport-write boundary;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;

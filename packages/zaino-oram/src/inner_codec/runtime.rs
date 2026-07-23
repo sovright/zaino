@@ -39,6 +39,12 @@ use zaino_state::{
     NodeBackedChainIndexSubscriber,
 };
 
+#[cfg(feature = "corpus-zaino")]
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
+
 #[cfg(test)]
 use crate::recent_snapshot::{ServingEpochObservation, ServingEpochUnavailable};
 
@@ -101,6 +107,152 @@ impl<const ENVELOPE_BYTES: usize> RuntimeRound<ENVELOPE_BYTES> {
     #[cfg(test)]
     const fn trace(&self) -> &AccessTrace {
         &self.trace
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+const RESPONSE_RELEASE_IDLE: u8 = 0;
+#[cfg(feature = "corpus-zaino")]
+const RESPONSE_RELEASE_PENDING: u8 = 1;
+#[cfg(feature = "corpus-zaino")]
+const RESPONSE_RELEASE_REFRESHING: u8 = 2;
+#[cfg(feature = "corpus-zaino")]
+const RESPONSE_RELEASE_CLOSED: u8 = 3;
+
+/// Single-owner exclusion between response release and epoch lifecycle work.
+///
+/// This gate does not know about a listener or transport. A later caller must
+/// retain the pending-round permit for exactly as long as its response remains
+/// eligible for release. Until then, refresh and shutdown fail before changing
+/// the retained epoch.
+#[cfg(feature = "corpus-zaino")]
+struct ResponseReleaseGate {
+    state: Arc<AtomicU8>,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl ResponseReleaseGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(RESPONSE_RELEASE_IDLE)),
+        }
+    }
+
+    fn begin_response(&self) -> Result<ResponseReleasePermit, FinalizedRuntimeOwnerError> {
+        self.begin(RESPONSE_RELEASE_PENDING)
+    }
+
+    fn begin_refresh(&self) -> Result<ResponseReleasePermit, FinalizedRuntimeOwnerError> {
+        self.begin(RESPONSE_RELEASE_REFRESHING)
+    }
+
+    fn begin(&self, held_state: u8) -> Result<ResponseReleasePermit, FinalizedRuntimeOwnerError> {
+        self.state
+            .compare_exchange(
+                RESPONSE_RELEASE_IDLE,
+                held_state,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| FinalizedRuntimeOwnerError)?;
+        Ok(ResponseReleasePermit {
+            state: Arc::clone(&self.state),
+            held_state,
+        })
+    }
+
+    fn stop(&self) -> Result<(), FinalizedRuntimeOwnerError> {
+        match self.state.compare_exchange(
+            RESPONSE_RELEASE_IDLE,
+            RESPONSE_RELEASE_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(RESPONSE_RELEASE_CLOSED) => Ok(()),
+            Err(_) => Err(FinalizedRuntimeOwnerError),
+        }
+    }
+
+    fn close(&self) {
+        self.state.store(RESPONSE_RELEASE_CLOSED, Ordering::Release);
+    }
+
+    fn is_idle(&self) -> bool {
+        self.state.load(Ordering::Acquire) == RESPONSE_RELEASE_IDLE
+    }
+
+    #[cfg(test)]
+    fn is_refreshing_for_tests(&self) -> bool {
+        self.state.load(Ordering::Acquire) == RESPONSE_RELEASE_REFRESHING
+    }
+
+    #[cfg(test)]
+    fn is_closed_for_tests(&self) -> bool {
+        self.state.load(Ordering::Acquire) == RESPONSE_RELEASE_CLOSED
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::fmt::Debug for ResponseReleaseGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResponseReleaseGate { ..REDACTED.. }")
+    }
+}
+
+/// Unique proof that one response or refresh owns the release gate.
+#[cfg(feature = "corpus-zaino")]
+struct ResponseReleasePermit {
+    state: Arc<AtomicU8>,
+    held_state: u8,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl Drop for ResponseReleasePermit {
+    fn drop(&mut self) {
+        if self
+            .state
+            .compare_exchange(
+                self.held_state,
+                RESPONSE_RELEASE_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.state.store(RESPONSE_RELEASE_CLOSED, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::fmt::Debug for ResponseReleasePermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResponseReleasePermit { ..REDACTED.. }")
+    }
+}
+
+/// One completed runtime round whose release permit remains outstanding.
+#[cfg(feature = "corpus-zaino")]
+struct PendingRuntimeRound<const ENVELOPE_BYTES: usize> {
+    round: RuntimeRound<ENVELOPE_BYTES>,
+    _release_permit: ResponseReleasePermit,
+}
+
+#[cfg(all(feature = "corpus-zaino", test))]
+impl<const ENVELOPE_BYTES: usize> PendingRuntimeRound<ENVELOPE_BYTES> {
+    const fn envelope(&self) -> &FixedEnvelope<ENVELOPE_BYTES> {
+        self.round.envelope()
+    }
+
+    const fn trace(&self) -> &AccessTrace {
+        self.round.trace()
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<const ENVELOPE_BYTES: usize> std::fmt::Debug for PendingRuntimeRound<ENVELOPE_BYTES> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingRuntimeRound { ..REDACTED.. }")
     }
 }
 
@@ -725,6 +877,102 @@ where
         .map_err(coarsen_runtime_owner_error)
 }
 
+/// Runs one round while returning the unique response-release permit with it.
+#[cfg(feature = "corpus-zaino")]
+fn handle_finalized_runtime_round<
+    E,
+    T,
+    R,
+    N,
+    C,
+    B,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+>(
+    runtime: &mut PrivateQueryRuntime<
+        FinalizedProjectionServingStore,
+        E,
+        T,
+        R,
+        N,
+        C,
+        B,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >,
+    stopped: bool,
+    response_release: &ResponseReleaseGate,
+    envelope: &FixedEnvelope<ENVELOPE_BYTES>,
+) -> Result<PendingRuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure>
+where
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+    C: ServingEpochCurrentness<B>,
+    B: ServingEpochBoundary,
+{
+    if stopped {
+        return Err(UniformExternalFailure);
+    }
+    let release_permit = response_release
+        .begin_response()
+        .map_err(|_| UniformExternalFailure)?;
+    if !runtime.healthy {
+        return Err(UniformExternalFailure);
+    }
+    let round = runtime.handle(envelope)?;
+    Ok(PendingRuntimeRound {
+        round,
+        _release_permit: release_permit,
+    })
+}
+
+/// Retires terminal runtime state without turning a busy rejection into cleanup.
+#[cfg(feature = "corpus-zaino")]
+fn retire_unhealthy_finalized_runtime_after_round<
+    E,
+    T,
+    R,
+    N,
+    C,
+    B,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+>(
+    runtime: &mut PrivateQueryRuntime<
+        FinalizedProjectionServingStore,
+        E,
+        T,
+        R,
+        N,
+        C,
+        B,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >,
+    protected_response_pending: bool,
+    response_release: &ResponseReleaseGate,
+) -> bool
+where
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+    C: ServingEpochCurrentness<B>,
+    B: ServingEpochBoundary,
+{
+    if runtime.healthy || (!protected_response_pending && !response_release.is_idle()) {
+        return false;
+    }
+    runtime.retire_epoch();
+    true
+}
+
 #[cfg(feature = "corpus-zaino")]
 fn stop_finalized_runtime<
     E,
@@ -760,6 +1008,46 @@ fn stop_finalized_runtime<
 {
     *stopped = true;
     runtime.retire_epoch();
+}
+
+#[cfg(feature = "corpus-zaino")]
+fn stop_finalized_runtime_after_responses<
+    E,
+    T,
+    R,
+    N,
+    C,
+    B,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+>(
+    runtime: &mut PrivateQueryRuntime<
+        FinalizedProjectionServingStore,
+        E,
+        T,
+        R,
+        N,
+        C,
+        B,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >,
+    stopped: &mut bool,
+    response_release: &ResponseReleaseGate,
+) -> Result<(), FinalizedRuntimeOwnerError>
+where
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+    C: ServingEpochCurrentness<B>,
+    B: ServingEpochBoundary,
+{
+    response_release.stop()?;
+    stop_finalized_runtime(runtime, stopped);
+    Ok(())
 }
 
 #[cfg(feature = "corpus-zaino")]
@@ -814,6 +1102,7 @@ struct FinalizedRuntimeOwner<
         ENVELOPE_BYTES,
         RECENT_SNAPSHOT_SLOTS,
     >,
+    response_release: ResponseReleaseGate,
     stopped: bool,
 }
 
@@ -857,6 +1146,7 @@ where
         Ok(Self {
             controller,
             runtime,
+            response_release: ResponseReleaseGate::new(),
             stopped: false,
         })
     }
@@ -867,6 +1157,7 @@ where
         subscriber: &NodeBackedChainIndexSubscriber<Source>,
         finalized_store: FinalizedProjectionServingStore,
     ) -> Result<(), FinalizedRuntimeOwnerError> {
+        let _refresh_permit = self.response_release.begin_refresh()?;
         let committed_finalized = finalized_store.committed_checkpoint();
         let controller = &mut self.controller;
         let candidate = async move {
@@ -889,21 +1180,60 @@ where
     fn handle(
         &mut self,
         envelope: &FixedEnvelope<ENVELOPE_BYTES>,
-    ) -> Result<RuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
-        if self.stopped {
-            return Err(UniformExternalFailure);
-        }
-        let result = self.runtime.handle(envelope);
-        if !self.runtime.healthy {
-            self.runtime.retire_epoch();
+    ) -> Result<PendingRuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
+        let result = handle_finalized_runtime_round(
+            &mut self.runtime,
+            self.stopped,
+            &self.response_release,
+            envelope,
+        );
+        if retire_unhealthy_finalized_runtime_after_round(
+            &mut self.runtime,
+            result.is_ok(),
+            &self.response_release,
+        ) {
             self.controller.invalidate_publication();
         }
         result
     }
 
-    fn shutdown(&mut self) {
-        stop_finalized_runtime(&mut self.runtime, &mut self.stopped);
+    fn shutdown(&mut self) -> Result<(), FinalizedRuntimeOwnerError> {
+        stop_finalized_runtime_after_responses(
+            &mut self.runtime,
+            &mut self.stopped,
+            &self.response_release,
+        )?;
         self.controller.invalidate_publication();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        const RESPONSE_SLOTS: usize,
+        const ENVELOPE_BYTES: usize,
+        const RECENT_SNAPSHOT_SLOTS: usize,
+    > Drop
+    for FinalizedRuntimeOwner<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >
+where
+    Source: BlockchainSource,
+{
+    fn drop(&mut self) {
+        self.response_release.close();
     }
 }
 
@@ -1889,8 +2219,8 @@ mod tests {
         assert_eq!(error.to_string(), "private-query runtime owner unavailable");
 
         let counters = FinalizedProcessCounters::capture(&owner.runtime);
-        owner.shutdown();
-        owner.shutdown();
+        owner.shutdown()?;
+        owner.shutdown()?;
         assert!(owner.stopped);
         assert!(owner.runtime.epoch.is_none());
         assert!(owner.controller.pin_serving_epoch().is_none());
@@ -1900,6 +2230,412 @@ mod tests {
         ));
         assert_eq!(FinalizedProcessCounters::capture(&owner.runtime), counters);
         let _refresh = FinalizedTestOwner::refresh;
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn owner_drop_closes_detached_response_permit() -> Result<(), Box<dyn std::error::Error>> {
+        let store_reads = finalized_serving_store_for_runtime_tests()?.slots_per_key();
+        let owner = FinalizedTestOwner::new(
+            CanonicalNetwork::Mainnet,
+            1,
+            7,
+            9,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let release_state = Arc::clone(&owner.response_release.state);
+        let permit = owner.response_release.begin_response()?;
+        assert_eq!(
+            format!("{:?}", owner.response_release),
+            "ResponseReleaseGate { ..REDACTED.. }"
+        );
+        assert_eq!(
+            format!("{permit:?}"),
+            "ResponseReleasePermit { ..REDACTED.. }"
+        );
+
+        drop(owner);
+        assert_eq!(
+            release_state.load(Ordering::Acquire),
+            RESPONSE_RELEASE_CLOSED
+        );
+        drop(permit);
+        assert_eq!(
+            release_state.load(Ordering::Acquire),
+            RESPONSE_RELEASE_CLOSED
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn pending_response_blocks_lifecycle_before_mutation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (first_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            first_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let request = request_envelope(
+            &runtime,
+            checkpoint,
+            UtxoQuery::new(address(0xee), 0),
+            None,
+            1,
+        )?;
+        let response_release = ResponseReleaseGate::new();
+        let mut stopped = false;
+
+        let pending =
+            handle_finalized_runtime_round(&mut runtime, stopped, &response_release, &request)?;
+        let response = runtime
+            .codec
+            .decode_response(pending.envelope(), &runtime.envelope_protector)?;
+        assert_eq!(response.page.outcome(), QueryOutcome::Complete);
+        assert_eq!(
+            pending.trace().completion(),
+            CompletionShape::UnaryFixedEnvelope
+        );
+        assert_eq!(
+            format!("{pending:?}"),
+            "PendingRuntimeRound { ..REDACTED.. }"
+        );
+        let counters = FinalizedProcessCounters::capture(&runtime);
+        let generation = runtime
+            .epoch_for_tests()
+            .recent_snapshot
+            .lineage()
+            .generation();
+
+        assert!(matches!(
+            handle_finalized_runtime_round(&mut runtime, stopped, &response_release, &request),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let refresh_work_started = Cell::new(false);
+        let refresh_admission = response_release.begin_refresh().inspect(|_| {
+            refresh_work_started.set(true);
+        });
+        assert!(matches!(refresh_admission, Err(FinalizedRuntimeOwnerError)));
+        assert!(!refresh_work_started.get());
+        assert_eq!(
+            runtime
+                .epoch_for_tests()
+                .recent_snapshot
+                .lineage()
+                .generation(),
+            generation
+        );
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        assert_eq!(
+            stop_finalized_runtime_after_responses(&mut runtime, &mut stopped, &response_release,),
+            Err(FinalizedRuntimeOwnerError)
+        );
+        assert!(!stopped);
+        assert_eq!(
+            runtime
+                .epoch_for_tests()
+                .recent_snapshot
+                .lineage()
+                .generation(),
+            generation
+        );
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let release_state = Arc::clone(&response_release.state);
+        response_release.close();
+        assert_eq!(
+            release_state.load(Ordering::Acquire),
+            RESPONSE_RELEASE_CLOSED
+        );
+        drop(pending);
+        assert_eq!(
+            release_state.load(Ordering::Acquire),
+            RESPONSE_RELEASE_CLOSED
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test]
+    async fn dropping_pending_response_allows_generation_two_replacement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (first_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            first_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let query = UtxoQuery::new(address(0xee), 0);
+        let request = request_envelope(&runtime, checkpoint, query, None, 1)?;
+        let response_release = ResponseReleaseGate::new();
+
+        let pending =
+            handle_finalized_runtime_round(&mut runtime, false, &response_release, &request)?;
+        assert!(!response_release.is_idle());
+        let response = runtime
+            .codec
+            .decode_response(pending.envelope(), &runtime.envelope_protector)?;
+        assert_eq!(response.page.outcome(), QueryOutcome::Complete);
+        let counters = FinalizedProcessCounters::capture(&runtime);
+        drop(pending);
+        assert!(response_release.is_idle());
+
+        let (replacement, _, replacement_store_reads) =
+            finalized_test_epoch_at_generation(2, |identity| identity)?;
+        assert_eq!(replacement_store_reads, store_reads);
+        {
+            let _refresh_permit = response_release.begin_refresh()?;
+            replace_finalized_runtime_epoch_from(
+                &mut runtime,
+                false,
+                std::future::ready(Ok(replacement)),
+            )
+            .await?;
+        }
+        assert!(response_release.is_idle());
+        assert_eq!(
+            runtime
+                .epoch_for_tests()
+                .recent_snapshot
+                .lineage()
+                .generation(),
+            2
+        );
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let replacement_request = request_envelope(&runtime, checkpoint, query, None, 2)?;
+        let replacement_pending = handle_finalized_runtime_round(
+            &mut runtime,
+            false,
+            &response_release,
+            &replacement_request,
+        )?;
+        let replacement_response = runtime
+            .codec
+            .decode_response(replacement_pending.envelope(), &runtime.envelope_protector)?;
+        assert_eq!(replacement_response.page.outcome(), QueryOutcome::Complete);
+        drop(replacement_pending);
+        assert!(response_release.is_idle());
+        assert!(runtime.healthy);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn protected_failure_retires_epoch_while_response_remains_pending(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (first_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            first_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::unavailable(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let request = request_envelope(
+            &runtime,
+            checkpoint,
+            UtxoQuery::new(address(0xee), 0),
+            None,
+            1,
+        )?;
+        let response_release = ResponseReleaseGate::new();
+
+        let pending =
+            handle_finalized_runtime_round(&mut runtime, false, &response_release, &request)?;
+        assert!(!runtime.healthy);
+        assert!(!response_release.is_idle());
+        assert!(retire_unhealthy_finalized_runtime_after_round(
+            &mut runtime,
+            true,
+            &response_release,
+        ));
+        assert!(runtime.epoch.is_none());
+        assert!(!response_release.is_idle());
+        let response = runtime
+            .codec
+            .decode_response(pending.envelope(), &runtime.envelope_protector)?;
+        assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
+
+        drop(pending);
+        assert!(response_release.is_idle());
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test]
+    async fn failed_round_does_not_wedge_release_and_health_remains_monotonic(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (first_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            first_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let request = request_envelope(
+            &runtime,
+            checkpoint,
+            UtxoQuery::new(address(0xee), 0),
+            None,
+            1,
+        )?;
+        let response_release = ResponseReleaseGate::new();
+        runtime
+            .epoch_for_tests()
+            .serving_epoch
+            .with_currentness_for_tests(|currentness| currentness.available = false)
+            .ok_or("serving-epoch currentness mutex is poisoned")?;
+
+        assert!(matches!(
+            handle_finalized_runtime_round(&mut runtime, false, &response_release, &request),
+            Err(UniformExternalFailure)
+        ));
+        assert!(response_release.is_idle());
+        assert!(!runtime.healthy);
+        let counters = FinalizedProcessCounters::capture(&runtime);
+
+        let (replacement, _, replacement_store_reads) =
+            finalized_test_epoch_at_generation(2, |identity| identity)?;
+        assert_eq!(replacement_store_reads, store_reads);
+        {
+            let _refresh_permit = response_release.begin_refresh()?;
+            assert_eq!(
+                replace_finalized_runtime_epoch_from(
+                    &mut runtime,
+                    false,
+                    std::future::ready(Ok(replacement)),
+                )
+                .await,
+                Err(FinalizedRuntimeOwnerError)
+            );
+        }
+        assert!(response_release.is_idle());
+        assert!(runtime.epoch.is_none());
+        assert!(!runtime.healthy);
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+        assert!(matches!(
+            handle_finalized_runtime_round(&mut runtime, false, &response_release, &request),
+            Err(UniformExternalFailure)
+        ));
+        assert!(response_release.is_idle());
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let mut stopped = false;
+        stop_finalized_runtime_after_responses(&mut runtime, &mut stopped, &response_release)?;
+        stop_finalized_runtime_after_responses(&mut runtime, &mut stopped, &response_release)?;
+        assert!(stopped);
+        assert!(response_release.is_closed_for_tests());
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test]
+    async fn cancelled_refresh_reopens_admission_without_stale_fallback(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (first_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            first_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let request = request_envelope(
+            &runtime,
+            checkpoint,
+            UtxoQuery::new(address(0xee), 0),
+            None,
+            1,
+        )?;
+        let response_release = ResponseReleaseGate::new();
+        let counters = FinalizedProcessCounters::capture(&runtime);
+
+        {
+            let _refresh_permit = response_release.begin_refresh()?;
+            let replacement = replace_finalized_runtime_epoch_from(
+                &mut runtime,
+                false,
+                std::future::pending::<Result<FinalizedTestEpoch, FinalizedRuntimeOwnerError>>(),
+            );
+            tokio::pin!(replacement);
+            tokio::select! {
+                biased;
+                result = &mut replacement => {
+                    panic!("pending replacement completed unexpectedly: {result:?}")
+                }
+                _ = async {} => {}
+            }
+            assert!(response_release.is_refreshing_for_tests());
+        }
+
+        assert!(response_release.is_idle());
+        assert!(runtime.epoch.is_none());
+        assert!(runtime.healthy);
+        assert!(matches!(
+            handle_finalized_runtime_round(&mut runtime, false, &response_release, &request),
+            Err(UniformExternalFailure)
+        ));
+        assert!(response_release.is_idle());
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let (replacement, _, replacement_store_reads) =
+            finalized_test_epoch_at_generation(2, |identity| identity)?;
+        assert_eq!(replacement_store_reads, store_reads);
+        {
+            let _refresh_permit = response_release.begin_refresh()?;
+            replace_finalized_runtime_epoch_from(
+                &mut runtime,
+                false,
+                std::future::ready(Ok(replacement)),
+            )
+            .await?;
+        }
+        assert!(response_release.is_idle());
+        assert_eq!(
+            runtime
+                .epoch_for_tests()
+                .recent_snapshot
+                .lineage()
+                .generation(),
+            2
+        );
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
         Ok(())
     }
 

@@ -107,7 +107,13 @@ offline dependency experiment:
   protectors, replay guard, material source, codec session binding, compiled
   profile, and monotonic fail-closed health. Failed refresh, pinning, or runtime
   construction leaves no active epoch and never restores the stale one;
-  repeated logical stop is idempotent;
+  repeated logical stop is idempotent. A listener-free response-release gate
+  lets one completed round retain a non-`Clone` outstanding permit. While that
+  permit is held, later handle, refresh, and explicit shutdown attempts reject
+  before mutating retained owner or runtime state; dropping it reopens the gate
+  unless it is already closed, while a successful stop or owner drop closes the
+  gate permanently. Once refresh has retired the epoch, cancellation never
+  restores it;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -173,10 +179,10 @@ Under the default-off `corpus-zaino` feature, a private refresh controller uses
 that input, an immutable identity-pinned finalized-outpoint classifier, and the
 ticketed publication owner to build and publish a serving epoch. Publication is
 last and binds the owner-issued finalized store, owner-assigned recent
-generation, opaque NFS Arc identity, and query-independent release-time
-currentness capability. The crate-internal exact-lease factory can consume an
-already-pinned epoch containing the concrete finalized serving store and build
-the listener-free runtime. The runtime derives its store, observer, and
+generation, opaque NFS Arc identity, and query-independent post-work,
+runtime-return currentness capability. The crate-internal exact-lease factory
+can consume an already-pinned epoch containing the concrete finalized serving
+store and build the listener-free runtime. The runtime derives its store, observer, and
 protected checkpoint only from that lease, completes the fixed-work response,
 and performs the final fail-closed observation before returning it.
 
@@ -188,15 +194,23 @@ identity. The runtime's injected protectors, replay guard, material source,
 session binding, compiled profile, and health latch survive epoch replacement;
 health can only move toward failed closed. A failed refresh or replacement has
 no stale fallback, and repeated logical stop remains a no-op after the first
-stop.
+stop. One non-`Clone` response permit can remain outstanding after a completed
+round. While it is held, later handle, refresh, and explicit shutdown attempts
+reject before changing owner or runtime state. Dropping the permit reopens the
+gate unless it is already closed; a successful stop or owner drop closes it
+permanently. Once refresh has retired the active epoch, cancellation never
+restores it.
 
 This private composition seam does not enforce a process-wide singleton and has
 no service or listener caller. It does not implement or prove concurrent query
-admission, FIFO execution, queue saturation, overload rejection, draining, or
-clean shutdown of the underlying worker. Its stop is logical: it retires the
-active runtime epoch and rejects later handle/refresh attempts. There is no
-listener or guard retained through a transport write, so the final currentness
-check does not close the race between runtime return and transport completion.
+admission, FIFO execution, queue saturation, overload rejection, waiting,
+deadlines, draining, or clean shutdown of the underlying worker. Its stop is
+logical: it retires the active runtime epoch and rejects later handle/refresh
+attempts. The response permit is listener-free and is not integrated with a
+transport write or response body. It therefore proves neither release-time
+currentness at the write boundary nor transport completion; the canonical
+source may advance independently while a permit is held. Private protobuf and
+body integration remain open.
 Replay state is volatile, and the injected protectors, clock/material source,
 and nonce/replay mechanisms are not production implementations. The frozen
 snapshot's lineage digest binds owner-assigned generation and exact
