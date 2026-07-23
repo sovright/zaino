@@ -13,13 +13,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   it is held, later handle, refresh, and explicit shutdown attempts reject
   before mutating owner or runtime state. Dropping the permit reopens the gate
   unless it is already closed; a successful stop or owner drop closes it
-  permanently. Once refresh has retired the active epoch, cancellation never
-  restores it. This is an ownership and exclusion contract only: it is not a
-  service, listener, transport-write, response-body, or currentness-at-write
-  proof, and the canonical source may advance independently while a permit is
-  held. It establishes no FIFO, queue, wait, deadline, drain, or
-  underlying-worker shutdown behavior; private protobuf and body integration
-  remain open.
+  permanently. The finalized-runtime pending round carries a narrow
+  first-release witness over its expected epoch identity, opaque capture, and
+  shared currentness observer. It atomically enters checking, re-observes and compares the source,
+  then authorizes the byte borrow; mismatch, observation failure, or owner
+  closure fails closed. Unpolled drop performs no observation, and the witness
+  retains no serving lease or finalized store. Once refresh has retired the
+  active epoch, cancellation never restores it. This is an internal ownership,
+  exclusion, and late-release contract only: it is not a service, listener,
+  transport-write, response-body, or currentness-at-write proof, and the
+  canonical source may advance immediately after the check. It establishes no
+  FIFO, queue, wait, deadline, drain, or underlying-worker shutdown behavior;
+  tests exercise the exact helper delegated to by the owner rather than a
+  successfully refreshed ready-owner lifecycle; a public owner factory and
+  private protobuf/body integration remain open.
 - A default-off crate-internal process-lifetime owner for the exact recent-chain
   refresh controller and one stable private-query runtime state. It retires the
   active epoch before capture, refreshes from the committed checkpoint of the

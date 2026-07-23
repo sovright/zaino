@@ -115,17 +115,26 @@ allows one completed response to retain a non-`Clone` outstanding permit.
 While held, that permit makes later handle, refresh, and explicit shutdown
 attempts reject before mutating retained owner or runtime state. Permit drop
 reopens the gate unless it is already closed; a successful stop or owner drop
-closes it permanently. Once refresh has retired the epoch, cancellation never
-restores it. A private Ready-only adapter now consumes the exact finalized
-projection worker into an
+closes it permanently. The finalized-runtime pending round now also owns only
+the expected epoch identity, cloned opaque capture boundary, and shared
+currentness capability needed for release. Its first fallible byte borrow atomically moves
+the gate through checking and authorization, re-observes the source, and closes
+admission permanently on mismatch, unavailability, or owner closure. Dropping
+an unpolled pending round performs no observation. The witness does not retain
+the serving lease, snapshot, or finalized store, so an intentionally protected
+terminal response remains releasable after internal epoch retirement when the
+source still matches its exact capture. Once refresh has retired the epoch,
+cancellation never restores it. A private Ready-only adapter now consumes the
+exact finalized projection worker into an
 identity-bound, non-cloneable serving store. Every successful in-profile read,
 absent a backend or worker failure, executes a complete key-addressed
 fixed-history worker command and folds the full padded event history into dense
 creation-order live outputs without caching. Decreasing event heights and events
 above the exact owner-bound checkpoint are rejected. The process-lifetime owner
 is not an enforced process singleton or service caller. Its release gate is
-not a listener, transport-write, response-body, or currentness-at-write proof;
-the canonical source may advance independently while a permit is held. It does
+not a listener, transport-write, or currentness-at-write proof. Its late
+release check is internal to `zaino-oram`, and the canonical source may advance
+immediately after that check. It does
 not establish concurrent admission, FIFO execution, queue/overload handling,
 waiting, deadlines, draining, or clean underlying-worker shutdown. An
 independent `zaino.private.v1` query protobuf and a crate-private listener-free
@@ -137,7 +146,9 @@ protobuf DATA frame on success, and suppresses a stale response as uniform
 check or byte borrow. The concrete owner, its bytes, and release permit remain
 private. The adapter does not construct the owner or implement the generated
 Tonic service. A lifetime-safe real-owner facade and body integration remain
-open; body-poll currentness is not socket-write or peer-delivery currentness.
+open; there is not yet a non-test production protector/replay/material provider
+bundle from which to build an honest public owner factory. Body-poll currentness
+is not socket-write or peer-delivery currentness.
 The logical stop only retires the active epoch and rejects later handle/refresh
 attempts. This path does not authenticate the tip, ancestry, or slot
 provenance. The lineage commitment is not an authenticated canonical/live Zaino
@@ -174,7 +185,13 @@ retired the epoch, cancellation does not restore it.
 Its listener-free response gate permits one non-`Clone` completed response to
 remain outstanding and rejects handle/refresh/shutdown before mutating retained
 owner or runtime state until permit drop reopens it unless already closed;
-successful stop and owner drop close it permanently. An adjacent crate-private
+successful stop and owner drop close it permanently. The finalized-runtime
+pending round adds an internal first-release witness over exact identity,
+opaque capture, and the same currentness capability, with atomic fail-closed
+authorization before its byte borrow. It retains neither the serving lease nor
+the store, performs no observation when dropped unpolled, and still permits an
+intentionally protected terminal response after internal epoch retirement when
+the source capture remains exact. An adjacent crate-private
 listener-free adapter validates the independent query protobuf against a mock
 runtime port without exposing the concrete owner's bytes or permit. Its custom
 Tonic codec/body retains the mock pending response until first outbound body
@@ -186,8 +203,8 @@ owner, and no generated service or listener calls it. No enforced process
 singleton, concurrent admission/FIFO/queue/wait/deadline/drain policy,
 real-owner response-body integration, transport-write or peer-delivery
 currentness proof, or clean worker-shutdown proof exists. The canonical source
-may advance after the body poll. This path
-does not provide persistence, an authenticated root or provenance, durable
+may advance after either release check. This path does not provide persistence,
+an authenticated root or provenance, durable
 rollback authority, production cryptography/clock/nonces/replay, physical or
 timing evidence, TDX, target-load, or mainnet service evidence.
 
@@ -492,17 +509,26 @@ listener-free response-release gate retains one completed response behind a
 non-`Clone` permit and rejects handle, refresh, and explicit shutdown before
 mutating retained owner or runtime state while that permit is held. Permit drop
 reopens the gate unless it is already closed; a successful stop or owner drop
-closes it permanently. Once refresh has retired the epoch, cancellation cannot
-restore it. This real-owner gate is not a listener, transport-write,
-response-body, or currentness-at-write proof: the canonical source may advance
-independently while a permit is held. The adjacent application package has a
-separate mock-backed lazy Tonic body proof at first outbound body poll, but it
-does not consume this real permit. A complete production projection feed still
+closes it permanently. The pending round carries a narrow release witness over
+the exact epoch identity, opaque capture, and shared observer. Its first byte
+borrow atomically enters a checking state, re-observes and compares the source,
+then commits authorization; mismatch, observer failure, or owner closure leaves
+the gate closed. The witness retains no serving lease or store, and unpolled
+drop performs no observation. Once refresh has retired the epoch, cancellation
+cannot restore it. This finalized-runtime helper proof remains internal to
+`zaino-oram`; it
+is not a listener, transport-write, response-body, or currentness-at-write
+proof, and the canonical source may advance immediately after the check. The
+adjacent application package has a separate mock-backed lazy Tonic body proof
+at first outbound body poll, but it does not consume this real permit. A
+complete production projection feed still
 needs finalized block application, a finalized checkpoint/watermark and
 catch-up protocol, an enforced process singleton and service caller, a
 lifetime-safe real-owner protobuf-body integration, concurrent
 admission/FIFO/queue/wait/deadline/drain behavior, clean worker shutdown, and
-service-lifetime ownership through the actual transport-write boundary.
+service-lifetime ownership through the actual transport-write boundary. A
+public opaque factory also remains deferred until non-test production
+protector, replay, and material providers exist.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
@@ -516,7 +542,11 @@ the exact successful DATA frame and collapses stale encoding to uniform
 `Unavailable` trailers with no DATA. The generated service trait remains
 unused because its hard-coded protobuf response cannot carry the pending
 permit. The next integration slice must add a lifetime-safe facade over the real
-`PrivateQueryEngine` owner without exporting detached bytes. The package also
+`PrivateQueryEngine` owner without exporting detached bytes. The
+finalized-runtime pending round now has the required internal release witness,
+but the facade must wait
+for a non-test production dependency bundle rather than expose uninstantiable
+generic security traits. The package also
 owns the attested listener, optional admin routes, configuration, metrics, and
 lifecycle orchestration. Domain results and validation failures are encoded
 inside the fixed envelope; outer gRPC status is uniform for completed private
@@ -823,10 +853,15 @@ Deliverables:
   or runtime state while it is outstanding; reopen on permit drop unless
   already closed, close permanently on successful stop or owner drop, and,
   once refresh has retired the epoch, never restore it after cancellation
-  (response-release gate complete; an adjacent mock-backed protobuf body-poll
-  proof exists, but no real-owner protobuf/body integration, service/listener,
-  transport-write or peer-delivery currentness, FIFO/queue/wait/deadline/drain,
-  or worker-shutdown proof);
+  (response-release gate complete); retain a narrow finalized-runtime witness
+  that atomically re-observes exact identity and opaque capture before first
+  byte borrow, fails closed without retaining the serving lease/store, and performs
+  no observation on unpolled drop (internal finalized-runtime helper release
+  witness complete; tests exercise the exact helper delegated to by the owner,
+  not a successfully refreshed ready-owner lifecycle; an adjacent mock-backed
+  protobuf body-poll proof exists, but no cross-crate owner facade/body
+  integration, service/listener, transport-write or peer-delivery currentness,
+  FIFO/queue/wait/deadline/drain, or worker-shutdown proof);
 - connect that owner to the production finalized projection owner, listener
   routing, and actual transport-write boundary;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;

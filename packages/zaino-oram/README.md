@@ -199,7 +199,15 @@ round. While it is held, later handle, refresh, and explicit shutdown attempts
 reject before changing owner or runtime state. Dropping the permit reopens the
 gate unless it is already closed; a successful stop or owner drop closes it
 permanently. Once refresh has retired the active epoch, cancellation never
-restores it.
+restores it. The finalized-runtime pending round also owns a narrow release
+witness over its expected epoch identity, cloned opaque capture boundary, and
+shared currentness observer. Its first fallible byte borrow atomically enters checking,
+re-observes and compares the source, and commits authorization; mismatch,
+observer failure, or owner closure leaves the gate closed. Unpolled drop makes
+no observation. The witness retains neither the serving lease nor the
+finalized store, so an intentionally protected terminal response remains
+releasable after internal epoch retirement when the source still matches its
+exact capture.
 
 This private composition seam does not enforce a process-wide singleton. The
 adjacent `zainod-oram` package now has an independent query protobuf, a
@@ -210,17 +218,23 @@ on a fallible release-time currentness check. A stale response emits no DATA and
 one uniform `Unavailable` trailer shape; dropping an unpolled body releases the
 pending value without borrowing its bytes.
 
-That proof does not expose or integrate this crate's actual owner bytes or
-release permit, construct or route the concrete process owner, or implement a
-generated Tonic service or listener. It does not implement or prove concurrent
+That adjacent mock proof does not expose or integrate this crate's actual
+owner bytes or release permit, construct or route the concrete process owner,
+or implement a generated Tonic service or listener. The finalized-runtime
+witness is internal to this crate; tests exercise the exact helper delegated to
+by the owner, not a successfully refreshed ready-owner lifecycle. A public
+opaque factory remains deferred because no
+non-test production protector/replay/material provider bundle exists. This does
+not implement or prove concurrent
 query admission, FIFO execution, queue saturation, overload rejection,
 waiting, deadlines, draining, or clean shutdown of the underlying worker. Its
 stop is logical: it retires the active runtime epoch and rejects later
-handle/refresh attempts. The real response permit remains listener-free and is
-not integrated with the response body or a transport write. The mock body proof
-establishes currentness only at first body poll, not at socket write, peer
-delivery, or transport completion; the canonical source may advance after the
-poll. Lifetime-safe real-owner body integration remains open.
+handle/refresh attempts. The real response permit and late-release witness
+remain listener-free and are not integrated with the response body or a
+transport write. Neither release check establishes currentness at socket write,
+peer delivery, or transport completion; the canonical source may advance
+immediately afterward. Lifetime-safe cross-crate real-owner body integration
+remains open.
 Replay state is volatile, and the injected protectors, clock/material source,
 and nonce/replay mechanisms are not production implementations. The frozen
 snapshot's lineage digest binds owner-assigned generation and exact
