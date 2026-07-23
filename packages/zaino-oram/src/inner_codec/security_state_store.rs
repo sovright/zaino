@@ -28,7 +28,7 @@ use super::SESSION_BINDING_BYTES;
 
 const SERVICE_ID_BYTES: usize = 16;
 const SECURITY_EPOCH_BINDING_BYTES: usize = 32;
-const STATE_DIGEST_BYTES: usize = 32;
+pub(super) const STATE_DIGEST_BYTES: usize = 32;
 const SECURITY_STATE_FILE_MAGIC: &[u8; 8] = b"ZORAMSS1";
 const SECURITY_STATE_FILE_VERSION: u16 = 1;
 const SECURITY_STATE_DIGEST_VERSION: u16 = 1;
@@ -108,7 +108,7 @@ impl SecurityStateEpochs {
 
 /// Stable identity of one future active security owner.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct SecurityStateIdentity {
+pub(super) struct SecurityStateIdentity {
     service_id: [u8; SERVICE_ID_BYTES],
     epochs: SecurityStateEpochs,
     profile_id: [u8; PROFILE_ID_BYTES],
@@ -187,6 +187,19 @@ impl SecurityStateIdentity {
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_security_state_identity(
+    byte: u8,
+) -> Result<SecurityStateIdentity, SecurityStateValueError> {
+    SecurityStateIdentity::new(
+        [byte; SERVICE_ID_BYTES],
+        SecurityStateEpochs::new(1, 2, 3, 4)?,
+        [byte.wrapping_add(1); PROFILE_ID_BYTES],
+        [byte.wrapping_add(2); SESSION_BINDING_BYTES],
+        [byte.wrapping_add(3); SECURITY_EPOCH_BINDING_BYTES],
+    )
+}
+
 impl fmt::Debug for SecurityStateIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SecurityStateIdentity { ..REDACTED.. }")
@@ -261,6 +274,35 @@ pub(super) struct SecurityStateSnapshot {
 }
 
 impl SecurityStateSnapshot {
+    pub(super) fn initial_with_component_state_digest(
+        identity: SecurityStateIdentity,
+        serving_identity_digest: [u8; STATE_DIGEST_BYTES],
+        component_state_digest: [u8; STATE_DIGEST_BYTES],
+    ) -> Result<Self, SecurityStateValueError> {
+        let commitment = SecurityStateCommitment::new(
+            identity,
+            serving_identity_digest,
+            component_state_digest,
+        )?;
+        Self::new(1, commitment)
+    }
+
+    pub(super) fn successor_with_component_state_digest(
+        &self,
+        component_state_digest: [u8; STATE_DIGEST_BYTES],
+    ) -> Result<Self, SecurityStateValueError> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(SecurityStateValueError::SequenceOverflow)?;
+        let commitment = SecurityStateCommitment::new(
+            self.commitment.identity,
+            self.commitment.serving_identity_digest,
+            component_state_digest,
+        )?;
+        Self::new(sequence, commitment)
+    }
+
     fn new(
         sequence: u64,
         commitment: SecurityStateCommitment,
@@ -276,6 +318,10 @@ impl SecurityStateSnapshot {
 
     const fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub(super) const fn component_state_digest(&self) -> [u8; STATE_DIGEST_BYTES] {
+        self.commitment.component_state_digest
     }
 
     fn freshness(&self) -> SecurityFreshness {
@@ -305,6 +351,7 @@ pub(super) enum SecurityStateValueError {
     ServingIdentityDigestIsEmpty,
     ComponentStateDigestIsEmpty,
     SequenceIsMissing,
+    SequenceOverflow,
 }
 
 impl fmt::Display for SecurityStateValueError {
@@ -333,6 +380,7 @@ impl fmt::Display for SecurityStateValueError {
                 f.write_str("security state has a zero component-state digest")
             }
             Self::SequenceIsMissing => f.write_str("security state has a zero sequence"),
+            Self::SequenceOverflow => f.write_str("security state sequence overflowed"),
         }
     }
 }
@@ -1219,6 +1267,80 @@ mod tests {
         assert_eq!(
             SecurityStateSnapshot::new(0, commitment(1)?),
             Err(SecurityStateValueError::SequenceIsMissing)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn component_state_snapshot_initializes_and_advances_only_mutable_state() -> TestResult {
+        let identity = identity(21)?;
+        let serving_identity_digest = [25; STATE_DIGEST_BYTES];
+        let initial_component_state_digest = [26; STATE_DIGEST_BYTES];
+        let initial = SecurityStateSnapshot::initial_with_component_state_digest(
+            identity,
+            serving_identity_digest,
+            initial_component_state_digest,
+        )?;
+
+        assert_eq!(initial.sequence(), 1);
+        assert_eq!(initial.commitment.identity, identity);
+        assert_eq!(
+            initial.commitment.serving_identity_digest,
+            serving_identity_digest
+        );
+        assert_eq!(
+            initial.component_state_digest(),
+            initial_component_state_digest
+        );
+
+        let next_component_state_digest = [27; STATE_DIGEST_BYTES];
+        let successor =
+            initial.successor_with_component_state_digest(next_component_state_digest)?;
+
+        assert_eq!(successor.sequence(), 2);
+        assert_eq!(successor.commitment.identity, initial.commitment.identity);
+        assert_eq!(
+            successor.commitment.serving_identity_digest,
+            initial.commitment.serving_identity_digest
+        );
+        assert_eq!(
+            successor.component_state_digest(),
+            next_component_state_digest
+        );
+        assert_ne!(
+            successor.component_state_digest(),
+            initial.component_state_digest()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn component_state_snapshot_helpers_reject_zero_digest_and_sequence_overflow() -> TestResult {
+        let identity = identity(22)?;
+        let serving_identity_digest = [26; STATE_DIGEST_BYTES];
+        assert_eq!(
+            SecurityStateSnapshot::initial_with_component_state_digest(
+                identity,
+                serving_identity_digest,
+                [0; STATE_DIGEST_BYTES],
+            ),
+            Err(SecurityStateValueError::ComponentStateDigestIsEmpty)
+        );
+
+        let initial = SecurityStateSnapshot::initial_with_component_state_digest(
+            identity,
+            serving_identity_digest,
+            [27; STATE_DIGEST_BYTES],
+        )?;
+        assert_eq!(
+            initial.successor_with_component_state_digest([0; STATE_DIGEST_BYTES]),
+            Err(SecurityStateValueError::ComponentStateDigestIsEmpty)
+        );
+
+        let exhausted = SecurityStateSnapshot::new(u64::MAX, initial.commitment)?;
+        assert_eq!(
+            exhausted.successor_with_component_state_digest([28; STATE_DIGEST_BYTES]),
+            Err(SecurityStateValueError::SequenceOverflow)
         );
         Ok(())
     }

@@ -213,6 +213,22 @@ impl fmt::Debug for ReplayJournalEntry {
     }
 }
 
+/// Opaque committed state of the local replay component.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplayJournalComponentStateDigest([u8; DIGEST_BYTES]);
+
+impl ReplayJournalComponentStateDigest {
+    pub(super) const fn as_bytes(&self) -> &[u8; DIGEST_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ReplayJournalComponentStateDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplayJournalComponentStateDigest([REDACTED])")
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalState {
     limits: ReplayJournalLimits,
@@ -338,8 +354,8 @@ impl ReplayJournalState {
         Ok((next, decision))
     }
 
-    fn component_state_digest(&self) -> [u8; DIGEST_BYTES] {
-        versioned_digest(
+    fn component_state_digest(&self) -> ReplayJournalComponentStateDigest {
+        ReplayJournalComponentStateDigest(versioned_digest(
             COMPONENT_STATE_DOMAIN,
             &[
                 &self.limits.max_transactions.to_be_bytes(),
@@ -348,7 +364,7 @@ impl ReplayJournalState {
                 &self.claimed_continuation_count.to_be_bytes(),
                 &self.entry_chain_digest,
             ],
-        )
+        ))
     }
 }
 
@@ -672,6 +688,28 @@ enum ReplayJournalStoreHealth {
     Indeterminate,
 }
 
+mod sealed {
+    pub trait Sealed {}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReplayJournalComponentStateUnavailable;
+
+impl fmt::Display for ReplayJournalComponentStateUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("replay journal component state is unavailable")
+    }
+}
+
+impl std::error::Error for ReplayJournalComponentStateUnavailable {}
+
+/// Supplies the current committed replay identity only while the store is ready.
+pub(super) trait ReplayJournalComponentState: sealed::Sealed {
+    fn component_state_digest(
+        &self,
+    ) -> Result<ReplayJournalComponentStateDigest, ReplayJournalComponentStateUnavailable>;
+}
+
 struct ReplayJournalStore<P> {
     recovery_directory: PathBuf,
     protection_context: ReplayJournalProtectionContext,
@@ -680,6 +718,19 @@ struct ReplayJournalStore<P> {
     request_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
     continuation_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
     health: ReplayJournalStoreHealth,
+}
+
+impl<P> sealed::Sealed for ReplayJournalStore<P> {}
+
+impl<P> ReplayJournalComponentState for ReplayJournalStore<P> {
+    fn component_state_digest(
+        &self,
+    ) -> Result<ReplayJournalComponentStateDigest, ReplayJournalComponentStateUnavailable> {
+        match self.health {
+            ReplayJournalStoreHealth::Ready => Ok(self.state.component_state_digest()),
+            ReplayJournalStoreHealth::Indeterminate => Err(ReplayJournalComponentStateUnavailable),
+        }
+    }
 }
 
 impl<P> ReplayJournalStore<P>
@@ -1256,7 +1307,18 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::runtime_security::{ContinuationReplayKey, ReplayNamespace, SecurityEpochTag};
+    use crate::{
+        inner_codec::{
+            security_state_binding::{
+                provision_initial_snapshot, successor_after_live_replay_advance, verify_current,
+                SecurityStateBindingError,
+            },
+            security_state_store::{
+                test_security_state_identity, PersistentSecurityState, STATE_DIGEST_BYTES,
+            },
+        },
+        runtime_security::{ContinuationReplayKey, ReplayNamespace, SecurityEpochTag},
+    };
 
     const TEST_PROTECTION_NONCE_BYTES: usize = 24;
     const TEST_PROTECTION_AUTHENTICATION_BYTES: usize = 16;
@@ -1819,6 +1881,153 @@ mod tests {
             ordered.component_state_digest(),
             changed.component_state_digest()
         );
+    }
+
+    #[test]
+    fn committed_component_digest_changes_after_every_transaction() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut store = open_store(&directory)?;
+        let (_, round) = security_round();
+        let initial = store.component_state_digest()?;
+
+        store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        let fresh_cover = store.component_state_digest()?;
+        assert_ne!(fresh_cover, initial);
+
+        store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        let duplicate_request = store.component_state_digest()?;
+        assert_ne!(duplicate_request, fresh_cover);
+
+        let continuation = continuation_key(2);
+        store.commit_transaction(
+            &round,
+            &request_key(2),
+            &ContinuationReplayPlan::ClaimOrCover(continuation),
+        )?;
+        let fresh_continuation = store.component_state_digest()?;
+        assert_ne!(fresh_continuation, duplicate_request);
+
+        store.commit_transaction(
+            &round,
+            &request_key(3),
+            &ContinuationReplayPlan::ClaimOrCover(continuation),
+        )?;
+        assert_ne!(store.component_state_digest()?, fresh_continuation);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_component_binding_is_exact_across_commit_and_replay_reopen() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut store = open_store(&directory)?;
+        let previous_replay_digest = store.component_state_digest()?;
+        let initial = provision_initial_snapshot(
+            test_security_state_identity(0x61)?,
+            [0x65; STATE_DIGEST_BYTES],
+            &store,
+        )?;
+
+        assert_ne!(
+            initial.component_state_digest(),
+            *previous_replay_digest.as_bytes()
+        );
+        assert_eq!(
+            initial.component_state_digest(),
+            [
+                0xf8, 0xa6, 0x2a, 0x85, 0xb0, 0x15, 0x7e, 0x96, 0xf6, 0x27, 0x26, 0xf1, 0xd7, 0xd8,
+                0x5a, 0xa3, 0xc5, 0x30, 0xf5, 0xe2, 0xee, 0xd3, 0xcc, 0xf0, 0xe2, 0xb8, 0x12, 0x17,
+                0x5f, 0xeb, 0xf2, 0xac,
+            ]
+        );
+        verify_current(&initial, &store)?;
+        assert_eq!(
+            successor_after_live_replay_advance(&initial, previous_replay_digest, &store),
+            Err(SecurityStateBindingError::ReplayComponentDidNotAdvance)
+        );
+        assert_eq!(
+            PersistentSecurityState::from_business(&initial).into_business()?,
+            initial
+        );
+
+        let (_, round) = security_round();
+        store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        assert_eq!(
+            verify_current(&initial, &store),
+            Err(SecurityStateBindingError::ReplayComponentMismatch)
+        );
+        assert_eq!(
+            successor_after_live_replay_advance(&initial, store.component_state_digest()?, &store,),
+            Err(SecurityStateBindingError::ReplayComponentMismatch)
+        );
+
+        let successor =
+            successor_after_live_replay_advance(&initial, previous_replay_digest, &store)?;
+        verify_current(&successor, &store)?;
+        assert_eq!(
+            PersistentSecurityState::from_business(&successor).into_business()?,
+            successor
+        );
+
+        drop(store);
+        let reopened = open_store(&directory)?;
+        verify_current(&successor, &reopened)?;
+        assert_eq!(
+            verify_current(&initial, &reopened),
+            Err(SecurityStateBindingError::ReplayComponentMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn indeterminate_replay_store_cannot_bind_an_outer_snapshot() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut store = open_store(&directory)?;
+        let previous_replay_digest = store.component_state_digest()?;
+        let initial = provision_initial_snapshot(
+            test_security_state_identity(0x71)?,
+            [0x75; STATE_DIGEST_BYTES],
+            &store,
+        )?;
+        let prepared = store.prepare_commit(&request_key(1), &ContinuationReplayPlan::Cover)?;
+        let staged_entry = store.stage_entry_file(&prepared)?;
+        let replaced_entry = store.replace_entry_file(staged_entry, &prepared)?;
+        store.confirm_entry_file_durable(replaced_entry)?;
+        let staged_current = store.stage_current_state(&prepared)?;
+        let _replaced_current = store.replace_current_state(staged_current)?;
+        // Model a directory-sync failure after the authoritative marker rename.
+        assert_eq!(
+            store.latch(ReplayJournalStoreError::CurrentStateIndeterminate),
+            ReplayJournalStoreError::CurrentStateIndeterminate
+        );
+
+        assert_eq!(
+            store.component_state_digest(),
+            Err(ReplayJournalComponentStateUnavailable)
+        );
+        assert_eq!(
+            provision_initial_snapshot(
+                test_security_state_identity(0x72)?,
+                [0x76; STATE_DIGEST_BYTES],
+                &store,
+            ),
+            Err(SecurityStateBindingError::ReplayComponentUnavailable)
+        );
+        assert_eq!(
+            verify_current(&initial, &store),
+            Err(SecurityStateBindingError::ReplayComponentUnavailable)
+        );
+        assert_eq!(
+            successor_after_live_replay_advance(&initial, previous_replay_digest, &store),
+            Err(SecurityStateBindingError::ReplayComponentUnavailable)
+        );
+
+        drop(store);
+        let reopened = open_store(&directory)?;
+        assert_eq!(
+            verify_current(&initial, &reopened),
+            Err(SecurityStateBindingError::ReplayComponentMismatch)
+        );
+        Ok(())
     }
 
     #[test]

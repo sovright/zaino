@@ -207,11 +207,26 @@ Duplicate requests and continuations both record cover, and one public
 transaction bound is enforced before any secret-dependent claim condition.
 The journal has only a deterministic test protector, a transaction bound not
 yet derived from the compiled profile, no process lock for its assumed single
-writer, no runtime caller, and no binding into the outer component-state
-digest.
+writer, and no runtime caller.
+
+A module-private construction and verification foundation now defines a
+versioned, domain-separated composite security-component digest that currently
+commits the replay-journal component digest. Initial provisioning is explicit;
+its restart-verification seam accepts only an exact
+outer-snapshot/current-replay match and otherwise fails closed. A journal
+latched indeterminate cannot supply component state. Live successor
+construction requires the caller to retain the pre-advance replay digest and
+reads the real post-advance digest from a ready concrete journal. Supplying the
+same authoritative instance and allowed commit count remains a coordinator
+obligation. The binding performs no automatic direction inference or repair.
+No non-test caller can construct and coordinate both private stores in this
+slice.
 These foundations are not a concrete production witness or protector, a nonce
-or trusted-time journal, a key/nonce owner, runtime construction path, deployed
-rollback result, or access-oblivious memory/page/storage/timing implementation.
+or trusted-time journal, a key/nonce owner, runtime/owner construction path,
+coordinated witness advancement, an atomic combined replay/snapshot
+transaction, deployed rollback result, or access-oblivious
+memory/page/storage/timing implementation. Profile-v4 replay capacity and
+maintenance-cadence binding is deferred; profile ID v3 remains unchanged.
 
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
@@ -729,9 +744,24 @@ fixed-width snapshot binds the stable security identity plus opaque serving and
 component-state digests to a nonzero sequence. It is staged and synchronized
 locally before an injected witness compare-and-advance, and startup accepts only
 an exact local sequence/digest match. Staging files are ignored, and ambiguous
-local or witness commits fail closed until a fresh reconciliation. The
-component digest is only a boundary: replay, nonce, trusted-time, and key state
-are not yet durably journaled or wired to it, and no production witness exists.
+local or witness commits fail closed until a fresh reconciliation.
+
+The module-private construction and verification foundation now defines the
+first concrete input to that boundary: a versioned, domain-separated composite
+security-component digest currently commits the local replay-journal digest.
+Provisioning is explicit, its restart-verification seam requires the outer
+snapshot to match the current replay state exactly, and live successor
+construction requires both the retained pre-advance replay digest and the real
+current digest read from a ready post-advance journal. Mismatch or indeterminate
+journal health fails closed, with no direction inference or repair. The future
+coordinator must supply the same authoritative instance and enforce the allowed
+commit count. No non-test caller can construct and coordinate both private
+stores in this slice. This is neither coordinated witness advancement nor an
+atomic transaction across the journal and snapshot.
+Nonce, trusted-time, and key state are not durably journaled or composed yet;
+runtime/owner wiring and profile-v4 replay capacity/cadence binding remain
+open, profile ID v3 is unchanged, and no production witness or rollback claim
+exists.
 
 ## Private wire contract
 
@@ -963,9 +993,13 @@ Deliverables:
 
 - a production monotonic freshness witness and security-state owner built on
   the fixed outer snapshot/reconciliation foundation;
-- qualify and integrate the local atomic request/continuation replay journal,
-  plus implement nonce-reservation and trusted-time journals, with every
-  committed root feeding the outer component digest;
+- extend the current replay-only composite digest in profile v4 to bind replay
+  capacity and maintenance cadence, then integrate the local
+  request/continuation journal with runtime/owner construction;
+- coordinate replay commit, outer-snapshot replacement, and witness advancement
+  under a reviewed atomic or recoverably staged protocol;
+- implement nonce-reservation and trusted-time journals, with every committed
+  component feeding the outer digest;
 - production protector/material/key providers behind the internal
   `ActiveSecurityLease`;
 - concrete private-owner integration through the existing lifetime-safe facade,

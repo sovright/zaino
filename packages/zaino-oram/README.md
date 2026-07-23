@@ -79,8 +79,8 @@ offline dependency experiment:
   mismatched, oversized, or ambiguous state fails closed without automatic
   repair. Version-one transitions prohibit namespace and epoch rollback and
   require complete binding rotation with a new owner generation. The crate
-  provides no concrete witness, outer component-store binding, or runtime
-  caller for this foundation;
+  provides no concrete witness, coordinated component/witness transaction, or
+  runtime caller for this foundation;
 - a module-private crash-durable local replay-journal foundation. It implements
   the existing atomic request plus real-or-cover continuation guard seam using
   fixed-size sealed current-state and entry records. Protection binds an opaque
@@ -89,13 +89,28 @@ offline dependency experiment:
   immutable. Startup opens only the exact committed sequence paths and never
   inspects the later candidate; every retry uniformly replaces that
   non-authoritative path. Only a deterministic test protector exists. The
-  store is not runtime-wired or bound into the outer component-state digest,
-  its one public transaction bound is not profile-derived, and it assumes one
-  live writer without a process lock. Without an external freshness witness,
-  an absent `current.bin` opens as empty so an initial pre-marker crash can
-  retry; deletion of a previously committed marker is not locally detectable.
-  It supplies no rollback resistance, trusted time, nonce journal, production
-  key/nonce owner, or access-oblivious memory or persistence;
+  store is not runtime-wired, its one public transaction bound is not
+  profile-derived, and it assumes one live writer without a process lock.
+  Without an external freshness witness, an absent `current.bin` opens as empty
+  so an initial pre-marker crash can retry; deletion of a previously committed
+  marker is not locally detectable. It supplies no rollback resistance,
+  trusted time, nonce journal, production key/nonce owner, or access-oblivious
+  memory or persistence;
+- a module-private replay-component construction and verification foundation
+  for the outer security-state snapshot. Its versioned, domain-separated
+  composite security-component digest currently commits the replay-journal
+  component digest. Initial provisioning is explicit. Its restart-verification
+  seam accepts only an exact match between the outer snapshot and current
+  replay digest, with mismatch failing closed. A journal latched indeterminate
+  cannot supply component state. A live successor requires an explicitly
+  retained pre-advance replay digest and reads the real post-advance digest from
+  a ready concrete journal; it never infers transition direction or repairs
+  either side. Supplying the same authoritative instance and allowed commit
+  count remains a coordinator obligation. No non-test caller can construct and
+  coordinate both private stores in this slice. This does not coordinate
+  witness advancement or make the journal and outer snapshot one atomic
+  transaction. Runtime/owner wiring and profile-v4 replay capacity/cadence
+  binding remain open, while profile ID v3 is unchanged;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -292,9 +307,19 @@ The separate security-state store fixes local-before-witness ordering and exact
 startup reconciliation for a future composite-state digest, but it has no
 concrete freshness witness and does not persist nonce reservations, trusted
 time, or keys. A separate local replay journal now persists the logical request
-and continuation claim sets, but remains unwired, unwitnessed, protected only
-by a test fixture, and unbound from the outer component digest; runtime replay
-state therefore remains volatile. The available
+and continuation claim sets, but remains runtime-unwired, unwitnessed, and
+protected only by a test fixture; runtime replay state therefore remains
+volatile. A module-private construction and verification foundation now defines
+a versioned, domain-separated composite digest that binds the replay component
+into outer snapshot values. Initial provisioning and restart matching are
+explicit, and successor construction requires the retained pre-advance replay
+digest and reads the post-advance digest from a ready concrete journal.
+Supplying the same authoritative instance and allowed commit count remains a
+coordinator obligation. No non-test caller can construct and coordinate both
+private stores in this slice. The binding performs no automatic direction
+inference or repair, does not coordinate witness advancement, and is not an
+atomic combined transaction. Profile-v4 replay capacity/cadence binding is
+deferred; profile ID v3 is unchanged. The available
 XChaCha20-Poly1305 protectors are
 wired only through a private fixture-backed runtime composition, not a
 production key/session owner; the clock/material source and nonce/replay
@@ -305,7 +330,7 @@ commitment, but does not authenticate that metadata or prove its canonical
 ancestry. Neither commitment is an authenticated canonical/live Zaino snapshot
 root. This slice supplies no durable persistence, authenticated provenance,
 production cryptographic ownership, physical-obliviousness, allocator or timing
-equivalence, TDX, target-load, or mainnet evidence.
+equivalence, rollback resistance, TDX, target-load, or mainnet evidence.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline

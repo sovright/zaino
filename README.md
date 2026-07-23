@@ -101,17 +101,34 @@ bind that protection to an opaque journal context, and synchronize the next
 sequence candidate before the sole `current.bin` commit marker. Recovery
 rebuilds only the exact committed sequence range and never inspects a later
 candidate; retries replace that non-authoritative candidate uniformly. It is
-not connected to the runtime or outer component-state digest and has only a
-deterministic test protector. Its one public transaction bound is not
-profile-derived, and it assumes a single live writer without enforcing a
-process lock.
+not connected to the runtime and has only a deterministic test protector. Its
+one public transaction bound is not profile-derived, and it assumes a single
+live writer without enforcing a process lock.
+
+A module-private construction and verification foundation now joins the value
+contracts of those two local foundations. Its versioned, domain-separated
+composite security-component digest currently commits the replay-journal
+component digest. Initial provisioning is explicit. Its restart-verification
+seam recomputes the current replay digest and accepts only an exact match with
+the outer snapshot; a mismatch fails closed. A journal latched indeterminate
+cannot supply component state. Live successor construction requires an
+explicitly retained pre-advance replay digest and reads the real post-advance
+digest from a ready concrete journal, with no automatic direction inference or
+repair. The future coordinator must supply the same authoritative journal
+instance and enforce the allowed commit count.
+The layer does not coordinate freshness-witness advancement and is not an
+atomic transaction spanning the journal and outer snapshot.
+No non-test runtime or security-owner caller can construct and coordinate both
+private stores in this slice; that owner integration remains separate.
 
 This is still source-level research evidence. A production protector/replay/
 material-provider bundle, generated route and listener, runtime-integrated
 witness-backed replay, trusted clock, nonce ledger, key management, production
-freshness-witness ownership, rollback deployment evidence, TDX, and
-transport-write or peer-delivery evidence remain open. Profile ID v3 and the
-existing ten-phase logical schedule are unchanged. See the
+freshness-witness ownership and advancement, profile-v4 replay capacity and
+cadence binding, atomic combined persistence, rollback deployment evidence,
+TDX, access-oblivious qualification, and transport-write or peer-delivery
+evidence remain open. Profile ID v3 and the existing ten-phase logical schedule
+are unchanged. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
 [feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and
 [runtime security-owner ADR](./docs/adr/0009-private-query-runtime-security-state-owner.md).

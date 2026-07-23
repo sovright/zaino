@@ -287,21 +287,50 @@ both persist cover, and a noncanonical duplicate claim fails closed on recovery.
 One public transaction bound is checked before any secret-dependent claim
 condition.
 
+A module-private construction and verification foundation now defines how that
+replay state feeds the outer security-state commitment. A versioned,
+domain-separated composite security-component digest currently commits the
+replay-journal component digest. Initial provisioning is an explicit operation
+that constructs the outer snapshot from the journal's current digest. The
+restart-verification seam recomputes the current replay digest and accepts only
+an exact match with the outer snapshot; a mismatch fails closed. A journal
+latched indeterminate after an ambiguous durability result cannot supply
+component state to this layer.
+
+Live advancement is intentionally directional at the API boundary. The caller
+must retain the replay digest from before the live advance and pass that
+retained value together with a ready concrete journal when constructing the
+outer successor. The binding first requires the current outer snapshot to
+commit the retained pre-advance digest, reads the real current digest from that
+journal, then constructs the successor from the post-advance digest. Supplying
+the same authoritative journal instance and enforcing the allowed commit count
+remain coordinator obligations. The binding does not infer whether the journal
+or snapshot is ahead, rewrite either component, or provide an automatic repair
+path.
+
 These are ordering and local recovery foundations, not provider selections or
 production rollback claims. The replay journal has only a deterministic test
-protector, its transaction bound is not derived from a compiled profile, its
-component digest is not committed through the outer snapshot, and no runtime
-caller uses it. It assumes exactly one live writer without enforcing a process
-lock. There is no concrete freshness witness, production replay
-protector/key/nonce owner, nonce-reservation journal, trusted-time journal, key
-persistence, attestation binding, owner construction path, or service caller.
+protector, and no runtime or security-owner caller uses the component binding.
+No non-test caller can yet construct and coordinate both private stores; their
+ownership and any compiler-required visibility widening belong to the later
+owner-integration slice.
+The replay-journal commit, outer-snapshot replacement, and witness advancement
+are not one atomic transaction and are not yet coordinated. Its transaction
+bound and maintenance cadence are not bound by a compiled profile; that work
+is deferred to profile v4, while profile ID v3 remains unchanged. It assumes
+exactly one live writer without enforcing a process lock. There is no concrete
+freshness witness, production replay protector/key/nonce owner,
+nonce-reservation journal, trusted-time journal, key persistence, attestation
+binding, owner construction path, or service caller.
 Consequently, a missing `current.bin` is locally indistinguishable from first
 initialization and opens as empty so an initial pre-marker crash can retry; loss
 or deletion of a previously committed marker is not detected until the journal
-is bound into an external freshness witness.
+and outer snapshot are coordinated with an external freshness witness.
 The path-based filesystem helpers reject direct symlink components but do not
 provide dirfd-based no-follow traversal or adversarial-host TOCTOU protection.
 The journal makes no access-oblivious memory, page, storage, or timing claim.
+The component binding does not establish production rollback resistance, TDX
+security, or access-oblivious qualification.
 The first qualified deployment remains single-owner as required below.
 
 ### Lifecycle and response-release ordering

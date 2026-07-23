@@ -9,6 +9,25 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-oram`: add a module-private replay-component construction and
+  verification foundation for the outer security-state snapshot. A versioned,
+  domain-separated composite security-component digest currently commits the
+  replay-journal component digest. Initial provisioning is explicit; its
+  restart-verification seam
+  accepts only an exact match between the outer snapshot and the current replay
+  state, and any mismatch fails closed. A journal latched indeterminate cannot
+  supply component state. Live successor construction requires the caller to
+  retain the pre-advance replay digest and reads the real post-advance digest
+  from a ready concrete journal. Supplying the same authoritative journal
+  instance and an allowed commit count remains a coordinator obligation, so the
+  binding never infers transition direction or repairs either component
+  automatically. This is a construction and reconciliation foundation, not
+  coordinated witness advancement or an atomic combined transaction.
+  No non-test runtime or security-owner caller can construct and coordinate both
+  private stores in this slice; that owner integration, profile-v4 replay
+  capacity and cadence binding, production protector/nonce/time/key ownership,
+  and rollback, TDX, and access-oblivious qualification remain deferred.
+  Profile ID v3 is unchanged.
 - `zaino-oram`: add a crate-private crash-durable local replay-journal
   foundation for the atomic request plus real-or-cover continuation contract.
   Version-one current-state and immutable-entry records have exact fixed sizes
@@ -23,13 +42,13 @@ and this library adheres to Rust's notion of
   public transaction bound, authentication, exact-size reads, restart,
   candidate overwrite, direct-component path rejection, and crash prefixes.
   The store implements the existing replay-guard seam but is not wired into the
-  runtime or outer security-state digest. Its transaction bound is not yet
-  profile-derived, and there is no production protector/key/nonce owner,
-  external freshness witness, rollback resistance, nonce or trusted-time
-  journal, single-writer process lock, access-oblivious memory or persistence,
-  listener integration, or production qualification claim. Until witness
-  integration, an absent `current.bin` opens as empty and cannot distinguish
-  first initialization from loss of a previously committed marker.
+  runtime. Its transaction bound is not yet profile-derived, and there is no
+  production protector/key/nonce owner, coordinated external freshness-witness
+  advancement, rollback resistance, nonce or trusted-time journal,
+  single-writer process lock, access-oblivious memory or persistence, listener
+  integration, or production qualification claim. Until witness integration,
+  an absent `current.bin` opens as empty and cannot distinguish first
+  initialization from loss of a previously committed marker.
 - `zaino-oram`: add a crate-private witness-bound security-state persistence
   foundation. One fixed-width, versioned snapshot binds stable service,
   protocol, owner, key, projection, profile, session, and security-epoch
@@ -43,9 +62,9 @@ and this library adheres to Rust's notion of
   Crash-boundary tests cover staged-but-unpublished state, a durable local
   advance without witness authority, rejected witness advancement, and an
   advance-then-error reconciliation. This foundation supplies no concrete
-  witness, outer replay-journal binding, trusted-time or nonce journal, key
-  owner, runtime construction path, rollback deployment evidence, or production
-  privacy claim.
+  witness, runtime/owner construction path, coordinated replay-journal and
+  witness advancement, trusted-time or nonce journal, key owner, rollback
+  deployment evidence, or production privacy claim.
 - `zaino-oram`: add a crate-private, fixture-only runtime security contract
   API. Canonical versioned identities separate authenticated request-nonce
   replay from continuation replay, while one atomic in-memory seam completes
