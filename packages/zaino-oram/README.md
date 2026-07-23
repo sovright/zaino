@@ -201,16 +201,20 @@ gate unless it is already closed; a successful stop or owner drop closes it
 permanently. Once refresh has retired the active epoch, cancellation never
 restores it.
 
-This private composition seam does not enforce a process-wide singleton and has
-no service or listener caller. It does not implement or prove concurrent query
+This private composition seam does not enforce a process-wide singleton. The
+adjacent `zainod-oram` package now has an independent query protobuf and a
+crate-private listener-free adapter tested against a mock port, but it does not
+expose the owner bytes or release permit, construct or route the concrete
+process owner, or implement a generated Tonic service or listener. It does not
+implement or prove concurrent query
 admission, FIFO execution, queue saturation, overload rejection, waiting,
 deadlines, draining, or clean shutdown of the underlying worker. Its stop is
 logical: it retires the active runtime epoch and rejects later handle/refresh
 attempts. The response permit is listener-free and is not integrated with a
 transport write or response body. It therefore proves neither release-time
 currentness at the write boundary nor transport completion; the canonical
-source may advance independently while a permit is held. Private protobuf and
-body integration remain open.
+source may advance independently while a permit is held. Guarded response-body
+integration and actual owner wiring remain open.
 Replay state is volatile, and the injected protectors, clock/material source,
 and nonce/replay mechanisms are not production implementations. The frozen
 snapshot's lineage digest binds owner-assigned generation and exact

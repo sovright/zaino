@@ -3,6 +3,46 @@
 `zainod-oram` is a non-published application package for Zaino ORAM research.
 It is not part of the workspace's default members.
 
+## Listener-free private service boundary
+
+The default-off `private-service` feature compiles an independent
+`zaino.private.v1` protobuf contract owned by this package. Its only method is
+`PrivateCompactTxStreamer.QueryPage`; both directions carry one non-empty
+`FixedEnvelope.bytes` field whose decoded length must exactly match the selected
+compile-time profile:
+
+```console
+cargo check -p zainod-oram --features private-service
+```
+
+When `protoc` is available, the build script regenerates and formats a temporary
+copy, then fails if it differs from the committed Rust source. Refreshing after
+an intentional schema change requires the pinned toolchain's `rustfmt` and the
+explicit update mode:
+
+```console
+ZAINO_UPDATE_PRIVATE_PROTO=1 cargo check -p zainod-oram --features private-service
+```
+
+Builds without `protoc` consume the same committed source, so ordinary and
+native-builder checks do not depend on an ambient compiler and never select a
+different generated contract.
+
+The same feature adds a crate-private synchronous, listener-free adapter over a
+crate-private mockable runtime port. It validates the protobuf boundary through
+named `try_from_wire` / `to_wire` methods, maps boundary and runtime-port
+failures to one redacted adapter error, and returns the encoded response only
+inside a non-`Clone` pending value that continues to own the port's pending
+response.
+The real process owner remains private and is not exposed, constructed, or
+routed by this package.
+
+The generated Tonic service trait is deliberately not implemented in this
+slice. There is no listener, TLS, compression or message-limit policy,
+concurrent admission, response-body ownership, release-time currentness check,
+transport completion, peer delivery, attestation, or production privacy claim.
+The guarded body and actual owner wiring remain separate integration work.
+
 ## Release-bound deterministic-build receipt
 
 From a completely clean checkout at an exact full source revision, the

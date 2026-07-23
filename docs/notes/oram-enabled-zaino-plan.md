@@ -127,8 +127,13 @@ is not an enforced process singleton or service caller. The release gate is
 not a listener, transport-write, response-body, or currentness-at-write proof;
 the canonical source may advance independently while a permit is held. It does
 not establish concurrent admission, FIFO execution, queue/overload handling,
-waiting, deadlines, draining, or clean underlying-worker shutdown. Private
-protobuf and body integration remain open. The logical stop only retires the
+waiting, deadlines, draining, or clean underlying-worker shutdown. An
+independent `zaino.private.v1` query protobuf and a crate-private listener-free
+`zainod-oram` adapter tested against a mock runtime port now exist, while the
+concrete owner, its bytes, and release permit remain private. The adapter does
+not construct the owner or implement the generated Tonic service. A guarded
+real-owner facade and body integration remain open. The logical stop only
+retires the
 active epoch and rejects later handle/refresh attempts. This
 path does not authenticate the tip, ancestry, or slot provenance. The lineage
 commitment is not an authenticated canonical/live Zaino snapshot root. Live NFS
@@ -136,8 +141,8 @@ service routing, authenticated provenance, durable rollback authority, physical
 obliviousness, allocator and timing equivalence, TDX, mainnet, and target-load
 evidence remain open.
 Production AEAD, trusted clock and nonce ownership, durable replay storage,
-private protobuf/transport framing, and a service lifecycle also remain
-integration gates.
+guarded protobuf body/transport framing, concrete owner routing, and a service
+lifecycle also remain integration gates.
 
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
@@ -164,8 +169,11 @@ retired the epoch, cancellation does not restore it.
 Its listener-free response gate permits one non-`Clone` completed response to
 remain outstanding and rejects handle/refresh/shutdown before mutating retained
 owner or runtime state until permit drop reopens it unless already closed;
-successful stop and owner drop close it permanently. No service or listener
-calls this owner, and no enforced process singleton, concurrent
+successful stop and owner drop close it permanently. An adjacent crate-private
+listener-free adapter validates the independent query protobuf against a mock
+runtime port, without exposing the concrete owner's bytes or permit. The
+application does not construct or route this owner, and no service or listener
+calls it. No enforced process singleton, concurrent
 admission/FIFO/queue/wait/deadline/drain policy, transport-write or response-body
 integration, currentness-at-write proof, or clean worker-shutdown proof exists.
 The canonical source may advance independently while a permit is held. This path
@@ -479,16 +487,22 @@ restore it. This is not a listener, transport-write,
 response-body, or currentness-at-write proof: the canonical source may advance
 independently while a permit is held. A complete production projection feed
 still needs finalized block application, a finalized checkpoint/watermark and
-catch-up protocol, an enforced process singleton and service caller, private
-protobuf/body integration, concurrent admission/FIFO/queue/wait/deadline/drain
-behavior, clean worker shutdown, and service-lifetime ownership through the
-actual transport-write boundary.
+catch-up protocol, an enforced process singleton and service caller, a guarded
+real-owner protobuf-body integration, concurrent
+admission/FIFO/queue/wait/deadline/drain behavior, clean worker shutdown, and
+service-lifetime ownership through the actual transport-write boundary.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
 `zainod-oram` is a new non-published application package. Its private `proto/` directory owns the independent `zaino.private.v1` service, attestation, and optional admin modules. Do not edit the upstream lightwallet protocol subtree/symlinked proto files and do not make the ordinary `zaino-proto` release carry an experimental contract.
 
-`zainod-oram` also owns the private adapter generic over `PrivateQueryEngine`, the attested listener, optional admin routes, configuration, metrics, and lifecycle orchestration. Domain results and validation failures are encoded inside the fixed envelope; outer gRPC status is uniform for completed private queries.
+`zainod-oram` also owns the private adapter. Its first listener-free slice is
+generic over a crate-private mockable fixed-envelope runtime port; the guarded
+body slice must add a lifetime-safe facade over the real `PrivateQueryEngine`
+owner without exporting detached bytes. The package also owns the attested
+listener, optional admin routes, configuration, metrics, and lifecycle
+orchestration. Domain results and validation failures are encoded inside the
+fixed envelope; outer gRPC status is uniform for completed private queries.
 
 The existing publishable `zaino-serve` and `zainod` packages remain free of a `zaino-oram` dependency. `zainod-oram` composes `zainodlib` and other public building blocks, then starts/rebuilds the projection, starts the attested private listener, optionally starts the admin listener, aggregates readiness/status, and shuts components down in dependency order. If a reusable seam is missing, add an ORAM-agnostic API to the publishable crate rather than introducing the internal dependency in the opposite direction.
 

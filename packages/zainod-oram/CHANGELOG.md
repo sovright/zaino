@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add a default-off `private-service` feature with an independent
+  `zaino.private.v1.PrivateCompactTxStreamer/QueryPage` schema, committed
+  generated Rust source, exact outer-envelope length validation through named
+  wire methods, and a crate-private listener-free adapter tested against a mock
+  runtime port. Its non-`Clone` result retains the port's pending response. The
+  generated Tonic trait is not implemented; no concrete owner routing,
+  response-body/transport guard, currentness-at-write, listener, attestation, or
+  production privacy claim is added.
 - Add listener-free `corpus capture` over one indexed non-finalized mainnet
   snapshot, with optional explicit height/hash selection and atomic,
   read-back-verified measurement artifacts.

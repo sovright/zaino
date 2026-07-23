@@ -54,6 +54,10 @@ mod corpus_artifact;
 mod execution_identity;
 #[cfg(feature = "typed-qualification")]
 mod full_map_saturation_artifact;
+#[cfg(feature = "private-service")]
+mod private_proto;
+#[cfg(feature = "private-service")]
+mod private_service;
 #[cfg(feature = "typed-qualification")]
 mod qualification_artifact;
 #[cfg(feature = "typed-qualification")]
