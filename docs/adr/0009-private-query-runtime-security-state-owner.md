@@ -270,13 +270,39 @@ bindings must change. A future namespace or protocol migration requires a new
 reviewed transition rather than being silently blessed by a higher witness
 sequence.
 
-This is an ordering and recovery foundation, not a provider selection or
-production rollback claim. There is no concrete freshness witness, durable
-request/continuation replay journal, nonce-reservation journal, trusted-time
-journal, key persistence, attestation binding, owner construction path, or
-service caller. Future component stores must become durable before their digest
-is committed through this outer snapshot. The first qualified deployment
-remains single-owner as required below.
+The crate now also contains a local replay component-store foundation. A
+crate-private journal records each request lane together with its applied
+real-or-cover continuation lane in one ordered transaction. Exact fixed-size
+version-one record bodies are sealed through an injected protector and opaque
+journal context; replay identities, lane tags, counters, and the entry chain
+are not plaintext record fields. Sequential entry filenames still expose the
+public transaction sequence. The next sequence candidate is synchronized before
+the atomic `current.bin` replacement, and only `current.bin` defines the locally
+committed prefix. Startup opens exactly that prefix, reconstructs both claim
+sets and the chain digest, and requires an exact match with the sealed current
+state. It never opens `head + 1`; every retry replaces that non-authoritative
+candidate without inspecting its contents, while entries at or below the
+committed head remain immutable. Duplicate requests and duplicate continuations
+both persist cover, and a noncanonical duplicate claim fails closed on recovery.
+One public transaction bound is checked before any secret-dependent claim
+condition.
+
+These are ordering and local recovery foundations, not provider selections or
+production rollback claims. The replay journal has only a deterministic test
+protector, its transaction bound is not derived from a compiled profile, its
+component digest is not committed through the outer snapshot, and no runtime
+caller uses it. It assumes exactly one live writer without enforcing a process
+lock. There is no concrete freshness witness, production replay
+protector/key/nonce owner, nonce-reservation journal, trusted-time journal, key
+persistence, attestation binding, owner construction path, or service caller.
+Consequently, a missing `current.bin` is locally indistinguishable from first
+initialization and opens as empty so an initial pre-marker crash can retry; loss
+or deletion of a previously committed marker is not detected until the journal
+is bound into an external freshness witness.
+The path-based filesystem helpers reject direct symlink components but do not
+provide dirfd-based no-follow traversal or adversarial-host TOCTOU protection.
+The journal makes no access-oblivious memory, page, storage, or timing claim.
+The first qualified deployment remains single-owner as required below.
 
 ### Lifecycle and response-release ordering
 

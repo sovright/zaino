@@ -183,9 +183,10 @@ snapshot root. Live NFS
 service routing, authenticated provenance, durable rollback authority, physical
 obliviousness, allocator and timing equivalence, TDX, mainnet, and target-load
 evidence remain open.
-Production AEAD, trusted clock and nonce ownership, durable replay storage,
-guarded real-owner protobuf body/transport framing, concrete owner routing, and
-a service lifecycle also remain integration gates.
+Production AEAD, trusted clock and nonce ownership, witness-backed replay
+storage integrated with the outer state and runtime, guarded real-owner
+protobuf body/transport framing, concrete owner routing, and a service
+lifecycle also remain integration gates.
 
 The private crate now has the first persistence sub-slice required by that
 provider bundle: a fixed-width composite security-state snapshot and an
@@ -195,8 +196,22 @@ exact local/witness match, while mismatches and ambiguous commits fail closed.
 The version-one successor policy keeps service/protocol/profile identity stable,
 prevents owner/key/projection regression, and requires a new owner generation
 plus fresh session/security bindings for rotation.
-This is not a concrete witness, durable replay journal, nonce or trusted-time
-journal, key owner, runtime construction path, or deployed rollback result.
+The next component sub-slice is also present: a crate-private local replay
+journal implements the atomic request plus applied real-or-cover continuation
+guard using exact fixed-size records sealed under an opaque journal context. It
+synchronizes a replaceable `head + 1` candidate before atomically replacing
+`current.bin`, treats that file as the sole local commit marker, and rebuilds
+only its exact sequence prefix. Recovery never opens the later candidate;
+every retry replaces it uniformly, while committed entries remain immutable.
+Duplicate requests and continuations both record cover, and one public
+transaction bound is enforced before any secret-dependent claim condition.
+The journal has only a deterministic test protector, a transaction bound not
+yet derived from the compiled profile, no process lock for its assumed single
+writer, no runtime caller, and no binding into the outer component-state
+digest.
+These foundations are not a concrete production witness or protector, a nonce
+or trusted-time journal, a key/nonce owner, runtime construction path, deployed
+rollback result, or access-oblivious memory/page/storage/timing implementation.
 
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
@@ -577,13 +592,13 @@ lifetime-safe concrete-owner protobuf-body integration, concurrent
 admission/FIFO/queue/wait/deadline/drain behavior, clean worker shutdown, and
 service-lifetime ownership through the actual transport-write boundary. A
 public constructor or factory is intentionally absent. A non-test production
-protector/replay/material-provider bundle, durable replay, trusted clock and
-nonce ledger, and key management must exist and satisfy
+protector/replay/material-provider bundle, runtime-integrated witness-backed
+replay, trusted clock and nonce ledger, and key management must exist and satisfy
 [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md); the
 crate-internal XChaCha20-Poly1305 primitives and test-only raw security-bundle
-assembly do not satisfy that production ownership boundary or establish durable
-replay, trusted time, nonce-ledger, rollback, TDX, listener, or transport
-evidence.
+assembly do not satisfy that production ownership boundary or establish
+production replay freshness, trusted time, nonce-ledger, rollback, TDX,
+listener, or transport evidence.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
@@ -948,8 +963,9 @@ Deliverables:
 
 - a production monotonic freshness witness and security-state owner built on
   the fixed outer snapshot/reconciliation foundation;
-- durable atomic request/continuation replay, nonce-reservation, and
-  trusted-time journals whose committed roots feed the outer component digest;
+- qualify and integrate the local atomic request/continuation replay journal,
+  plus implement nonce-reservation and trusted-time journals, with every
+  committed root feeding the outer component digest;
 - production protector/material/key providers behind the internal
   `ActiveSecurityLease`;
 - concrete private-owner integration through the existing lifetime-safe facade,

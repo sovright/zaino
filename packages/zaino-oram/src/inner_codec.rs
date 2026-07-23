@@ -31,6 +31,7 @@ use crate::{
     },
 };
 
+mod replay_journal;
 mod runtime;
 mod security_owner;
 mod security_state_store;

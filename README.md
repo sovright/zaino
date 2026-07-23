@@ -94,12 +94,24 @@ sequence/digest exactly matches that witness. Ambiguous replacement or witness
 advancement fails closed. No concrete witness or runtime owner uses this store
 yet.
 
+Alongside it, a crate-private local replay-journal foundation durably orders
+one request lane with one real-or-cover continuation lane. Its fixed-size
+records seal replay identities and semantic state behind an injected protector,
+bind that protection to an opaque journal context, and synchronize the next
+sequence candidate before the sole `current.bin` commit marker. Recovery
+rebuilds only the exact committed sequence range and never inspects a later
+candidate; retries replace that non-authoritative candidate uniformly. It is
+not connected to the runtime or outer component-state digest and has only a
+deterministic test protector. Its one public transaction bound is not
+profile-derived, and it assumes a single live writer without enforcing a
+process lock.
+
 This is still source-level research evidence. A production protector/replay/
-material-provider bundle, generated route and listener, durable replay,
-trusted clock, nonce ledger, key management, production freshness-witness
-ownership, rollback deployment evidence, TDX, and transport-write or
-peer-delivery evidence remain open. Profile ID v3 and the existing ten-phase
-logical schedule are unchanged. See the
+material-provider bundle, generated route and listener, runtime-integrated
+witness-backed replay, trusted clock, nonce ledger, key management, production
+freshness-witness ownership, rollback deployment evidence, TDX, and
+transport-write or peer-delivery evidence remain open. Profile ID v3 and the
+existing ten-phase logical schedule are unchanged. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
 [feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and
 [runtime security-owner ADR](./docs/adr/0009-private-query-runtime-security-state-owner.md).

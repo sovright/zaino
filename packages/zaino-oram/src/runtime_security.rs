@@ -11,7 +11,9 @@ use std::{fmt, sync::Arc};
 use blake2::{Blake2s256, Digest};
 
 const CANONICAL_REPLAY_ENCODING_VERSION: u16 = 1;
-const REPLAY_DIGEST_BYTES: usize = 32;
+/// Fixed width of one opaque persistence-facing replay record identity.
+pub(super) const REPLAY_RECORD_KEY_BYTES: usize = 32;
+const REPLAY_DIGEST_BYTES: usize = REPLAY_RECORD_KEY_BYTES;
 const NONCE_BYTES: usize = 24;
 
 const REPLAY_NAMESPACE_DOMAIN: &[u8] = b"zaino-oram/runtime-security/replay-namespace";

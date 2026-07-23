@@ -66,9 +66,9 @@ offline dependency experiment:
   `ActiveSecurityLease` as the sole owner of its protection, replay, material,
   namespace, epoch, and release authority. No service/session handshake, key
   derivation/provisioning/rotation, nonce source or uniqueness owner, trusted
-  clock, durable replay state, attestation binding, or KMS/TDX lifecycle is
-  selected. The required joint ownership, rollback, and release contract is
-  fixed by
+  clock, runtime-integrated durable replay provider, attestation binding, or
+  KMS/TDX lifecycle is selected. The required joint ownership, rollback, and
+  release contract is fixed by
   [ADR 0009](../../docs/adr/0009-private-query-runtime-security-state-owner.md);
 - a module-private witness-bound security-state persistence foundation. Its
   fixed-width, versioned snapshot binds stable service, protocol, owner, key,
@@ -79,8 +79,23 @@ offline dependency experiment:
   mismatched, oversized, or ambiguous state fails closed without automatic
   repair. Version-one transitions prohibit namespace and epoch rollback and
   require complete binding rotation with a new owner generation. The crate
-  provides no concrete witness, component journal, or runtime caller for this
-  foundation;
+  provides no concrete witness, outer component-store binding, or runtime
+  caller for this foundation;
+- a module-private crash-durable local replay-journal foundation. It implements
+  the existing atomic request plus real-or-cover continuation guard seam using
+  fixed-size sealed current-state and entry records. Protection binds an opaque
+  journal context. The next sequence candidate becomes durable before
+  `current.bin`, the sole local commit marker, and committed entries are then
+  immutable. Startup opens only the exact committed sequence paths and never
+  inspects the later candidate; every retry uniformly replaces that
+  non-authoritative path. Only a deterministic test protector exists. The
+  store is not runtime-wired or bound into the outer component-state digest,
+  its one public transaction bound is not profile-derived, and it assumes one
+  live writer without a process lock. Without an external freshness witness,
+  an absent `current.bin` opens as empty so an initial pre-marker crash can
+  retry; deletion of a previously committed marker is not locally detectable.
+  It supplies no rollback resistance, trusted time, nonce journal, production
+  key/nonce owner, or access-oblivious memory or persistence;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -275,8 +290,11 @@ immediately afterward. Lifetime-safe cross-crate real-owner body integration
 remains open.
 The separate security-state store fixes local-before-witness ordering and exact
 startup reconciliation for a future composite-state digest, but it has no
-concrete freshness witness and does not persist replay, nonce reservations,
-trusted time, or keys. Replay state is volatile. The available
+concrete freshness witness and does not persist nonce reservations, trusted
+time, or keys. A separate local replay journal now persists the logical request
+and continuation claim sets, but remains unwired, unwitnessed, protected only
+by a test fixture, and unbound from the outer component digest; runtime replay
+state therefore remains volatile. The available
 XChaCha20-Poly1305 protectors are
 wired only through a private fixture-backed runtime composition, not a
 production key/session owner; the clock/material source and nonce/replay
