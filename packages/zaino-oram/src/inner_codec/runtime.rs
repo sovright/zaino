@@ -27,7 +27,17 @@ use crate::{
 };
 
 #[cfg(feature = "corpus-zaino")]
-use crate::projection_owner::FinalizedProjectionServingStore;
+use crate::{
+    canonical_chain::CanonicalNetwork,
+    projection_owner::FinalizedProjectionServingStore,
+    recent_snapshot::{CanonicalServingEpochCurrentness, RecentSnapshotRefreshController},
+};
+
+#[cfg(feature = "corpus-zaino")]
+use zaino_state::{
+    chain_index::CanonicalTransparentProjectionBoundary, BlockchainSource,
+    NodeBackedChainIndexSubscriber,
+};
 
 #[cfg(test)]
 use crate::recent_snapshot::{ServingEpochObservation, ServingEpochUnavailable};
@@ -118,7 +128,61 @@ impl<E, T, R, N> RuntimeDependencies<E, T, R, N> {
     }
 }
 
-/// Private synchronous adapter for one compiled logical research profile.
+/// Epoch-scoped query state replaced only after one coherent controller refresh.
+struct PrivateQueryRuntimeEpoch<
+    S,
+    C,
+    B,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+> {
+    engine: PrivateQueryEngine<ServingEpochStore<S>, RESPONSE_SLOTS, ENVELOPE_BYTES>,
+    recent_snapshot: FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>,
+    recent_snapshot_content_digest: [u8; 32],
+    recent_snapshot_binding_digest: [u8; 32],
+    serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
+    checkpoint: PrivateQueryCheckpoint,
+}
+
+impl<
+        S,
+        C,
+        B,
+        const RESPONSE_SLOTS: usize,
+        const ENVELOPE_BYTES: usize,
+        const RECENT_SNAPSHOT_SLOTS: usize,
+    > PrivateQueryRuntimeEpoch<S, C, B, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>
+where
+    S: ObliviousStore,
+{
+    fn new(
+        serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        checkpoint: PrivateQueryCheckpoint,
+    ) -> Result<Self, UniformExternalFailure> {
+        let recent_snapshot = serving_epoch.snapshot().clone();
+        if recent_snapshot.slots() != RECENT_SNAPSHOT_SLOTS
+            || recent_snapshot.identity() != recent_snapshot_identity(&checkpoint)
+        {
+            return Err(UniformExternalFailure);
+        }
+        let recent_snapshot_content_digest = recent_snapshot.content_digest();
+        let recent_snapshot_binding_digest = recent_snapshot.binding_digest();
+        let engine = PrivateQueryEngine::new(serving_epoch.finalized_store(), shape)
+            .map_err(|_| UniformExternalFailure)?;
+        Ok(Self {
+            engine,
+            recent_snapshot,
+            recent_snapshot_content_digest,
+            recent_snapshot_binding_digest,
+            serving_epoch,
+            checkpoint,
+        })
+    }
+}
+
+/// Private synchronous adapter for one process-lifetime protection context.
 struct PrivateQueryRuntime<
     S,
     E,
@@ -131,17 +195,15 @@ struct PrivateQueryRuntime<
     const ENVELOPE_BYTES: usize,
     const RECENT_SNAPSHOT_SLOTS: usize,
 > {
+    shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
     codec: PrivateQueryCodec<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-    engine: PrivateQueryEngine<ServingEpochStore<S>, RESPONSE_SLOTS, ENVELOPE_BYTES>,
-    recent_snapshot: FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>,
-    recent_snapshot_content_digest: [u8; 32],
-    recent_snapshot_binding_digest: [u8; 32],
     envelope_protector: E,
     token_protector: T,
     replay_guard: R,
     material_source: N,
-    serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
-    checkpoint: PrivateQueryCheckpoint,
+    epoch: Option<
+        PrivateQueryRuntimeEpoch<S, C, B, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>,
+    >,
     healthy: bool,
 }
 
@@ -167,25 +229,15 @@ where
     C: ServingEpochCurrentness<B>,
     B: ServingEpochBoundary,
 {
-    fn new(
-        serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
+    fn without_epoch(
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
         session_binding: [u8; 32],
-        checkpoint: PrivateQueryCheckpoint,
         dependencies: RuntimeDependencies<E, T, R, N>,
     ) -> Result<Self, UniformExternalFailure> {
-        let recent_snapshot = serving_epoch.snapshot().clone();
         shape
             .profile()
             .validate_recent_snapshot_slots::<RECENT_SNAPSHOT_SLOTS>()
             .map_err(|_| UniformExternalFailure)?;
-        if recent_snapshot.slots() != RECENT_SNAPSHOT_SLOTS
-            || recent_snapshot.identity() != recent_snapshot_identity(&checkpoint)
-        {
-            return Err(UniformExternalFailure);
-        }
-        let recent_snapshot_content_digest = recent_snapshot.content_digest();
-        let recent_snapshot_binding_digest = recent_snapshot.binding_digest();
         let combined_scan_slots = shape
             .profile()
             .combined_scan_slots()
@@ -193,22 +245,71 @@ where
         u64::try_from(combined_scan_slots).map_err(|_| UniformExternalFailure)?;
         let codec = PrivateQueryCodec::new(&shape, session_binding)
             .map_err(InnerCodecError::into_uniform_external_failure)?;
-        let engine = PrivateQueryEngine::new(serving_epoch.finalized_store(), shape)
-            .map_err(|_| UniformExternalFailure)?;
         Ok(Self {
+            shape,
             codec,
-            engine,
-            recent_snapshot,
-            recent_snapshot_content_digest,
-            recent_snapshot_binding_digest,
             envelope_protector: dependencies.envelope_protector,
             token_protector: dependencies.token_protector,
             replay_guard: dependencies.replay_guard,
             material_source: dependencies.material_source,
-            serving_epoch,
-            checkpoint,
+            epoch: None,
             healthy: true,
         })
+    }
+
+    fn new(
+        serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        session_binding: [u8; 32],
+        checkpoint: PrivateQueryCheckpoint,
+        dependencies: RuntimeDependencies<E, T, R, N>,
+    ) -> Result<Self, UniformExternalFailure> {
+        let mut runtime = Self::without_epoch(shape, session_binding, dependencies)?;
+        runtime.activate_epoch(serving_epoch, checkpoint)?;
+        Ok(runtime)
+    }
+
+    fn activate_epoch(
+        &mut self,
+        serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
+        checkpoint: PrivateQueryCheckpoint,
+    ) -> Result<(), UniformExternalFailure> {
+        self.epoch = None;
+        if !self.healthy {
+            return Err(UniformExternalFailure);
+        }
+        let epoch = PrivateQueryRuntimeEpoch::new(serving_epoch, self.shape, checkpoint)?;
+        self.epoch = Some(epoch);
+        Ok(())
+    }
+
+    fn retire_epoch(&mut self) {
+        self.epoch = None;
+    }
+
+    #[cfg(test)]
+    fn epoch_for_tests(
+        &self,
+    ) -> &PrivateQueryRuntimeEpoch<S, C, B, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>
+    {
+        self.epoch
+            .as_ref()
+            .expect("test runtime has an active serving epoch")
+    }
+
+    #[cfg(test)]
+    fn epoch_mut_for_tests(
+        &mut self,
+    ) -> &mut PrivateQueryRuntimeEpoch<S, C, B, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>
+    {
+        self.epoch
+            .as_mut()
+            .expect("test runtime has an active serving epoch")
+    }
+
+    #[cfg(test)]
+    fn continuation_query_digest_for_tests(&self, query: &crate::records::UtxoQuery) -> [u8; 32] {
+        self.continuation_query_digest(self.epoch_for_tests(), query)
     }
 
     /// Handles one fixed request without owning any listener or transport.
@@ -216,12 +317,30 @@ where
         &mut self,
         envelope: &FixedEnvelope<ENVELOPE_BYTES>,
     ) -> Result<RuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
+        let mut epoch = self.epoch.take().ok_or(UniformExternalFailure)?;
+        let result = self.handle_epoch(&mut epoch, envelope);
+        self.epoch = Some(epoch);
+        result
+    }
+
+    fn handle_epoch(
+        &mut self,
+        epoch: &mut PrivateQueryRuntimeEpoch<
+            S,
+            C,
+            B,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            RECENT_SNAPSHOT_SLOTS,
+        >,
+        envelope: &FixedEnvelope<ENVELOPE_BYTES>,
+    ) -> Result<RuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
         let (request, request_nonce) = self
             .codec
             .decode_request_with_nonce(envelope, &self.envelope_protector)
             .map_err(InnerCodecError::into_uniform_external_failure)?;
 
-        let profile = *self.engine.profile();
+        let profile = *epoch.engine.profile();
         let mut trace = TraceRecorder::new();
         trace
             .record_request_frame(ENVELOPE_BYTES)
@@ -238,7 +357,7 @@ where
             .record_runtime_phase(RuntimePhase::NonceAcquisition)
             .map_err(|_| self.latch_failure())?;
 
-        let query_digest = self.continuation_query_digest(request.query());
+        let query_digest = self.continuation_query_digest(epoch, request.query());
         let cursor_limit = u64::try_from(
             profile
                 .combined_scan_slots()
@@ -251,7 +370,7 @@ where
             .ok_or_else(|| self.latch_failure())?;
         let token_context = self
             .codec
-            .continuation_protection_context(&self.checkpoint)
+            .continuation_protection_context(&epoch.checkpoint)
             .map_err(|error| {
                 self.healthy = false;
                 error.into_uniform_external_failure()
@@ -260,7 +379,7 @@ where
             CONTINUATION_VERSION,
             *profile.profile_id(),
             query_digest,
-            self.checkpoint.projection_epoch,
+            epoch.checkpoint.projection_epoch,
             material.now_unix_seconds,
             cursor_limit,
         );
@@ -284,7 +403,7 @@ where
             .map_err(|_| self.latch_failure())?;
 
         let was_healthy = self.healthy;
-        let checkpoint_matches = request.checkpoint == self.checkpoint;
+        let checkpoint_matches = request.checkpoint == epoch.checkpoint;
         let (cursor, continuation_expiry, invalid_continuation, replay_unavailable) =
             match continuation_use {
                 ContinuationUse::Initial => (0, initial_expiry, false, false),
@@ -316,7 +435,7 @@ where
             trace
                 .record_recent_snapshot_read(ordinal)
                 .map_err(|_| self.latch_failure())?;
-            match self.recent_snapshot.read_slot(ordinal) {
+            match epoch.recent_snapshot.read_slot(ordinal) {
                 Ok(slot) => *destination = slot,
                 Err(_) => recent_snapshot_failed = true,
             }
@@ -325,16 +444,16 @@ where
             .complete_recent_snapshot_scan(RECENT_SNAPSHOT_SLOTS)
             .map_err(|_| self.latch_failure())?;
         let scanned_content_digest = content_digest(&recent_snapshot);
-        if self.recent_snapshot.slots() != RECENT_SNAPSHOT_SLOTS
-            || self.recent_snapshot.identity() != recent_snapshot_identity(&self.checkpoint)
-            || scanned_content_digest != self.recent_snapshot_content_digest
-            || lineage_binding_digest(self.recent_snapshot.lineage(), scanned_content_digest)
-                != self.recent_snapshot_binding_digest
+        if epoch.recent_snapshot.slots() != RECENT_SNAPSHOT_SLOTS
+            || epoch.recent_snapshot.identity() != recent_snapshot_identity(&epoch.checkpoint)
+            || scanned_content_digest != epoch.recent_snapshot_content_digest
+            || lineage_binding_digest(epoch.recent_snapshot.lineage(), scanned_content_digest)
+                != epoch.recent_snapshot_binding_digest
         {
             recent_snapshot_failed = true;
         }
 
-        let execution = self
+        let execution = epoch
             .engine
             .execute_from(request.query(), cursor, &recent_snapshot, &mut trace)
             .map_err(|_| self.latch_failure())?;
@@ -381,7 +500,7 @@ where
             CONTINUATION_VERSION,
             *profile.profile_id(),
             query_digest,
-            self.checkpoint.projection_epoch,
+            epoch.checkpoint.projection_epoch,
             issue_cursor,
             continuation_expiry,
             material.token_nonce,
@@ -393,7 +512,7 @@ where
 
         let has_more = protected_outcome == QueryOutcome::ResultBudgetExceeded;
         let continuation = if has_more { Some(issued) } else { None };
-        let response = PrivateQueryResponse::new(self.checkpoint, page, has_more, continuation)
+        let response = PrivateQueryResponse::new(epoch.checkpoint, page, has_more, continuation)
             .map_err(|error| {
                 self.healthy = false;
                 error.into_uniform_external_failure()
@@ -420,11 +539,11 @@ where
         let trace = trace
             .finish(profile.access_budget())
             .map_err(|_| self.latch_failure())?;
-        let observation = match self.serving_epoch.observe_current() {
+        let observation = match epoch.serving_epoch.observe_current() {
             Ok(observation) => observation,
             Err(_) => return Err(self.latch_failure()),
         };
-        if !self.serving_epoch.is_current(&observation) {
+        if !epoch.serving_epoch.is_current(&observation) {
             return Err(self.latch_failure());
         }
         Ok(RuntimeRound { envelope, trace })
@@ -435,10 +554,21 @@ where
         UniformExternalFailure
     }
 
-    fn continuation_query_digest(&self, query: &crate::records::UtxoQuery) -> [u8; 32] {
+    fn continuation_query_digest(
+        &self,
+        epoch: &PrivateQueryRuntimeEpoch<
+            S,
+            C,
+            B,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            RECENT_SNAPSHOT_SLOTS,
+        >,
+        query: &crate::records::UtxoQuery,
+    ) -> [u8; 32] {
         bind_query_digest(
             self.codec.query_digest(query),
-            self.recent_snapshot_binding_digest,
+            epoch.recent_snapshot_binding_digest,
         )
     }
 }
@@ -510,18 +640,328 @@ where
         session_binding: [u8; SESSION_BINDING_BYTES],
         dependencies: RuntimeDependencies<E, T, R, N>,
     ) -> Result<Self, FinalizedRuntimeBuildError> {
+        let mut runtime = Self::without_epoch(shape, session_binding, dependencies)
+            .map_err(|_| FinalizedRuntimeBuildError)?;
+        runtime.activate_finalized_serving_epoch(serving_epoch)?;
+        Ok(runtime)
+    }
+
+    fn activate_finalized_serving_epoch(
+        &mut self,
+        serving_epoch: ServingEpochLease<
+            RECENT_SNAPSHOT_SLOTS,
+            B,
+            FinalizedProjectionServingStore,
+            C,
+        >,
+    ) -> Result<(), FinalizedRuntimeBuildError> {
+        self.retire_epoch();
+        if !self.healthy {
+            return Err(FinalizedRuntimeBuildError);
+        }
         let checkpoint =
             PrivateQueryCheckpoint::try_from_serving_identity(serving_epoch.identity())?;
-        Self::new(
-            serving_epoch,
-            shape,
-            session_binding,
-            checkpoint,
-            dependencies,
-        )
-        .map_err(|_| FinalizedRuntimeBuildError)
+        self.activate_epoch(serving_epoch, checkpoint)
+            .map_err(|_| FinalizedRuntimeBuildError)
     }
 }
+
+/// Replaces only the epoch-scoped portion of one finalized runtime.
+///
+/// Retirement happens before the candidate future is polled, so cancellation
+/// while an asynchronous refresh is pending cannot leave the prior epoch
+/// eligible for later requests. Process-scoped protection, replay, material,
+/// session, profile, and health state remain owned by `runtime`.
+#[cfg(feature = "corpus-zaino")]
+async fn replace_finalized_runtime_epoch_from<
+    E,
+    T,
+    R,
+    N,
+    C,
+    B,
+    Candidate,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+>(
+    runtime: &mut PrivateQueryRuntime<
+        FinalizedProjectionServingStore,
+        E,
+        T,
+        R,
+        N,
+        C,
+        B,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >,
+    stopped: bool,
+    candidate: Candidate,
+) -> Result<(), FinalizedRuntimeOwnerError>
+where
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+    C: ServingEpochCurrentness<B>,
+    B: ServingEpochBoundary,
+    Candidate: std::future::Future<
+        Output = Result<
+            ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, FinalizedProjectionServingStore, C>,
+            FinalizedRuntimeOwnerError,
+        >,
+    >,
+{
+    runtime.retire_epoch();
+    if stopped || !runtime.healthy {
+        return Err(FinalizedRuntimeOwnerError);
+    }
+
+    let serving_epoch = candidate.await?;
+    runtime
+        .activate_finalized_serving_epoch(serving_epoch)
+        .map_err(coarsen_runtime_owner_error)
+}
+
+#[cfg(feature = "corpus-zaino")]
+fn stop_finalized_runtime<
+    E,
+    T,
+    R,
+    N,
+    C,
+    B,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+>(
+    runtime: &mut PrivateQueryRuntime<
+        FinalizedProjectionServingStore,
+        E,
+        T,
+        R,
+        N,
+        C,
+        B,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >,
+    stopped: &mut bool,
+) where
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+    C: ServingEpochCurrentness<B>,
+    B: ServingEpochBoundary,
+{
+    *stopped = true;
+    runtime.retire_epoch();
+}
+
+#[cfg(feature = "corpus-zaino")]
+type FinalizedProcessRuntime<
+    Source,
+    E,
+    T,
+    R,
+    N,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+> = PrivateQueryRuntime<
+    FinalizedProjectionServingStore,
+    E,
+    T,
+    R,
+    N,
+    CanonicalServingEpochCurrentness<Source>,
+    CanonicalTransparentProjectionBoundary,
+    RESPONSE_SLOTS,
+    ENVELOPE_BYTES,
+    RECENT_SNAPSHOT_SLOTS,
+>;
+
+/// Process-lifetime owner for one controller and at most one active epoch.
+#[cfg(feature = "corpus-zaino")]
+struct FinalizedRuntimeOwner<
+    Source,
+    E,
+    T,
+    R,
+    N,
+    const RESPONSE_SLOTS: usize,
+    const ENVELOPE_BYTES: usize,
+    const RECENT_SNAPSHOT_SLOTS: usize,
+> where
+    Source: BlockchainSource,
+{
+    controller: RecentSnapshotRefreshController<
+        RECENT_SNAPSHOT_SLOTS,
+        FinalizedProjectionServingStore,
+        CanonicalServingEpochCurrentness<Source>,
+    >,
+    runtime: FinalizedProcessRuntime<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >,
+    stopped: bool,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        const RESPONSE_SLOTS: usize,
+        const ENVELOPE_BYTES: usize,
+        const RECENT_SNAPSHOT_SLOTS: usize,
+    >
+    FinalizedRuntimeOwner<Source, E, T, R, N, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>
+where
+    Source: BlockchainSource,
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+{
+    fn new(
+        network: CanonicalNetwork,
+        schema_version: u32,
+        projection_epoch: u64,
+        key_epoch: u64,
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        session_binding: [u8; SESSION_BINDING_BYTES],
+        dependencies: RuntimeDependencies<E, T, R, N>,
+    ) -> Result<Self, FinalizedRuntimeOwnerError> {
+        let controller = RecentSnapshotRefreshController::new(
+            network,
+            schema_version,
+            projection_epoch,
+            key_epoch,
+        )
+        .map_err(coarsen_runtime_owner_error)?;
+        let runtime = PrivateQueryRuntime::without_epoch(shape, session_binding, dependencies)
+            .map_err(coarsen_runtime_owner_error)?;
+        Ok(Self {
+            controller,
+            runtime,
+            stopped: false,
+        })
+    }
+
+    /// Retires the prior epoch before capture and publishes no stale fallback.
+    async fn refresh(
+        &mut self,
+        subscriber: &NodeBackedChainIndexSubscriber<Source>,
+        finalized_store: FinalizedProjectionServingStore,
+    ) -> Result<(), FinalizedRuntimeOwnerError> {
+        let committed_finalized = finalized_store.committed_checkpoint();
+        let controller = &mut self.controller;
+        let candidate = async move {
+            controller
+                .refresh(subscriber, committed_finalized, finalized_store)
+                .await
+                .map_err(coarsen_runtime_owner_error)?;
+            controller
+                .pin_serving_epoch()
+                .ok_or(FinalizedRuntimeOwnerError)
+        };
+        let result =
+            replace_finalized_runtime_epoch_from(&mut self.runtime, self.stopped, candidate).await;
+        if result.is_err() {
+            self.controller.invalidate_publication();
+        }
+        result
+    }
+
+    fn handle(
+        &mut self,
+        envelope: &FixedEnvelope<ENVELOPE_BYTES>,
+    ) -> Result<RuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
+        if self.stopped {
+            return Err(UniformExternalFailure);
+        }
+        let result = self.runtime.handle(envelope);
+        if !self.runtime.healthy {
+            self.runtime.retire_epoch();
+            self.controller.invalidate_publication();
+        }
+        result
+    }
+
+    fn shutdown(&mut self) {
+        stop_finalized_runtime(&mut self.runtime, &mut self.stopped);
+        self.controller.invalidate_publication();
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        const RESPONSE_SLOTS: usize,
+        const ENVELOPE_BYTES: usize,
+        const RECENT_SNAPSHOT_SLOTS: usize,
+    > std::fmt::Debug
+    for FinalizedRuntimeOwner<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >
+where
+    Source: BlockchainSource,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FinalizedRuntimeOwner { ..REDACTED.. }")
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+fn coarsen_runtime_owner_error<T>(_: T) -> FinalizedRuntimeOwnerError {
+    FinalizedRuntimeOwnerError
+}
+
+/// Coarsened process-lifecycle failure without epoch identifiers.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FinalizedRuntimeOwnerError;
+
+#[cfg(feature = "corpus-zaino")]
+impl std::fmt::Debug for FinalizedRuntimeOwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FinalizedRuntimeOwnerError { ..REDACTED.. }")
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::fmt::Display for FinalizedRuntimeOwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("private-query runtime owner unavailable")
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::error::Error for FinalizedRuntimeOwnerError {}
 
 /// Coarsened finalized-runtime construction failure without epoch identifiers.
 #[cfg(feature = "corpus-zaino")]
@@ -690,8 +1130,21 @@ mod tests {
         DeterministicServingEpochCurrentness,
     >;
 
+    #[cfg(feature = "corpus-zaino")]
+    type FinalizedTestOwner = FinalizedRuntimeOwner<
+        zaino_state::ValidatorConnector,
+        DeterministicEnvelopeProtector,
+        CountingTokenProtector,
+        CountingReplayGuard,
+        DeterministicMaterialSource,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >;
+
     fn finalized_store_reads(runtime: &TestRuntime) -> usize {
         runtime
+            .epoch_for_tests()
             .engine
             .store()
             .inspect_for_tests(|store| store.read_slots().len())
@@ -703,6 +1156,7 @@ mod tests {
         inspect: impl FnOnce(&mut DeterministicServingEpochCurrentness) -> T,
     ) -> T {
         runtime
+            .epoch_for_tests()
             .serving_epoch
             .with_currentness_for_tests(inspect)
             .expect("serving-epoch test currentness mutex is not poisoned")
@@ -1131,8 +1585,15 @@ mod tests {
     }
 
     fn recent_snapshot_lineage(identity: RecentSnapshotIdentity) -> RecentSnapshotLineage {
+        recent_snapshot_lineage_at_generation(identity, 1)
+    }
+
+    fn recent_snapshot_lineage_at_generation(
+        identity: RecentSnapshotIdentity,
+        generation: u64,
+    ) -> RecentSnapshotLineage {
         RecentSnapshotLineage::from_parts_for_tests(
-            1,
+            generation,
             identity,
             identity
                 .finalized_height()
@@ -1148,13 +1609,22 @@ mod tests {
         map_identity: impl FnOnce(RecentSnapshotIdentity) -> RecentSnapshotIdentity,
     ) -> Result<(FinalizedTestEpoch, RecentSnapshotIdentity, usize), Box<dyn std::error::Error>>
     {
+        finalized_test_epoch_at_generation(1, map_identity)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn finalized_test_epoch_at_generation(
+        generation: u64,
+        map_identity: impl FnOnce(RecentSnapshotIdentity) -> RecentSnapshotIdentity,
+    ) -> Result<(FinalizedTestEpoch, RecentSnapshotIdentity, usize), Box<dyn std::error::Error>>
+    {
         let store = finalized_serving_store_for_runtime_tests()?;
         let owner_identity = store.serving_identity();
         let store_reads = store.slots_per_key();
         let snapshot_identity = map_identity(owner_identity);
         let snapshot = recent_snapshot_with_lineage(
             [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
-            recent_snapshot_lineage(snapshot_identity),
+            recent_snapshot_lineage_at_generation(snapshot_identity, generation),
         );
         Ok((
             serving_epoch_with_store(snapshot, store),
@@ -1178,18 +1648,93 @@ mod tests {
         )
     }
 
-    fn request_envelope(
-        runtime: &TestRuntime,
+    fn request_envelope<S, C, B>(
+        runtime: &PrivateQueryRuntime<
+            S,
+            DeterministicEnvelopeProtector,
+            CountingTokenProtector,
+            CountingReplayGuard,
+            DeterministicMaterialSource,
+            C,
+            B,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            RECENT_SNAPSHOT_SLOTS,
+        >,
         checkpoint: PrivateQueryCheckpoint,
         query: UtxoQuery,
         continuation: Option<ContinuationToken>,
         nonce_byte: u8,
-    ) -> Result<FixedEnvelope<ENVELOPE_BYTES>, InnerCodecError> {
+    ) -> Result<FixedEnvelope<ENVELOPE_BYTES>, InnerCodecError>
+    where
+        S: ObliviousStore,
+        C: ServingEpochCurrentness<B>,
+        B: ServingEpochBoundary,
+    {
         runtime.codec.encode_request(
             &super::super::PrivateQueryRequest::new(checkpoint, query, continuation),
             [nonce_byte; ENVELOPE_NONCE_BYTES],
             &runtime.envelope_protector,
         )
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn finalized_handle_and_decode(
+        runtime: &mut FinalizedTestRuntime,
+        request: &FixedEnvelope<ENVELOPE_BYTES>,
+    ) -> Result<PrivateQueryResponse<RESPONSE_SLOTS>, Box<dyn std::error::Error>> {
+        let round = runtime.handle(request)?;
+        Ok(runtime
+            .codec
+            .decode_response(round.envelope(), &runtime.envelope_protector)?)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FinalizedProcessCounters {
+        envelope_opens: usize,
+        envelope_seals: usize,
+        token_opens: usize,
+        token_seals: usize,
+        replay_calls: usize,
+        replay_claims: usize,
+        replay_reads: usize,
+        replay_writes: usize,
+        material_calls: usize,
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    impl FinalizedProcessCounters {
+        fn capture<C, B>(
+            runtime: &PrivateQueryRuntime<
+                FinalizedProjectionServingStore,
+                DeterministicEnvelopeProtector,
+                CountingTokenProtector,
+                CountingReplayGuard,
+                DeterministicMaterialSource,
+                C,
+                B,
+                RESPONSE_SLOTS,
+                ENVELOPE_BYTES,
+                RECENT_SNAPSHOT_SLOTS,
+            >,
+        ) -> Self
+        where
+            C: ServingEpochCurrentness<B>,
+            B: ServingEpochBoundary,
+        {
+            Self {
+                envelope_opens: runtime.envelope_protector.opens.get(),
+                envelope_seals: runtime.envelope_protector.seals.get(),
+                token_opens: runtime.token_protector.opens.get(),
+                token_seals: runtime.token_protector.seals.get(),
+                replay_calls: runtime.replay_guard.calls,
+                replay_claims: runtime.replay_guard.real_claim_attempts,
+                replay_reads: runtime.replay_guard.logical_reads,
+                replay_writes: runtime.replay_guard.logical_writes,
+                material_calls: runtime.material_source.calls,
+            }
+        }
     }
 
     struct RuntimeCounters {
@@ -1218,7 +1763,7 @@ mod tests {
                 replay_writes: runtime.replay_guard.logical_writes,
                 material_calls: runtime.material_source.calls,
                 serving_epoch_observations: serving_epoch_observations(runtime),
-                recent_snapshot_reads: runtime.recent_snapshot.read_calls(),
+                recent_snapshot_reads: runtime.epoch_for_tests().recent_snapshot.read_calls(),
                 store_reads: finalized_store_reads(runtime),
             }
         }
@@ -1243,12 +1788,12 @@ mod tests {
                 1
             );
             assert_eq!(
-                runtime.recent_snapshot.read_calls() - self.recent_snapshot_reads,
+                runtime.epoch_for_tests().recent_snapshot.read_calls() - self.recent_snapshot_reads,
                 RECENT_SNAPSHOT_SLOTS
             );
             assert_eq!(
                 finalized_store_reads(runtime) - self.store_reads,
-                runtime.engine.profile().store_reads()
+                runtime.epoch_for_tests().engine.profile().store_reads()
             );
         }
     }
@@ -1266,7 +1811,10 @@ mod tests {
             .codec
             .decode_response(round.envelope(), &runtime.envelope_protector)?;
         assert_eq!(trace.runtime_phases(), RuntimePhase::COUNT);
-        assert_eq!(trace.store_reads(), runtime.engine.profile().store_reads());
+        assert_eq!(
+            trace.store_reads(),
+            runtime.epoch_for_tests().engine.profile().store_reads()
+        );
         assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_SLOTS);
         assert_eq!(trace.replay_reads(), 1);
         assert_eq!(trace.replay_writes(), 1);
@@ -1305,6 +1853,114 @@ mod tests {
 
     #[cfg(feature = "corpus-zaino")]
     #[test]
+    fn finalized_runtime_owner_is_unready_before_refresh_and_stops_once(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store_reads = finalized_serving_store_for_runtime_tests()?.slots_per_key();
+        let mut owner = FinalizedTestOwner::new(
+            CanonicalNetwork::Mainnet,
+            1,
+            7,
+            9,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let request = FixedEnvelope::from_array([0; ENVELOPE_BYTES]);
+
+        assert!(matches!(
+            owner.handle(&request),
+            Err(UniformExternalFailure)
+        ));
+        assert!(owner.runtime.healthy);
+        assert!(owner.runtime.epoch.is_none());
+        assert!(owner.controller.pin_serving_epoch().is_none());
+        assert_eq!(
+            format!("{owner:?}"),
+            "FinalizedRuntimeOwner { ..REDACTED.. }"
+        );
+        let error = FinalizedRuntimeOwnerError;
+        assert_eq!(
+            format!("{error:?}"),
+            "FinalizedRuntimeOwnerError { ..REDACTED.. }"
+        );
+        assert_eq!(error.to_string(), "private-query runtime owner unavailable");
+
+        let counters = FinalizedProcessCounters::capture(&owner.runtime);
+        owner.shutdown();
+        owner.shutdown();
+        assert!(owner.stopped);
+        assert!(owner.runtime.epoch.is_none());
+        assert!(owner.controller.pin_serving_epoch().is_none());
+        assert!(matches!(
+            owner.handle(&request),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(FinalizedProcessCounters::capture(&owner.runtime), counters);
+        let _refresh = FinalizedTestOwner::refresh;
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test]
+    async fn ready_finalized_runtime_stop_is_idempotent_and_prevents_reactivation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (serving_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            serving_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let request = request_envelope(
+            &runtime,
+            checkpoint,
+            UtxoQuery::new(address(0xee), 0),
+            None,
+            1,
+        )?;
+        let response = finalized_handle_and_decode(&mut runtime, &request)?;
+        assert_eq!(response.page.outcome(), QueryOutcome::Complete);
+        let counters = FinalizedProcessCounters::capture(&runtime);
+
+        let mut stopped = false;
+        stop_finalized_runtime(&mut runtime, &mut stopped);
+        stop_finalized_runtime(&mut runtime, &mut stopped);
+        assert!(stopped);
+        assert!(runtime.epoch.is_none());
+        assert!(runtime.healthy);
+        assert!(matches!(
+            runtime.handle(&request),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let (replacement, _, replacement_store_reads) =
+            finalized_test_epoch_at_generation(2, |identity| identity)?;
+        assert_eq!(replacement_store_reads, store_reads);
+        assert_eq!(
+            replace_finalized_runtime_epoch_from(
+                &mut runtime,
+                stopped,
+                std::future::ready(Ok(replacement)),
+            )
+            .await,
+            Err(FinalizedRuntimeOwnerError)
+        );
+        assert!(runtime.epoch.is_none());
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
     fn finalized_epoch_factory_derives_checkpoint_and_retains_runtime_state(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (serving_epoch, identity, store_reads) = finalized_test_epoch(|identity| identity)?;
@@ -1318,23 +1974,21 @@ mod tests {
             ),
         )?;
 
-        assert_eq!(runtime.checkpoint.network.tag(), identity.network_tag());
-        assert_eq!(runtime.checkpoint.height, identity.finalized_height());
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        assert_eq!(checkpoint.network.tag(), identity.network_tag());
+        assert_eq!(checkpoint.height, identity.finalized_height());
         assert_eq!(
-            runtime.checkpoint.block_hash_display,
+            checkpoint.block_hash_display,
             *identity.finalized_hash_display()
         );
-        assert_eq!(runtime.checkpoint.schema_version, identity.schema_version());
-        assert_eq!(
-            runtime.checkpoint.projection_epoch,
-            identity.projection_epoch()
-        );
-        assert_eq!(runtime.checkpoint.key_epoch, identity.key_epoch());
+        assert_eq!(checkpoint.schema_version, identity.schema_version());
+        assert_eq!(checkpoint.projection_epoch, identity.projection_epoch());
+        assert_eq!(checkpoint.key_epoch, identity.key_epoch());
 
         for nonce_byte in [1, 2] {
             let request = runtime.codec.encode_request(
                 &super::super::PrivateQueryRequest::new(
-                    runtime.checkpoint,
+                    checkpoint,
                     UtxoQuery::new(address(0xee), 0),
                     None,
                 ),
@@ -1349,6 +2003,284 @@ mod tests {
         }
         assert_eq!(runtime.material_source.calls, 2);
         assert!(runtime.healthy);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test]
+    async fn pending_finalized_epoch_replacement_retires_before_await_without_state_reset(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (first_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            first_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let request = request_envelope(
+            &runtime,
+            checkpoint,
+            UtxoQuery::new(address(0xee), 0),
+            None,
+            1,
+        )?;
+        let response = finalized_handle_and_decode(&mut runtime, &request)?;
+        assert_eq!(response.page.outcome(), QueryOutcome::Complete);
+        let counters = FinalizedProcessCounters::capture(&runtime);
+
+        {
+            let replacement = replace_finalized_runtime_epoch_from(
+                &mut runtime,
+                false,
+                std::future::pending::<Result<FinalizedTestEpoch, FinalizedRuntimeOwnerError>>(),
+            );
+            tokio::pin!(replacement);
+            tokio::select! {
+                biased;
+                result = &mut replacement => {
+                    panic!("pending replacement completed unexpectedly: {result:?}")
+                }
+                _ = async {} => {}
+            }
+        }
+
+        assert!(runtime.epoch.is_none());
+        assert!(runtime.healthy);
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+        assert!(matches!(
+            runtime.handle(&request),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test]
+    async fn finalized_epoch_replacement_preserves_process_state_and_monotonic_health(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (first_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::without_epoch(
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        runtime.activate_finalized_serving_epoch(first_epoch)?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let query = UtxoQuery::new(address(0xee), 0);
+        let first_binding_digest = runtime.epoch_for_tests().recent_snapshot_binding_digest;
+        assert_eq!(
+            runtime
+                .epoch_for_tests()
+                .recent_snapshot
+                .lineage()
+                .generation(),
+            1
+        );
+
+        let first_request = request_envelope(&runtime, checkpoint, query, None, 1)?;
+        let first_response = finalized_handle_and_decode(&mut runtime, &first_request)?;
+        assert_eq!(first_response.page.outcome(), QueryOutcome::Complete);
+        assert_eq!(runtime.replay_guard.calls, 1);
+        assert_eq!(runtime.material_source.calls, 1);
+
+        let profile = *runtime.epoch_for_tests().engine.profile();
+        let token_context = runtime.codec.continuation_protection_context(&checkpoint)?;
+        let old_continuation = ContinuationToken::issue(
+            &ContinuationState::new(
+                CONTINUATION_VERSION,
+                *profile.profile_id(),
+                runtime.continuation_query_digest_for_tests(&query),
+                checkpoint.projection_epoch,
+                1,
+                160,
+                [0x41; ENVELOPE_NONCE_BYTES],
+            ),
+            &token_context,
+            &runtime.token_protector,
+        );
+        let counters_before_replacement = FinalizedProcessCounters::capture(&runtime);
+
+        let (replacement_epoch, _, replacement_store_reads) =
+            finalized_test_epoch_at_generation(2, |identity| identity)?;
+        assert_eq!(replacement_store_reads, store_reads);
+        replace_finalized_runtime_epoch_from(
+            &mut runtime,
+            false,
+            std::future::ready(Ok(replacement_epoch)),
+        )
+        .await?;
+        assert_eq!(
+            runtime
+                .epoch_for_tests()
+                .recent_snapshot
+                .lineage()
+                .generation(),
+            2
+        );
+        assert_ne!(
+            runtime.epoch_for_tests().recent_snapshot_binding_digest,
+            first_binding_digest
+        );
+        assert_eq!(runtime.epoch_for_tests().checkpoint, checkpoint);
+        assert_eq!(
+            FinalizedProcessCounters::capture(&runtime),
+            counters_before_replacement
+        );
+
+        let old_continuation_request =
+            request_envelope(&runtime, checkpoint, query, Some(old_continuation), 2)?;
+        let old_continuation_response =
+            finalized_handle_and_decode(&mut runtime, &old_continuation_request)?;
+        assert_eq!(
+            old_continuation_response.page.outcome(),
+            QueryOutcome::InvalidContinuation
+        );
+        assert!(old_continuation_response.page.is_all_dummy());
+
+        let replacement_request = request_envelope(&runtime, checkpoint, query, None, 3)?;
+        let replacement_response = finalized_handle_and_decode(&mut runtime, &replacement_request)?;
+        assert_eq!(replacement_response.page.outcome(), QueryOutcome::Complete);
+        assert_eq!(runtime.replay_guard.calls, 3);
+        assert_eq!(runtime.material_source.calls, 3);
+        assert!(runtime.healthy);
+
+        runtime
+            .epoch_for_tests()
+            .serving_epoch
+            .with_currentness_for_tests(|currentness| currentness.available = false)
+            .ok_or("serving-epoch currentness mutex is poisoned")?;
+        let unavailable_request = request_envelope(&runtime, checkpoint, query, None, 4)?;
+        assert!(matches!(
+            runtime.handle(&unavailable_request),
+            Err(UniformExternalFailure)
+        ));
+        assert!(!runtime.healthy);
+        assert_eq!(runtime.replay_guard.calls, 4);
+        assert_eq!(runtime.material_source.calls, 4);
+
+        let (recovery_epoch, _, _) = finalized_test_epoch_at_generation(3, |identity| identity)?;
+        assert_eq!(
+            replace_finalized_runtime_epoch_from(
+                &mut runtime,
+                false,
+                std::future::ready(Ok(recovery_epoch)),
+            )
+            .await,
+            Err(FinalizedRuntimeOwnerError)
+        );
+        assert!(runtime.epoch.is_none());
+        assert!(matches!(
+            runtime.handle(&unavailable_request),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(runtime.replay_guard.calls, 4);
+        assert_eq!(runtime.material_source.calls, 4);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test]
+    async fn failed_finalized_epoch_replacements_never_fall_back_and_can_recover(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (first_epoch, _, store_reads) =
+            finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+            first_epoch,
+            runtime_shape(store_reads)?,
+            SESSION_BINDING,
+            runtime_dependencies(
+                CountingReplayGuard::available(),
+                DeterministicMaterialSource::at(100),
+            ),
+        )?;
+        let checkpoint = runtime.epoch_for_tests().checkpoint;
+        let request = request_envelope(
+            &runtime,
+            checkpoint,
+            UtxoQuery::new(address(0xee), 0),
+            None,
+            1,
+        )?;
+        let counters = FinalizedProcessCounters::capture(&runtime);
+
+        assert_eq!(
+            replace_finalized_runtime_epoch_from(
+                &mut runtime,
+                false,
+                std::future::ready(Err(FinalizedRuntimeOwnerError)),
+            )
+            .await,
+            Err(FinalizedRuntimeOwnerError)
+        );
+        assert!(runtime.epoch.is_none());
+        assert!(runtime.healthy);
+        assert!(matches!(
+            runtime.handle(&request),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let (invalid_epoch, _, _) = finalized_test_epoch(|identity| {
+            RecentSnapshotIdentity::new(
+                u8::MAX,
+                identity.finalized_height(),
+                *identity.finalized_hash_display(),
+                identity.schema_version(),
+                identity.projection_epoch(),
+                identity.key_epoch(),
+            )
+        })?;
+        assert_eq!(
+            replace_finalized_runtime_epoch_from(
+                &mut runtime,
+                false,
+                std::future::ready(Ok(invalid_epoch)),
+            )
+            .await,
+            Err(FinalizedRuntimeOwnerError)
+        );
+        assert!(runtime.epoch.is_none());
+        assert!(runtime.healthy);
+        assert!(matches!(
+            runtime.handle(&request),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let (recovery_epoch, _, recovery_store_reads) =
+            finalized_test_epoch_at_generation(2, |identity| identity)?;
+        assert_eq!(recovery_store_reads, store_reads);
+        replace_finalized_runtime_epoch_from(
+            &mut runtime,
+            false,
+            std::future::ready(Ok(recovery_epoch)),
+        )
+        .await?;
+        assert_eq!(
+            runtime
+                .epoch_for_tests()
+                .recent_snapshot
+                .lineage()
+                .generation(),
+            2
+        );
+        assert_eq!(FinalizedProcessCounters::capture(&runtime), counters);
+
+        let response = finalized_handle_and_decode(&mut runtime, &request)?;
+        assert_eq!(response.page.outcome(), QueryOutcome::Complete);
+        assert!(runtime.healthy);
+        assert_eq!(runtime.replay_guard.calls, 1);
+        assert_eq!(runtime.material_source.calls, 1);
         Ok(())
     }
 
@@ -1483,7 +2415,10 @@ mod tests {
 
         let mut in_flight_refresh = runtime(4, &[(0, utxo(1, 10))])?;
         let request = request_envelope(&in_flight_refresh, checkpoint(), query, None, 4)?;
-        let invalidator = in_flight_refresh.serving_epoch.invalidator_for_tests();
+        let invalidator = in_flight_refresh
+            .epoch_for_tests()
+            .serving_epoch
+            .invalidator_for_tests();
         with_serving_epoch_currentness(&in_flight_refresh, |currentness| {
             currentness.after_comparison = Some(Rc::new(move || invalidator.clear_epoch()));
         });
@@ -1581,11 +2516,11 @@ mod tests {
         let token_context = runtime
             .codec
             .continuation_protection_context(&checkpoint())?;
-        let profile = *runtime.engine.profile();
+        let profile = *runtime.epoch_for_tests().engine.profile();
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
             *profile.profile_id(),
-            runtime.continuation_query_digest(&query),
+            runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             102,
             8,
@@ -1633,7 +2568,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            runtime.recent_snapshot.read_calls(),
+            runtime.epoch_for_tests().recent_snapshot.read_calls(),
             3 * RECENT_SNAPSHOT_SLOTS
         );
         Ok(())
@@ -1653,6 +2588,7 @@ mod tests {
             .continuation
             .expect("capped first page carries a continuation");
         runtime
+            .epoch_mut_for_tests()
             .recent_snapshot
             .replace_slot(0, RecentSnapshotSlot::created(key, utxo(4, 13)));
 
@@ -1666,7 +2602,7 @@ mod tests {
         assert!(drift_response.page.is_all_dummy());
         assert!(!runtime.healthy);
         assert_eq!(
-            runtime.recent_snapshot.read_calls(),
+            runtime.epoch_for_tests().recent_snapshot.read_calls(),
             2 * RECENT_SNAPSHOT_SLOTS
         );
         assert_eq!(finalized_store_reads(&runtime), 8);
@@ -1680,6 +2616,7 @@ mod tests {
         let mut runtime = runtime(4, &[(0, utxo(1, 10))])?;
         let current = checkpoint();
         runtime
+            .epoch_mut_for_tests()
             .recent_snapshot
             .replace_identity(RecentSnapshotIdentity::new(
                 current.network.tag(),
@@ -1705,8 +2642,9 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let key = address(1);
         let mut runtime = runtime(4, &[(0, utxo(1, 10))])?;
-        let current = runtime.recent_snapshot.lineage();
+        let current = runtime.epoch_for_tests().recent_snapshot.lineage();
         runtime
+            .epoch_mut_for_tests()
             .recent_snapshot
             .replace_lineage(RecentSnapshotLineage::from_parts_for_tests(
                 current
@@ -1752,7 +2690,10 @@ mod tests {
         assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
         assert!(response.page.is_all_dummy());
         assert!(!runtime.healthy);
-        assert_eq!(runtime.recent_snapshot.read_calls(), RECENT_SNAPSHOT_SLOTS);
+        assert_eq!(
+            runtime.epoch_for_tests().recent_snapshot.read_calls(),
+            RECENT_SNAPSHOT_SLOTS
+        );
         Ok(())
     }
 
@@ -1804,7 +2745,7 @@ mod tests {
             .continuation
             .expect("capped issuer page carries a continuation");
 
-        let current = issuer.recent_snapshot.lineage();
+        let current = issuer.epoch_for_tests().recent_snapshot.lineage();
         let next_lineage = RecentSnapshotLineage::from_parts_for_tests(
             current
                 .generation()
@@ -1869,11 +2810,11 @@ mod tests {
         let token_context = runtime
             .codec
             .continuation_protection_context(&checkpoint())?;
-        let profile = *runtime.engine.profile();
+        let profile = *runtime.epoch_for_tests().engine.profile();
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
             *profile.profile_id(),
-            runtime.continuation_query_digest(&query),
+            runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             102,
             14,
@@ -1988,11 +2929,11 @@ mod tests {
         assert_invalid_continuation(&mismatch);
 
         let mut cursor_runtime = runtime(4, &entries)?;
-        let cursor_profile = *cursor_runtime.engine.profile();
+        let cursor_profile = *cursor_runtime.epoch_for_tests().engine.profile();
         let cursor_state = ContinuationState::new(
             CONTINUATION_VERSION,
             *cursor_profile.profile_id(),
-            cursor_runtime.continuation_query_digest(&query),
+            cursor_runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             0,
             160,
@@ -2014,7 +2955,7 @@ mod tests {
 
         for (wrong_profile, wrong_epoch, nonce_byte) in [(true, false, 8_u8), (false, true, 9_u8)] {
             let mut binding_runtime = runtime(4, &entries)?;
-            let binding_profile = *binding_runtime.engine.profile();
+            let binding_profile = *binding_runtime.epoch_for_tests().engine.profile();
             let mut profile_id = *binding_profile.profile_id();
             if wrong_profile {
                 profile_id[0] ^= 1;
@@ -2023,7 +2964,7 @@ mod tests {
             let binding_state = ContinuationState::new(
                 CONTINUATION_VERSION,
                 profile_id,
-                binding_runtime.continuation_query_digest(&query),
+                binding_runtime.continuation_query_digest_for_tests(&query),
                 projection_epoch,
                 2,
                 160,
@@ -2243,7 +3184,7 @@ mod tests {
                 assert!(!runtime.healthy);
             }
             assert_eq!(
-                runtime.recent_snapshot.read_calls(),
+                runtime.epoch_for_tests().recent_snapshot.read_calls(),
                 2 * RECENT_SNAPSHOT_SLOTS
             );
             assert_eq!(finalized_store_reads(&runtime), 8);

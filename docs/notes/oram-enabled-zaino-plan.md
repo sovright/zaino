@@ -96,20 +96,31 @@ scans an immutable copy of the pinned recent generation, executes and protects
 the complete fixed-work response, then re-observes the exact finalized identity
 and source boundary. Any mismatch, unavailable observation, or in-flight epoch
 replacement latches readiness and discards the encoded envelope as one uniform
-external failure. A default-off, crate-internal non-test factory now consumes
+external failure. A default-off, crate-internal non-test factory consumes
 one already-pinned serving-epoch lease specialized to the concrete finalized
 store and constructs that runtime. It derives all six protected checkpoint
 fields from the lease identity rather than accepting an independent checkpoint,
-store, or currentness observer. It does not pin from the refresh controller,
-choose a runtime replacement policy, or own process lifecycle. A private
-Ready-only adapter now consumes the exact finalized projection worker into an
-identity-bound, non-cloneable serving store. Every successful in-profile read,
+store, or currentness observer. A private process-lifetime owner now retains
+that exact refresh controller and one stable runtime state. It retires the
+active runtime epoch before capture, passes the committed checkpoint of the
+supplied exact finalized store into the controller, pins only the
+controller-published epoch, and derives the replacement runtime checkpoint from
+that exact store-bound lease identity. Epoch replacement preserves the injected
+envelope/token protectors, replay guard, material source, codec session binding,
+compiled profile, and monotonic fail-closed health. Failed refresh, pinning, or
+epoch construction leaves no active epoch and never restores the stale one.
+Repeated logical stop is idempotent. A private Ready-only adapter now consumes
+the exact finalized projection worker into an identity-bound, non-cloneable
+serving store. Every successful in-profile read,
 absent a backend or worker failure, executes a complete key-addressed
 fixed-history worker command and folds the full padded event history into dense
 creation-order live outputs without caching. Decreasing event heights and events
-above the exact owner-bound checkpoint are rejected. This is not a process-wide
-service owner or transport-write guard and does not authenticate
-the tip, ancestry, or slot provenance. The lineage
+above the exact owner-bound checkpoint are rejected. The process-lifetime owner
+is not an enforced process singleton or service caller. It does not establish
+concurrent admission, FIFO execution, queue/overload handling, draining, a
+transport-write guard, or clean underlying-worker shutdown. The logical stop
+only retires the active epoch and rejects later handle/refresh attempts. This
+path does not authenticate the tip, ancestry, or slot provenance. The lineage
 commitment is not an authenticated canonical/live Zaino snapshot root. Live NFS
 service routing, authenticated provenance, durable rollback authority, physical
 obliviousness, allocator and timing equivalence, TDX, mainnet, and target-load
@@ -133,13 +144,17 @@ and construct the owner-generated `FrozenRecentSnapshot`; direct raw-slot
 activation remains test-only. The controller publication contract and the
 listener-free runtime consumption contract exercise the same generation-bound
 epoch-lease shape, including the owner-issued finalized store, opaque NFS Arc
-identity, and bound release-time currentness capability. The exact-lease factory
-provides a non-test store-to-runtime construction path only after a caller has
-already pinned that lease. No non-test path pins the controller into the factory,
-and there is no process owner, listener, or transport integration. This path does
-not provide an
-authenticated root, durable rollback authority, production cryptography,
-physical or TDX evidence, or mainnet service evidence.
+identity, and bound release-time currentness capability. The process-lifetime
+owner provides a non-test path that drives the controller refresh, pins its
+published lease, and replaces only the runtime's epoch-scoped
+engine/snapshot/lease state while retaining its process-scoped dependencies,
+session/profile, replay state, and health latch. It retires before capture and
+offers no stale fallback after a failed refresh or build. No service or listener
+calls this owner, and no enforced process singleton, concurrent admission/queue
+policy, transport-write guard, or clean worker-shutdown proof exists. This path
+does not provide persistence, an authenticated root or provenance, durable
+rollback authority, production cryptography/clock/nonces/replay, physical or
+timing evidence, TDX, target-load, or mainnet service evidence.
 
 The following two paragraphs preserve the evidence boundaries of earlier
 slices; their then-current controller and epoch limitations are superseded only
@@ -431,15 +446,18 @@ blocks. Its implemented ORAM-agnostic
 recent-chain seam that cannot perform address/txid queries or fall back to a DB
 or backing source. The private `corpus-zaino` controller can consume the newer
 coherent transparent-projection input, convert under the publication ticket,
-and publish a generation-bound serving epoch last. A crate-internal factory can
-consume an already-pinned lease specialized to the concrete finalized serving
-store, derive its protected checkpoint internally, and construct the
-listener-free runtime that performs the final currentness gate. The factory does
-not pin from the controller or retain a release guard beyond the runtime return.
-A complete production projection feed therefore still needs finalized block
-application, a finalized checkpoint/watermark and catch-up protocol, a
-process-wide owner that pins, retains, replaces, and retires runtimes, and
-service-lifetime epoch ownership through the transport-write boundary.
+and publish a generation-bound serving epoch last. A crate-internal
+process-lifetime owner retains that controller and one stable listener-free
+runtime state. It retires the old epoch before refresh, supplies the exact
+finalized store checkpoint to capture, pins the controller-published lease, and
+derives its protected checkpoint internally before activating the replacement.
+Its protection, replay/material, session/profile, and monotonic health state
+survive epoch swaps; failed refresh or activation has no stale fallback. A
+complete production projection feed still needs finalized block application, a
+finalized checkpoint/watermark and catch-up protocol, an enforced process
+singleton and service caller, concurrent admission/queue/draining behavior,
+clean worker shutdown, and service-lifetime epoch ownership through the
+transport-write boundary.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
@@ -734,11 +752,15 @@ Deliverables:
 - consume one already-pinned, generation-bound whole-serving-epoch lease through
   a default-off crate-internal factory specialized to the concrete finalized
   store, deriving the runtime checkpoint solely from that lease (exact-lease
-  factory complete; controller pinning and process ownership remain open);
-- add the process-wide owner that pins from the coherent refresh controller,
-  retains and replaces the listener-free runtime without resetting replay,
-  material, or readiness policy, then connect it to the production finalized
-  projection owner, listener routing, and actual transport-write boundary;
+  factory complete);
+- own the coherent refresh controller and one stable listener-free runtime,
+  retire before capture, pin and activate the newly published epoch, and retain
+  protector, replay/material, session/profile, and monotonic health state across
+  replacements without a stale fallback (crate-internal process-lifetime owner
+  complete; enforced singleton, concurrent admission/queue/draining policy,
+  clean worker shutdown, and a service caller remain open);
+- connect that owner to the production finalized projection owner, listener
+  routing, and actual transport-write boundary;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;
 - production ownership of manifest authentication keys and the external
   freshness witness, with a measured rebuild RTO or composite durable ORAM

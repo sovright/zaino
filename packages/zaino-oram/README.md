@@ -98,8 +98,16 @@ offline dependency experiment:
   one already-pinned lease specialized to the concrete finalized serving store
   and constructs the listener-free runtime. It derives all six protected
   checkpoint fields from the lease identity and accepts no independent
-  checkpoint, store, or currentness observer. The factory does not pin the
-  controller, choose runtime replacement policy, or own process lifecycle;
+  checkpoint, store, or currentness observer. A private process-lifetime owner
+  now retains that exact refresh controller and one stable runtime state. Each
+  refresh retires the active runtime epoch before capture, refreshes the
+  controller from the committed checkpoint of the supplied exact finalized
+  store, pins only the controller-published epoch, and activates it through the
+  exact-lease path. Epoch replacement preserves the injected envelope and token
+  protectors, replay guard, material source, codec session binding, compiled
+  profile, and monotonic fail-closed health. Failed refresh, pinning, or runtime
+  construction leaves no active epoch and never restores the stale one;
+  repeated logical stop is idempotent;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -135,9 +143,10 @@ offline dependency experiment:
   directory and 82-byte event-page records on Linux x86_64. A private offline
   construction path places those stores behind the same business-command
   worker for the offline projection owner and its Ready-only serving-store
-  handoff. The exact-lease factory is its only non-test runtime construction
-  seam; there is no process or service caller, and unsupported hosts reject
-  construction before creating upstream state.
+  handoff. The exact-lease factory and process-lifetime owner are its
+  crate-internal non-test runtime construction seams; there is no service or
+  listener caller, and unsupported hosts reject construction before creating
+  upstream state.
 
 It does **not** contain a production envelope protector or nonce owner,
 production encryption, durable ORAM persistence, TDX attestation, protobufs,
@@ -171,22 +180,32 @@ the listener-free runtime. The runtime derives its store, observer, and
 protected checkpoint only from that lease, completes the fixed-work response,
 and performs the final fail-closed observation before returning it.
 
-The factory does not pin the private controller, and no non-test caller invokes
-the controller's live-subscriber entry point. Each factory invocation consumes
-one lease, but there is no process-wide owner enforcing unique construction,
-retaining and replacing runtimes, sharing or durably storing replay state,
-owning trusted time and globally unique nonces, or enforcing the compiled
-query-level concurrency and overload policy. Runtime health, injected replay
-and material dependencies, and the epoch lease remain owned by the returned
-runtime. There is no listener or guard retained through a transport write, so
-the final currentness check does not close the race between runtime return and
-transport completion. The frozen snapshot's
-lineage digest binds owner-assigned generation and exact finalized/tip metadata
-to the internally computed deterministic slot commitment, but does not
-authenticate that metadata or prove its canonical ancestry. Neither commitment
-is an authenticated canonical/live Zaino snapshot root, and this slice supplies
-no production cryptography or physical-obliviousness, allocator, timing, TDX,
-mainnet, or target-load evidence.
+The private process-lifetime owner now invokes that controller's live-subscriber
+refresh path, owns one stable runtime state, retires its active epoch before
+capture, pins the controller-published epoch, and activates a replacement only
+after deriving the protected checkpoint from the exact store-bound lease
+identity. The runtime's injected protectors, replay guard, material source,
+session binding, compiled profile, and health latch survive epoch replacement;
+health can only move toward failed closed. A failed refresh or replacement has
+no stale fallback, and repeated logical stop remains a no-op after the first
+stop.
+
+This private composition seam does not enforce a process-wide singleton and has
+no service or listener caller. It does not implement or prove concurrent query
+admission, FIFO execution, queue saturation, overload rejection, draining, or
+clean shutdown of the underlying worker. Its stop is logical: it retires the
+active runtime epoch and rejects later handle/refresh attempts. There is no
+listener or guard retained through a transport write, so the final currentness
+check does not close the race between runtime return and transport completion.
+Replay state is volatile, and the injected protectors, clock/material source,
+and nonce/replay mechanisms are not production implementations. The frozen
+snapshot's lineage digest binds owner-assigned generation and exact
+finalized/tip metadata to the internally computed deterministic slot
+commitment, but does not authenticate that metadata or prove its canonical
+ancestry. Neither commitment is an authenticated canonical/live Zaino snapshot
+root. This slice supplies no durable persistence, authenticated provenance,
+production cryptography, physical-obliviousness, allocator or timing
+equivalence, TDX, target-load, or mainnet evidence.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline

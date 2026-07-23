@@ -58,7 +58,7 @@ where
 
 impl FinalizedProjectionServingStore {
     /// Returns the public checkpoint captured by the consumed Ready owner.
-    pub(super) const fn committed_checkpoint(&self) -> PublicChainCheckpoint {
+    pub(crate) const fn committed_checkpoint(&self) -> PublicChainCheckpoint {
         self.checkpoint
     }
 }

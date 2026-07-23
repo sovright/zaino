@@ -25,6 +25,8 @@ use crate::{
 };
 #[cfg(feature = "corpus-zaino")]
 mod controller;
+#[cfg(feature = "corpus-zaino")]
+pub(crate) use controller::{CanonicalServingEpochCurrentness, RecentSnapshotRefreshController};
 
 /// Lineage that distinguishes every immutable recent snapshot generation.
 ///

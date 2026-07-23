@@ -8,18 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- A default-off crate-internal process-lifetime owner for the exact recent-chain
+  refresh controller and one stable private-query runtime state. It retires the
+  active epoch before capture, refreshes from the committed checkpoint of the
+  supplied exact finalized store, pins the controller-published epoch, and
+  derives the protected runtime checkpoint only from that store-bound lease
+  identity. Epoch replacement preserves the injected envelope/token protectors,
+  replay guard, material source, codec session binding, compiled profile, and
+  monotonic fail-closed health. Failed refresh, pinning, or epoch construction
+  leaves no active epoch and never falls back to the retired one. Its logical
+  stop is idempotent. This is not an enforced process singleton or service
+  caller, and it does not establish concurrent admission, FIFO/queue/overload or
+  draining behavior, a transport-write guard, clean underlying-worker shutdown,
+  persistence, authenticated provenance, production cryptography, trusted time,
+  nonce uniqueness, durable replay, physical or timing obliviousness, TDX,
+  target-load, or mainnet readiness.
 - A default-off crate-internal exact-lease runtime factory. It consumes one
   already-pinned serving-epoch lease specialized to
   `FinalizedProjectionServingStore`, derives all six protected
   `PrivateQueryCheckpoint` fields from the lease identity, and constructs the
   existing listener-free `PrivateQueryRuntime` without accepting an independent
-  checkpoint, store, or currentness observer. This is a non-test typed
-  store-to-runtime construction seam only: it does not pin from the refresh
-  controller, enforce unique runtime construction or the query-level
-  concurrency policy, own replacement or shutdown, supply production replay,
-  trusted-time, nonce, session, or protection dependencies, retain a guard
-  through a transport write, or establish service, physical-obliviousness, TDX,
-  target-load, or mainnet readiness.
+  checkpoint, store, or currentness observer. The process-lifetime owner above
+  now uses the same exact-lease activation seam after pinning from its owned
+  controller; the standalone factory still does not enforce unique
+  construction, query-level concurrency, service lifecycle, or transport-write
+  completion.
 - A private Ready-only finalized serving-store adapter. Consuming an
   `OfflineProjectionOwner` now transfers its exact `AtomicWorker` into a
   non-cloneable read-only facade, derives the finalized serving identity within
@@ -31,8 +44,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   cross-call cache or query-derived fallback. Decreasing event heights and
   events above the owner-bound committed checkpoint fail closed. This is a
   concrete logical adapter for the existing serving-epoch contract and is
-  consumed only by the exact-lease runtime factory above; it still has no
-  controller, process, or service caller and establishes neither persistence nor
+  consumed through the exact-lease runtime path by the process-lifetime owner
+  above. It still has no service caller and establishes neither persistence nor
   physical or timing obliviousness, production cryptography, TDX, target-load,
   or mainnet readiness.
 - A private generation-bound serving-epoch contract. The refresh controller
@@ -46,9 +59,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   protects the fixed-work response, and then discards it on a failed final
   observation or double currentness check. The exact-lease factory above now
   provides a non-test construction path after a caller has already pinned the
-  epoch. There remains no controller-to-factory pinning path, process-wide
-  service owner, listener, or transport-write guard. The concrete private
-  adapter above supersedes only the then-current lack of an implementation.
+  epoch. The process-lifetime owner above now supplies the private
+  controller-to-runtime pinning and replacement path. There remains no enforced
+  process singleton, service or listener caller, or transport-write guard. The
+  concrete private adapter above supersedes only the then-current lack of an
+  implementation.
 - The default-off `corpus-zaino` integration now has a private conversion
   candidate that consumes one `CanonicalRecentChainSnapshot` and an immutable,
   identity-pinned finalized-outpoint classifier. It preserves dense

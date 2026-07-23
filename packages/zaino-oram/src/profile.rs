@@ -495,6 +495,7 @@ pub(super) const fn all_zero<const N: usize>(bytes: &[u8; N]) -> bool {
 }
 
 /// A profile sealed to exact compile-time page and envelope shapes.
+#[derive(Clone, Copy)]
 pub(super) struct CompiledQueryShape<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize> {
     profile: PrivacyProfile,
     envelope_shape: PhantomData<FixedEnvelope<ENVELOPE_BYTES>>,
