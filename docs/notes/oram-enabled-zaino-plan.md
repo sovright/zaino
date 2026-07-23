@@ -187,6 +187,17 @@ Production AEAD, trusted clock and nonce ownership, durable replay storage,
 guarded real-owner protobuf body/transport framing, concrete owner routing, and
 a service lifecycle also remain integration gates.
 
+The private crate now has the first persistence sub-slice required by that
+provider bundle: a fixed-width composite security-state snapshot and an
+injected exact sequence-and-digest freshness-witness contract. The local
+snapshot becomes durable before witness advancement; restart serves only an
+exact local/witness match, while mismatches and ambiguous commits fail closed.
+The version-one successor policy keeps service/protocol/profile identity stable,
+prevents owner/key/projection regression, and requires a new owner generation
+plus fresh session/security bindings for rotation.
+This is not a concrete witness, durable replay journal, nonce or trusted-time
+journal, key owner, runtime construction path, or deployed rollback result.
+
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
 caller-supplied finalized `BlockIndex` to one immutable NFS `Arc`, verifies the
@@ -698,6 +709,15 @@ position maps, stash, or query-induced remaps. Advancing to production still
 requires a production key/witness lifecycle plus either a durable composite
 ORAM transaction or a target-hardware rebuild that meets the declared RTO.
 
+The private security side now has a separate outer-commit foundation. A
+fixed-width snapshot binds the stable security identity plus opaque serving and
+component-state digests to a nonzero sequence. It is staged and synchronized
+locally before an injected witness compare-and-advance, and startup accepts only
+an exact local sequence/digest match. Staging files are ignored, and ambiguous
+local or witness commits fail closed until a fresh reconciliation. The
+component digest is only a boundary: replay, nonce, trusted-time, and key state
+are not yet durably journaled or wired to it, and no production witness exists.
+
 ## Private wire contract
 
 Use an outer protobuf message with one always-present, exactly sized `bytes envelope`. Repeated dummy protobuf records are unsuitable because proto3 omission and encoding length can change the visible shape.
@@ -926,7 +946,11 @@ Acceptance:
 
 Deliverables:
 
-- production protector/replay/material providers behind the internal
+- a production monotonic freshness witness and security-state owner built on
+  the fixed outer snapshot/reconciliation foundation;
+- durable atomic request/continuation replay, nonce-reservation, and
+  trusted-time journals whose committed roots feed the outer component digest;
+- production protector/material/key providers behind the internal
   `ActiveSecurityLease`;
 - concrete private-owner integration through the existing lifetime-safe facade,
   without detached response bytes;

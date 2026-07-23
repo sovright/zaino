@@ -9,6 +9,22 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-oram`: add a crate-private witness-bound security-state persistence
+  foundation. One fixed-width, versioned snapshot binds stable service,
+  protocol, owner, key, projection, profile, session, and security-epoch
+  identity to opaque serving and component-state digests. Mutations stage and
+  synchronize the local snapshot before advancing an injected exact
+  sequence-and-digest freshness witness; startup accepts only an exact
+  local/witness match, and post-replace or witness ambiguity fails closed.
+  Version-one transitions keep service/protocol/profile identity stable,
+  prevent owner/key/projection epoch regression, and require a new owner
+  generation plus new session/security bindings for any identity rotation.
+  Crash-boundary tests cover staged-but-unpublished state, a durable local
+  advance without witness authority, rejected witness advancement, and an
+  advance-then-error reconciliation. This foundation supplies no concrete
+  witness, durable replay journal, trusted-time or nonce journal, key owner,
+  runtime construction path, rollback deployment evidence, or production
+  privacy claim.
 - `zaino-oram`: add a crate-private, fixture-only runtime security contract
   API. Canonical versioned identities separate authenticated request-nonce
   replay from continuation replay, while one atomic in-memory seam completes

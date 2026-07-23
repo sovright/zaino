@@ -504,6 +504,15 @@ The following statements are **not** established by that evidence:
   bundle, generated route/listener, live owner integration, TLS/attestation
   identity, readiness path, transport evidence, and private-service lifecycle
   remain open;
+- the separate private outer security-state commit foundation does not
+  establish production rollback resistance. Its fixed-width snapshot binds the
+  stable security identity to opaque serving and component-state digests; local
+  replacement is synchronized before an injected exact sequence-and-digest
+  witness advances, and startup accepts only an exact match. Tests cover a
+  staged sequence-two orphan, a durable local sequence-two advance with a
+  sequence-one witness, rejected witness advancement, and advance-then-error
+  reconciliation. No concrete witness, replay/nonce/time component journal,
+  key owner, or runtime caller exists;
 - no durable ORAM backend, production freshness-witness/key owner, atomic
   coupling between public publication and ROSTL buckets/position maps/stash,
   published full-corpus rebuild result, controlled source-cache result, or
@@ -620,7 +629,7 @@ The following statements are **not** established by that evidence:
 | Assembly/compiler-preservation experiment | Missing | No release assembly or instruction trace | Resolve the concern tracked by [`rostl` issue #8](https://github.com/obliviouslabs/rostl/issues/8) for the pinned binary/toolchain |
 | Failure probability | Missing | No long-run or analytical bound | Address [`rostl` issue #24](https://github.com/obliviouslabs/rostl/issues/24) and document node-year risk |
 | Typed capacity/stash/queue failure | Partial | Local validation is typed; the research worker has nonblocking bounded admission, a typed identifier-free `QueueFull`, no fallback, and terminal backend/panic latching. `SmokeV1` checks the per-address limit. Separate `FullMapSaturationV1` workers reach the directory and event admission bounds independently, fail closed on the next append, and latch terminal state. `BuilderFoundationV1` reaches both source-sized admission limits in one healthy run and requires a clean stopped snapshot, but its single caller does not load the queue and the backend exposes no stash telemetry | Replace panic-based upstream boundaries, type stash exhaustion, and prove capacity/stash/queue behavior under native target load |
-| Persistence/recovery/RTO | Partial public-manifest and fresh-worker runner foundation; production gate blocked | Fixed authenticated manifests, exact digest-bound external freshness transitions, deterministic crash-boundary tests, and fresh-worker genesis replay establish a fail-closed public publication/rebuild contract. A separate runner now binds a fixed source checkpoint, recomputes and exactly matches the capture during replay, measures allocation through validated readiness, records shutdown separately, and publishes valid budget misses. The candidate ROSTL adapter remains volatile; source cache is uncontrolled, and no production witness/key owner, composite ORAM-state commit, full-corpus result, controlled-cache result, or full-service RTO exists | Wire production key/freshness ownership and either implement authenticated atomic ORAM persistence or run a controlled target-hardware rebuild and publish an accepted full-service RTO |
+| Persistence/recovery/RTO | Partial public-rebuild and private outer-commit foundations; production gate blocked | Fixed authenticated public manifests, exact digest-bound external freshness transitions, deterministic crash-boundary tests, and fresh-worker genesis replay establish a fail-closed public publication/rebuild contract. A separate private fixed-width snapshot now commits stable security identity plus opaque serving/component digests locally before an injected exact witness, with fail-closed startup reconciliation and sequence-one-to-two crash tests. The source-bound runner still measures only allocation through validated readiness. The candidate ROSTL adapter remains volatile; source cache is uncontrolled, and no production witness/key owner, durable replay/nonce/time journal, composite ORAM-state commit, full-corpus result, controlled-cache result, or full-service RTO exists | Implement the replay/nonce/time journals and production freshness/key ownership, then either implement authenticated atomic ORAM persistence or run a controlled target-hardware rebuild and publish an accepted full-service RTO |
 | Go/no-go stakeholder acceptance | Missing | No accepted numeric profile or client contract | Security, operator, and client teams approve the exact leakage budget |
 
 Phase 0 does not pass. Mainnet capacity, hardware memory, physical behavior,

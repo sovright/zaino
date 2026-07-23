@@ -240,6 +240,44 @@ compare-and-advance semantics. Host-local state is usable only when it exactly
 matches the authoritative witness. Missing, ahead, behind, corrupt,
 equivocating, or unavailable state is never served.
 
+### Implemented persistence foundation
+
+The research crate now contains a private fixed-width snapshot store for the
+outer composite security-state commitment. The snapshot binds a nonzero
+sequence; stable service, protocol, owner-generation, key, projection, profile,
+session, and security-epoch identity; an opaque serving-identity digest; and an
+opaque digest of the component state. A versioned domain-separated BLAKE2s
+digest plus the sequence is the value compared by an injected freshness
+witness. Version one fixes the layout at 204 bytes with compile-time offsets
+and a golden encoding. Reads are bounded to that exact size and reject trailing
+bytes.
+
+The store stages and synchronizes a new local snapshot, atomically replaces and
+synchronizes `current.bin`, and only then performs the witness
+compare-and-advance. Startup has one exact reconciliation matrix: both sides
+absent is empty; a present witness requires a readable, valid, byte-derived
+local snapshot with the same sequence and digest; every other combination is
+unready. Staging files are never recovery authority. An ambiguous local
+replacement or witness advance latches that store instance, and a fresh
+instance must reconcile with the authoritative witness before use. There is no
+truncate, repair, or retry path after ambiguity.
+
+Within version one, service identity, protocol version, and profile identity
+cannot change. Owner-generation, key, and projection epochs cannot regress.
+Any epoch or session/security-binding change is a complete identity rotation:
+the owner generation must increase and both the session and security-epoch
+bindings must change. A future namespace or protocol migration requires a new
+reviewed transition rather than being silently blessed by a higher witness
+sequence.
+
+This is an ordering and recovery foundation, not a provider selection or
+production rollback claim. There is no concrete freshness witness, durable
+request/continuation replay journal, nonce-reservation journal, trusted-time
+journal, key persistence, attestation binding, owner construction path, or
+service caller. Future component stores must become durable before their digest
+is committed through this outer snapshot. The first qualified deployment
+remains single-owner as required below.
+
 ### Lifecycle and response-release ordering
 
 The owner moves through explicit unready, provisioning, active, retiring, and

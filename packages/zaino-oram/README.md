@@ -70,6 +70,17 @@ offline dependency experiment:
   selected. The required joint ownership, rollback, and release contract is
   fixed by
   [ADR 0009](../../docs/adr/0009-private-query-runtime-security-state-owner.md);
+- a module-private witness-bound security-state persistence foundation. Its
+  fixed-width, versioned snapshot binds stable service, protocol, owner, key,
+  projection, profile, session, and security-epoch identity to opaque serving
+  and component-state digests. A mutation stages and synchronizes the local
+  snapshot before advancing an injected exact sequence-and-digest freshness
+  witness. Startup accepts only an exact local/witness match; missing, corrupt,
+  mismatched, oversized, or ambiguous state fails closed without automatic
+  repair. Version-one transitions prohibit namespace and epoch rollback and
+  require complete binding rotation with a new owner generation. The crate
+  provides no concrete witness, component journal, or runtime caller for this
+  foundation;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -262,7 +273,11 @@ transport write. Neither release check establishes currentness at socket write,
 peer delivery, or transport completion; the canonical source may advance
 immediately afterward. Lifetime-safe cross-crate real-owner body integration
 remains open.
-Replay state is volatile. The available XChaCha20-Poly1305 protectors are
+The separate security-state store fixes local-before-witness ordering and exact
+startup reconciliation for a future composite-state digest, but it has no
+concrete freshness witness and does not persist replay, nonce reservations,
+trusted time, or keys. Replay state is volatile. The available
+XChaCha20-Poly1305 protectors are
 wired only through a private fixture-backed runtime composition, not a
 production key/session owner; the clock/material source and nonce/replay
 mechanisms are not production implementations. The

@@ -86,11 +86,20 @@ The crate exports only the small lifetime-safe `FixedEnvelopeRuntime`,
 export detached response bytes. The concrete runtime owner remains private,
 with no public constructor or factory.
 
+The crate also contains a private, fixed-width security-state persistence
+foundation. It binds the complete security identity to opaque serving and
+component-state digests, commits local state durably before advancing an
+injected exact freshness witness, and accepts startup state only when the local
+sequence/digest exactly matches that witness. Ambiguous replacement or witness
+advancement fails closed. No concrete witness or runtime owner uses this store
+yet.
+
 This is still source-level research evidence. A production protector/replay/
 material-provider bundle, generated route and listener, durable replay,
-trusted clock, nonce ledger, key management, rollback resistance, TDX, and
-transport-write or peer-delivery evidence remain open. Profile ID v3 and the
-existing ten-phase logical schedule are unchanged. See the
+trusted clock, nonce ledger, key management, production freshness-witness
+ownership, rollback deployment evidence, TDX, and transport-write or
+peer-delivery evidence remain open. Profile ID v3 and the existing ten-phase
+logical schedule are unchanged. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
 [feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and
 [runtime security-owner ADR](./docs/adr/0009-private-query-runtime-security-state-owner.md).
