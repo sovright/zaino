@@ -32,6 +32,7 @@ use crate::{
 };
 
 mod runtime;
+mod security_owner;
 mod xchacha20;
 
 const FORMAT_VERSION: u16 = 1;

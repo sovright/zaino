@@ -531,15 +531,17 @@ runtime state. It retires the old epoch before refresh, supplies the exact
 finalized store checkpoint to capture, pins the controller-published lease, and
 derives its protected checkpoint internally before activating the replacement.
 Its protection, replay/material, session/profile, and monotonic health state
-survive epoch swaps; failed refresh or activation has no stale fallback. A
-crate-private fixture owner now makes the security side of that lifetime
-contract explicit: it retains the opaque process security epoch, canonical
-request and continuation replay namespace, protection providers, atomic
-two-lane replay seam, and material source. Each encoded round carries distinct
-non-`Clone` reservation and replay-commit authorities for one opaque round
-capture. The security release witness checks both authorities and the active
-security epoch together, so unavailable, retired, equal-value reminted, or
-cross-round state fails closed.
+survive epoch swaps; failed refresh or activation has no stale fallback. One
+profile-bound, non-`Clone` `ActiveSecurityLease` is the sole internal owner of
+the runtime's opaque security epoch, replay namespace, protection providers,
+atomic two-lane replay seam, and material source. Full raw security-bundle
+fixture assembly is restricted to `#[cfg(test)]`. Each encoded round carries
+distinct non-`Clone` reservation and replay-commit authorities minted under
+that lease for one opaque round capture. The security release witness checks
+both authorities and the active security epoch together, so unavailable,
+retired, equal-value reminted, or cross-round state fails closed.
+This ownership refactor changes neither profile ID v3 nor the ten-phase logical
+schedule.
 
 A listener-free response-release gate retains one completed response behind a
 non-`Clone` permit and rejects handle, refresh, and explicit shutdown before
@@ -560,15 +562,15 @@ at first outbound body poll, but it does not consume this real permit. A
 complete production projection feed still
 needs finalized block application, a finalized checkpoint/watermark and
 catch-up protocol, an enforced process singleton and service caller, a
-lifetime-safe real-owner protobuf-body integration, concurrent
+lifetime-safe concrete-owner protobuf-body integration, concurrent
 admission/FIFO/queue/wait/deadline/drain behavior, clean worker shutdown, and
 service-lifetime ownership through the actual transport-write boundary. A
-public opaque factory also remains deferred until non-test production
-key/session/nonce ownership plus durable replay and trusted-material providers
-exist and satisfy
+public constructor or factory is intentionally absent. A non-test production
+protector/replay/material-provider bundle, durable replay, trusted clock and
+nonce ledger, and key management must exist and satisfy
 [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md); the
-crate-internal XChaCha20-Poly1305 primitives and process-local fixture security
-owner do not satisfy that production ownership boundary or establish durable
+crate-internal XChaCha20-Poly1305 primitives and test-only raw security-bundle
+assembly do not satisfy that production ownership boundary or establish durable
 replay, trusted time, nonce-ledger, rollback, TDX, listener, or transport
 evidence.
 
@@ -576,19 +578,16 @@ evidence.
 
 `zainod-oram` is a new non-published application package. Its private `proto/` directory owns the independent `zaino.private.v1` service, attestation, and optional admin modules. Do not edit the upstream lightwallet protocol subtree/symlinked proto files and do not make the ordinary `zaino-proto` release carry an experimental contract.
 
-`zainod-oram` also owns the private adapter. Its first listener-free slice is
-generic over a crate-private mockable fixed-envelope runtime port. A second
-mock-backed slice adds a custom lazy Tonic codec/body that delays the fallible
-currentness check and fixed-byte borrow until first outbound body poll. It pins
-the exact successful DATA frame and collapses stale encoding to uniform
-`Unavailable` trailers with no DATA. The generated service trait remains
-unused because its hard-coded protobuf response cannot carry the pending
-permit. The next integration slice must add a lifetime-safe facade over the real
-`PrivateQueryEngine` owner without exporting detached bytes. The
-finalized-runtime pending round now has the required internal release witness,
-but the facade must wait
-for a non-test production dependency bundle rather than expose uninstantiable
-generic security traits. The package also
+`zainod-oram` also owns the private adapter. It now consumes only the small
+lifetime-safe `zaino-oram` `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and
+`PrivateQueryUnavailable` facade. Its mock-backed custom lazy Tonic codec/body
+delays the fallible currentness check and fixed-byte borrow until first
+outbound body poll, pins the exact successful DATA frame, and collapses stale
+encoding to uniform `Unavailable` trailers with no DATA. The pending value
+retains its authority while lending bytes, so the facade exports no detached
+response bytes. The concrete runtime owner remains private with no public
+constructor or factory; a generated route/listener and concrete-owner
+integration must wait for the production provider bundle. The package also
 owns the attested listener, optional admin routes, configuration, metrics, and
 lifecycle orchestration. Domain results and validation failures are encoded
 inside the fixed envelope; outer gRPC status is uniform for completed private
@@ -887,9 +886,11 @@ Deliverables:
 - own the coherent refresh controller and one stable listener-free runtime,
   retire before capture, pin and activate the newly published epoch, and retain
   protector, replay/material, session/profile, and monotonic health state across
-  replacements without a stale fallback (crate-internal process-lifetime owner
-  complete; enforced singleton, concurrent admission/queue/draining policy,
-  clean worker shutdown, and a service caller remain open);
+  replacements without a stale fallback, with one profile-bound non-`Clone`
+  `ActiveSecurityLease` as the sole security owner and raw bundle assembly
+  restricted to tests (crate-internal process-lifetime owner complete; enforced
+  singleton, production provider bundle, concurrent admission/queue/draining
+  policy, clean worker shutdown, and a service caller remain open);
 - retain one completed listener-free response behind a non-`Clone` permit so
   handle, refresh, and explicit shutdown reject before mutating retained owner
   or runtime state while it is outstanding; reopen on permit drop unless
@@ -900,10 +901,11 @@ Deliverables:
   byte borrow, fails closed without retaining the serving lease/store, and performs
   no observation on unpolled drop (internal finalized-runtime helper release
   witness complete; tests exercise the exact helper delegated to by the owner,
-  not a successfully refreshed ready-owner lifecycle; an adjacent mock-backed
-  protobuf body-poll proof exists, but no cross-crate owner facade/body
-  integration, service/listener, transport-write or peer-delivery currentness,
-  FIFO/queue/wait/deadline/drain, or worker-shutdown proof);
+  not a successfully refreshed ready-owner lifecycle; the small lifetime-safe
+  facade is consumed by an adjacent mock-backed protobuf body-poll proof without
+  detached bytes, but concrete-owner integration, generated service/listener,
+  transport-write or peer-delivery currentness, FIFO/queue/wait/deadline/drain,
+  and worker-shutdown proof remain open);
 - connect that owner to the production finalized projection owner, listener
   routing, and actual transport-write boundary;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;
@@ -924,6 +926,10 @@ Acceptance:
 
 Deliverables:
 
+- production protector/replay/material providers behind the internal
+  `ActiveSecurityLease`;
+- concrete private-owner integration through the existing lifetime-safe facade,
+  without detached response bytes;
 - private/attestation listener with exact limits and compression disabled;
 - `zainod-oram` config, feature selection, lifecycle/status/readiness, and safe aggregate metrics;
 - clientless fixed-envelope/frame/access-trace tests;

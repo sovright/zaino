@@ -77,18 +77,19 @@ LICENSE                            Apache-2.0 license text
 
 ## ORAM research-fork status
 
-The non-published `zaino-oram` research crate now includes a crate-private,
-fixture-only runtime security contract API. It defines versioned opaque
-identities for authenticated request-nonce replay and continuation replay,
-models their real-or-cover lanes as one atomic in-memory fixture transaction,
-and retains distinct non-`Clone` round-material reservation and replay-commit
-authorities. An opaque in-process security-epoch owner validates both
-authorities together with epoch currentness before releasing a completed
-response; unavailable or retired state fails closed.
+The non-published `zaino-oram` research crate now keeps one profile-bound,
+non-`Clone` `ActiveSecurityLease` as the sole internal owner of runtime
+security state. Full raw security-bundle assembly is available only to tests.
+The crate exports only the small lifetime-safe `FixedEnvelopeRuntime`,
+`PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade consumed by
+`zainod-oram`; pending responses retain their release authority and never
+export detached response bytes. The concrete runtime owner remains private,
+with no public constructor or factory.
 
-This is source-level fixture evidence only. It provides no production durable
-replay, trusted clock, nonce ledger, key management, rollback resistance, TDX,
-listener, transport-write, or peer-delivery evidence. Profile ID v3 and the
+This is still source-level research evidence. A production protector/replay/
+material-provider bundle, generated route and listener, durable replay,
+trusted clock, nonce ledger, key management, rollback resistance, TDX, and
+transport-write or peer-delivery evidence remain open. Profile ID v3 and the
 existing ten-phase logical schedule are unchanged. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
 [feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and

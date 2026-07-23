@@ -125,6 +125,17 @@ equivalence, production encryption, durable ORAM state, a measured recovery-time
 TDX isolation, attestation, wire-shape equivalence, mainnet capacity, or
 target-load behavior.
 
+The latest boundary refinement does not change that decision. Internally, a
+profile-bound non-`Clone` `ActiveSecurityLease` is now the sole runtime security
+owner and full raw security-bundle assembly is test-only. `zaino-oram` exposes
+only the lifetime-safe `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and
+`PrivateQueryUnavailable` facade consumed by `zainod-oram`, with no detached
+response bytes. The concrete owner remains private with no public constructor
+or factory. Production security providers, generated routing/listening,
+durability, trusted time/nonces, key management, rollback, TDX, and transport
+evidence remain blockers; profile ID v3 and the ten-phase schedule are
+unchanged.
+
 This is a gate decision, not a conclusion that ORAM is infeasible. Server work
 must remain closed until the Phase 0 blockers in this report have measured,
 reviewable results and the decision is revisited.
@@ -457,19 +468,20 @@ The following statements are **not** established by that evidence:
   non-cryptographic. Separate crate-internal XChaCha20-Poly1305 primitives now
   own separate zeroized request, response, and continuation role-key objects
   and pin canonical associated-data, fixed-vector, mutation, and cross-domain
-  behavior. A private opaque dependency composer exercises them end to end in
-  the listener-free runtime. A newer crate-private fixture contract defines
-  canonical versioned request-nonce and continuation replay identities, runs
-  the request and real-or-cover continuation lanes as one atomic in-memory
-  transaction, and returns a non-`Clone` replay-commit authority distinct from
-  the exact round-material reservation authority. An opaque in-process
-  security-epoch owner retains both through response construction; release
-  validates both against the same round and active epoch, and unavailable or
-  retired state fails closed. This is not production durable replay, a trusted
-  clock, a nonce ledger, key management, rollback resistance, TDX, listener, or
-  transport evidence. Profile ID v3 and the ten-phase logical schedule remain
-  unchanged. The required joint owner, rollback, lifecycle, real/cover
-  durability, and response-release contract is fixed by
+  behavior. Full raw security-bundle fixture assembly is now restricted to
+  `#[cfg(test)]`. Non-test runtime code instead retains one profile-bound,
+  non-`Clone` `ActiveSecurityLease` as the sole owner of protection, replay,
+  material, namespace, epoch, and release authority. Canonical versioned
+  request-nonce and continuation replay identities feed one atomic request plus
+  real-or-cover continuation transaction, whose non-`Clone` replay-commit
+  authority remains distinct from the exact round-material reservation
+  authority. Release validates both against the same round and active epoch,
+  and unavailable or retired state fails closed. This is not production
+  durable replay, a trusted clock, a nonce ledger, key management, rollback
+  resistance, TDX, listener, or transport evidence. Profile ID v3 and the
+  ten-phase logical schedule remain unchanged. The required joint owner,
+  rollback, lifecycle, real/cover durability, and response-release contract is
+  fixed by
   [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md), but
   production provider and service evidence remains open;
 - codec/runtime tests prove exact/canonical bytes, protection-interface
@@ -483,12 +495,15 @@ The following statements are **not** established by that evidence:
   from a generic source-reported digest, and its fault/corruption hooks are
   test-only. That deterministic commitment is neither externally authenticated
   nor a canonical/live Zaino snapshot root;
-- no private protobuf, gRPC adapter, live Zaino NFS acquisition or canonical
-  snapshot-publication seam, attestation provider, TLS identity, readiness
-  path, or private-service lifecycle exists;
-  `zainod-oram` contains listener-free corpus, fixed qualification,
-  target-load, and fresh-worker rebuild research runners, not a serving
-  lifecycle;
+- `zaino-oram` exports only the small lifetime-safe `FixedEnvelopeRuntime`,
+  `PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade. `zainod-oram`
+  consumes it in its independent private protobuf and lazy listener-free Tonic
+  body adapter; pending values lend guarded bytes without exporting detached
+  response bytes. The concrete runtime owner remains private with no public
+  constructor or factory. A production protector/replay/material-provider
+  bundle, generated route/listener, live owner integration, TLS/attestation
+  identity, readiness path, transport evidence, and private-service lifecycle
+  remain open;
 - no durable ORAM backend, production freshness-witness/key owner, atomic
   coupling between public publication and ROSTL buckets/position maps/stash,
   published full-corpus rebuild result, controlled source-cache result, or
@@ -617,14 +632,14 @@ open the server gate.
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
 | Business and persistent records | Partial pass | Fixed UTXO and 72-byte event types exist with named conversions and adjacent tests; finalized create/spend states are enforced, and an in-memory offline checkpoint/projection model exists; persistent page/directory/checkpoint representations remain incomplete |
-| Fixed envelope codec | Partial pass | A crate-internal versioned codec binds direction, derived profile ID, fixed checkpoint, prepared query, opaque optional token, session binding, outcome/`has_more`, and canonical fixed result slots inside one exact envelope. Version/profile/session/direction are explicit protection context. Checked arithmetic rejects undersized shapes; a non-cryptographic deterministic fixture rejects one single-bit mutation at every byte offset, reseals malformed plaintext to exercise protected canonical rejection, and pins exact request/response digests. Separate XChaCha20-Poly1305 role-key objects pin request/response/token domains, canonical associated data, an independent cross-implementation vector, and mutation rejection; a private runtime test rejects a wrong request key before material/replay work and completes encrypted pagination, token-tamper, valid-claim, and replay paths with one modeled trace. Distinct effective key material is deferred to the owner/KDF slice. All pre-runtime decode failures map to one external failure class. There is no production key/session/nonce owner or protobuf framing |
+| Fixed envelope codec | Partial pass | A crate-internal versioned codec binds direction, derived profile ID, fixed checkpoint, prepared query, opaque optional token, session binding, outcome/`has_more`, and canonical fixed result slots inside one exact envelope. Version/profile/session/direction are explicit protection context. Checked arithmetic rejects undersized shapes; a non-cryptographic deterministic fixture rejects one single-bit mutation at every byte offset, reseals malformed plaintext to exercise protected canonical rejection, and pins exact request/response digests. Separate XChaCha20-Poly1305 role-key objects pin request/response/token domains, canonical associated data, an independent cross-implementation vector, and mutation rejection; a private runtime test rejects a wrong request key before material/replay work and completes encrypted pagination, token-tamper, valid-claim, and replay paths with one modeled trace. Distinct effective key material is deferred to the owner/KDF slice. All pre-runtime decode failures map to one external failure class. There is no production key/session/nonce owner; protobuf framing exists only in the adjacent listener-free facade consumer, with no generated route or listener |
 | Compiled profile table | Partial pass | Profile ID v3 binds query-store reads, zero query-store writes/allocations/source calls, the recent-snapshot scan budget, padded input slots, one replay lookup/write-back, one request/response application frame, fixed bytes, unary completion, response slots, cover rounds, runtime schedule version/count, continuation lifetime, timeout bucket, and a typed single-worker FIFO execution/queue/reject-at-capacity policy. Regression tests prove every selectable authoritative dimension changes the ID while the diagnostic label does not. Listener-free runtime fixtures bind a nonzero four-slot recent-snapshot budget; the fixture security contract changes neither profile ID v3 nor the ten-phase logical schedule, and no production profile constants are guessed or accepted |
 | Continuation tokens | Partial pass for the logical model | The fixed token is opened and semantically validated before engine use; full checkpoint plus codec-session bytes are protector context, and continuation query binding v2 commits to the content computed internally from every slot plus in-memory generation, exact finalized identity, and recent tip height/hash. Cursors are bounded absolute ordinals in the combined finalized-plus-recent domain, expiry does not slide, and valid uses are atomically claimed through the injected guard. A continuation issued by one runtime lifecycle is rejected by another with different mock contents or a new generation with identical contents. Invalid/expired/mismatched/replayed tokens become one protected all-dummy outcome after the same modeled schedule when no higher-priority store or projection-readiness failure applies. Initial/invalid paths write back to a dedicated non-durable cover slot without mutating the real-token namespace, and every completed protected round after server-material acquisition issues one real-or-cover token. The newer fixture seam derives separate canonical versioned identities for the authenticated request nonce and continuation claim, then completes the request and real-or-cover continuation lanes atomically. A crate-internal XChaCha20-Poly1305 primitive pins canonical token context, but no production key/session/nonce owner, trusted clock, nonce ledger, durable replay store, service integration, or instruction/memory/timing result exists |
 | Deterministic mock store | Pass for logical modeling | Bounded plaintext mock rejects duplicate/out-of-range/capacity errors |
 | Logical store trace | Partial pass for the offline model | Allocation-free recorder validates sequential query-store reads, a separately ordered recent-snapshot scan budget, zero query-store writes/allocations/source calls, one replay lookup/write-back, modeled application frames/bytes, completion, and the exact ordered ten-phase decode/token/replay/read/issue/encode schedule. The listener-free runtime executes the nonzero profile-bound ordinal scan through its concrete `FrozenRecentSnapshot<N>` and, only after completing the scan, rechecks exact checkpoint identity and recomputes both content and lineage commitments from the scanned slots and frozen metadata. It merges changes before pagination and rejects missing, extra, or reordered reads while keeping query-derived source calls at zero. Live NFS acquisition, physical, allocator, instruction, timing, and transport evidence remain open |
 | Failure completion schedule | Partial pass | Every test-injected finalized-store or recent-snapshot read fault still completes all configured logical reads. A read fault, checkpoint/content/lineage mismatch, malformed same-outpoint sequence, owner mismatch against a finalized output, or duplicate create produces a protected all-dummy `ProjectionNotReady` result and latches readiness only after the full modeled work. Fault and post-construction corruption hooks are `#[cfg(test)]` only and absent from the production API; physical failure behavior is not equivalent or measured |
 | Independent private proto | Partial pass | `zainod-oram/proto/private.proto` owns one independent `zaino.private.v1.PrivateCompactTxStreamer/QueryPage` method over a single `FixedEnvelope.bytes` field. Generated Rust is committed, verified when `protoc` is available, and refreshed only in explicit update mode. Exact non-empty decoded lengths are enforced by the listener-free adapter; attestation/public-info/admin schemas, generated-service integration, package/profile-specific message limits, and transport evidence remain open |
-| Private service adapter | Partial pass | A crate-private `zainod-oram` adapter uses named wire conversions, coarsens invalid-length and runtime-port errors, and retains only a mock port's non-`Clone` pending response without an eager byte copy. A custom listener-free Tonic codec/body performs the pending value's fallible currentness check at first outbound body poll. Tests pin the successful fixed-envelope DATA frame, prove a stale response emits no DATA and one uniform `Unavailable` trailer shape without borrowing response bytes, prove dropping an unpolled body releases without checking or borrowing, and prove detailed request/body errors lose metadata, details, and response extensions at the boundary. Separately, the internal `zaino-oram` finalized-runtime pending round combines its exact serving-epoch witness with a fixture security-epoch witness. Before its first byte borrow, the latter validates the active opaque security capture and the distinct non-`Clone` material-reservation and replay-commit authorities together; stale, unavailable, retired, reminted equal-value, cross-round, or owner-closed state fails closed, while unpolled drop does not observe. Tests exercise internal helpers and deterministic fixtures, not a successfully refreshed ready-owner lifecycle with production security providers. `zainod-oram` still consumes only its mock port: the concrete process owner, its bytes, and release permit remain unexposed, and the package does not construct that owner or implement the generated Tonic trait. A lifetime-safe real-owner facade backed by non-test production providers, generated route/listener integration, concurrent policy, socket-write/peer-delivery currentness, transport completion/equivalence, TLS, compression, and package/profile-specific message-limit policy remain open |
+| Private service adapter | Partial pass | `zaino-oram` exports only the small lifetime-safe `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade, and the crate-private `zainod-oram` adapter consumes it through named wire conversions and one coarsened error. Its custom listener-free Tonic codec/body retains the non-`Clone` pending value and performs the fallible currentness check at first outbound body poll; no detached response bytes cross the facade. Tests pin the successful fixed-envelope DATA frame, prove a stale response emits no DATA and one uniform `Unavailable` trailer shape without borrowing response bytes, prove dropping an unpolled body releases without checking or borrowing, and prove detailed request/body errors lose metadata, details, and response extensions at the boundary. Internally, one profile-bound non-`Clone` `ActiveSecurityLease` is the sole runtime security owner; full raw bundle assembly is `#[cfg(test)]`, and release validates distinct material-reservation and replay-commit authorities against the active round and epoch. The concrete runtime owner remains private with no public constructor or factory, so `zainod-oram` currently exercises the facade with mocks and does not implement the generated Tonic trait. A production protector/replay/material-provider bundle, generated route/listener integration, concurrent policy, socket-write/peer-delivery currentness, transport completion/equivalence, TLS/TDX, compression, and package/profile-specific message-limit policy remain open |
 | Frame/byte/completion equivalence | Partial model | Every offline round models one fixed request and response application envelope, equal bytes, and unary completion; this is explicitly not protobuf, HTTP/2, TLS, packet-capture, or outer-status evidence |
 | NFS/source-call equivalence | Partial logical mock | The runtime owns a concrete `FrozenRecentSnapshot<N>` rather than a generic source, and the frozen type computes its content commitment internally from fixed slots and binds it to in-memory generation, exact finalized identity, and recent tip height/hash. Each round reads only public sequential ordinals, completes the nonzero profile-bound scan, rechecks exact checkpoint identity and recomputed content/lineage commitments, validates same-outpoint ownership/sequencing, and merges recent creates/spends before pagination. The lineage commitment is continuation-query-digest-bound across runtime lifecycles, and query-derived host/source calls remain modeled at zero. Under `corpus-zaino`, the private in-memory publication owner accepts a generation-free converted candidate only through its current ticket, checks exact finalized/tip metadata, and moves its slots into an owner-generated frozen snapshot; raw-slot activation is test-only. Begin-before-conversion ordering is not type-enforced, and no live refresh controller owns it. The owner still has no runtime caller and depends on a rolled projection epoch when recreated. This is not an authenticated canonical/live Zaino snapshot root; there is no live NFS acquisition, canonical ancestry validation, reorg-safe service publication, or integrated validator/LMDB/raw-transaction instrumentation |
 | Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior; static ordinary-source versus offline-oracle UTXO parity is committed, while live direct/RPC and finalised-database parity remain open |

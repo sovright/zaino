@@ -20,6 +20,17 @@ and this library adheres to Rust's notion of
   logical schedule, and it supplies no production durable replay, trusted
   clock, nonce ledger, key management, rollback resistance, TDX, listener,
   transport-write, or peer-delivery evidence.
+- `zaino-oram` / `zainod-oram`: make one internal, profile-bound, non-`Clone`
+  `ActiveSecurityLease` the sole owner of runtime security state, with full raw
+  security-bundle fixture assembly restricted to `#[cfg(test)]`. `zaino-oram`
+  exports only the lifetime-safe `FixedEnvelopeRuntime`,
+  `PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade, which
+  `zainod-oram` consumes without extracting detached response bytes. The
+  concrete runtime owner remains private and has no public constructor or
+  factory. A production protector/replay/material-provider bundle, generated
+  route/listener, durable replay, trusted clock, nonce ledger, key management,
+  rollback resistance, TDX, and transport evidence remain open. Profile ID v3
+  and the ten-phase logical schedule are unchanged.
 - `zaino-oram` / `zaino-state`: add a private generation-bound serving-epoch
   contract. The refresh controller invalidates publication before its sole
   await, validates one coherent transparent-projection capture, activates the

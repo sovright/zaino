@@ -58,15 +58,17 @@ offline dependency experiment:
   protection-context field. Fixed vectors and exhaustive single-byte mutation
   tests over the shared primitive, plus cross-direction and
   continuation-context tests, pin the wrapper contract. This is a
-  cryptographic primitive only. A private opaque dependency composer is
-  exercised end to end by the listener-free runtime with deterministic
-  material and counting replay fixtures; it exercises real request/response
-  and continuation protection, wrong-key rejection, token-tamper rejection, and
-  replay rejection without exposing either concrete key-bearing type. No
-  service/session handshake, key derivation/provisioning/rotation, nonce source
-  or uniqueness owner, trusted clock, durable replay state, attestation
-  binding, or KMS/TDX lifecycle is selected. The required joint ownership,
-  rollback, and release contract is fixed by
+  cryptographic primitive only. The full raw security-bundle composer is
+  restricted to `#[cfg(test)]`; those fixtures exercise real request/response
+  and continuation protection, wrong-key rejection, token-tamper rejection,
+  and replay rejection without exposing either concrete key-bearing type.
+  Non-test runtime code instead retains one profile-bound, non-`Clone`
+  `ActiveSecurityLease` as the sole owner of its protection, replay, material,
+  namespace, epoch, and release authority. No service/session handshake, key
+  derivation/provisioning/rotation, nonce source or uniqueness owner, trusted
+  clock, durable replay state, attestation binding, or KMS/TDX lifecycle is
+  selected. The required joint ownership, rollback, and release contract is
+  fixed by
   [ADR 0009](../../docs/adr/0009-private-query-runtime-security-state-owner.md);
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
@@ -131,6 +133,12 @@ offline dependency experiment:
   unless it is already closed, while a successful stop or owner drop closes the
   gate permanently. Once refresh has retired the epoch, cancellation never
   restores it;
+- the crate's only public private-query runtime boundary is the small
+  lifetime-safe `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and
+  `PrivateQueryUnavailable` facade. A pending value retains the guarded round
+  while lending response bytes, so callers cannot extract detached response
+  bytes. The concrete process/runtime owner remains private, with no public
+  constructor or factory;
 - an internal store interface and bounded plaintext mock implementation;
 - exact logical store-call schedules and schedule-equivalence tests;
 - an aggregate-only corpus measurement with an exact joint event/live/peak
@@ -171,10 +179,10 @@ offline dependency experiment:
   listener caller, and unsupported hosts reject construction before creating
   upstream state.
 
-It does **not** contain a production envelope protector or nonce owner,
-production encryption, durable ORAM persistence, TDX attestation, protobufs,
-or a network listener, and it makes no production privacy claim. Codec and
-runtime tests
+It does **not** contain a production protector/replay/material-provider bundle,
+trusted clock or nonce ledger, durable ORAM persistence, TDX attestation,
+protobuf route, or network listener, and it makes no production privacy claim.
+Codec and runtime tests
 use a non-cryptographic deterministic integrity fixture; they prove exact
 bytes, protection-interface plumbing, one single-bit rejection at every byte
 offset, canonical rejection, and equality of the modeled logical phase/store
@@ -227,21 +235,22 @@ releasable after internal epoch retirement when the source still matches its
 exact capture.
 
 This private composition seam does not enforce a process-wide singleton. The
-adjacent `zainod-oram` package now has an independent query protobuf, a
-crate-private listener-free adapter tested against a mock port, and a
-mock-backed custom Tonic codec/body. The body retains only the pending value
+adjacent `zainod-oram` package now consumes the exported lifetime-safe facade
+from its crate-private listener-free adapter and mock-backed custom Tonic
+codec/body. The body retains only the pending value
 until its first outbound poll, then gates its fixed-envelope protobuf encoding
 on a fallible release-time currentness check. A stale response emits no DATA and
 one uniform `Unavailable` trailer shape; dropping an unpolled body releases the
 pending value without borrowing its bytes.
 
-That adjacent mock proof does not expose or integrate this crate's actual
-owner bytes or release permit, construct or route the concrete process owner,
-or implement a generated Tonic service or listener. The finalized-runtime
+That adjacent mock proof does not construct or route this crate's concrete
+process owner, or implement a generated Tonic service or listener. The
+finalized-runtime
 witness is internal to this crate; tests exercise the exact helper delegated to
 by the owner, not a successfully refreshed ready-owner lifecycle. A public
-opaque factory remains deferred until concrete providers satisfy ADR 0009; the
-protection primitives still have no production key/session/nonce owner and
+constructor or factory is intentionally absent; concrete production providers
+must satisfy ADR 0009 before the private owner can be assembled outside tests.
+The protection primitives still have no production key/session/nonce owner and
 there is no qualified durable replay or trusted-material bundle. This does
 not implement or prove concurrent
 query admission, FIFO execution, queue saturation, overload rejection,
