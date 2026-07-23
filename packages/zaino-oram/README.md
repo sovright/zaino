@@ -202,19 +202,25 @@ permanently. Once refresh has retired the active epoch, cancellation never
 restores it.
 
 This private composition seam does not enforce a process-wide singleton. The
-adjacent `zainod-oram` package now has an independent query protobuf and a
-crate-private listener-free adapter tested against a mock port, but it does not
-expose the owner bytes or release permit, construct or route the concrete
-process owner, or implement a generated Tonic service or listener. It does not
-implement or prove concurrent query
-admission, FIFO execution, queue saturation, overload rejection, waiting,
-deadlines, draining, or clean shutdown of the underlying worker. Its stop is
-logical: it retires the active runtime epoch and rejects later handle/refresh
-attempts. The response permit is listener-free and is not integrated with a
-transport write or response body. It therefore proves neither release-time
-currentness at the write boundary nor transport completion; the canonical
-source may advance independently while a permit is held. Guarded response-body
-integration and actual owner wiring remain open.
+adjacent `zainod-oram` package now has an independent query protobuf, a
+crate-private listener-free adapter tested against a mock port, and a
+mock-backed custom Tonic codec/body. The body retains only the pending value
+until its first outbound poll, then gates its fixed-envelope protobuf encoding
+on a fallible release-time currentness check. A stale response emits no DATA and
+one uniform `Unavailable` trailer shape; dropping an unpolled body releases the
+pending value without borrowing its bytes.
+
+That proof does not expose or integrate this crate's actual owner bytes or
+release permit, construct or route the concrete process owner, or implement a
+generated Tonic service or listener. It does not implement or prove concurrent
+query admission, FIFO execution, queue saturation, overload rejection,
+waiting, deadlines, draining, or clean shutdown of the underlying worker. Its
+stop is logical: it retires the active runtime epoch and rejects later
+handle/refresh attempts. The real response permit remains listener-free and is
+not integrated with the response body or a transport write. The mock body proof
+establishes currentness only at first body poll, not at socket write, peer
+delivery, or transport completion; the canonical source may advance after the
+poll. Lifetime-safe real-owner body integration remains open.
 Replay state is volatile, and the injected protectors, clock/material source,
 and nonce/replay mechanisms are not production implementations. The frozen
 snapshot's lineage digest binds owner-assigned generation and exact

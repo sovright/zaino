@@ -31,17 +31,27 @@ different generated contract.
 The same feature adds a crate-private synchronous, listener-free adapter over a
 crate-private mockable runtime port. It validates the protobuf boundary through
 named `try_from_wire` / `to_wire` methods, maps boundary and runtime-port
-failures to one redacted adapter error, and returns the encoded response only
-inside a non-`Clone` pending value that continues to own the port's pending
-response.
-The real process owner remains private and is not exposed, constructed, or
-routed by this package.
+failures to one redacted adapter error, and retains only the port's non-`Clone`
+pending response without eagerly copying its bytes.
 
-The generated Tonic service trait is deliberately not implemented in this
-slice. There is no listener, TLS, compression or message-limit policy,
-concurrent admission, response-body ownership, release-time currentness check,
-transport completion, peer delivery, attestation, or production privacy claim.
-The guarded body and actual owner wiring remain separate integration work.
+A crate-private custom Tonic codec and body adapter consumes that pending value
+only when the outbound body is first polled. That poll performs the pending
+value's fallible release-time currentness check before borrowing its fixed
+bytes. A successful check encodes one exact fixed-envelope protobuf DATA frame
+and releases the pending value after encoding. A stale or unavailable response
+emits no DATA and is collapsed to one static `Unavailable` trailer shape. If
+the body is dropped before it is polled, the pending value is released without
+a currentness check or response-byte borrow.
+
+The real process owner remains private and is not exposed, constructed, or
+routed by this package. The generated Tonic service trait is deliberately not
+implemented; it fixes the response type to the generated protobuf message and
+cannot carry this pending value. There is no listener, route, TLS, compression
+or package/profile-specific message-limit policy, concurrent admission,
+real-owner integration,
+socket-write or peer-delivery proof, transport completion, attestation, or
+production privacy claim. Currentness at first body poll is not currentness at
+the later transport-write boundary.
 
 ## Release-bound deterministic-build receipt
 

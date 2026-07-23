@@ -12,6 +12,8 @@ use std::fmt;
 
 use crate::private_proto;
 
+mod tonic_body;
+
 /// Crate-private port for one exact listener-free runtime round.
 trait FixedEnvelopeRuntime<const N: usize> {
     /// Pending runtime response retained until the adapter result is dropped.
@@ -22,10 +24,10 @@ trait FixedEnvelopeRuntime<const N: usize> {
         -> Result<Self::PendingResponse, RuntimeUnavailable>;
 }
 
-/// Borrows response bytes while the crate-private pending value remains owned.
+/// Borrows response bytes only after the release-time check succeeds.
 trait PendingFixedEnvelope<const N: usize> {
-    /// Returns one exact response envelope without consuming the pending value.
-    fn envelope_bytes(&self) -> &[u8; N];
+    /// Checks release-time currentness before returning one exact response.
+    fn try_release_bytes(&self) -> Result<&[u8; N], RuntimeUnavailable>;
 }
 
 /// Coarsened runtime-port rejection used only inside this adapter module.
@@ -106,15 +108,14 @@ impl std::error::Error for WireEnvelopeError {}
 
 /// One protobuf response that still owns the runtime port's pending value.
 ///
-/// This type deliberately offers no production extraction method. The guarded
-/// response-body slice must consume the whole value and retain it through body
-/// completion or cancellation.
-struct PendingQueryPage<P> {
-    wire_response: private_proto::FixedEnvelope,
-    _pending_response: P,
+/// This type deliberately offers no production extraction method. The lazy
+/// Tonic encoder consumes the whole value at its first outbound body poll;
+/// cancellation drops it without borrowing the response bytes.
+struct PendingQueryPage<P, const N: usize> {
+    pending_response: P,
 }
 
-impl<P> fmt::Debug for PendingQueryPage<P> {
+impl<P, const N: usize> fmt::Debug for PendingQueryPage<P, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PendingQueryPage { ..REDACTED.. }")
     }
@@ -136,18 +137,14 @@ where
     fn query_page(
         &mut self,
         request: private_proto::FixedEnvelope,
-    ) -> Result<PendingQueryPage<H::PendingResponse>, PrivateServiceError> {
+    ) -> Result<PendingQueryPage<H::PendingResponse, N>, PrivateServiceError> {
         let request = ValidatedFixedEnvelope::<N>::try_from_wire(request)
             .map_err(coarsen_private_service_error)?;
         let pending_response = self
             .handler
             .query_page(request.bytes)
             .map_err(coarsen_private_service_error)?;
-        let response = ValidatedFixedEnvelope::from_array(*pending_response.envelope_bytes());
-        Ok(PendingQueryPage {
-            wire_response: response.to_wire(),
-            _pending_response: pending_response,
-        })
+        Ok(PendingQueryPage { pending_response })
     }
 }
 
@@ -181,7 +178,10 @@ impl std::error::Error for PrivateServiceError {}
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
 
     use prost::Message;
 
@@ -191,24 +191,24 @@ mod tests {
 
     struct MockPendingResponse {
         response: [u8; ENVELOPE_BYTES],
-        busy: Rc<Cell<bool>>,
+        busy: Arc<AtomicBool>,
     }
 
     impl PendingFixedEnvelope<ENVELOPE_BYTES> for MockPendingResponse {
-        fn envelope_bytes(&self) -> &[u8; ENVELOPE_BYTES] {
-            &self.response
+        fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], RuntimeUnavailable> {
+            Ok(&self.response)
         }
     }
 
     impl Drop for MockPendingResponse {
         fn drop(&mut self) {
-            self.busy.set(false);
+            self.busy.store(false, Ordering::SeqCst);
         }
     }
 
     struct MockHandler {
-        busy: Rc<Cell<bool>>,
-        calls: Rc<Cell<usize>>,
+        busy: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
         response: [u8; ENVELOPE_BYTES],
     }
 
@@ -219,13 +219,13 @@ mod tests {
             &mut self,
             _request: [u8; ENVELOPE_BYTES],
         ) -> Result<Self::PendingResponse, RuntimeUnavailable> {
-            self.calls.set(self.calls.get() + 1);
-            if self.busy.replace(true) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.busy.swap(true, Ordering::SeqCst) {
                 return Err(RuntimeUnavailable);
             }
             Ok(MockPendingResponse {
                 response: self.response,
-                busy: Rc::clone(&self.busy),
+                busy: Arc::clone(&self.busy),
             })
         }
     }
@@ -234,12 +234,12 @@ mod tests {
         response: [u8; ENVELOPE_BYTES],
     ) -> (
         PrivateServiceAdapter<MockHandler, ENVELOPE_BYTES>,
-        Rc<Cell<usize>>,
+        Arc<AtomicUsize>,
     ) {
-        let calls = Rc::new(Cell::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
         let handler = MockHandler {
-            busy: Rc::new(Cell::new(false)),
-            calls: Rc::clone(&calls),
+            busy: Arc::new(AtomicBool::new(false)),
+            calls: Arc::clone(&calls),
             response,
         };
         (PrivateServiceAdapter::new(handler), calls)
@@ -302,7 +302,7 @@ mod tests {
                 Err(PrivateServiceError)
             ));
         }
-        assert_eq!(calls.get(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -318,18 +318,16 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut adapter, calls) = mock_adapter([9, 8, 7, 6]);
         let first = adapter.query_page(wire(&[1, 2, 3, 4]))?;
-        assert_eq!(first.wire_response.envelope, [9, 8, 7, 6]);
 
         assert!(matches!(
             adapter.query_page(wire(&[4, 3, 2, 1])),
             Err(PrivateServiceError)
         ));
-        assert_eq!(calls.get(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         drop(first);
-        let second = adapter.query_page(wire(&[4, 3, 2, 1]))?;
-        assert_eq!(second.wire_response.envelope, [9, 8, 7, 6]);
-        assert_eq!(calls.get(), 3);
+        let _second = adapter.query_page(wire(&[4, 3, 2, 1]))?;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         Ok(())
     }
 

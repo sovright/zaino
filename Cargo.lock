@@ -6230,6 +6230,7 @@ dependencies = [
  "blake2",
  "clap",
  "hex",
+ "http-body",
  "prost",
  "rustix",
  "serde",

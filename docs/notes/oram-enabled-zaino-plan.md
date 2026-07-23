@@ -123,26 +123,31 @@ absent a backend or worker failure, executes a complete key-addressed
 fixed-history worker command and folds the full padded event history into dense
 creation-order live outputs without caching. Decreasing event heights and events
 above the exact owner-bound checkpoint are rejected. The process-lifetime owner
-is not an enforced process singleton or service caller. The release gate is
+is not an enforced process singleton or service caller. Its release gate is
 not a listener, transport-write, response-body, or currentness-at-write proof;
 the canonical source may advance independently while a permit is held. It does
 not establish concurrent admission, FIFO execution, queue/overload handling,
 waiting, deadlines, draining, or clean underlying-worker shutdown. An
 independent `zaino.private.v1` query protobuf and a crate-private listener-free
-`zainod-oram` adapter tested against a mock runtime port now exist, while the
-concrete owner, its bytes, and release permit remain private. The adapter does
-not construct the owner or implement the generated Tonic service. A guarded
-real-owner facade and body integration remain open. The logical stop only
-retires the
-active epoch and rejects later handle/refresh attempts. This
-path does not authenticate the tip, ancestry, or slot provenance. The lineage
-commitment is not an authenticated canonical/live Zaino snapshot root. Live NFS
+`zainod-oram` adapter tested against a mock runtime port now exist. A custom
+mock-backed Tonic codec/body retains the pending response until first outbound
+body poll, checks currentness before borrowing the fixed bytes, emits the exact
+protobuf DATA frame on success, and suppresses a stale response as uniform
+`Unavailable` trailers with no DATA. Dropping an unpolled body performs no
+check or byte borrow. The concrete owner, its bytes, and release permit remain
+private. The adapter does not construct the owner or implement the generated
+Tonic service. A lifetime-safe real-owner facade and body integration remain
+open; body-poll currentness is not socket-write or peer-delivery currentness.
+The logical stop only retires the active epoch and rejects later handle/refresh
+attempts. This path does not authenticate the tip, ancestry, or slot
+provenance. The lineage commitment is not an authenticated canonical/live Zaino
+snapshot root. Live NFS
 service routing, authenticated provenance, durable rollback authority, physical
 obliviousness, allocator and timing equivalence, TDX, mainnet, and target-load
 evidence remain open.
 Production AEAD, trusted clock and nonce ownership, durable replay storage,
-guarded protobuf body/transport framing, concrete owner routing, and a service
-lifecycle also remain integration gates.
+guarded real-owner protobuf body/transport framing, concrete owner routing, and
+a service lifecycle also remain integration gates.
 
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
@@ -171,12 +176,17 @@ remain outstanding and rejects handle/refresh/shutdown before mutating retained
 owner or runtime state until permit drop reopens it unless already closed;
 successful stop and owner drop close it permanently. An adjacent crate-private
 listener-free adapter validates the independent query protobuf against a mock
-runtime port, without exposing the concrete owner's bytes or permit. The
-application does not construct or route this owner, and no service or listener
-calls it. No enforced process singleton, concurrent
-admission/FIFO/queue/wait/deadline/drain policy, transport-write or response-body
-integration, currentness-at-write proof, or clean worker-shutdown proof exists.
-The canonical source may advance independently while a permit is held. This path
+runtime port without exposing the concrete owner's bytes or permit. Its custom
+Tonic codec/body retains the mock pending response until first outbound body
+poll, then checks currentness before fixed-envelope protobuf encoding. Tests
+prove the exact successful DATA frame, stale suppression as uniform
+`Unavailable` trailers with no DATA, and cancellation before poll without a
+response-byte borrow. The application does not construct or route the real
+owner, and no generated service or listener calls it. No enforced process
+singleton, concurrent admission/FIFO/queue/wait/deadline/drain policy,
+real-owner response-body integration, transport-write or peer-delivery
+currentness proof, or clean worker-shutdown proof exists. The canonical source
+may advance after the body poll. This path
 does not provide persistence, an authenticated root or provenance, durable
 rollback authority, production cryptography/clock/nonces/replay, physical or
 timing evidence, TDX, target-load, or mainnet service evidence.
@@ -483,12 +493,14 @@ non-`Clone` permit and rejects handle, refresh, and explicit shutdown before
 mutating retained owner or runtime state while that permit is held. Permit drop
 reopens the gate unless it is already closed; a successful stop or owner drop
 closes it permanently. Once refresh has retired the epoch, cancellation cannot
-restore it. This is not a listener, transport-write,
+restore it. This real-owner gate is not a listener, transport-write,
 response-body, or currentness-at-write proof: the canonical source may advance
-independently while a permit is held. A complete production projection feed
-still needs finalized block application, a finalized checkpoint/watermark and
-catch-up protocol, an enforced process singleton and service caller, a guarded
-real-owner protobuf-body integration, concurrent
+independently while a permit is held. The adjacent application package has a
+separate mock-backed lazy Tonic body proof at first outbound body poll, but it
+does not consume this real permit. A complete production projection feed still
+needs finalized block application, a finalized checkpoint/watermark and
+catch-up protocol, an enforced process singleton and service caller, a
+lifetime-safe real-owner protobuf-body integration, concurrent
 admission/FIFO/queue/wait/deadline/drain behavior, clean worker shutdown, and
 service-lifetime ownership through the actual transport-write boundary.
 
@@ -497,12 +509,19 @@ service-lifetime ownership through the actual transport-write boundary.
 `zainod-oram` is a new non-published application package. Its private `proto/` directory owns the independent `zaino.private.v1` service, attestation, and optional admin modules. Do not edit the upstream lightwallet protocol subtree/symlinked proto files and do not make the ordinary `zaino-proto` release carry an experimental contract.
 
 `zainod-oram` also owns the private adapter. Its first listener-free slice is
-generic over a crate-private mockable fixed-envelope runtime port; the guarded
-body slice must add a lifetime-safe facade over the real `PrivateQueryEngine`
-owner without exporting detached bytes. The package also owns the attested
-listener, optional admin routes, configuration, metrics, and lifecycle
-orchestration. Domain results and validation failures are encoded inside the
-fixed envelope; outer gRPC status is uniform for completed private queries.
+generic over a crate-private mockable fixed-envelope runtime port. A second
+mock-backed slice adds a custom lazy Tonic codec/body that delays the fallible
+currentness check and fixed-byte borrow until first outbound body poll. It pins
+the exact successful DATA frame and collapses stale encoding to uniform
+`Unavailable` trailers with no DATA. The generated service trait remains
+unused because its hard-coded protobuf response cannot carry the pending
+permit. The next integration slice must add a lifetime-safe facade over the real
+`PrivateQueryEngine` owner without exporting detached bytes. The package also
+owns the attested listener, optional admin routes, configuration, metrics, and
+lifecycle orchestration. Domain results and validation failures are encoded
+inside the fixed envelope; outer gRPC status is uniform for completed private
+queries. Body-poll currentness alone is not a socket-write, peer-delivery, or
+transport-completion claim.
 
 The existing publishable `zaino-serve` and `zainod` packages remain free of a `zaino-oram` dependency. `zainod-oram` composes `zainodlib` and other public building blocks, then starts/rebuilds the projection, starts the attested private listener, optionally starts the admin listener, aggregates readiness/status, and shuts components down in dependency order. If a reusable seam is missing, add an ORAM-agnostic API to the publishable crate rather than introducing the internal dependency in the opposite direction.
 
@@ -738,7 +757,8 @@ Deliverables:
 
 - `packages/zaino-oram` skeleton with business records, persistence/wire conversions, fixed-envelope codec, profile table, continuation tokens, typed errors, and a deterministic mock `ObliviousStore`;
 - independent private/attestation proto generation under `zainod-oram/proto`;
-- private service adapter tested against the mock engine;
+- private service adapter and lazy Tonic body-poll guard tested against the mock
+  engine;
 - access-trace recorder that counts logical reads, writes, allocations, source calls, frames, and bytes;
 - legacy golden/parity tests proving no `CompactTxStreamer` change.
 
@@ -803,9 +823,10 @@ Deliverables:
   or runtime state while it is outstanding; reopen on permit drop unless
   already closed, close permanently on successful stop or owner drop, and,
   once refresh has retired the epoch, never restore it after cancellation
-  (response-release gate complete; no service/listener, private protobuf/body,
-  transport-write, currentness-at-write, FIFO/queue/wait/deadline/drain, or
-  worker-shutdown proof);
+  (response-release gate complete; an adjacent mock-backed protobuf body-poll
+  proof exists, but no real-owner protobuf/body integration, service/listener,
+  transport-write or peer-delivery currentness, FIFO/queue/wait/deadline/drain,
+  or worker-shutdown proof);
 - connect that owner to the production finalized projection owner, listener
   routing, and actual transport-write boundary;
 - startup comparison, rebuild, key rotation, and shutdown sequencing;
