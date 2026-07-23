@@ -51,6 +51,17 @@ offline dependency experiment:
   layout arithmetic rejects profile/page shapes that cannot fit; the protection
   interface binds version/profile/session/direction context and must open the
   whole nonce/body/tag envelope before canonical decoding;
+- crate-internal XChaCha20-Poly1305 protection primitives for request envelopes,
+  response envelopes, and continuation tokens. The three roles own separate
+  zeroized 256-bit key objects, use fixed 192-bit nonces, and authenticate
+  distinct canonical domain prefixes plus every existing public
+  protection-context field. Fixed vectors and exhaustive single-byte mutation
+  tests over the shared primitive, plus cross-direction and
+  continuation-context tests, pin the wrapper contract. This is a
+  cryptographic primitive only: no service/session handshake, key
+  derivation/provisioning/rotation, nonce source or uniqueness owner, trusted
+  clock, durable replay state, attestation binding, or KMS/TDX lifecycle is
+  selected;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -223,8 +234,9 @@ owner bytes or release permit, construct or route the concrete process owner,
 or implement a generated Tonic service or listener. The finalized-runtime
 witness is internal to this crate; tests exercise the exact helper delegated to
 by the owner, not a successfully refreshed ready-owner lifecycle. A public
-opaque factory remains deferred because no
-non-test production protector/replay/material provider bundle exists. This does
+opaque factory remains deferred because the protection primitives have no
+production key/session/nonce owner and there is no durable replay or trusted
+material provider bundle. This does
 not implement or prove concurrent
 query admission, FIFO execution, queue saturation, overload rejection,
 waiting, deadlines, draining, or clean shutdown of the underlying worker. Its
@@ -235,14 +247,15 @@ transport write. Neither release check establishes currentness at socket write,
 peer delivery, or transport completion; the canonical source may advance
 immediately afterward. Lifetime-safe cross-crate real-owner body integration
 remains open.
-Replay state is volatile, and the injected protectors, clock/material source,
-and nonce/replay mechanisms are not production implementations. The frozen
-snapshot's lineage digest binds owner-assigned generation and exact
+Replay state is volatile. The available XChaCha20-Poly1305 protectors remain
+unwired to any runtime or production key/session owner, and the clock/material
+source and nonce/replay mechanisms are not production implementations. The
+frozen snapshot's lineage digest binds owner-assigned generation and exact
 finalized/tip metadata to the internally computed deterministic slot
 commitment, but does not authenticate that metadata or prove its canonical
 ancestry. Neither commitment is an authenticated canonical/live Zaino snapshot
 root. This slice supplies no durable persistence, authenticated provenance,
-production cryptography, physical-obliviousness, allocator or timing
+production cryptographic ownership, physical-obliviousness, allocator or timing
 equivalence, TDX, target-load, or mainnet evidence.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated

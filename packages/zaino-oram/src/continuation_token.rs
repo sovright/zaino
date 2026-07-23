@@ -5,6 +5,8 @@ use crate::{
     protection::{AuthenticationDecision, ProtectionUnavailable},
 };
 
+mod xchacha20;
+
 const QUERY_DIGEST_BYTES: usize = 32;
 const NONCE_BYTES: usize = 24;
 const AUTHENTICATION_BYTES: usize = 16;
@@ -367,8 +369,8 @@ impl fmt::Debug for ContinuationUse {
 /// associated data. `seal` may encrypt the body in place and returns its fixed
 /// authentication field. `open` must authenticate before exposing plaintext
 /// and may decrypt in place only on success. The codec deliberately supplies no
-/// concrete production implementation until the private service selects and
-/// audits an AEAD construction.
+/// crate-internal XChaCha20-Poly1305 implementation still remains a primitive,
+/// not a production key, nonce, replay, or service owner.
 pub(super) trait ContinuationTokenProtector {
     /// Protects `body`, or reports that no token can be issued.
     fn seal(

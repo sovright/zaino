@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Crate-internal XChaCha20-Poly1305 request-envelope, response-envelope, and
+  continuation-token protectors backed by separately owned, zeroized 256-bit
+  role-key objects. Distinct canonical associated-data domains authenticate all
+  existing profile, direction, session, and checkpoint context. A fixed vector
+  was cross-checked against Go's independent `x/crypto/chacha20poly1305` v0.47.0
+  implementation; tests also reject nonce, ciphertext, tag, associated-data,
+  context, direction, and key changes without exposing plaintext. The direct
+  dependency stays on the workspace-compatible RustCrypto 0.10.1 line, whose
+  upstream project reports an NCC Group audit; this integration still requires
+  independent cryptographic review. Version 0.11 currently conflicts with the
+  prerelease `crypto-common` version pinned by the Zcash dependency graph. This
+  slice does not select or expose service key establishment, derivation,
+  provisioning, rotation, nonce generation, trusted time, durable replay,
+  KMS/TDX ownership, or a public runtime factory.
 - A listener-free response-release gate inside the private process-lifetime
   owner. One non-`Clone` permit keeps a completed response outstanding; while
   it is held, later handle, refresh, and explicit shutdown attempts reject

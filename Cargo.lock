@@ -6074,6 +6074,7 @@ dependencies = [
  "arc-swap",
  "blake2",
  "bytemuck",
+ "chacha20poly1305",
  "rand 0.9.4",
  "rostl-oram",
  "rostl-primitives",

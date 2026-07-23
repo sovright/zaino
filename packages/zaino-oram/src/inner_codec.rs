@@ -32,6 +32,7 @@ use crate::{
 };
 
 mod runtime;
+mod xchacha20;
 
 const FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
@@ -215,11 +216,12 @@ impl<const RESPONSE_SLOTS: usize> fmt::Debug for PrivateQueryResponse<RESPONSE_S
 
 /// Protection injected around the complete fixed envelope body.
 ///
-/// No production implementation is supplied. A later runtime must own nonce
-/// generation and provide reviewed AEAD protection. It must bind the complete
-/// [`EnvelopeProtectionContext`] as associated data or through domain-separated
-/// key derivation before releasing plaintext. The codec never treats the
-/// deterministic test implementation as cryptographic evidence.
+/// A crate-internal XChaCha20-Poly1305 primitive is available, but no service
+/// yet owns its keys, session establishment, or nonce lifecycle. Any selected
+/// implementation must bind the complete [`EnvelopeProtectionContext`] as
+/// associated data or through domain-separated key derivation before releasing
+/// plaintext. The codec never treats the deterministic test implementation as
+/// cryptographic evidence.
 trait EnvelopeProtector {
     /// Protects `body`, or reports that no protected output can be produced.
     fn seal(

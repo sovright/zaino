@@ -47,8 +47,14 @@ versioned request/response codec with checked profile-capacity coupling, a
 complete-budget-derived profile ID, fixed checkpoint/query/token/session/result
 fields, direction separation, canonical decoding, and an injected
 whole-envelope protection interface. Its deterministic protector is a
-non-cryptographic test fixture. A private listener-free child runtime now owns
-the modeled decode/token/replay/full-scan/issuance/encode sequence. It validates
+non-cryptographic test fixture. A later provider slice adds crate-internal
+XChaCha20-Poly1305 implementations with separately owned zeroized request,
+response, and continuation role-key objects plus canonical domain-separated
+associated data. Those providers remain unwired primitives: session key
+establishment, key provisioning/rotation, trusted nonce and clock ownership,
+durable replay, and attestation binding are still open. A private listener-free
+child runtime now owns the modeled decode/token/replay/full-scan/issuance/encode
+sequence. It validates
 combined finalized-plus-recent cursors, preserves token expiry across pages,
 maps semantic token failures to one protected fixed `InvalidContinuation` page
 when no higher-priority store or projection-readiness failure applies, and
@@ -528,7 +534,9 @@ lifetime-safe real-owner protobuf-body integration, concurrent
 admission/FIFO/queue/wait/deadline/drain behavior, clean worker shutdown, and
 service-lifetime ownership through the actual transport-write boundary. A
 public opaque factory also remains deferred until non-test production
-protector, replay, and material providers exist.
+key/session/nonce ownership plus durable replay and trusted-material providers
+exist; the crate-internal XChaCha20-Poly1305 primitives alone do not satisfy
+that ownership boundary.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 
