@@ -8,17 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- Profile ID v5 and authenticated fixed-width replay-entry format v2
-  (`ZORJENT2`) for fresh replay-journal provisioning. Each persisted real
-  continuation claim is one typed value containing its opaque replay key and a
-  nonzero, one-based ceiling expiry-bucket ordinal. The current head remains
-  version two and all record widths remain unchanged. V4 state is neither
-  migrated nor dual-accepted, and a later incompatible persisted replay
-  successor requires another profile identity. This is authenticated metadata,
-  not a trusted-time provider, expiry/eligibility decision, maintenance
-  watermark, deletion, count reduction, compaction, reclamation, or
-  garbage-collection implementation. Request claims remain unexpired and
-  capacity remains lifetime cumulative.
+- Profile ID v6 and authenticated fixed-width replay-current format v3
+  (`ZORJCUR3`) for fresh replay-journal provisioning. Replay-entry v2
+  (`ZORJENT2`) remains unchanged, and all current/entry record widths remain
+  fixed. Current v3 persists a `u64` maintenance watermark: zero is the
+  sentinel for no classified bucket, and a nonzero value is the inclusive
+  recorded highest fully expired continuation expiry bucket for future
+  maintenance classification. The raw recorded value is not trusted-time,
+  epoch, profile, currentness, expiry, or retirement authority. A lower
+  proposal rejects; an equal proposal returns typed `NoAdvance` without a
+  write, receipt, or outer sequence advance; and a greater proposal durably
+  advances replay-current, mints a distinct move-only maintenance receipt, and
+  follows serialized replay-current -> outer-local -> witness ordering. A hard
+  witness rejection fresh-opens as `WitnessLocalMismatch`; witness
+  advance-then-error can reconcile on fresh open. The current-only advance
+  appends no entry and changes no claim set or count. Profile v6 requires fresh
+  provisioning and neither migrates nor dual-accepts profile-v5/current-v2 or
+  earlier state. The mutation/coordinator surface remains module-private with
+  no non-test caller and no trusted-time, epoch, or profile grant; any
+  visibility widening or runtime wiring must first consume a live
+  epoch/profile/currentness-bound move-only grant. This is recorded
+  classification metadata, not request expiry, deletion, count reduction,
+  compaction, reclamation, bounded retention, or garbage-collection
+  execution. Capacity remains lifetime cumulative. This is not TDX, mainnet,
+  target-load, or access-oblivious proof.
 - ADR 0009's production gate for one opaque, rollback-resistant runtime
   security-state owner spanning key/projection epochs, sessions and distinct
   role keys, request/server nonce ownership, trusted time, real-or-cover replay

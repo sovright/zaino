@@ -9,11 +9,14 @@
 //! timing access. It also assumes exactly one live writer for a recovery
 //! directory; no process lock or multi-writer linearizability is provided.
 //!
-//! The v5 journal is append-only and capacity counts total committed
+//! The v6 journal is append-only and capacity counts total committed
 //! transactions, not live claims. Request claims have no expiry. A continuation
 //! claim keeps its opaque key and profile-derived expiry bucket ordinal
-//! inseparable in entry v2. There is no claim deletion, count reduction,
-//! capacity reclamation, or maintenance-only state transition in this format.
+//! inseparable in entry v2. Current-state v3 can persist a monotonic inclusive
+//! expiry-bucket watermark through a dedicated typed transition, but this
+//! module supplies no trusted authority or non-test caller for that transition.
+//! There is still no claim deletion, count reduction, compaction, or capacity
+//! reclamation.
 
 use std::{
     collections::HashSet,
@@ -43,7 +46,7 @@ use crate::{
 use super::{
     security_state_binding::{
         preflight_successor, provision_initial_snapshot, successor_after_replay_commit,
-        verify_current, SecurityStateBindingError,
+        successor_after_replay_maintenance, verify_current, SecurityStateBindingError,
     },
     security_state_store::{
         SecurityFreshnessWitness, SecurityStateIdentity, SecurityStateSnapshot, SecurityStateStore,
@@ -51,17 +54,17 @@ use super::{
     },
 };
 
-const CURRENT_FORMAT_VERSION: u16 = 2;
+const CURRENT_FORMAT_VERSION: u16 = 3;
 const ENTRY_FORMAT_VERSION: u16 = 2;
 const U16_BYTES: usize = 2;
 const U64_BYTES: usize = 8;
 const DIGEST_BYTES: usize = 32;
 const RECORD_MAGIC_BYTES: usize = 8;
 const PROTECTION_OVERHEAD_BYTES: usize = 40;
-const CURRENT_RESERVED_BYTES: usize = 48;
+const CURRENT_RESERVED_BYTES: usize = 40;
 const ENTRY_RESERVED_BYTES: usize = 15;
 
-const CURRENT_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJCUR2";
+const CURRENT_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJCUR3";
 const ENTRY_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJENT2";
 const CURRENT_STATE_FILE: &str = "current.bin";
 const ENTRIES_DIRECTORY: &str = "entries";
@@ -78,7 +81,8 @@ const CURRENT_SEQUENCE_START: usize = CURRENT_PROFILE_ID_START + PROFILE_ID_BYTE
 const CURRENT_REQUEST_COUNT_START: usize = CURRENT_SEQUENCE_START + U64_BYTES;
 const CURRENT_CONTINUATION_COUNT_START: usize = CURRENT_REQUEST_COUNT_START + U64_BYTES;
 const CURRENT_CHAIN_DIGEST_START: usize = CURRENT_CONTINUATION_COUNT_START + U64_BYTES;
-const CURRENT_RESERVED_START: usize = CURRENT_CHAIN_DIGEST_START + DIGEST_BYTES;
+const CURRENT_MAINTENANCE_WATERMARK_START: usize = CURRENT_CHAIN_DIGEST_START + DIGEST_BYTES;
+const CURRENT_RESERVED_START: usize = CURRENT_MAINTENANCE_WATERMARK_START + U64_BYTES;
 const CURRENT_BODY_BYTES: usize = CURRENT_RESERVED_START + CURRENT_RESERVED_BYTES;
 const CURRENT_PROTECTED_BYTES: usize = CURRENT_BODY_BYTES + PROTECTION_OVERHEAD_BYTES;
 const CURRENT_PROTECTED_START: usize = RECORD_MAGIC_BYTES + U16_BYTES;
@@ -154,21 +158,21 @@ impl fmt::Debug for ReplayJournalProtectionContext {
 
 #[derive(Clone, Copy)]
 enum ReplayJournalRecordKind {
-    CurrentStateV2,
+    CurrentStateV3,
     ImmutableEntryV2,
 }
 
 impl ReplayJournalRecordKind {
     const fn tag(self) -> u8 {
         match self {
-            Self::CurrentStateV2 => 0,
+            Self::CurrentStateV3 => 0,
             Self::ImmutableEntryV2 => 1,
         }
     }
 
     const fn format_version(self) -> u16 {
         match self {
-            Self::CurrentStateV2 => CURRENT_FORMAT_VERSION,
+            Self::CurrentStateV3 => CURRENT_FORMAT_VERSION,
             Self::ImmutableEntryV2 => ENTRY_FORMAT_VERSION,
         }
     }
@@ -176,7 +180,7 @@ impl ReplayJournalRecordKind {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalLimits {
-    /// Maximum lifetime append count; v5 never reclaims consumed capacity.
+    /// Maximum lifetime append count; v6 never reclaims consumed capacity.
     max_transactions: u64,
 }
 
@@ -198,6 +202,33 @@ impl ReplayJournalLimits {
 impl fmt::Debug for ReplayJournalLimits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ReplayJournalLimits { ..REDACTED.. }")
+    }
+}
+
+/// Recorded inclusive continuation expiry-bucket ceiling for maintenance.
+///
+/// Zero means that no continuation bucket is maintenance-addressable. A
+/// nonzero value is classification metadata only: it is not trusted-time
+/// authority and does not authorize deletion, claim-count reduction,
+/// compaction, or capacity reclamation.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ReplayMaintenanceWatermark(u64);
+
+impl ReplayMaintenanceWatermark {
+    const NONE: Self = Self(0);
+
+    const fn new(inclusive_expiry_bucket_ordinal: u64) -> Self {
+        Self(inclusive_expiry_bucket_ordinal)
+    }
+
+    const fn inclusive_expiry_bucket_ordinal(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Debug for ReplayMaintenanceWatermark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplayMaintenanceWatermark([REDACTED])")
     }
 }
 
@@ -284,11 +315,11 @@ impl fmt::Debug for ReplayJournalComponentStateDigest {
     }
 }
 
-/// Monotonic v5 replay head reconstructed from every committed entry.
+/// Monotonic v6 replay head reconstructed from every committed entry plus the
+/// independently persisted maintenance watermark.
 ///
 /// Both claim counts only increase. This state has no deletion base, live-count
-/// distinction, or maintenance watermark from which claims or capacity could
-/// be retired.
+/// distinction, or authority to retire claims or capacity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalState {
     limits: ReplayJournalLimits,
@@ -297,6 +328,7 @@ struct ReplayJournalState {
     claimed_request_count: u64,
     claimed_continuation_count: u64,
     entry_chain_digest: [u8; DIGEST_BYTES],
+    maintenance_expiry_bucket_watermark: ReplayMaintenanceWatermark,
 }
 
 impl ReplayJournalState {
@@ -308,6 +340,7 @@ impl ReplayJournalState {
             claimed_request_count: 0,
             claimed_continuation_count: 0,
             entry_chain_digest: [0; DIGEST_BYTES],
+            maintenance_expiry_bucket_watermark: ReplayMaintenanceWatermark::NONE,
         }
     }
 
@@ -342,8 +375,14 @@ impl ReplayJournalState {
             .copy_from_slice(&self.claimed_request_count.to_be_bytes());
         body[CURRENT_CONTINUATION_COUNT_START..CURRENT_CHAIN_DIGEST_START]
             .copy_from_slice(&self.claimed_continuation_count.to_be_bytes());
-        body[CURRENT_CHAIN_DIGEST_START..CURRENT_RESERVED_START]
+        body[CURRENT_CHAIN_DIGEST_START..CURRENT_MAINTENANCE_WATERMARK_START]
             .copy_from_slice(&self.entry_chain_digest);
+        body[CURRENT_MAINTENANCE_WATERMARK_START..CURRENT_RESERVED_START].copy_from_slice(
+            &self
+                .maintenance_expiry_bucket_watermark
+                .inclusive_expiry_bucket_ordinal()
+                .to_be_bytes(),
+        );
         body
     }
 
@@ -405,6 +444,7 @@ impl ReplayJournalState {
             claimed_request_count,
             claimed_continuation_count,
             entry_chain_digest,
+            maintenance_expiry_bucket_watermark: self.maintenance_expiry_bucket_watermark,
         };
         Ok((
             next,
@@ -443,6 +483,26 @@ impl ReplayJournalState {
             CURRENT_FORMAT_VERSION,
             &[&self.canonical_current_body()],
         ))
+    }
+
+    fn preview_maintenance_watermark(
+        &self,
+        proposed: ReplayMaintenanceWatermark,
+    ) -> Result<Option<Self>, ReplayJournalStoreError> {
+        if proposed < self.maintenance_expiry_bucket_watermark {
+            return Err(ReplayJournalStoreError::MaintenanceWatermarkRegressed);
+        }
+        if proposed == self.maintenance_expiry_bucket_watermark {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            maintenance_expiry_bucket_watermark: proposed,
+            ..*self
+        }))
+    }
+
+    const fn has_persisted_transition(&self) -> bool {
+        self.committed_sequence != 0 || self.maintenance_expiry_bucket_watermark.0 != 0
     }
 }
 
@@ -500,9 +560,9 @@ impl fmt::Debug for ReplayJournalTransitionError {
     }
 }
 
-struct PersistentReplayJournalCurrentStateV2([u8; CURRENT_RECORD_BYTES]);
+struct PersistentReplayJournalCurrentStateV3([u8; CURRENT_RECORD_BYTES]);
 
-impl PersistentReplayJournalCurrentStateV2 {
+impl PersistentReplayJournalCurrentStateV3 {
     fn from_business<P>(
         state: &ReplayJournalState,
         context: &ReplayJournalProtectionContext,
@@ -514,7 +574,7 @@ impl PersistentReplayJournalCurrentStateV2 {
         state
             .validate()
             .map_err(ReplayJournalRecordError::InvalidValue)?;
-        if state.committed_sequence == 0 {
+        if !state.has_persisted_transition() {
             return Err(ReplayJournalRecordError::InvalidValue(
                 ReplayJournalValueError::InvalidState,
             ));
@@ -529,7 +589,7 @@ impl PersistentReplayJournalCurrentStateV2 {
         protector
             .seal(
                 context,
-                ReplayJournalRecordKind::CurrentStateV2,
+                ReplayJournalRecordKind::CurrentStateV3,
                 &body,
                 &mut bytes[CURRENT_PROTECTED_START..],
             )
@@ -550,7 +610,7 @@ impl PersistentReplayJournalCurrentStateV2 {
         match protector
             .open(
                 context,
-                ReplayJournalRecordKind::CurrentStateV2,
+                ReplayJournalRecordKind::CurrentStateV3,
                 &self.0[CURRENT_PROTECTED_START..],
                 &mut body,
             )
@@ -575,11 +635,15 @@ impl PersistentReplayJournalCurrentStateV2 {
             claimed_request_count: read_u64(&body, CURRENT_REQUEST_COUNT_START),
             claimed_continuation_count: read_u64(&body, CURRENT_CONTINUATION_COUNT_START),
             entry_chain_digest: read_array(&body, CURRENT_CHAIN_DIGEST_START),
+            maintenance_expiry_bucket_watermark: ReplayMaintenanceWatermark::new(read_u64(
+                &body,
+                CURRENT_MAINTENANCE_WATERMARK_START,
+            )),
         };
         state
             .validate()
             .map_err(ReplayJournalRecordError::InvalidValue)?;
-        if state.committed_sequence == 0 {
+        if !state.has_persisted_transition() {
             return Err(ReplayJournalRecordError::InvalidValue(
                 ReplayJournalValueError::InvalidState,
             ));
@@ -592,9 +656,9 @@ impl PersistentReplayJournalCurrentStateV2 {
     }
 }
 
-impl fmt::Debug for PersistentReplayJournalCurrentStateV2 {
+impl fmt::Debug for PersistentReplayJournalCurrentStateV3 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("PersistentReplayJournalCurrentStateV2([REDACTED])")
+        f.write_str("PersistentReplayJournalCurrentStateV3([REDACTED])")
     }
 }
 
@@ -748,6 +812,22 @@ struct PreparedReplayJournalCommit {
     decision: ReplayDuplicateDecision,
 }
 
+enum ReplayMaintenancePreparation {
+    NoAdvance,
+    Advance(PreparedReplayMaintenanceAdvance),
+}
+
+struct PreparedReplayMaintenanceAdvance {
+    previous_digest: ReplayJournalComponentStateDigest,
+    next_state: ReplayJournalState,
+}
+
+impl fmt::Debug for ReplayMaintenancePreparation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplayMaintenancePreparation { ..REDACTED.. }")
+    }
+}
+
 impl fmt::Debug for PreparedReplayJournalCommit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PreparedReplayJournalCommit { ..REDACTED.. }")
@@ -772,17 +852,43 @@ mod committed_advance {
         }
     }
 
-    /// Move-only evidence minted after one replay transaction's durable
-    /// boundary.
-    ///
-    /// This receipt does not represent maintenance. A future maintenance-only
-    /// mutation needs a distinct receipt consumed through the serialized
-    /// replay-current -> outer-local -> witness coordinator path so it cannot
-    /// be mistaken for a request replay commit.
-    pub(in crate::inner_codec) struct ReplayJournalAdvanceReceipt {
+    struct ReplayJournalAdvanceEvidence {
         instance_identity: ReplayJournalInstanceIdentity,
         previous_digest: ReplayJournalComponentStateDigest,
         committed_digest: ReplayJournalComponentStateDigest,
+    }
+
+    impl ReplayJournalAdvanceEvidence {
+        fn new(
+            instance_identity: ReplayJournalInstanceIdentity,
+            previous_digest: ReplayJournalComponentStateDigest,
+            committed_digest: ReplayJournalComponentStateDigest,
+        ) -> Self {
+            Self {
+                instance_identity,
+                previous_digest,
+                committed_digest,
+            }
+        }
+
+        fn into_digests(
+            self,
+        ) -> (
+            ReplayJournalComponentStateDigest,
+            ReplayJournalComponentStateDigest,
+        ) {
+            (self.previous_digest, self.committed_digest)
+        }
+
+        fn was_minted_for(&self, instance_identity: &ReplayJournalInstanceIdentity) -> bool {
+            self.instance_identity.matches(instance_identity)
+        }
+    }
+
+    /// Move-only evidence minted after one replay transaction's durable
+    /// boundary.
+    pub(in crate::inner_codec) struct ReplayJournalAdvanceReceipt {
+        evidence: ReplayJournalAdvanceEvidence,
     }
 
     impl ReplayJournalAdvanceReceipt {
@@ -792,20 +898,54 @@ mod committed_advance {
             ReplayJournalComponentStateDigest,
             ReplayJournalComponentStateDigest,
         ) {
-            (self.previous_digest, self.committed_digest)
+            self.evidence.into_digests()
         }
 
         pub(super) fn was_minted_for(
             &self,
             instance_identity: &ReplayJournalInstanceIdentity,
         ) -> bool {
-            self.instance_identity.matches(instance_identity)
+            self.evidence.was_minted_for(instance_identity)
         }
     }
 
     impl fmt::Debug for ReplayJournalAdvanceReceipt {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("ReplayJournalAdvanceReceipt { ..REDACTED.. }")
+        }
+    }
+
+    /// Move-only evidence minted after one maintenance-watermark advance's
+    /// durable boundary.
+    ///
+    /// This distinct type cannot be consumed by the request-commit binding
+    /// path. It proves only a replay-current mutation, not trusted-time
+    /// authority, claim retirement, deletion, or capacity reclamation.
+    pub(in crate::inner_codec) struct ReplayJournalMaintenanceAdvanceReceipt {
+        evidence: ReplayJournalAdvanceEvidence,
+    }
+
+    impl ReplayJournalMaintenanceAdvanceReceipt {
+        pub(in crate::inner_codec) fn into_digests(
+            self,
+        ) -> (
+            ReplayJournalComponentStateDigest,
+            ReplayJournalComponentStateDigest,
+        ) {
+            self.evidence.into_digests()
+        }
+
+        pub(super) fn was_minted_for(
+            &self,
+            instance_identity: &ReplayJournalInstanceIdentity,
+        ) -> bool {
+            self.evidence.was_minted_for(instance_identity)
+        }
+    }
+
+    impl fmt::Debug for ReplayJournalMaintenanceAdvanceReceipt {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("ReplayJournalMaintenanceAdvanceReceipt { ..REDACTED.. }")
         }
     }
 
@@ -841,16 +981,45 @@ mod committed_advance {
             let staged_entry = self.stage_entry_file(&prepared)?;
             let replaced_entry = self.replace_entry_file(staged_entry, &prepared)?;
             self.confirm_entry_file_durable(replaced_entry)?;
-            let staged_current = self.stage_current_state(&prepared)?;
+            let staged_current = match self.stage_current_state(&prepared.next_state) {
+                Ok(staged_current) => staged_current,
+                Err(error) => return Err(self.latch(error)),
+            };
             let replaced_current = self.replace_current_state(staged_current)?;
             self.confirm_current_state_durable(replaced_current)?;
             let result = self.apply_prepared_commit_in_memory(security_round, prepared);
             let receipt = ReplayJournalAdvanceReceipt {
-                instance_identity: self.instance_identity.clone(),
-                previous_digest,
-                committed_digest: self.state.component_state_digest(),
+                evidence: ReplayJournalAdvanceEvidence::new(
+                    self.instance_identity.clone(),
+                    previous_digest,
+                    self.state.component_state_digest(),
+                ),
             };
             Ok(ReplayJournalCommittedAdvance { result, receipt })
+        }
+
+        pub(super) fn commit_prepared_maintenance_and_capture(
+            &mut self,
+            prepared: PreparedReplayMaintenanceAdvance,
+        ) -> Result<ReplayJournalMaintenanceAdvanceReceipt, ReplayJournalStoreError> {
+            if self.health == ReplayJournalStoreHealth::Indeterminate {
+                return Err(ReplayJournalStoreError::LatchedIndeterminate);
+            }
+            if self.state.component_state_digest() != prepared.previous_digest {
+                return Err(ReplayJournalStoreError::CurrentStateMismatch);
+            }
+            self.ensure_directories()?;
+            let staged_current = self.stage_current_state(&prepared.next_state)?;
+            let replaced_current = self.replace_current_state(staged_current)?;
+            self.confirm_current_state_durable(replaced_current)?;
+            self.state = prepared.next_state;
+            Ok(ReplayJournalMaintenanceAdvanceReceipt {
+                evidence: ReplayJournalAdvanceEvidence::new(
+                    self.instance_identity.clone(),
+                    prepared.previous_digest,
+                    self.state.component_state_digest(),
+                ),
+            })
         }
 
         #[cfg(test)]
@@ -860,16 +1029,35 @@ mod committed_advance {
             committed_digest: ReplayJournalComponentStateDigest,
         ) -> ReplayJournalAdvanceReceipt {
             ReplayJournalAdvanceReceipt {
-                instance_identity: self.instance_identity.clone(),
-                previous_digest,
-                committed_digest,
+                evidence: ReplayJournalAdvanceEvidence::new(
+                    self.instance_identity.clone(),
+                    previous_digest,
+                    committed_digest,
+                ),
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_maintenance_receipt_for_digests(
+            &self,
+            previous_digest: ReplayJournalComponentStateDigest,
+            committed_digest: ReplayJournalComponentStateDigest,
+        ) -> ReplayJournalMaintenanceAdvanceReceipt {
+            ReplayJournalMaintenanceAdvanceReceipt {
+                evidence: ReplayJournalAdvanceEvidence::new(
+                    self.instance_identity.clone(),
+                    previous_digest,
+                    committed_digest,
+                ),
             }
         }
     }
 }
 
-pub(super) use committed_advance::ReplayJournalAdvanceReceipt;
 use committed_advance::ReplayJournalInstanceIdentity;
+pub(super) use committed_advance::{
+    ReplayJournalAdvanceReceipt, ReplayJournalMaintenanceAdvanceReceipt,
+};
 
 struct StagedReplayJournalEntry {
     file: NamedTempFile,
@@ -913,6 +1101,11 @@ pub(super) trait ReplayJournalComponentState: sealed::Sealed {
     ) -> Result<ReplayJournalComponentStateDigest, ReplayJournalComponentStateUnavailable>;
 
     fn recognizes_receipt(&self, receipt: &ReplayJournalAdvanceReceipt) -> bool;
+
+    fn recognizes_maintenance_receipt(
+        &self,
+        receipt: &ReplayJournalMaintenanceAdvanceReceipt,
+    ) -> bool;
 }
 
 struct ReplayJournalStore<P> {
@@ -939,6 +1132,13 @@ impl<P> ReplayJournalComponentState for ReplayJournalStore<P> {
     }
 
     fn recognizes_receipt(&self, receipt: &ReplayJournalAdvanceReceipt) -> bool {
+        receipt.was_minted_for(&self.instance_identity)
+    }
+
+    fn recognizes_maintenance_receipt(
+        &self,
+        receipt: &ReplayJournalMaintenanceAdvanceReceipt,
+    ) -> bool {
         receipt.was_minted_for(&self.instance_identity)
     }
 }
@@ -1001,7 +1201,7 @@ where
                 return Err(ReplayJournalStoreError::CurrentStateUnreadable);
             }
         };
-        let persisted_state = PersistentReplayJournalCurrentStateV2(current_bytes)
+        let persisted_state = PersistentReplayJournalCurrentStateV3(current_bytes)
             .into_business(&protection_context, &protector);
         let persisted_state = match persisted_state {
             Ok(state) => state,
@@ -1037,6 +1237,8 @@ where
                 .map_err(|_| ReplayJournalStoreError::CommittedEntryCorrupt)?;
             state = next;
         }
+        state.maintenance_expiry_bucket_watermark =
+            persisted_state.maintenance_expiry_bucket_watermark;
         if state != persisted_state {
             return Err(ReplayJournalStoreError::CurrentStateMismatch);
         }
@@ -1132,6 +1334,24 @@ where
         })
     }
 
+    fn prepare_maintenance_watermark(
+        &self,
+        watermark: ReplayMaintenanceWatermark,
+    ) -> Result<ReplayMaintenancePreparation, ReplayJournalStoreError> {
+        if self.health == ReplayJournalStoreHealth::Indeterminate {
+            return Err(ReplayJournalStoreError::LatchedIndeterminate);
+        }
+        let Some(next_state) = self.state.preview_maintenance_watermark(watermark)? else {
+            return Ok(ReplayMaintenancePreparation::NoAdvance);
+        };
+        Ok(ReplayMaintenancePreparation::Advance(
+            PreparedReplayMaintenanceAdvance {
+                previous_digest: self.state.component_state_digest(),
+                next_state,
+            },
+        ))
+    }
+
     fn ensure_directories(&self) -> Result<(), ReplayJournalStoreError> {
         ensure_real_directory(&self.recovery_directory).map_err(map_directory_error)?;
         ensure_real_directory(&self.entries_directory()).map_err(map_directory_error)?;
@@ -1197,20 +1417,20 @@ where
     }
 
     fn stage_current_state(
-        &mut self,
-        prepared: &PreparedReplayJournalCommit,
+        &self,
+        next_state: &ReplayJournalState,
     ) -> Result<StagedReplayJournalCurrentState, ReplayJournalStoreError> {
-        let persistent = PersistentReplayJournalCurrentStateV2::from_business(
-            &prepared.next_state,
+        let persistent = PersistentReplayJournalCurrentStateV3::from_business(
+            next_state,
             &self.protection_context,
             &self.protector,
         )
-        .map_err(|error| self.latch(map_current_record_for_commit(error)))?;
+        .map_err(map_current_record_for_commit)?;
         let mut file = create_unique_file(&self.staging_directory(), "replay-current")
-            .map_err(|_| self.latch(ReplayJournalStoreError::CandidateStateIndeterminate))?;
+            .map_err(|_| ReplayJournalStoreError::LocalStageUnavailable)?;
         file.write_all(persistent.as_bytes())
             .and_then(|()| file.as_file().sync_all())
-            .map_err(|_| self.latch(ReplayJournalStoreError::CandidateStateIndeterminate))?;
+            .map_err(|_| ReplayJournalStoreError::LocalStageUnavailable)?;
         Ok(StagedReplayJournalCurrentState { file })
     }
 
@@ -1294,8 +1514,8 @@ where
 /// across the journal, local snapshot, and external freshness witness. Once a
 /// replay commit succeeds, any unresolved outer advance latches this instance
 /// indeterminate and withholds the replay authority. It coordinates only
-/// request-triggered replay commits; v5 has no maintenance-only receipt or
-/// coordinator transition.
+/// request-triggered replay commits and private maintenance-watermark advances.
+/// It supplies no trusted maintenance authority or non-test maintenance caller.
 struct ReplaySnapshotCoordinator<P, W> {
     replay_journal: ReplayJournalStore<P>,
     security_state: SecurityStateStore<W>,
@@ -1427,30 +1647,105 @@ where
         ) {
             Ok(next_snapshot) => next_snapshot,
             Err(error) => {
-                return Err(self.latch_after_replay(
-                    ReplaySnapshotCoordinatorOuterAdvanceError::SnapshotBinding(error),
-                ));
+                self.latch_after_replay();
+                return Err(
+                    ReplaySnapshotCoordinatorCommitError::OuterAdvanceAfterReplay(
+                        ReplaySnapshotCoordinatorOuterAdvanceError::SnapshotBinding(error),
+                    ),
+                );
             }
         };
         if let Err(error) = self
             .security_state
             .compare_and_advance(Some(self.current_snapshot), next_snapshot)
         {
-            return Err(self.latch_after_replay(
-                ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(error),
-            ));
+            self.latch_after_replay();
+            return Err(
+                ReplaySnapshotCoordinatorCommitError::OuterAdvanceAfterReplay(
+                    ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(error),
+                ),
+            );
         }
 
         self.current_snapshot = next_snapshot;
         Ok(committed.result)
     }
 
-    fn latch_after_replay(
+    /// Advances only journal-local maintenance metadata.
+    ///
+    /// This stays private and has no non-test caller. Any future visibility
+    /// widening or runtime wiring must replace the raw watermark with a
+    /// move-only grant bound to a live epoch, profile, and currentness proof.
+    fn commit_maintenance_watermark(
         &mut self,
-        error: ReplaySnapshotCoordinatorOuterAdvanceError,
-    ) -> ReplaySnapshotCoordinatorCommitError {
+        watermark: ReplayMaintenanceWatermark,
+    ) -> Result<
+        ReplaySnapshotCoordinatorMaintenanceOutcome,
+        ReplaySnapshotCoordinatorMaintenanceError,
+    > {
+        if self.health == ReplaySnapshotCoordinatorHealth::Indeterminate {
+            return Err(ReplaySnapshotCoordinatorMaintenanceError::LatchedIndeterminate);
+        }
+
+        let prepared = self
+            .replay_journal
+            .prepare_maintenance_watermark(watermark)
+            .map_err(ReplaySnapshotCoordinatorMaintenanceError::ReplayJournal)?;
+        let ReplayMaintenancePreparation::Advance(prepared) = prepared else {
+            return Ok(ReplaySnapshotCoordinatorMaintenanceOutcome::NoAdvance);
+        };
+
+        preflight_successor(&self.current_snapshot)
+            .map_err(ReplaySnapshotCoordinatorMaintenanceError::OuterAdvancePreflight)?;
+
+        let receipt = match self
+            .replay_journal
+            .commit_prepared_maintenance_and_capture(prepared)
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if self.replay_journal.health == ReplayJournalStoreHealth::Indeterminate {
+                    self.health = ReplaySnapshotCoordinatorHealth::Indeterminate;
+                }
+                return Err(ReplaySnapshotCoordinatorMaintenanceError::ReplayJournal(
+                    error,
+                ));
+            }
+        };
+
+        let next_snapshot = match successor_after_replay_maintenance(
+            &self.current_snapshot,
+            receipt,
+            &self.replay_journal,
+        ) {
+            Ok(next_snapshot) => next_snapshot,
+            Err(error) => {
+                self.latch_after_replay();
+                return Err(
+                    ReplaySnapshotCoordinatorMaintenanceError::OuterAdvanceAfterReplay(
+                        ReplaySnapshotCoordinatorOuterAdvanceError::SnapshotBinding(error),
+                    ),
+                );
+            }
+        };
+        if let Err(error) = self
+            .security_state
+            .compare_and_advance(Some(self.current_snapshot), next_snapshot)
+        {
+            self.latch_after_replay();
+            return Err(
+                ReplaySnapshotCoordinatorMaintenanceError::OuterAdvanceAfterReplay(
+                    ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(error),
+                ),
+            );
+        }
+
+        self.current_snapshot = next_snapshot;
+        Ok(ReplaySnapshotCoordinatorMaintenanceOutcome::Advanced)
+    }
+
+    fn latch_after_replay(&mut self) {
         self.health = ReplaySnapshotCoordinatorHealth::Indeterminate;
-        ReplaySnapshotCoordinatorCommitError::OuterAdvanceAfterReplay(error)
     }
 }
 
@@ -1549,6 +1844,46 @@ impl std::error::Error for ReplaySnapshotCoordinatorCommitError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaySnapshotCoordinatorMaintenanceError {
+    LatchedIndeterminate,
+    OuterAdvancePreflight(SecurityStateBindingError),
+    ReplayJournal(ReplayJournalStoreError),
+    OuterAdvanceAfterReplay(ReplaySnapshotCoordinatorOuterAdvanceError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaySnapshotCoordinatorMaintenanceOutcome {
+    NoAdvance,
+    Advanced,
+}
+
+impl fmt::Display for ReplaySnapshotCoordinatorMaintenanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LatchedIndeterminate => {
+                f.write_str("replay snapshot coordinator is indeterminate")
+            }
+            Self::OuterAdvancePreflight(_) => f.write_str("outer security snapshot cannot advance"),
+            Self::ReplayJournal(_) => f.write_str("replay maintenance watermark advance failed"),
+            Self::OuterAdvanceAfterReplay(_) => {
+                f.write_str("outer security-state advance failed after replay maintenance")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplaySnapshotCoordinatorMaintenanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OuterAdvancePreflight(error) => Some(error),
+            Self::ReplayJournal(error) => Some(error),
+            Self::OuterAdvanceAfterReplay(error) => Some(error),
+            Self::LatchedIndeterminate => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplaySnapshotCoordinatorOuterAdvanceError {
     SnapshotBinding(SecurityStateBindingError),
     SecurityState(SecurityStateStoreError),
@@ -1558,7 +1893,7 @@ impl fmt::Display for ReplaySnapshotCoordinatorOuterAdvanceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SnapshotBinding(_) => {
-                f.write_str("replay commit receipt did not match the outer snapshot")
+                f.write_str("replay transition receipt did not match the outer snapshot")
             }
             Self::SecurityState(_) => f.write_str("outer security-state transition is unresolved"),
         }
@@ -1604,6 +1939,7 @@ enum ReplayJournalStoreError {
     CurrentStateMismatch,
     TransactionCapacityExceeded,
     SequenceOverflow,
+    MaintenanceWatermarkRegressed,
     LocalStageUnavailable,
     CandidateStateIndeterminate,
     CurrentStateIndeterminate,
@@ -1832,8 +2168,8 @@ mod tests {
         continuation_token::ContinuationReplayClaim,
         inner_codec::{
             security_state_binding::{
-                provision_initial_snapshot, successor_after_replay_commit, verify_current,
-                SecurityStateBindingError,
+                provision_initial_snapshot, successor_after_replay_commit,
+                successor_after_replay_maintenance, verify_current, SecurityStateBindingError,
             },
             security_state_store::{
                 test_security_state_identity, test_security_state_identity_with_profile_id,
@@ -2180,6 +2516,18 @@ mod tests {
         )
     }
 
+    fn advance_maintenance_watermark(
+        store: &mut ReplayJournalStore<DeterministicTestProtector>,
+        watermark: ReplayMaintenanceWatermark,
+    ) -> Result<Option<ReplayJournalMaintenanceAdvanceReceipt>, ReplayJournalStoreError> {
+        match store.prepare_maintenance_watermark(watermark)? {
+            ReplayMaintenancePreparation::NoAdvance => Ok(None),
+            ReplayMaintenancePreparation::Advance(prepared) => store
+                .commit_prepared_maintenance_and_capture(prepared)
+                .map(Some),
+        }
+    }
+
     fn provision_coordinator(
         replay_root: &Path,
         security_state_root: &Path,
@@ -2291,7 +2639,7 @@ mod tests {
         protector: &DeterministicTestProtector,
     ) -> TestResult {
         fs::create_dir_all(root)?;
-        let persistent = PersistentReplayJournalCurrentStateV2::from_business(
+        let persistent = PersistentReplayJournalCurrentStateV3::from_business(
             state,
             &protection_context(),
             protector,
@@ -2354,7 +2702,7 @@ mod tests {
         let persistent_entry =
             PersistentReplayJournalEntry::from_business(&replay_entry, &context, &protector)?;
         let persistent_current =
-            PersistentReplayJournalCurrentStateV2::from_business(&state, &context, &protector)?;
+            PersistentReplayJournalCurrentStateV3::from_business(&state, &context, &protector)?;
 
         assert_eq!(persistent_entry.as_bytes().len(), ENTRY_RECORD_BYTES);
         assert_eq!(persistent_current.as_bytes().len(), CURRENT_RECORD_BYTES);
@@ -2392,9 +2740,76 @@ mod tests {
             replay_entry
         );
         assert_eq!(
-            PersistentReplayJournalCurrentStateV2(*persistent_current.as_bytes())
+            PersistentReplayJournalCurrentStateV3(*persistent_current.as_bytes())
                 .into_business(&context, &protector)?,
             state
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_v3_body_layout_is_canonical() {
+        let replay_entry = entry(1, 0x51, claim_lane(0x61, 7));
+        let mut state = one_entry_state(limits(), &replay_entry);
+        state.maintenance_expiry_bucket_watermark = ReplayMaintenanceWatermark::new(9);
+        let body = state.canonical_current_body();
+
+        assert_eq!(
+            &body[CURRENT_LIMIT_TRANSACTIONS_START..CURRENT_PROFILE_ID_START],
+            &limits().max_transactions.to_be_bytes()
+        );
+        assert_eq!(
+            &body[CURRENT_PROFILE_ID_START..CURRENT_SEQUENCE_START],
+            &test_profile_id()
+        );
+        assert_eq!(
+            &body[CURRENT_SEQUENCE_START..CURRENT_REQUEST_COUNT_START],
+            &1_u64.to_be_bytes()
+        );
+        assert_eq!(
+            &body[CURRENT_REQUEST_COUNT_START..CURRENT_CONTINUATION_COUNT_START],
+            &1_u64.to_be_bytes()
+        );
+        assert_eq!(
+            &body[CURRENT_CONTINUATION_COUNT_START..CURRENT_CHAIN_DIGEST_START],
+            &1_u64.to_be_bytes()
+        );
+        assert_eq!(
+            &body[CURRENT_CHAIN_DIGEST_START..CURRENT_MAINTENANCE_WATERMARK_START],
+            &state.entry_chain_digest
+        );
+        assert_eq!(
+            &body[CURRENT_MAINTENANCE_WATERMARK_START..CURRENT_RESERVED_START],
+            &9_u64.to_be_bytes()
+        );
+        assert!(all_zero(&body[CURRENT_RESERVED_START..]));
+        assert_eq!(CURRENT_MAGIC, *b"ZORJCUR3");
+        assert_eq!(CURRENT_FORMAT_VERSION, 3);
+        assert_eq!(body.len(), 128);
+        assert_eq!(CURRENT_RECORD_BYTES, 178);
+    }
+
+    #[test]
+    fn current_v3_round_trips_watermark_without_entries() -> TestResult {
+        let protector = DeterministicTestProtector::available();
+        let context = protection_context();
+        let state = ReplayJournalState::empty(limits(), test_profile_id())
+            .preview_maintenance_watermark(ReplayMaintenanceWatermark::new(7))?
+            .expect("greater fixture watermark prepares an advance");
+        let persistent =
+            PersistentReplayJournalCurrentStateV3::from_business(&state, &context, &protector)?;
+
+        assert_eq!(
+            PersistentReplayJournalCurrentStateV3(*persistent.as_bytes())
+                .into_business(&context, &protector)?,
+            state
+        );
+        assert_eq!(state.committed_sequence, 0);
+        assert_eq!(state.claimed_request_count, 0);
+        assert_eq!(state.claimed_continuation_count, 0);
+        assert_eq!(
+            state.maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
         );
         Ok(())
     }
@@ -2439,7 +2854,7 @@ mod tests {
         let replay_entry = entry(1, 0x51, ReplayJournalContinuationLane::Cover);
         let persistent =
             PersistentReplayJournalEntry::from_business(&replay_entry, &context, &protector)?;
-        let current = PersistentReplayJournalCurrentStateV2::from_business(
+        let current = PersistentReplayJournalCurrentStateV3::from_business(
             &one_entry_state(limits(), &replay_entry),
             &context,
             &protector,
@@ -2462,7 +2877,7 @@ mod tests {
         let mut wrong_current_magic = *current.as_bytes();
         wrong_current_magic[0] ^= 1;
         assert!(matches!(
-            PersistentReplayJournalCurrentStateV2(wrong_current_magic)
+            PersistentReplayJournalCurrentStateV3(wrong_current_magic)
                 .into_business(&context, &protector),
             Err(ReplayJournalRecordError::InvalidMagic)
         ));
@@ -2470,7 +2885,7 @@ mod tests {
         let mut wrong_current_version = *current.as_bytes();
         wrong_current_version[RECORD_MAGIC_BYTES + 1] ^= 1;
         assert!(matches!(
-            PersistentReplayJournalCurrentStateV2(wrong_current_version)
+            PersistentReplayJournalCurrentStateV3(wrong_current_version)
                 .into_business(&context, &protector),
             Err(ReplayJournalRecordError::UnsupportedVersion)
         ));
@@ -2479,7 +2894,7 @@ mod tests {
             let mut tampered = *current.as_bytes();
             tampered[index] ^= 1;
             assert!(matches!(
-                PersistentReplayJournalCurrentStateV2(tampered).into_business(&context, &protector),
+                PersistentReplayJournalCurrentStateV3(tampered).into_business(&context, &protector),
                 Err(ReplayJournalRecordError::AuthenticationFailed)
             ));
         }
@@ -2615,6 +3030,31 @@ mod tests {
     }
 
     #[test]
+    fn recovery_rejects_current_v2_without_migration() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        fs::create_dir_all(&root)?;
+        let mut legacy_current = [0; CURRENT_RECORD_BYTES];
+        legacy_current[..RECORD_MAGIC_BYTES].copy_from_slice(b"ZORJCUR2");
+        legacy_current[RECORD_MAGIC_BYTES..CURRENT_PROTECTED_START]
+            .copy_from_slice(&2_u16.to_be_bytes());
+        fs::write(root.join(CURRENT_STATE_FILE), legacy_current)?;
+
+        assert_eq!(
+            ReplayJournalStore::open_with_limits(
+                root,
+                limits(),
+                test_profile_id(),
+                protection_context(),
+                DeterministicTestProtector::available(),
+            )
+            .expect_err("current v2 must not be reinterpreted as profile-v6 current state"),
+            ReplayJournalStoreError::CurrentStateCorrupt
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rejected_protection_never_exposes_plaintext() -> TestResult {
         let protector = DeterministicTestProtector::available();
         let context = protection_context();
@@ -2732,6 +3172,12 @@ mod tests {
             ordered.component_state_digest(),
             changed.component_state_digest()
         );
+        changed = ordered;
+        changed.maintenance_expiry_bucket_watermark = ReplayMaintenanceWatermark::new(7);
+        assert_ne!(
+            ordered.component_state_digest(),
+            changed.component_state_digest()
+        );
 
         let mut bucket_seven_requests = HashSet::new();
         let mut bucket_seven_continuations = HashSet::new();
@@ -2792,6 +3238,187 @@ mod tests {
             &ContinuationReplayPlan::ClaimOrCover(claim),
         )?;
         assert_ne!(store.component_state_digest()?, fresh_continuation);
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_watermark_advance_is_current_only_and_recoverable() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        let mut store = open_store(&directory)?;
+        let initial_state = store.state;
+        let initial_request_claims = store.request_claims.clone();
+        let initial_continuation_claims = store.continuation_claims.clone();
+        let initial_digest = store.component_state_digest()?;
+
+        let receipt =
+            advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::new(7))?
+                .expect("greater watermark must mint a maintenance receipt");
+        assert_eq!(
+            format!("{receipt:?}"),
+            "ReplayJournalMaintenanceAdvanceReceipt { ..REDACTED.. }"
+        );
+        let (previous_digest, committed_digest) = receipt.into_digests();
+        assert_eq!(previous_digest, initial_digest);
+        assert_eq!(committed_digest, store.component_state_digest()?);
+        assert_ne!(committed_digest, initial_digest);
+        assert_eq!(
+            store.state.committed_sequence,
+            initial_state.committed_sequence
+        );
+        assert_eq!(
+            store.state.claimed_request_count,
+            initial_state.claimed_request_count
+        );
+        assert_eq!(
+            store.state.claimed_continuation_count,
+            initial_state.claimed_continuation_count
+        );
+        assert_eq!(store.request_claims, initial_request_claims);
+        assert_eq!(store.continuation_claims, initial_continuation_claims);
+        assert_eq!(
+            store.state.maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
+        );
+        assert_eq!(fs::read_dir(root.join(ENTRIES_DIRECTORY))?.count(), 0);
+        assert_eq!(
+            fs::metadata(root.join(CURRENT_STATE_FILE))?.len(),
+            CURRENT_RECORD_BYTES as u64
+        );
+        drop(store);
+
+        let mut reopened = open_store(&directory)?;
+        assert_eq!(
+            reopened.state.maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
+        );
+        assert_eq!(reopened.state.committed_sequence, 0);
+        let (_, round) = security_round();
+        reopened.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        assert_eq!(reopened.state.committed_sequence, 1);
+        assert_eq!(
+            reopened.state.maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_watermark_equal_is_noop_and_regressions_do_not_latch() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut store = open_store(&directory)?;
+        assert!(
+            advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::NONE)?.is_none()
+        );
+        assert_eq!(store.health, ReplayJournalStoreHealth::Ready);
+        advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::new(7))?
+            .expect("greater watermark must advance");
+        let state_at_seven = store.state;
+        let digest_at_seven = store.component_state_digest()?;
+
+        assert!(
+            advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::new(7))?
+                .is_none()
+        );
+        assert_eq!(
+            advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::new(6),)
+                .expect_err("maintenance watermark must not regress"),
+            ReplayJournalStoreError::MaintenanceWatermarkRegressed
+        );
+        assert_eq!(
+            advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::NONE)
+                .expect_err("zero must not replace a nonzero maintenance watermark"),
+            ReplayJournalStoreError::MaintenanceWatermarkRegressed
+        );
+        assert_eq!(store.health, ReplayJournalStoreHealth::Ready);
+        assert_eq!(store.state, state_at_seven);
+        assert_eq!(store.component_state_digest()?, digest_at_seven);
+
+        advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::new(u64::MAX))?
+            .expect("skipped greater watermark must advance");
+        assert_eq!(
+            store.state.maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(u64::MAX)
+        );
+        assert_eq!(store.state.committed_sequence, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_prepared_maintenance_after_request_commit_is_non_latching() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut store = open_store(&directory)?;
+        let prepared =
+            match store.prepare_maintenance_watermark(ReplayMaintenanceWatermark::new(7))? {
+                ReplayMaintenancePreparation::Advance(prepared) => prepared,
+                ReplayMaintenancePreparation::NoAdvance => {
+                    return Err("greater fixture watermark must prepare an advance".into());
+                }
+            };
+        let (_, round) = security_round();
+        store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        let state_after_request = store.state;
+
+        assert_eq!(
+            store
+                .commit_prepared_maintenance_and_capture(prepared)
+                .expect_err("intervening request must stale the prepared maintenance advance"),
+            ReplayJournalStoreError::CurrentStateMismatch
+        );
+        assert_eq!(store.health, ReplayJournalStoreHealth::Ready);
+        assert_eq!(store.state, state_after_request);
+        assert_eq!(
+            store.state.maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::NONE
+        );
+
+        advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::new(7))?
+            .expect("freshly prepared greater watermark must advance");
+        assert_eq!(store.health, ReplayJournalStoreHealth::Ready);
+        assert_eq!(
+            store.state.maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_stage_failure_before_rename_keeps_store_ready() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let protector = DeterministicTestProtector::available();
+        let mut store = ReplayJournalStore::open_with_limits(
+            directory.path().join("journal"),
+            limits(),
+            test_profile_id(),
+            protection_context(),
+            protector.clone(),
+        )?;
+        let initial_state = store.state;
+        let prepared =
+            match store.prepare_maintenance_watermark(ReplayMaintenanceWatermark::new(7))? {
+                ReplayMaintenancePreparation::NoAdvance => {
+                    return Err("greater fixture watermark did not prepare an advance".into());
+                }
+                ReplayMaintenancePreparation::Advance(prepared) => prepared,
+            };
+
+        protector.set_available(false);
+        assert_eq!(
+            store
+                .commit_prepared_maintenance_and_capture(prepared)
+                .expect_err("pre-rename protector failure must not mint a receipt"),
+            ReplayJournalStoreError::CurrentStateProtectionUnavailable
+        );
+        assert_eq!(store.health, ReplayJournalStoreHealth::Ready);
+        assert_eq!(store.state, initial_state);
+
+        protector.set_available(true);
+        advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::new(7))?
+            .expect("retry after a safe stage failure must advance");
+        assert_eq!(
+            store.state.maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
+        );
         Ok(())
     }
 
@@ -2888,6 +3515,226 @@ mod tests {
             witness,
         )?;
         assert_eq!(reopened.current_snapshot.test_sequence(), 3);
+        verify_current(&reopened.current_snapshot, &reopened.replay_journal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_advances_outer_snapshot_for_maintenance_watermark() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+
+        assert_eq!(
+            coordinator.commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::Advanced
+        );
+        assert_eq!(coordinator.current_snapshot.test_sequence(), 2);
+        assert_eq!(
+            coordinator
+                .replay_journal
+                .state
+                .maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
+        );
+        assert_eq!(coordinator.replay_journal.state.committed_sequence, 0);
+        verify_current(&coordinator.current_snapshot, &coordinator.replay_journal)?;
+        drop(coordinator);
+
+        let reopened = open_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness,
+        )?;
+        assert_eq!(reopened.current_snapshot.test_sequence(), 2);
+        assert_eq!(
+            reopened
+                .replay_journal
+                .state
+                .maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
+        );
+        verify_current(&reopened.current_snapshot, &reopened.replay_journal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_rejects_watermark_current_rollback_with_zero_entries() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        assert_eq!(
+            coordinator.commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::Advanced
+        );
+        assert_eq!(coordinator.replay_journal.state.committed_sequence, 0);
+        drop(coordinator);
+
+        fs::remove_file(replay_root.join(CURRENT_STATE_FILE))?;
+        assert!(matches!(
+            open_coordinator(
+                &replay_root,
+                &security_state_root,
+                DeterministicTestProtector::available(),
+                witness,
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::SnapshotBinding(
+                SecurityStateBindingError::ReplayComponentMismatch,
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_noops_nonadvancing_watermark_without_latching() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness,
+        )?;
+        let initial_snapshot = coordinator.current_snapshot;
+        assert_eq!(
+            coordinator.commit_maintenance_watermark(ReplayMaintenanceWatermark::NONE)?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::NoAdvance
+        );
+        assert_eq!(coordinator.current_snapshot, initial_snapshot);
+        assert_eq!(
+            coordinator
+                .replay_journal
+                .state
+                .maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::NONE
+        );
+        assert_eq!(
+            coordinator.commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::Advanced
+        );
+        let snapshot_at_seven = coordinator.current_snapshot;
+
+        assert_eq!(
+            coordinator.commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::NoAdvance
+        );
+        assert_eq!(coordinator.health, ReplaySnapshotCoordinatorHealth::Ready);
+        assert_eq!(coordinator.current_snapshot, snapshot_at_seven);
+        verify_current(&coordinator.current_snapshot, &coordinator.replay_journal)?;
+
+        assert_eq!(
+            coordinator.commit_maintenance_watermark(ReplayMaintenanceWatermark::new(8))?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::Advanced
+        );
+        assert_eq!(coordinator.current_snapshot.test_sequence(), 3);
+        verify_current(&coordinator.current_snapshot, &coordinator.replay_journal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_latches_when_witness_rejects_after_maintenance_advance() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        witness.set_reject_advance(true);
+
+        assert_eq!(
+            coordinator
+                .commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))
+                .expect_err("rejected witness must leave maintenance unresolved"),
+            ReplaySnapshotCoordinatorMaintenanceError::OuterAdvanceAfterReplay(
+                ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(
+                    SecurityStateStoreError::WitnessAdvanceUnresolved,
+                ),
+            )
+        );
+        assert_eq!(
+            coordinator
+                .commit_maintenance_watermark(ReplayMaintenanceWatermark::new(8))
+                .expect_err("coordinator must remain latched"),
+            ReplaySnapshotCoordinatorMaintenanceError::LatchedIndeterminate
+        );
+
+        witness.set_reject_advance(false);
+        drop(coordinator);
+        assert!(matches!(
+            open_coordinator(
+                &replay_root,
+                &security_state_root,
+                DeterministicTestProtector::available(),
+                witness,
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::SecurityState(
+                SecurityStateStoreError::WitnessLocalMismatch,
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_reopens_when_maintenance_witness_advanced_before_error() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        witness.set_advance_then_fail();
+
+        assert_eq!(
+            coordinator
+                .commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))
+                .expect_err("ambiguous witness result must latch maintenance"),
+            ReplaySnapshotCoordinatorMaintenanceError::OuterAdvanceAfterReplay(
+                ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(
+                    SecurityStateStoreError::WitnessAdvanceUnresolved,
+                ),
+            )
+        );
+        drop(coordinator);
+
+        let reopened = open_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness,
+        )?;
+        assert_eq!(reopened.current_snapshot.test_sequence(), 2);
+        assert_eq!(
+            reopened
+                .replay_journal
+                .state
+                .maintenance_expiry_bucket_watermark,
+            ReplayMaintenanceWatermark::new(7)
+        );
         verify_current(&reopened.current_snapshot, &reopened.replay_journal)?;
         Ok(())
     }
@@ -3133,6 +3980,58 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_latches_on_outer_stage_failure_after_maintenance_advance() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        let outer_staging_directory = security_state_root.join(STAGING_DIRECTORY);
+        fs::remove_dir(&outer_staging_directory)?;
+        fs::write(&outer_staging_directory, b"not a directory")?;
+
+        assert_eq!(
+            coordinator
+                .commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))
+                .expect_err("outer stage failure after maintenance must latch"),
+            ReplaySnapshotCoordinatorMaintenanceError::OuterAdvanceAfterReplay(
+                ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(
+                    SecurityStateStoreError::UnsafeRecoveryPath,
+                ),
+            )
+        );
+        assert_eq!(
+            coordinator.health,
+            ReplaySnapshotCoordinatorHealth::Indeterminate
+        );
+        assert_eq!(
+            coordinator
+                .commit_maintenance_watermark(ReplayMaintenanceWatermark::new(8))
+                .expect_err("coordinator must remain latched"),
+            ReplaySnapshotCoordinatorMaintenanceError::LatchedIndeterminate
+        );
+        drop(coordinator);
+
+        assert!(matches!(
+            open_coordinator(
+                &replay_root,
+                &security_state_root,
+                DeterministicTestProtector::available(),
+                witness,
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::SnapshotBinding(
+                SecurityStateBindingError::ReplayComponentMismatch,
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn coordinator_safe_pre_authority_failure_keeps_pair_ready() -> TestResult {
         let directory = tempfile::tempdir()?;
         let replay_root = directory.path().join("replay");
@@ -3227,6 +4126,52 @@ mod tests {
             &ContinuationReplayPlan::Cover,
         )?;
         assert_eq!(result.into_parts().1, ReplayDuplicateDecision::Fresh);
+        assert_eq!(coordinator.current_snapshot.test_sequence(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_preflights_outer_sequence_before_maintenance_advance() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness,
+        )?;
+        let initial_snapshot = coordinator.current_snapshot;
+        let replay_before = coordinator.replay_journal.state;
+        coordinator.current_snapshot = initial_snapshot.test_with_sequence(u64::MAX)?;
+
+        assert_eq!(
+            coordinator
+                .commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))
+                .expect_err("outer sequence exhaustion must precede maintenance persistence"),
+            ReplaySnapshotCoordinatorMaintenanceError::OuterAdvancePreflight(
+                SecurityStateBindingError::InvalidSnapshot(
+                    SecurityStateValueError::SequenceOverflow,
+                ),
+            )
+        );
+        assert_eq!(coordinator.replay_journal.state, replay_before);
+        assert_eq!(
+            coordinator.replay_journal.health,
+            ReplayJournalStoreHealth::Ready
+        );
+        assert_eq!(coordinator.health, ReplaySnapshotCoordinatorHealth::Ready);
+        assert_eq!(
+            coordinator.security_state.current()?,
+            Some(initial_snapshot)
+        );
+
+        coordinator.current_snapshot = initial_snapshot;
+        assert_eq!(
+            coordinator.commit_maintenance_watermark(ReplayMaintenanceWatermark::new(7))?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::Advanced
+        );
         assert_eq!(coordinator.current_snapshot.test_sequence(), 2);
         Ok(())
     }
@@ -3375,9 +4320,9 @@ mod tests {
         assert_eq!(
             initial.component_state_digest(),
             [
-                0xf2, 0x06, 0x75, 0xbc, 0x27, 0x14, 0x83, 0x68, 0x70, 0xbe, 0x7f, 0xba, 0xcd, 0x40,
-                0xfa, 0xb3, 0x10, 0xf8, 0x0d, 0x85, 0x2e, 0x14, 0x40, 0x16, 0x02, 0x72, 0x2c, 0x0f,
-                0x67, 0xad, 0x45, 0xbe,
+                0x30, 0x64, 0x43, 0xa4, 0x74, 0x04, 0xd8, 0xbc, 0xbd, 0x86, 0xfc, 0x37, 0xfb, 0xa2,
+                0xc2, 0x3c, 0x70, 0x22, 0x26, 0x4a, 0x65, 0x80, 0x0c, 0x2b, 0xce, 0x2b, 0x00, 0x5a,
+                0x0e, 0x8d, 0xb5, 0xf9,
             ]
         );
         verify_current(&initial, &store)?;
@@ -3493,6 +4438,53 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_receipt_requires_its_live_instance_and_current_head() -> TestResult {
+        let first_directory = tempfile::tempdir()?;
+        let second_directory = tempfile::tempdir()?;
+        let mut first_store = open_store(&first_directory)?;
+        let mut second_store = open_store(&second_directory)?;
+        let previous_digest = first_store.component_state_digest()?;
+        let initial = provision_initial_snapshot(
+            test_security_state_identity(0x64)?,
+            [0x68; STATE_DIGEST_BYTES],
+            &first_store,
+        )?;
+
+        let no_op_receipt =
+            first_store.test_maintenance_receipt_for_digests(previous_digest, previous_digest);
+        assert_eq!(
+            successor_after_replay_maintenance(&initial, no_op_receipt, &first_store),
+            Err(SecurityStateBindingError::ReplayComponentDidNotAdvance)
+        );
+
+        let first_receipt =
+            advance_maintenance_watermark(&mut first_store, ReplayMaintenanceWatermark::new(7))?
+                .expect("greater watermark must mint a receipt");
+        let digest_at_seven = first_store.component_state_digest()?;
+        let successor = successor_after_replay_maintenance(&initial, first_receipt, &first_store)?;
+        verify_current(&successor, &first_store)?;
+
+        let second_receipt =
+            advance_maintenance_watermark(&mut second_store, ReplayMaintenanceWatermark::new(7))?
+                .expect("greater watermark must mint a receipt");
+        assert_eq!(second_store.component_state_digest()?, digest_at_seven);
+        assert_eq!(
+            successor_after_replay_maintenance(&initial, second_receipt, &first_store),
+            Err(SecurityStateBindingError::ReplayJournalInstanceMismatch)
+        );
+
+        advance_maintenance_watermark(&mut first_store, ReplayMaintenanceWatermark::new(8))?
+            .expect("greater watermark must advance");
+        let stale_receipt =
+            first_store.test_maintenance_receipt_for_digests(previous_digest, digest_at_seven);
+        assert_eq!(
+            successor_after_replay_maintenance(&initial, stale_receipt, &first_store),
+            Err(SecurityStateBindingError::ReplayReceiptNotCurrent)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn indeterminate_replay_store_cannot_bind_an_outer_snapshot() -> TestResult {
         let directory = tempfile::tempdir()?;
         let mut store = open_store(&directory)?;
@@ -3506,7 +4498,7 @@ mod tests {
         let staged_entry = store.stage_entry_file(&prepared)?;
         let replaced_entry = store.replace_entry_file(staged_entry, &prepared)?;
         store.confirm_entry_file_durable(replaced_entry)?;
-        let staged_current = store.stage_current_state(&prepared)?;
+        let staged_current = store.stage_current_state(&prepared.next_state)?;
         let _replaced_current = store.replace_current_state(staged_current)?;
         // Model a directory-sync failure after the authoritative marker rename.
         assert_eq!(
@@ -3646,6 +4638,7 @@ mod tests {
             claimed_request_count: 2,
             claimed_continuation_count: 1,
             entry_chain_digest: [0x71; DIGEST_BYTES],
+            maintenance_expiry_bucket_watermark: ReplayMaintenanceWatermark::NONE,
         };
         write_current(&root, &noncanonical_state, &protector)?;
 
@@ -3887,7 +4880,7 @@ mod tests {
         let staged_entry = store.stage_entry_file(&prepared)?;
         let replaced_entry = store.replace_entry_file(staged_entry, &prepared)?;
         store.confirm_entry_file_durable(replaced_entry)?;
-        let staged_current = store.stage_current_state(&prepared)?;
+        let staged_current = store.stage_current_state(&prepared.next_state)?;
         let replaced_current = store.replace_current_state(staged_current)?;
         store.confirm_current_state_durable(replaced_current)?;
         assert_eq!(store.state.committed_sequence, 0);
@@ -3914,7 +4907,7 @@ mod tests {
         let staged_entry = store.stage_entry_file(&prepared)?;
         let replaced_entry = store.replace_entry_file(staged_entry, &prepared)?;
         store.confirm_entry_file_durable(replaced_entry)?;
-        let _staged_current = store.stage_current_state(&prepared)?;
+        let _staged_current = store.stage_current_state(&prepared.next_state)?;
         drop(store);
 
         let mut reopened = open_store(&directory)?;
@@ -3932,7 +4925,7 @@ mod tests {
         let staged_entry = store.stage_entry_file(&prepared)?;
         let replaced_entry = store.replace_entry_file(staged_entry, &prepared)?;
         store.confirm_entry_file_durable(replaced_entry)?;
-        let staged_current = store.stage_current_state(&prepared)?;
+        let staged_current = store.stage_current_state(&prepared.next_state)?;
         let _replaced_current = store.replace_current_state(staged_current)?;
         drop(store);
 

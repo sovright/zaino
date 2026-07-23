@@ -5,7 +5,8 @@
 //! inside deterministic fixtures and one live process. Their `Arc` identities
 //! prevent equal-value ABA and cross-round mixing in memory; they are not
 //! durable reservation, commit, freshness, trusted-time, or rollback evidence.
-//! The v5 replay identities also do not encode a maintenance transition.
+//! Profile v6 keeps its maintenance-watermark transition journal-local; these
+//! replay identities do not encode trusted maintenance authority.
 
 use std::{fmt, sync::Arc};
 

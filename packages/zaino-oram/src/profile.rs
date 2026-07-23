@@ -8,7 +8,7 @@ use crate::{
 };
 
 pub(super) const PROFILE_ID_BYTES: usize = 16;
-const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v5";
+const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v6";
 const UNARY_FIXED_ENVELOPE_TAG: u8 = 1;
 const SINGLE_WORKER_FIFO_TAG: u8 = 1;
 const REJECT_AT_CAPACITY_TAG: u8 = 1;
@@ -838,7 +838,7 @@ mod tests {
         let baseline = profile();
         assert_eq!(
             baseline.profile_id(),
-            &[93, 53, 106, 68, 183, 91, 143, 143, 69, 130, 88, 156, 163, 4, 167, 157,]
+            &[242, 71, 113, 71, 227, 192, 130, 40, 112, 11, 108, 206, 85, 56, 119, 181,]
         );
         let mut relabeled = definition();
         relabeled.label = "renamed";

@@ -9,18 +9,30 @@ and this library adheres to Rust's notion of
 
 ### Added
 
-- `zaino-oram`: supersede profile ID v4 with v5 for fresh replay-journal
-  provisioning. The immutable replay-entry format advances to authenticated
-  version two (`ZORJENT2`) while the current head remains version two and all
-  fixed record widths remain unchanged. Each persisted real continuation claim
-  is one typed value containing its opaque replay key and a nonzero, one-based
-  ceiling expiry-bucket ordinal. Profile v5 does not migrate or dual-accept v4
-  journal state; a later incompatible persisted replay successor requires
-  another profile identity. This slice adds metadata only: it provides no
-  trusted-time authority, replay-maintenance expiry or eligibility
-  classification, maintenance state, watermark, deletion, count reduction,
-  compaction, capacity reclamation, or garbage-collection execution. Request
-  claims still have no expiry, so replay capacity remains lifetime cumulative.
+- `zaino-oram`: supersede profile ID v5 with v6 and replay-current v2 with
+  fixed-width v3 (`ZORJCUR3`) for fresh replay-journal provisioning. Entry v2
+  (`ZORJENT2`) and every current/entry record width remain unchanged. Current
+  v3 persists a `u64` maintenance watermark: zero is the sentinel for no
+  classified bucket, and a nonzero value is the inclusive recorded highest
+  fully expired continuation expiry bucket for future maintenance
+  classification. The raw recorded value is not trusted-time, epoch, profile,
+  currentness, expiry, or retirement authority. A lower proposal rejects; an
+  equal proposal returns typed `NoAdvance` without a write, receipt, or outer
+  sequence advance; and a greater proposal durably advances replay-current,
+  mints a distinct move-only maintenance receipt, and proceeds through the
+  serialized replay-current -> outer-local -> witness coordinator path.
+  Recovery retains the same fail-closed ordering: hard witness rejection
+  fresh-opens as `WitnessLocalMismatch`, while witness advance-then-error can
+  reconcile on fresh open. The advance appends no replay entry and changes no
+  claim set or count. Profile v6 neither migrates nor dual-accepts
+  profile-v5/current-v2 or earlier state. The mutation/coordinator surface
+  remains module-private with no non-test caller and no trusted-time,
+  epoch, or profile grant; visibility widening or runtime wiring must first
+  consume a live epoch/profile/currentness-bound move-only grant. This slice
+  provides no request expiry, deletion, count reduction, compaction,
+  reclamation, bounded retention, or garbage-collection execution, so replay
+  capacity remains lifetime cumulative. It supplies no TDX, mainnet,
+  target-load, or access-oblivious proof.
 - `zaino-oram`: add a module-private replay-component construction and
   verification foundation for the outer security-state snapshot. A versioned,
   domain-separated composite security-component digest currently commits the
