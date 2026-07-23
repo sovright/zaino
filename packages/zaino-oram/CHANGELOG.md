@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Profile ID v5 and authenticated fixed-width replay-entry format v2
+  (`ZORJENT2`) for fresh replay-journal provisioning. Each persisted real
+  continuation claim is one typed value containing its opaque replay key and a
+  nonzero, one-based ceiling expiry-bucket ordinal. The current head remains
+  version two and all record widths remain unchanged. V4 state is neither
+  migrated nor dual-accepted, and a later incompatible persisted replay
+  successor requires another profile identity. This is authenticated metadata,
+  not a trusted-time provider, expiry/eligibility decision, maintenance
+  watermark, deletion, count reduction, compaction, reclamation, or
+  garbage-collection implementation. Request claims remain unexpired and
+  capacity remains lifetime cumulative.
 - ADR 0009's production gate for one opaque, rollback-resistant runtime
   security-state owner spanning key/projection epochs, sessions and distinct
   role keys, request/server nonce ownership, trusted time, real-or-cover replay

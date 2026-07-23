@@ -689,7 +689,7 @@ where
             })?;
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             query_digest,
             epoch.checkpoint.projection_epoch,
             material.now_unix_seconds(),
@@ -1582,7 +1582,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        continuation_token::ContinuationProtectionContext,
+        continuation_token::{ContinuationProtectionContext, ContinuationReplayPlan},
         profile::test_profile_with_recent_snapshot,
         recent_snapshot::{
             serving_epoch_for_tests, FrozenRecentSnapshot, RecentSnapshotLineage,
@@ -1590,9 +1590,9 @@ mod tests {
         },
         records::{AddressKey, TransparentUtxo, UtxoQuery, ADDRESS_KEY_BYTES, TXID_BYTES},
         runtime_security::{
-            ContinuationReplayKey, ContinuationReplayPlan, ReplayCommitAuthority,
-            ReplayCommitResult, ReplayCommitUnavailable, ReplayDuplicateDecision, RequestReplayKey,
-            RoundReservationAuthority, SecurityEpochTag, SecurityRoundCapture,
+            ReplayCommitAuthority, ReplayCommitResult, ReplayCommitUnavailable,
+            ReplayDuplicateDecision, RequestReplayKey, RoundReservationAuthority, SecurityEpochTag,
+            SecurityRoundCapture, REPLAY_RECORD_KEY_BYTES,
         },
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
@@ -1979,7 +1979,7 @@ mod tests {
 
     struct CountingReplayGuard {
         claimed_requests: [Option<RequestReplayKey>; 16],
-        claimed: [Option<ContinuationReplayKey>; 16],
+        claimed: [Option<[u8; REPLAY_RECORD_KEY_BYTES]>; 16],
         calls: usize,
         real_claim_attempts: usize,
         logical_reads: usize,
@@ -2031,12 +2031,13 @@ mod tests {
             } else {
                 match continuation_plan {
                     ContinuationReplayPlan::Cover => (None, false),
-                    ContinuationReplayPlan::ClaimOrCover(key) => {
+                    ContinuationReplayPlan::ClaimOrCover(claim) => {
                         self.real_claim_attempts += 1;
+                        let key = *claim.replay_key_bytes();
                         let duplicate = self
                             .claimed
                             .iter()
-                            .any(|candidate| candidate.as_ref() == Some(key));
+                            .any(|candidate| candidate.as_ref() == Some(&key));
                         (Some(key), duplicate)
                     }
                 }
@@ -2067,7 +2068,7 @@ mod tests {
                 };
                 self.claimed_requests[request_slot] = Some(*request_key);
                 if let (Some(slot), Some(key)) = (continuation_slot, continuation_key) {
-                    self.claimed[slot] = Some(*key);
+                    self.claimed[slot] = Some(key);
                 }
             }
 
@@ -4223,7 +4224,7 @@ mod tests {
         let profile = *runtime.epoch_for_tests().engine.profile();
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             102,
@@ -4529,7 +4530,7 @@ mod tests {
         let profile = *runtime.epoch_for_tests().engine.profile();
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             102,

@@ -188,11 +188,16 @@ collision-resistant canonical digest, at least:
 Request-nonce claims have no expiry in the current protocol. A continuation
 token's expiry therefore cannot authorize deletion of its paired request
 claim, reduction of the request-claim count, or reclamation of replay capacity.
-Any future persisted continuation claim that participates in expiry
-maintenance must bind its canonical replay key and public expiry bucket in one
-validated typed claim constructed after token authentication and profile
-validation. The persistence and maintenance boundaries must not accept the key
-and bucket as independently supplied values.
+Profile v5 replay-entry format v2 persists each real continuation as one
+authenticated typed claim containing its opaque replay key and a nonzero,
+one-based ceiling expiry-bucket ordinal. The ordinal is
+`ceil(expiry_unix_seconds / expiry_bucket_width_seconds)` and is constructed
+with overflow-safe arithmetic only after token authentication and profile
+validation.
+The persistence boundary does not accept the key and ordinal as independently
+supplied values. This ordinal is authenticated metadata, not trusted-time
+authority, replay-maintenance expiry or eligibility classification, or
+authorization to delete either claim.
 
 The canonical request and continuation replay-key encodings and their
 collision-resistant digests are versioned and covered by the profile identity.
@@ -291,11 +296,14 @@ sequence.
 The crate now also contains a local replay component-store foundation. A
 crate-private journal records each request lane together with its applied
 real-or-cover continuation lane in one ordered transaction. Exact fixed-size
-version-two current-state and version-one entry record bodies are sealed through
-an injected protector and opaque journal context; the current state also binds
-the exact compiled profile ID. Replay identities, lane tags, counters, and the
-entry chain are not plaintext record fields. Sequential entry filenames still
-expose the public transaction sequence. The next sequence candidate is
+version-two current-state and version-two entry record bodies are sealed through
+an injected protector and opaque journal context. Entry v2 (`ZORJENT2`) persists
+each real continuation replay key and its nonzero, one-based ceiling
+expiry-bucket ordinal as one typed claim. The current-state format remains v2,
+all fixed record widths remain unchanged, and the current state binds the exact
+compiled profile ID. Replay identities, lane tags, expiry ordinals, counters,
+and the entry chain are not plaintext record fields. Sequential entry filenames
+still expose the public transaction sequence. The next sequence candidate is
 synchronized before the atomic `current.bin` replacement, and only
 `current.bin` defines the locally committed prefix. Startup opens exactly that
 profile-bound prefix, reconstructs both claim sets and the chain digest, and
@@ -346,26 +354,29 @@ protector, and no non-test runtime or security-owner caller constructs the
 coordinator. The replay-journal commit, outer-snapshot replacement, and witness
 advancement are not one atomic transaction: replay may be durably ahead after
 an outer failure, and the protocol responds by latching rather than claiming
-automatic repair. Profile ID v4 binds the total committed replay-transaction
-capacity, public trusted-time expiry-bucket width, and proactive fixed
-garbage-collection interval. Journal/coordinator construction derives the
+automatic repair. Profile ID v5 supersedes v4. It retains the total committed
+replay-transaction capacity, public trusted-time expiry-bucket width, and
+proactive fixed garbage-collection interval bindings and adds the authenticated
+entry-v2 semantics above. Journal/coordinator construction derives the
 persisted transaction bound from the compiled profile, and outer-sequence
-exhaustion is rejected before replay commit. The journal does not yet execute
-expiry or garbage collection, and the exact trusted-time authority remains
-unselected. This v4 policy binding is identity only: the journal performs no
-expiry, garbage collection, replay-entry deletion, claim-count reduction, or
-capacity reclamation, and its capacity remains a lifetime
-committed-transaction bound. The next persisted replay-entry or current-state
-format or semantic successor to v4 requires the distinct profile ID v5 and
-fresh provisioning; each later incompatible successor likewise requires a new
-profile identity. There is no in-place migration, older/newer dual acceptance,
-or reinterpretation of an existing v4 journal. V3 envelopes, tokens, replay
-namespaces, leases, journal heads, and outer identities likewise have no
-dual-acceptance or in-place successor path; v4 requires fresh provisioning. It
-assumes exactly one live writer without enforcing a process lock. There is no
-production freshness witness, production replay protector/key/nonce owner,
-nonce-reservation journal, trusted-time journal, key persistence, attestation
-binding, owner construction path, or service caller.
+exhaustion is rejected before replay commit. The current head remains version
+two and all fixed record widths remain unchanged.
+
+This v5 metadata does not provide trusted time, replay-maintenance expiry or
+eligibility classification, maintenance state or a watermark,
+garbage-collection execution, replay-entry deletion, claim-count reduction,
+compaction, or capacity reclamation. Request claims still have no expiry, and
+journal capacity
+remains a lifetime committed-transaction bound. V5 requires fresh provisioning:
+there is no in-place v4 migration, v4/v5 dual acceptance, or reinterpretation of
+an existing v4 journal. A later incompatible persisted replay format or
+semantic successor requires another profile identity. Earlier profile and
+journal generations likewise have no dual-acceptance or in-place path. The
+journal assumes exactly one live writer without enforcing a process lock. There
+is no production freshness
+witness, production replay protector/key/nonce owner, nonce-reservation
+journal, trusted-time journal, key persistence, attestation binding, owner
+construction path, or service caller.
 At the standalone-journal layer, a missing `current.bin` is locally
 indistinguishable from first initialization and opens as empty so an initial
 pre-marker crash can retry. An existing coordinator open detects loss or

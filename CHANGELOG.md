@@ -9,6 +9,18 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-oram`: supersede profile ID v4 with v5 for fresh replay-journal
+  provisioning. The immutable replay-entry format advances to authenticated
+  version two (`ZORJENT2`) while the current head remains version two and all
+  fixed record widths remain unchanged. Each persisted real continuation claim
+  is one typed value containing its opaque replay key and a nonzero, one-based
+  ceiling expiry-bucket ordinal. Profile v5 does not migrate or dual-accept v4
+  journal state; a later incompatible persisted replay successor requires
+  another profile identity. This slice adds metadata only: it provides no
+  trusted-time authority, replay-maintenance expiry or eligibility
+  classification, maintenance state, watermark, deletion, count reduction,
+  compaction, capacity reclamation, or garbage-collection execution. Request
+  claims still have no expiry, so replay capacity remains lifetime cumulative.
 - `zaino-oram`: add a module-private replay-component construction and
   verification foundation for the outer security-state snapshot. A versioned,
   domain-separated composite security-component digest currently commits the

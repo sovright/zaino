@@ -4,17 +4,17 @@
 //! observation. This module neither establishes that observation as trusted
 //! time nor authorizes replay-journal claim retirement from it.
 
-use std::{fmt, mem::size_of};
+use std::{fmt, mem::size_of, num::NonZeroU64};
 
 use blake2::{Blake2s256, Digest};
 
 use crate::{
-    profile::PROFILE_ID_BYTES,
+    profile::{PrivacyProfile, PROFILE_ID_BYTES},
     protection::{AuthenticationDecision, ProtectionUnavailable},
     runtime_security::{
-        ContinuationReplayKey, ContinuationReplayPlan, ReplayCommitAuthority, ReplayCommitResult,
-        ReplayCommitUnavailable, ReplayDuplicateDecision, ReplayNamespace, RequestReplayKey,
-        SecurityRoundCapture,
+        ContinuationReplayKey, ReplayCommitAuthority, ReplayCommitResult, ReplayCommitUnavailable,
+        ReplayDuplicateDecision, ReplayNamespace, RequestReplayKey, SecurityRoundCapture,
+        REPLAY_RECORD_KEY_BYTES,
     },
 };
 
@@ -117,6 +117,7 @@ impl fmt::Debug for ContinuationState {
 pub(super) struct ContinuationExpectation {
     version: u16,
     profile_id: [u8; PROFILE_ID_BYTES],
+    expiry_bucket_width: NonZeroU64,
     query_digest: [u8; QUERY_DIGEST_BYTES],
     projection_epoch: u64,
     now_unix_seconds: u64,
@@ -124,9 +125,9 @@ pub(super) struct ContinuationExpectation {
 }
 
 impl ContinuationExpectation {
-    pub(super) const fn new(
+    pub(super) fn new(
         version: u16,
-        profile_id: [u8; PROFILE_ID_BYTES],
+        profile: &PrivacyProfile,
         query_digest: [u8; QUERY_DIGEST_BYTES],
         projection_epoch: u64,
         now_unix_seconds: u64,
@@ -134,7 +135,8 @@ impl ContinuationExpectation {
     ) -> Self {
         Self {
             version,
-            profile_id,
+            profile_id: *profile.profile_id(),
+            expiry_bucket_width: profile.replay_policy().expiry_bucket_width(),
             query_digest,
             projection_epoch,
             now_unix_seconds,
@@ -146,6 +148,86 @@ impl ContinuationExpectation {
 impl fmt::Debug for ContinuationExpectation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ContinuationExpectation { ..REDACTED.. }")
+    }
+}
+
+/// Authenticated continuation identity paired with its profile-derived expiry
+/// bucket.
+///
+/// Fields and the production constructor stay private to this
+/// post-authentication module so persistence cannot combine an independently
+/// supplied key and bucket ordinal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ContinuationReplayClaim {
+    replay_key: ContinuationReplayKey,
+    expiry_bucket_ordinal: NonZeroU64,
+}
+
+impl ContinuationReplayClaim {
+    fn from_authenticated_state(
+        state: &ContinuationState,
+        replay_namespace: &ReplayNamespace,
+        context_digest: [u8; QUERY_DIGEST_BYTES],
+        expiry_bucket_width: NonZeroU64,
+    ) -> Option<Self> {
+        let expires_at_unix_seconds = NonZeroU64::new(state.expires_at_unix_seconds)?;
+        let expiry_bucket_ordinal =
+            NonZeroU64::new(1 + ((expires_at_unix_seconds.get() - 1) / expiry_bucket_width.get()))?;
+        Some(Self {
+            replay_key: ContinuationReplayKey::new(
+                replay_namespace,
+                state.projection_epoch,
+                state.query_digest,
+                state.cursor,
+                expires_at_unix_seconds.get(),
+                state.nonce,
+                context_digest,
+            ),
+            expiry_bucket_ordinal,
+        })
+    }
+
+    /// Returns the opaque persistence-facing replay identity.
+    pub(super) const fn replay_key_bytes(&self) -> &[u8; REPLAY_RECORD_KEY_BYTES] {
+        self.replay_key.as_bytes()
+    }
+
+    /// Returns the nonzero one-based ceiling bucket ordinal for token expiry.
+    pub(super) const fn expiry_bucket_ordinal(&self) -> NonZeroU64 {
+        self.expiry_bucket_ordinal
+    }
+
+    /// Builds a typed claim for sibling-module fixtures.
+    #[cfg(test)]
+    pub(super) const fn for_test(
+        replay_key: ContinuationReplayKey,
+        expiry_bucket_ordinal: NonZeroU64,
+    ) -> Self {
+        Self {
+            replay_key,
+            expiry_bucket_ordinal,
+        }
+    }
+}
+
+impl fmt::Debug for ContinuationReplayClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ContinuationReplayClaim { ..REDACTED.. }")
+    }
+}
+
+/// Selects the continuation lane paired with every real request-nonce lane.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContinuationReplayPlan {
+    /// Commit the profile-fixed durable cover operation.
+    Cover,
+    /// Claim a fresh continuation or commit cover when it is already claimed.
+    ClaimOrCover(ContinuationReplayClaim),
+}
+
+impl fmt::Debug for ContinuationReplayPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ContinuationReplayPlan([REDACTED])")
     }
 }
 
@@ -236,9 +318,9 @@ impl ContinuationToken {
     /// its ordered logical phase schedule.
     ///
     /// A real continuation claim commits the token's exact
-    /// `expires_at_unix_seconds` into [`ContinuationReplayKey`]. The v4 replay
-    /// journal receives only that opaque key: it has no explicit expiry bucket
-    /// or independently validated key-and-bucket pair.
+    /// `expires_at_unix_seconds` into [`ContinuationReplayKey`] and pairs it
+    /// with the one-based ceiling bucket derived from the same compiled profile
+    /// that supplied the expected profile identifier.
     pub(super) fn inspect_optional<P>(
         token: Option<&Self>,
         protector: &P,
@@ -260,15 +342,15 @@ impl ContinuationToken {
         let context_digest = continuation_context_digest(context);
         let continuation_plan = match disposition {
             InspectedContinuation::Continue(state) => {
-                ContinuationReplayPlan::ClaimOrCover(ContinuationReplayKey::new(
+                match ContinuationReplayClaim::from_authenticated_state(
+                    &state,
                     replay_namespace,
-                    state.projection_epoch,
-                    state.query_digest,
-                    state.cursor,
-                    state.expires_at_unix_seconds,
-                    state.nonce,
                     context_digest,
-                ))
+                    expectation.expiry_bucket_width,
+                ) {
+                    Some(claim) => ContinuationReplayPlan::ClaimOrCover(claim),
+                    None => ContinuationReplayPlan::Cover,
+                }
             }
             InspectedContinuation::Initial
             | InspectedContinuation::Invalid(_)
@@ -654,7 +736,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::runtime_security::SecurityEpochTag;
+    use crate::{
+        profile::test_profile_without_recent_snapshot, runtime_security::SecurityEpochTag,
+    };
 
     const TEST_KEY: [u8; AUTHENTICATION_BYTES] = [0x6b; AUTHENTICATION_BYTES];
 
@@ -788,11 +872,8 @@ mod tests {
                         self.cover_commits += 1;
                         ReplayDuplicateDecision::Fresh
                     }
-                    ContinuationReplayPlan::ClaimOrCover(continuation_key) => {
-                        if self
-                            .claimed_continuations
-                            .insert(*continuation_key.as_bytes())
-                        {
+                    ContinuationReplayPlan::ClaimOrCover(claim) => {
+                        if self.claimed_continuations.insert(*claim.replay_key_bytes()) {
                             ReplayDuplicateDecision::Fresh
                         } else {
                             self.cover_commits += 1;
@@ -809,12 +890,16 @@ mod tests {
     }
 
     fn replay_namespace() -> ReplayNamespace {
+        replay_namespace_for_profile(&profile())
+    }
+
+    fn replay_namespace_for_profile(profile: &PrivacyProfile) -> ReplayNamespace {
         ReplayNamespace::new(
             [0x71; 16],
             1,
             2,
             3,
-            [0x11; PROFILE_ID_BYTES],
+            *profile.profile_id(),
             [0x72; QUERY_DIGEST_BYTES],
         )
     }
@@ -850,19 +935,32 @@ mod tests {
 
     fn continuation_plan_key(plan: &ContinuationReplayPlan) -> &[u8; QUERY_DIGEST_BYTES] {
         match plan {
-            ContinuationReplayPlan::ClaimOrCover(key) => key.as_bytes(),
+            ContinuationReplayPlan::ClaimOrCover(claim) => claim.replay_key_bytes(),
             ContinuationReplayPlan::Cover => {
                 panic!("valid fixture token must select a real continuation claim")
             }
         }
     }
 
+    fn profile() -> PrivacyProfile {
+        test_profile_without_recent_snapshot("continuation-token", 1, 1, 512, 1, 60)
+            .expect("continuation-token fixture profile is valid")
+    }
+
     fn state() -> ContinuationState {
-        ContinuationState::new(1, [0x11; 16], [0x22; 32], 41, 7, 1_000, [0x33; 24])
+        ContinuationState::new(
+            1,
+            *profile().profile_id(),
+            [0x22; 32],
+            41,
+            7,
+            1_000,
+            [0x33; 24],
+        )
     }
 
     fn expectation() -> ContinuationExpectation {
-        ContinuationExpectation::new(1, [0x11; 16], [0x22; 32], 41, 999, 16)
+        ContinuationExpectation::new(1, &profile(), [0x22; 32], 41, 999, 16)
     }
 
     fn context() -> ContinuationProtectionContext {
@@ -980,6 +1078,115 @@ mod tests {
             invalid.continuation_plan,
             ContinuationReplayPlan::Cover
         ));
+    }
+
+    #[test]
+    fn authenticated_claims_use_nonzero_one_based_ceiling_expiry_buckets() {
+        let cases = [
+            (1, 1, 1),
+            (1, u64::MAX, u64::MAX),
+            (2, 1, 1),
+            (2, 2, 1),
+            (2, 3, 2),
+            (2, u64::MAX, 9_223_372_036_854_775_808),
+            (60, 1, 1),
+            (60, 59, 1),
+            (60, 60, 1),
+            (60, 61, 2),
+            (60, 119, 2),
+            (60, 120, 2),
+            (60, 121, 3),
+            (60, u64::MAX, 307_445_734_561_825_861),
+            (u64::MAX, 1, 1),
+            (u64::MAX, u64::MAX, 1),
+        ];
+
+        for (bucket_width, expires_at_unix_seconds, expected_ordinal) in cases {
+            let profile = profile()
+                .with_test_replay_policy(32, bucket_width, 300)
+                .expect("fixture replay policy is valid");
+            let expectation = ContinuationExpectation::new(1, &profile, [0x22; 32], 41, 0, 16);
+            let namespace = replay_namespace_for_profile(&profile);
+            let state = ContinuationState::new(
+                1,
+                *profile.profile_id(),
+                [0x22; 32],
+                41,
+                7,
+                expires_at_unix_seconds,
+                [0x33; NONCE_BYTES],
+            );
+            let token = issue(&state);
+            let inspection = ContinuationToken::inspect_optional(
+                Some(&token),
+                &protector(),
+                &context(),
+                &expectation,
+                &namespace,
+                [0x58; NONCE_BYTES],
+            );
+            let claim = match inspection.continuation_plan {
+                ContinuationReplayPlan::ClaimOrCover(claim) => claim,
+                ContinuationReplayPlan::Cover => {
+                    panic!("authenticated unexpired token must produce a typed claim")
+                }
+            };
+            assert_eq!(
+                claim.expiry_bucket_ordinal(),
+                NonZeroU64::new(expected_ordinal).expect("fixture bucket ordinal is nonzero"),
+                "width {bucket_width}, expiry {expires_at_unix_seconds}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_expiry_never_creates_a_replay_claim() {
+        let profile = profile();
+        let state = ContinuationState::new(
+            1,
+            *profile.profile_id(),
+            [0x22; 32],
+            41,
+            7,
+            0,
+            [0x33; NONCE_BYTES],
+        );
+        assert!(ContinuationReplayClaim::from_authenticated_state(
+            &state,
+            &replay_namespace(),
+            continuation_context_digest(&context()),
+            profile.replay_policy().expiry_bucket_width(),
+        )
+        .is_none());
+
+        let token = issue(&state);
+        let expectation = ContinuationExpectation::new(1, &profile, [0x22; 32], 41, 0, 16);
+        let inspection = ContinuationToken::inspect_optional(
+            Some(&token),
+            &protector(),
+            &context(),
+            &expectation,
+            &replay_namespace(),
+            [0x59; NONCE_BYTES],
+        );
+        assert!(matches!(
+            inspection.continuation_plan,
+            ContinuationReplayPlan::Cover
+        ));
+    }
+
+    #[test]
+    fn expectation_binds_profile_id_and_bucket_width_from_one_profile() {
+        let profile = profile()
+            .with_test_replay_policy(32, 7, 300)
+            .expect("fixture replay policy is valid");
+        let expectation = ContinuationExpectation::new(1, &profile, [0x22; 32], 41, 0, 16);
+
+        assert_eq!(expectation.profile_id, *profile.profile_id());
+        assert_eq!(
+            expectation.expiry_bucket_width,
+            profile.replay_policy().expiry_bucket_width()
+        );
     }
 
     #[test]
@@ -1208,12 +1415,27 @@ mod tests {
     fn debug_output_redacts_token_state_and_decisions() {
         let state = state();
         let token = issue(&state);
+        let claim = ContinuationReplayClaim::from_authenticated_state(
+            &state,
+            &replay_namespace(),
+            continuation_context_digest(&context()),
+            profile().replay_policy().expiry_bucket_width(),
+        )
+        .expect("valid fixture state produces a claim");
 
         assert_eq!(format!("{state:?}"), "ContinuationState { ..REDACTED.. }");
         assert_eq!(format!("{token:?}"), "ContinuationToken { len: 128, .. }");
         assert_eq!(
             format!("{:?}", expectation()),
             "ContinuationExpectation { ..REDACTED.. }"
+        );
+        assert_eq!(
+            format!("{claim:?}"),
+            "ContinuationReplayClaim { ..REDACTED.. }"
+        );
+        assert_eq!(
+            format!("{:?}", ContinuationReplayPlan::ClaimOrCover(claim)),
+            "ContinuationReplayPlan([REDACTED])"
         );
         assert_eq!(
             format!(

@@ -9,18 +9,18 @@
 //! timing access. It also assumes exactly one live writer for a recovery
 //! directory; no process lock or multi-writer linearizability is provided.
 //!
-//! The v4 journal is append-only and capacity counts total committed
+//! The v5 journal is append-only and capacity counts total committed
 //! transactions, not live claims. Request claims have no expiry. A continuation
-//! key commits its exact token expiry before reaching this module, but entry v1
-//! stores only the opaque key and no explicit expiry bucket. There is no claim
-//! deletion, count reduction, capacity reclamation, or maintenance-only state
-//! transition in this format.
+//! claim keeps its opaque key and profile-derived expiry bucket ordinal
+//! inseparable in entry v2. There is no claim deletion, count reduction,
+//! capacity reclamation, or maintenance-only state transition in this format.
 
 use std::{
     collections::HashSet,
     fmt,
     fs::{self, File},
     io::{self, Read, Write},
+    num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
@@ -28,14 +28,14 @@ use blake2::{Blake2s256, Digest};
 use tempfile::NamedTempFile;
 
 use crate::{
-    continuation_token::ContinuationReplayGuard,
+    continuation_token::{ContinuationReplayGuard, ContinuationReplayPlan},
     persistence::fs_atomic::{
         create_unique_file, ensure_real_directory, sync_directory, RealDirectoryError,
     },
     profile::{CompiledReplayPolicy, PrivacyProfile, PROFILE_ID_BYTES},
     protection::{AuthenticationDecision, ProtectionUnavailable},
     runtime_security::{
-        ContinuationReplayPlan, ReplayCommitAuthority, ReplayCommitResult, ReplayCommitUnavailable,
+        ReplayCommitAuthority, ReplayCommitResult, ReplayCommitUnavailable,
         ReplayDuplicateDecision, RequestReplayKey, SecurityRoundCapture, REPLAY_RECORD_KEY_BYTES,
     },
 };
@@ -52,17 +52,17 @@ use super::{
 };
 
 const CURRENT_FORMAT_VERSION: u16 = 2;
-const ENTRY_FORMAT_VERSION: u16 = 1;
+const ENTRY_FORMAT_VERSION: u16 = 2;
 const U16_BYTES: usize = 2;
 const U64_BYTES: usize = 8;
 const DIGEST_BYTES: usize = 32;
 const RECORD_MAGIC_BYTES: usize = 8;
 const PROTECTION_OVERHEAD_BYTES: usize = 40;
 const CURRENT_RESERVED_BYTES: usize = 48;
-const ENTRY_RESERVED_BYTES: usize = 23;
+const ENTRY_RESERVED_BYTES: usize = 15;
 
 const CURRENT_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJCUR2";
-const ENTRY_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJENT1";
+const ENTRY_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJENT2";
 const CURRENT_STATE_FILE: &str = "current.bin";
 const ENTRIES_DIRECTORY: &str = "entries";
 const STAGING_DIRECTORY: &str = "staging";
@@ -88,7 +88,9 @@ const ENTRY_SEQUENCE_START: usize = 0;
 const ENTRY_REQUEST_KEY_START: usize = ENTRY_SEQUENCE_START + U64_BYTES;
 const ENTRY_CONTINUATION_TAG_START: usize = ENTRY_REQUEST_KEY_START + REPLAY_RECORD_KEY_BYTES;
 const ENTRY_CONTINUATION_KEY_START: usize = ENTRY_CONTINUATION_TAG_START + 1;
-const ENTRY_RESERVED_START: usize = ENTRY_CONTINUATION_KEY_START + REPLAY_RECORD_KEY_BYTES;
+const ENTRY_CONTINUATION_EXPIRY_BUCKET_ORDINAL_START: usize =
+    ENTRY_CONTINUATION_KEY_START + REPLAY_RECORD_KEY_BYTES;
+const ENTRY_RESERVED_START: usize = ENTRY_CONTINUATION_EXPIRY_BUCKET_ORDINAL_START + U64_BYTES;
 const ENTRY_BODY_BYTES: usize = ENTRY_RESERVED_START + ENTRY_RESERVED_BYTES;
 const ENTRY_PROTECTED_BYTES: usize = ENTRY_BODY_BYTES + PROTECTION_OVERHEAD_BYTES;
 const ENTRY_PROTECTED_START: usize = RECORD_MAGIC_BYTES + U16_BYTES;
@@ -153,28 +155,28 @@ impl fmt::Debug for ReplayJournalProtectionContext {
 #[derive(Clone, Copy)]
 enum ReplayJournalRecordKind {
     CurrentStateV2,
-    ImmutableEntryV1,
+    ImmutableEntryV2,
 }
 
 impl ReplayJournalRecordKind {
     const fn tag(self) -> u8 {
         match self {
             Self::CurrentStateV2 => 0,
-            Self::ImmutableEntryV1 => 1,
+            Self::ImmutableEntryV2 => 1,
         }
     }
 
     const fn format_version(self) -> u16 {
         match self {
             Self::CurrentStateV2 => CURRENT_FORMAT_VERSION,
-            Self::ImmutableEntryV1 => ENTRY_FORMAT_VERSION,
+            Self::ImmutableEntryV2 => ENTRY_FORMAT_VERSION,
         }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalLimits {
-    /// Maximum lifetime append count; v4 never reclaims consumed capacity.
+    /// Maximum lifetime append count; v5 never reclaims consumed capacity.
     max_transactions: u64,
 }
 
@@ -202,7 +204,10 @@ impl fmt::Debug for ReplayJournalLimits {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplayJournalContinuationLane {
     Cover,
-    Claim([u8; REPLAY_RECORD_KEY_BYTES]),
+    Claim {
+        key: [u8; REPLAY_RECORD_KEY_BYTES],
+        expiry_bucket_ordinal: NonZeroU64,
+    },
 }
 
 impl fmt::Debug for ReplayJournalContinuationLane {
@@ -211,11 +216,11 @@ impl fmt::Debug for ReplayJournalContinuationLane {
     }
 }
 
-/// One immutable v1 transaction entry.
+/// One immutable v2 transaction entry.
 ///
 /// The continuation claim is an opaque digest that already binds its exact
-/// token expiry. This record carries neither an independently inspectable
-/// expiry bucket nor expiry metadata for the request claim.
+/// token expiry plus its profile-derived nonzero one-based expiry bucket
+/// ordinal. Request claims still carry no expiry metadata.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalEntry {
     sequence: u64,
@@ -234,9 +239,15 @@ impl ReplayJournalEntry {
             ReplayJournalContinuationLane::Cover => {
                 body[ENTRY_CONTINUATION_TAG_START] = CONTINUATION_COVER_TAG;
             }
-            ReplayJournalContinuationLane::Claim(key) => {
+            ReplayJournalContinuationLane::Claim {
+                key,
+                expiry_bucket_ordinal,
+            } => {
                 body[ENTRY_CONTINUATION_TAG_START] = CONTINUATION_CLAIM_TAG;
-                body[ENTRY_CONTINUATION_KEY_START..ENTRY_RESERVED_START].copy_from_slice(&key);
+                body[ENTRY_CONTINUATION_KEY_START..ENTRY_CONTINUATION_EXPIRY_BUCKET_ORDINAL_START]
+                    .copy_from_slice(&key);
+                body[ENTRY_CONTINUATION_EXPIRY_BUCKET_ORDINAL_START..ENTRY_RESERVED_START]
+                    .copy_from_slice(&expiry_bucket_ordinal.get().to_be_bytes());
             }
         }
         body
@@ -273,7 +284,7 @@ impl fmt::Debug for ReplayJournalComponentStateDigest {
     }
 }
 
-/// Monotonic v4 replay head reconstructed from every committed entry.
+/// Monotonic v5 replay head reconstructed from every committed entry.
 ///
 /// Both claim counts only increase. This state has no deletion base, live-count
 /// distinction, or maintenance watermark from which claims or capacity could
@@ -358,7 +369,7 @@ impl ReplayJournalState {
         let (insert_continuation, decision) = if request_is_fresh {
             match entry.continuation_lane {
                 ReplayJournalContinuationLane::Cover => (None, ReplayDuplicateDecision::Fresh),
-                ReplayJournalContinuationLane::Claim(key) => {
+                ReplayJournalContinuationLane::Claim { key, .. } => {
                     if continuation_claims.contains(&key) {
                         return Err(ReplayJournalTransitionError::InvalidDuplicateContinuationLane);
                     }
@@ -455,6 +466,8 @@ enum ReplayJournalValueError {
     InvalidContinuationTag,
     NonZeroReservedBytes,
     NonZeroCoverKey,
+    NonZeroCoverExpiryBucketOrdinal,
+    ZeroClaimExpiryBucketOrdinal,
 }
 
 impl fmt::Debug for ReplayJournalValueError {
@@ -609,7 +622,7 @@ impl PersistentReplayJournalEntry {
         protector
             .seal(
                 context,
-                ReplayJournalRecordKind::ImmutableEntryV1,
+                ReplayJournalRecordKind::ImmutableEntryV2,
                 &body,
                 &mut bytes[ENTRY_PROTECTED_START..],
             )
@@ -630,7 +643,7 @@ impl PersistentReplayJournalEntry {
         match protector
             .open(
                 context,
-                ReplayJournalRecordKind::ImmutableEntryV1,
+                ReplayJournalRecordKind::ImmutableEntryV2,
                 &self.0[ENTRY_PROTECTED_START..],
                 &mut body,
             )
@@ -649,6 +662,8 @@ impl PersistentReplayJournalEntry {
 
         let continuation_key =
             read_array::<REPLAY_RECORD_KEY_BYTES>(&body, ENTRY_CONTINUATION_KEY_START);
+        let continuation_expiry_bucket_ordinal =
+            read_u64(&body, ENTRY_CONTINUATION_EXPIRY_BUCKET_ORDINAL_START);
         let continuation_lane = match body[ENTRY_CONTINUATION_TAG_START] {
             CONTINUATION_COVER_TAG => {
                 if continuation_key != [0; REPLAY_RECORD_KEY_BYTES] {
@@ -656,9 +671,21 @@ impl PersistentReplayJournalEntry {
                         ReplayJournalValueError::NonZeroCoverKey,
                     ));
                 }
+                if continuation_expiry_bucket_ordinal != 0 {
+                    return Err(ReplayJournalRecordError::InvalidValue(
+                        ReplayJournalValueError::NonZeroCoverExpiryBucketOrdinal,
+                    ));
+                }
                 ReplayJournalContinuationLane::Cover
             }
-            CONTINUATION_CLAIM_TAG => ReplayJournalContinuationLane::Claim(continuation_key),
+            CONTINUATION_CLAIM_TAG => ReplayJournalContinuationLane::Claim {
+                key: continuation_key,
+                expiry_bucket_ordinal: NonZeroU64::new(continuation_expiry_bucket_ordinal).ok_or(
+                    ReplayJournalRecordError::InvalidValue(
+                        ReplayJournalValueError::ZeroClaimExpiryBucketOrdinal,
+                    ),
+                )?,
+            },
             _ => {
                 return Err(ReplayJournalRecordError::InvalidValue(
                     ReplayJournalValueError::InvalidContinuationTag,
@@ -1069,8 +1096,8 @@ where
                     ReplayJournalContinuationLane::Cover,
                     ReplayDuplicateDecision::Fresh,
                 ),
-                ContinuationReplayPlan::ClaimOrCover(key) => {
-                    let key = *key.as_bytes();
+                ContinuationReplayPlan::ClaimOrCover(claim) => {
+                    let key = *claim.replay_key_bytes();
                     if self.continuation_claims.contains(&key) {
                         (
                             ReplayJournalContinuationLane::Cover,
@@ -1078,7 +1105,10 @@ where
                         )
                     } else {
                         (
-                            ReplayJournalContinuationLane::Claim(key),
+                            ReplayJournalContinuationLane::Claim {
+                                key,
+                                expiry_bucket_ordinal: claim.expiry_bucket_ordinal(),
+                            },
                             ReplayDuplicateDecision::Fresh,
                         )
                     }
@@ -1264,7 +1294,7 @@ where
 /// across the journal, local snapshot, and external freshness witness. Once a
 /// replay commit succeeds, any unresolved outer advance latches this instance
 /// indeterminate and withholds the replay authority. It coordinates only
-/// request-triggered replay commits; v4 has no maintenance-only receipt or
+/// request-triggered replay commits; v5 has no maintenance-only receipt or
 /// coordinator transition.
 struct ReplaySnapshotCoordinator<P, W> {
     replay_journal: ReplayJournalStore<P>,
@@ -1799,6 +1829,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        continuation_token::ContinuationReplayClaim,
         inner_codec::{
             security_state_binding::{
                 provision_initial_snapshot, successor_after_replay_commit, verify_current,
@@ -2112,6 +2143,25 @@ mod tests {
         )
     }
 
+    fn continuation_claim(
+        key: ContinuationReplayKey,
+        expiry_bucket_ordinal: u64,
+    ) -> ContinuationReplayClaim {
+        ContinuationReplayClaim::for_test(
+            key,
+            NonZeroU64::new(expiry_bucket_ordinal)
+                .expect("fixture expiry bucket ordinal is nonzero"),
+        )
+    }
+
+    fn claim_lane(byte: u8, expiry_bucket_ordinal: u64) -> ReplayJournalContinuationLane {
+        ReplayJournalContinuationLane::Claim {
+            key: [byte; REPLAY_RECORD_KEY_BYTES],
+            expiry_bucket_ordinal: NonZeroU64::new(expiry_bucket_ordinal)
+                .expect("fixture expiry bucket ordinal is nonzero"),
+        }
+    }
+
     fn security_round() -> (SecurityEpochTag, SecurityRoundCapture) {
         let epoch = SecurityEpochTag::new([0x44; 32]);
         let round = SecurityRoundCapture::new(&epoch);
@@ -2269,6 +2319,24 @@ mod tests {
         Ok(())
     }
 
+    fn protect_entry_body(
+        body: &[u8; ENTRY_BODY_BYTES],
+        context: &ReplayJournalProtectionContext,
+        protector: &DeterministicTestProtector,
+    ) -> Result<PersistentReplayJournalEntry, ProtectionUnavailable> {
+        let mut record = [0; ENTRY_RECORD_BYTES];
+        record[..RECORD_MAGIC_BYTES].copy_from_slice(&ENTRY_MAGIC);
+        record[RECORD_MAGIC_BYTES..ENTRY_PROTECTED_START]
+            .copy_from_slice(&ENTRY_FORMAT_VERSION.to_be_bytes());
+        protector.seal(
+            context,
+            ReplayJournalRecordKind::ImmutableEntryV2,
+            body,
+            &mut record[ENTRY_PROTECTED_START..],
+        )?;
+        Ok(PersistentReplayJournalEntry(record))
+    }
+
     #[test]
     fn limits_reject_zero_transactions() {
         assert_eq!(
@@ -2281,11 +2349,7 @@ mod tests {
     fn fixed_width_records_round_trip_without_plaintext_semantics() -> TestResult {
         let protector = DeterministicTestProtector::available();
         let context = protection_context();
-        let replay_entry = entry(
-            1,
-            0x51,
-            ReplayJournalContinuationLane::Claim([0x61; REPLAY_RECORD_KEY_BYTES]),
-        );
+        let replay_entry = entry(1, 0x51, claim_lane(0x61, 7));
         let state = one_entry_state(limits(), &replay_entry);
         let persistent_entry =
             PersistentReplayJournalEntry::from_business(&replay_entry, &context, &protector)?;
@@ -2333,6 +2397,39 @@ mod tests {
             state
         );
         Ok(())
+    }
+
+    #[test]
+    fn entry_v2_body_layout_is_canonical() {
+        let cover = entry(7, 0x51, ReplayJournalContinuationLane::Cover).canonical_body();
+        assert_eq!(
+            &cover[ENTRY_SEQUENCE_START..ENTRY_REQUEST_KEY_START],
+            &7_u64.to_be_bytes()
+        );
+        assert_eq!(
+            &cover[ENTRY_REQUEST_KEY_START..ENTRY_CONTINUATION_TAG_START],
+            &[0x51; REPLAY_RECORD_KEY_BYTES]
+        );
+        assert_eq!(cover[ENTRY_CONTINUATION_TAG_START], CONTINUATION_COVER_TAG);
+        assert!(all_zero(
+            &cover[ENTRY_CONTINUATION_KEY_START..ENTRY_RESERVED_START]
+        ));
+        assert!(all_zero(&cover[ENTRY_RESERVED_START..]));
+
+        let claim = entry(7, 0x51, claim_lane(0x61, 9)).canonical_body();
+        assert_eq!(claim[ENTRY_CONTINUATION_TAG_START], CONTINUATION_CLAIM_TAG);
+        assert_eq!(
+            &claim[ENTRY_CONTINUATION_KEY_START..ENTRY_CONTINUATION_EXPIRY_BUCKET_ORDINAL_START],
+            &[0x61; REPLAY_RECORD_KEY_BYTES]
+        );
+        assert_eq!(
+            &claim[ENTRY_CONTINUATION_EXPIRY_BUCKET_ORDINAL_START..ENTRY_RESERVED_START],
+            &9_u64.to_be_bytes()
+        );
+        assert!(all_zero(&claim[ENTRY_RESERVED_START..]));
+        assert_eq!(ENTRY_MAGIC, *b"ZORJENT2");
+        assert_eq!(ENTRY_FORMAT_VERSION, 2);
+        assert_eq!(claim.len(), 96);
     }
 
     #[test]
@@ -2421,18 +2518,9 @@ mod tests {
         let context = protection_context();
         let mut invalid_tag = entry(1, 0x51, ReplayJournalContinuationLane::Cover).canonical_body();
         invalid_tag[ENTRY_CONTINUATION_TAG_START] = 9;
-        let mut tag_record = [0; ENTRY_RECORD_BYTES];
-        tag_record[..RECORD_MAGIC_BYTES].copy_from_slice(&ENTRY_MAGIC);
-        tag_record[RECORD_MAGIC_BYTES..ENTRY_PROTECTED_START]
-            .copy_from_slice(&ENTRY_FORMAT_VERSION.to_be_bytes());
-        protector.seal(
-            &context,
-            ReplayJournalRecordKind::ImmutableEntryV1,
-            &invalid_tag,
-            &mut tag_record[ENTRY_PROTECTED_START..],
-        )?;
+        let tag_record = protect_entry_body(&invalid_tag, &context, &protector)?;
         assert!(matches!(
-            PersistentReplayJournalEntry(tag_record).into_business(&context, &protector),
+            tag_record.into_business(&context, &protector),
             Err(ReplayJournalRecordError::InvalidValue(
                 ReplayJournalValueError::InvalidContinuationTag
             ))
@@ -2441,22 +2529,88 @@ mod tests {
         let mut nonzero_cover =
             entry(1, 0x51, ReplayJournalContinuationLane::Cover).canonical_body();
         nonzero_cover[ENTRY_CONTINUATION_KEY_START] = 1;
-        let mut cover_record = [0; ENTRY_RECORD_BYTES];
-        cover_record[..RECORD_MAGIC_BYTES].copy_from_slice(&ENTRY_MAGIC);
-        cover_record[RECORD_MAGIC_BYTES..ENTRY_PROTECTED_START]
-            .copy_from_slice(&ENTRY_FORMAT_VERSION.to_be_bytes());
-        protector.seal(
-            &context,
-            ReplayJournalRecordKind::ImmutableEntryV1,
-            &nonzero_cover,
-            &mut cover_record[ENTRY_PROTECTED_START..],
-        )?;
+        let cover_record = protect_entry_body(&nonzero_cover, &context, &protector)?;
         assert!(matches!(
-            PersistentReplayJournalEntry(cover_record).into_business(&context, &protector),
+            cover_record.into_business(&context, &protector),
             Err(ReplayJournalRecordError::InvalidValue(
                 ReplayJournalValueError::NonZeroCoverKey
             ))
         ));
+
+        let mut nonzero_cover_bucket =
+            entry(1, 0x51, ReplayJournalContinuationLane::Cover).canonical_body();
+        nonzero_cover_bucket[ENTRY_RESERVED_START - 1] = 1;
+        let cover_bucket_record = protect_entry_body(&nonzero_cover_bucket, &context, &protector)?;
+        assert!(matches!(
+            cover_bucket_record.into_business(&context, &protector),
+            Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::NonZeroCoverExpiryBucketOrdinal
+            ))
+        ));
+
+        let mut nonzero_cover_tail =
+            entry(1, 0x51, ReplayJournalContinuationLane::Cover).canonical_body();
+        nonzero_cover_tail[ENTRY_RESERVED_START] = 1;
+        let cover_tail_record = protect_entry_body(&nonzero_cover_tail, &context, &protector)?;
+        assert!(matches!(
+            cover_tail_record.into_business(&context, &protector),
+            Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::NonZeroReservedBytes
+            ))
+        ));
+
+        let mut zero_claim_bucket = entry(1, 0x51, claim_lane(0x61, 7)).canonical_body();
+        zero_claim_bucket[ENTRY_CONTINUATION_EXPIRY_BUCKET_ORDINAL_START..ENTRY_RESERVED_START]
+            .fill(0);
+        let zero_claim_record = protect_entry_body(&zero_claim_bucket, &context, &protector)?;
+        assert!(matches!(
+            zero_claim_record.into_business(&context, &protector),
+            Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::ZeroClaimExpiryBucketOrdinal
+            ))
+        ));
+
+        for reserved_index in ENTRY_RESERVED_START..ENTRY_BODY_BYTES {
+            let mut nonzero_reserved = entry(1, 0x51, claim_lane(0x61, 7)).canonical_body();
+            nonzero_reserved[reserved_index] = 1;
+            let reserved_record = protect_entry_body(&nonzero_reserved, &context, &protector)?;
+            assert!(matches!(
+                reserved_record.into_business(&context, &protector),
+                Err(ReplayJournalRecordError::InvalidValue(
+                    ReplayJournalValueError::NonZeroReservedBytes
+                ))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_entry_v1_without_migration() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        let protector = DeterministicTestProtector::available();
+        let replay_entry = entry(1, 0x51, claim_lane(0x61, 7));
+        let state = one_entry_state(limits(), &replay_entry);
+        write_current(&root, &state, &protector)?;
+        let entries = root.join(ENTRIES_DIRECTORY);
+        fs::create_dir_all(&entries)?;
+        let mut legacy_entry = [0; ENTRY_RECORD_BYTES];
+        legacy_entry[..RECORD_MAGIC_BYTES].copy_from_slice(b"ZORJENT1");
+        legacy_entry[RECORD_MAGIC_BYTES..ENTRY_PROTECTED_START]
+            .copy_from_slice(&1_u16.to_be_bytes());
+        fs::write(entries.join(entry_filename(1)), legacy_entry)?;
+
+        assert_eq!(
+            ReplayJournalStore::open_with_limits(
+                root,
+                limits(),
+                test_profile_id(),
+                protection_context(),
+                protector,
+            )
+            .expect_err("entry v1 has no explicit expiry bucket and must not be migrated"),
+            ReplayJournalStoreError::CommittedEntryCorrupt
+        );
         Ok(())
     }
 
@@ -2468,7 +2622,7 @@ mod tests {
         let mut protected = [0; ENTRY_PROTECTED_BYTES];
         protector.seal(
             &context,
-            ReplayJournalRecordKind::ImmutableEntryV1,
+            ReplayJournalRecordKind::ImmutableEntryV2,
             &plaintext,
             &mut protected,
         )?;
@@ -2477,7 +2631,7 @@ mod tests {
         assert_eq!(
             protector.open(
                 &context,
-                ReplayJournalRecordKind::ImmutableEntryV1,
+                ReplayJournalRecordKind::ImmutableEntryV2,
                 &protected,
                 &mut output
             )?,
@@ -2489,11 +2643,7 @@ mod tests {
 
     #[test]
     fn debug_output_redacts_replay_material() {
-        let replay_entry = entry(
-            1,
-            0x51,
-            ReplayJournalContinuationLane::Claim([0x61; REPLAY_RECORD_KEY_BYTES]),
-        );
+        let replay_entry = entry(1, 0x51, claim_lane(0x61, 7));
         let state = one_entry_state(limits(), &replay_entry);
         assert_eq!(
             format!("{replay_entry:?}"),
@@ -2504,28 +2654,14 @@ mod tests {
 
     #[test]
     fn entry_payload_digest_binds_every_semantic_field() {
-        let baseline = entry(
-            1,
-            0x51,
-            ReplayJournalContinuationLane::Claim([0x61; REPLAY_RECORD_KEY_BYTES]),
+        let baseline = entry(1, 0x51, claim_lane(0x61, 7));
+        assert_ne!(
+            baseline.payload_digest(),
+            entry(2, 0x51, claim_lane(0x61, 7)).payload_digest()
         );
         assert_ne!(
             baseline.payload_digest(),
-            entry(
-                2,
-                0x51,
-                ReplayJournalContinuationLane::Claim([0x61; REPLAY_RECORD_KEY_BYTES])
-            )
-            .payload_digest()
-        );
-        assert_ne!(
-            baseline.payload_digest(),
-            entry(
-                1,
-                0x52,
-                ReplayJournalContinuationLane::Claim([0x61; REPLAY_RECORD_KEY_BYTES])
-            )
-            .payload_digest()
+            entry(1, 0x52, claim_lane(0x61, 7)).payload_digest()
         );
         assert_ne!(
             baseline.payload_digest(),
@@ -2533,12 +2669,11 @@ mod tests {
         );
         assert_ne!(
             baseline.payload_digest(),
-            entry(
-                1,
-                0x51,
-                ReplayJournalContinuationLane::Claim([0x62; REPLAY_RECORD_KEY_BYTES])
-            )
-            .payload_digest()
+            entry(1, 0x51, claim_lane(0x62, 7)).payload_digest()
+        );
+        assert_ne!(
+            baseline.payload_digest(),
+            entry(1, 0x51, claim_lane(0x61, 8)).payload_digest()
         );
     }
 
@@ -2597,6 +2732,33 @@ mod tests {
             ordered.component_state_digest(),
             changed.component_state_digest()
         );
+
+        let mut bucket_seven_requests = HashSet::new();
+        let mut bucket_seven_continuations = HashSet::new();
+        let (bucket_seven, _) = ReplayJournalState::empty(limits(), test_profile_id())
+            .apply_entry(
+                &mut bucket_seven_requests,
+                &mut bucket_seven_continuations,
+                &entry(1, 0x51, claim_lane(0x61, 7)),
+            )
+            .expect("bucket-seven fixture entry is valid");
+        let mut bucket_eight_requests = HashSet::new();
+        let mut bucket_eight_continuations = HashSet::new();
+        let (bucket_eight, _) = ReplayJournalState::empty(limits(), test_profile_id())
+            .apply_entry(
+                &mut bucket_eight_requests,
+                &mut bucket_eight_continuations,
+                &entry(1, 0x51, claim_lane(0x61, 8)),
+            )
+            .expect("bucket-eight fixture entry is valid");
+        assert_ne!(
+            bucket_seven.entry_chain_digest,
+            bucket_eight.entry_chain_digest
+        );
+        assert_ne!(
+            bucket_seven.component_state_digest(),
+            bucket_eight.component_state_digest()
+        );
     }
 
     #[test]
@@ -2615,10 +2777,11 @@ mod tests {
         assert_ne!(duplicate_request, fresh_cover);
 
         let continuation = continuation_key(2);
+        let claim = continuation_claim(continuation, 7);
         store.commit_transaction(
             &round,
             &request_key(2),
-            &ContinuationReplayPlan::ClaimOrCover(continuation),
+            &ContinuationReplayPlan::ClaimOrCover(claim),
         )?;
         let fresh_continuation = store.component_state_digest()?;
         assert_ne!(fresh_continuation, duplicate_request);
@@ -2626,7 +2789,7 @@ mod tests {
         store.commit_transaction(
             &round,
             &request_key(3),
-            &ContinuationReplayPlan::ClaimOrCover(continuation),
+            &ContinuationReplayPlan::ClaimOrCover(claim),
         )?;
         assert_ne!(store.component_state_digest()?, fresh_continuation);
         Ok(())
@@ -3397,14 +3560,19 @@ mod tests {
         );
 
         let claim_key = continuation_key(2);
+        let claim_plan = continuation_claim(claim_key, 7);
         let claim = store.prepare_commit(
             &request_key(2),
-            &ContinuationReplayPlan::ClaimOrCover(claim_key),
+            &ContinuationReplayPlan::ClaimOrCover(claim_plan),
         )?;
         assert_eq!(claim.decision, ReplayDuplicateDecision::Fresh);
         assert_eq!(
             claim.entry.continuation_lane,
-            ReplayJournalContinuationLane::Claim(*claim_key.as_bytes())
+            ReplayJournalContinuationLane::Claim {
+                key: *claim_key.as_bytes(),
+                expiry_bucket_ordinal: NonZeroU64::new(7)
+                    .expect("fixture expiry bucket ordinal is nonzero"),
+            }
         );
         Ok(())
     }
@@ -3419,7 +3587,7 @@ mod tests {
         let new_continuation = continuation_key(2);
         let prepared = store.prepare_commit(
             &request,
-            &ContinuationReplayPlan::ClaimOrCover(new_continuation),
+            &ContinuationReplayPlan::ClaimOrCover(continuation_claim(new_continuation, 7)),
         )?;
 
         assert_eq!(prepared.decision, ReplayDuplicateDecision::RequestDuplicate);
@@ -3437,14 +3605,16 @@ mod tests {
         let mut store = open_store(&directory)?;
         let (_, round) = security_round();
         let continuation = continuation_key(2);
+        let first_claim = continuation_claim(continuation, 7);
+        let second_claim = continuation_claim(continuation, 8);
         store.commit_transaction(
             &round,
             &request_key(1),
-            &ContinuationReplayPlan::ClaimOrCover(continuation),
+            &ContinuationReplayPlan::ClaimOrCover(first_claim),
         )?;
         let prepared = store.prepare_commit(
             &request_key(2),
-            &ContinuationReplayPlan::ClaimOrCover(continuation),
+            &ContinuationReplayPlan::ClaimOrCover(second_claim),
         )?;
 
         assert_eq!(
@@ -3465,9 +3635,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("journal");
         let protector = DeterministicTestProtector::available();
-        let continuation = [0x61; REPLAY_RECORD_KEY_BYTES];
-        let first = entry(1, 0x51, ReplayJournalContinuationLane::Claim(continuation));
-        let second = entry(2, 0x52, ReplayJournalContinuationLane::Claim(continuation));
+        let first = entry(1, 0x51, claim_lane(0x61, 7));
+        let second = entry(2, 0x52, claim_lane(0x61, 8));
         write_entry(&root, &first, &protector)?;
         write_entry(&root, &second, &protector)?;
         let noncanonical_state = ReplayJournalState {
@@ -3516,6 +3685,49 @@ mod tests {
         );
         assert_eq!(store.state, before);
         assert_eq!(store.health, ReplayJournalStoreHealth::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_bucket_metadata_does_not_reclaim_transaction_capacity() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        let one_transaction = ReplayJournalLimits::new(1)?;
+        let mut store = ReplayJournalStore::open_with_limits(
+            root.clone(),
+            one_transaction,
+            test_profile_id(),
+            protection_context(),
+            DeterministicTestProtector::available(),
+        )?;
+        let (_, round) = security_round();
+        let claim = continuation_claim(continuation_key(2), 1);
+        store.commit_transaction(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::ClaimOrCover(claim),
+        )?;
+        drop(store);
+
+        let reopened = ReplayJournalStore::open_with_limits(
+            root,
+            one_transaction,
+            test_profile_id(),
+            protection_context(),
+            DeterministicTestProtector::available(),
+        )?;
+        assert_eq!(reopened.state.committed_sequence, 1);
+        assert_eq!(reopened.state.claimed_request_count, 1);
+        assert_eq!(reopened.state.claimed_continuation_count, 1);
+        assert!(reopened
+            .continuation_claims
+            .contains(claim.replay_key_bytes()));
+        assert_eq!(
+            reopened
+                .prepare_commit(&request_key(2), &ContinuationReplayPlan::Cover)
+                .expect_err("expiry bucket metadata does not authorize capacity reclamation"),
+            ReplayJournalStoreError::TransactionCapacityExceeded
+        );
         Ok(())
     }
 

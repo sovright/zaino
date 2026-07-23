@@ -96,14 +96,17 @@ store yet.
 
 Alongside it, a crate-private local replay-journal foundation durably orders
 one request lane with one real-or-cover continuation lane. Its fixed-size
-records seal replay identities and semantic state behind an injected protector,
-bind that protection to an opaque journal context, and synchronize the next
-sequence candidate before the sole `current.bin` commit marker. Recovery
-rebuilds only the exact committed sequence range and never inspects a later
-candidate; retries replace that non-authoritative candidate uniformly. It is
-not connected to the runtime and has only a deterministic test protector. Its
-total committed-transaction bound is derived from compiled profile v4, and it
-assumes a single live writer without enforcing a process lock.
+version-two entry records (`ZORJENT2`) seal replay identities and semantic state
+behind an injected protector, bind that protection to an opaque journal
+context, and synchronize the next sequence candidate before the sole
+`current.bin` commit marker. Each persisted real continuation claim is one
+typed value containing its opaque replay key and a nonzero, one-based ceiling
+expiry-bucket ordinal. Recovery rebuilds only the exact committed sequence
+range and never inspects a later candidate; retries replace that
+non-authoritative candidate uniformly. It is not connected to the runtime and
+has only a deterministic test protector. Its total committed-transaction bound
+is derived from compiled profile v5, and it assumes a single live writer
+without enforcing a process lock.
 
 A module-private coordinator now joins those two local foundations. Initial
 provisioning is an explicit operation distinct from opening existing state, and
@@ -123,14 +126,22 @@ This protocol is not one atomic transaction across the replay journal, outer
 snapshot, and witness. No non-test runtime or security-owner caller constructs
 the coordinator in this slice; owner integration remains separate.
 
-The private profile identifier is now v4. It binds the total committed replay
-transaction capacity, public trusted-time expiry-bucket width, and proactive
-fixed garbage-collection interval. Replay journal and coordinator construction
-derive the persisted transaction bound from that compiled profile, and the
-coordinator rejects an exhausted outer sequence before committing replay.
-Expiry/garbage-collection execution is not implemented by this slice.
-There is no v3 dual-acceptance or in-place migration: v4 requires fresh
-profile-bound journal and outer-state provisioning.
+The private profile identifier is now v5. It retains the v4 bindings for total
+committed replay-transaction capacity, public trusted-time expiry-bucket width,
+and proactive fixed garbage-collection interval, and binds the version-two
+persisted replay-entry semantics above. The authenticated current head remains
+version two and all fixed record widths remain unchanged. Replay journal and
+coordinator construction derive the lifetime-cumulative transaction bound from
+the compiled profile, and the coordinator rejects an exhausted outer sequence
+before committing replay. There is no v4 dual acceptance or in-place migration:
+v5 requires fresh profile-bound journal and outer-state provisioning. A later
+incompatible persisted replay successor requires another profile identity.
+
+The expiry-bucket ordinal is authenticated metadata only. This slice adds no
+trusted-time provider, replay-maintenance expiry or eligibility classification,
+maintenance state or watermark, replay-entry deletion, claim-count reduction,
+compaction, capacity reclamation, or garbage-collection execution. Request
+claims still have no expiry.
 
 This is still source-level research evidence. A production protector/replay/
 material-provider bundle, generated route and listener, runtime-integrated

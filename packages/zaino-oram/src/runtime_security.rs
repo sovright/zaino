@@ -5,7 +5,7 @@
 //! inside deterministic fixtures and one live process. Their `Arc` identities
 //! prevent equal-value ABA and cross-round mixing in memory; they are not
 //! durable reservation, commit, freshness, trusted-time, or rollback evidence.
-//! The v4 replay identities also do not encode a maintenance transition.
+//! The v5 replay identities also do not encode a maintenance transition.
 
 use std::{fmt, sync::Arc};
 
@@ -92,10 +92,9 @@ impl fmt::Debug for RequestReplayKey {
 
 /// Opaque canonical identity for one continuation-token use.
 ///
-/// The digest binds the exact token expiry, but exposes no separately
-/// recoverable expiry bucket to persistence. A future journal format that
-/// indexes claims by bucket must derive and validate the replay key and bucket
-/// as one inseparable value so mismatched metadata cannot be admitted.
+/// The digest binds the exact token expiry. The post-authentication token
+/// module pairs this key with its profile-derived expiry-bucket ordinal before
+/// persistence can observe a continuation claim.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ContinuationReplayKey {
     digest: [u8; REPLAY_DIGEST_BYTES],
@@ -135,21 +134,6 @@ impl ContinuationReplayKey {
 impl fmt::Debug for ContinuationReplayKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ContinuationReplayKey { ..REDACTED.. }")
-    }
-}
-
-/// Selects the continuation lane paired with every real request-nonce lane.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ContinuationReplayPlan {
-    /// Commit the profile-fixed durable cover operation.
-    Cover,
-    /// Claim a fresh continuation or commit cover when it is already claimed.
-    ClaimOrCover(ContinuationReplayKey),
-}
-
-impl fmt::Debug for ContinuationReplayPlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ContinuationReplayPlan([REDACTED])")
     }
 }
 
