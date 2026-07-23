@@ -1,3 +1,9 @@
+//! Fixed continuation-token codec and replay-admission preparation.
+//!
+//! Token expiry is evaluated against a caller-supplied Unix-seconds
+//! observation. This module neither establishes that observation as trusted
+//! time nor authorizes replay-journal claim retirement from it.
+
 use std::{fmt, mem::size_of};
 
 use blake2::{Blake2s256, Digest};
@@ -103,6 +109,10 @@ impl fmt::Debug for ContinuationState {
 }
 
 /// Expected public and request-bound values for token validation.
+///
+/// `now_unix_seconds` is an observed host/fixture input. The expiry comparison
+/// below enforces token semantics for that observation; it is not evidence of
+/// a monotonic or rollback-resistant time authority.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ContinuationExpectation {
     version: u16,
@@ -224,6 +234,11 @@ impl ContinuationToken {
     /// Performs exactly one real-or-cover open and every semantic comparison.
     /// Replay access is deliberately a separate step so the runtime can prove
     /// its ordered logical phase schedule.
+    ///
+    /// A real continuation claim commits the token's exact
+    /// `expires_at_unix_seconds` into [`ContinuationReplayKey`]. The v4 replay
+    /// journal receives only that opaque key: it has no explicit expiry bucket
+    /// or independently validated key-and-bucket pair.
     pub(super) fn inspect_optional<P>(
         token: Option<&Self>,
         protector: &P,

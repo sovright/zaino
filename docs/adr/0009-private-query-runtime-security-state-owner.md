@@ -22,8 +22,10 @@ dependencies, but those seams do not yet form a production security boundary:
 - the runtime owner accepts a caller-supplied `key_epoch`, `session_binding`,
   and `RuntimeDependencies` bundle whose protector, replay, and material-source
   components remain independently constructible by the caller;
-- `RoundMaterialSource` returns a bare Unix timestamp plus response and token
-  nonces without a freshness or reservation proof;
+- `RoundMaterialSource` returns a bare host-supplied Unix timestamp plus
+  response and token nonces without a freshness or reservation proof; that
+  `u64` is only observed time in the research runtime, not trusted-time
+  authority;
 - authenticated request nonces have no production uniqueness/replay owner;
 - `ReplayBinding` does not explicitly namespace claims by deployment, key
   epoch, or session binding;
@@ -158,6 +160,13 @@ reduce availability; it must never extend a token's validity or resurrect an
 expired token. Time refresh runs independently of secret queries or with one
 profile-fixed operation on every round.
 
+The current runtime's bare `u64` Unix timestamp remains an observed
+host-provided value even when tests choose it deterministically. It becomes
+trusted time only after the future owner validates an authority ticket or
+lease, commits the required rollback-resistant state, and returns a typed
+authority tied to that validation. Naming, bucketing, or persisting the
+observed value does not confer authority.
+
 ### Durable replay and rollback
 
 Request-nonce and continuation claims use explicit namespaces. A request-nonce
@@ -175,6 +184,15 @@ collision-resistant canonical digest, at least:
 - authenticated query, cursor, expiry, and token nonce; and
 - the authenticated token/context identity needed to prevent cross-namespace
   aliasing.
+
+Request-nonce claims have no expiry in the current protocol. A continuation
+token's expiry therefore cannot authorize deletion of its paired request
+claim, reduction of the request-claim count, or reclamation of replay capacity.
+Any future persisted continuation claim that participates in expiry
+maintenance must bind its canonical replay key and public expiry bucket in one
+validated typed claim constructed after token authentication and profile
+validation. The persistence and maintenance boundaries must not accept the key
+and bucket as independently supplied values.
 
 The canonical request and continuation replay-key encodings and their
 collision-resistant digests are versioned and covered by the profile identity.
@@ -334,11 +352,18 @@ garbage-collection interval. Journal/coordinator construction derives the
 persisted transaction bound from the compiled profile, and outer-sequence
 exhaustion is rejected before replay commit. The journal does not yet execute
 expiry or garbage collection, and the exact trusted-time authority remains
-unselected. V3 envelopes, tokens, replay namespaces, leases, journal heads, and
-outer identities have no dual-acceptance or in-place successor path; v4
-requires fresh provisioning. It assumes exactly one live writer without
-enforcing a process lock. There is no production freshness witness, production
-replay protector/key/nonce owner,
+unselected. This v4 policy binding is identity only: the journal performs no
+expiry, garbage collection, replay-entry deletion, claim-count reduction, or
+capacity reclamation, and its capacity remains a lifetime
+committed-transaction bound. The next persisted replay-entry or current-state
+format or semantic successor to v4 requires the distinct profile ID v5 and
+fresh provisioning; each later incompatible successor likewise requires a new
+profile identity. There is no in-place migration, older/newer dual acceptance,
+or reinterpretation of an existing v4 journal. V3 envelopes, tokens, replay
+namespaces, leases, journal heads, and outer identities likewise have no
+dual-acceptance or in-place successor path; v4 requires fresh provisioning. It
+assumes exactly one live writer without enforcing a process lock. There is no
+production freshness witness, production replay protector/key/nonce owner,
 nonce-reservation journal, trusted-time journal, key persistence, attestation
 binding, owner construction path, or service caller.
 At the standalone-journal layer, a missing `current.bin` is locally
@@ -354,6 +379,13 @@ The journal makes no access-oblivious memory, page, storage, or timing claim.
 The coordinator does not establish production rollback resistance, TDX
 security, mainnet readiness, or access-oblivious qualification.
 The first qualified deployment remains single-owner as required below.
+
+A future replay-maintenance mutation must advance the authenticated replay
+current state through its durable path and mint a dedicated move-only typed
+maintenance receipt. It must not reuse the query replay-commit receipt or
+mutate replay files out of band. The coordinator consumes that receipt through
+one serialized replay-current -> outer-local -> witness transition, retaining
+the existing fail-closed ambiguity and latching rules at every boundary.
 
 ### Lifecycle and response-release ordering
 

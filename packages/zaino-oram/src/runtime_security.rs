@@ -4,7 +4,8 @@
 //! epoch, round, reservation, and commit capabilities below only bind values
 //! inside deterministic fixtures and one live process. Their `Arc` identities
 //! prevent equal-value ABA and cross-round mixing in memory; they are not
-//! durable reservation, commit, freshness, or rollback evidence.
+//! durable reservation, commit, freshness, trusted-time, or rollback evidence.
+//! The v4 replay identities also do not encode a maintenance transition.
 
 use std::{fmt, sync::Arc};
 
@@ -65,7 +66,9 @@ pub(super) struct RequestReplayKey {
 impl RequestReplayKey {
     /// Binds only the stable namespace and authenticated request nonce.
     ///
-    /// Request payload and query fields are deliberately absent.
+    /// Request payload and query fields are deliberately absent. There is also
+    /// no request expiry or retirement field, so continuation expiry cannot
+    /// justify deleting this lane's claim.
     pub(super) fn new(namespace: &ReplayNamespace, authenticated_nonce: [u8; NONCE_BYTES]) -> Self {
         let mut hasher = versioned_hasher(REQUEST_REPLAY_KEY_DOMAIN);
         Digest::update(&mut hasher, namespace.digest);
@@ -88,13 +91,19 @@ impl fmt::Debug for RequestReplayKey {
 }
 
 /// Opaque canonical identity for one continuation-token use.
+///
+/// The digest binds the exact token expiry, but exposes no separately
+/// recoverable expiry bucket to persistence. A future journal format that
+/// indexes claims by bucket must derive and validate the replay key and bucket
+/// as one inseparable value so mismatched metadata cannot be admitted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ContinuationReplayKey {
     digest: [u8; REPLAY_DIGEST_BYTES],
 }
 
 impl ContinuationReplayKey {
-    /// Commits every stable continuation claim field in canonical order.
+    /// Commits every stable continuation claim field, including the exact
+    /// expiry Unix second, in canonical order.
     pub(super) fn new(
         namespace: &ReplayNamespace,
         projection_epoch: u64,

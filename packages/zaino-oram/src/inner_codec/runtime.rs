@@ -6,7 +6,9 @@
 //! its pinned serving epoch is still current after response encoding. It does
 //! not provide a production key/session owner, nonce source, trusted clock,
 //! replay database, listener, transport-write guard, physical ORAM trace,
-//! timing result, or TDX claim.
+//! timing result, or TDX claim. The round's Unix-seconds value is only observed
+//! host/fixture input used by token issue and validation; it does not authorize
+//! replay-journal maintenance or claim retirement.
 
 use crate::{
     continuation_token::{
@@ -671,6 +673,9 @@ where
                 .map_err(|_| self.latch_failure())?,
         )
         .map_err(|_| self.latch_failure())?;
+        // This observed round value drives token semantics only. Matching it to
+        // the reservation later prevents cross-round mixing, but does not turn
+        // it into a trusted clock or an eviction/maintenance cutoff.
         let initial_expiry = material
             .now_unix_seconds()
             .checked_add(profile.continuation_ttl_seconds())

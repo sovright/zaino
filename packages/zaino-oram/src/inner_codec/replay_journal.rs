@@ -8,6 +8,13 @@
 //! durable nonce owner, runtime wiring, or oblivious memory, page, storage, or
 //! timing access. It also assumes exactly one live writer for a recovery
 //! directory; no process lock or multi-writer linearizability is provided.
+//!
+//! The v4 journal is append-only and capacity counts total committed
+//! transactions, not live claims. Request claims have no expiry. A continuation
+//! key commits its exact token expiry before reaching this module, but entry v1
+//! stores only the opaque key and no explicit expiry bucket. There is no claim
+//! deletion, count reduction, capacity reclamation, or maintenance-only state
+//! transition in this format.
 
 use std::{
     collections::HashSet,
@@ -167,6 +174,7 @@ impl ReplayJournalRecordKind {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalLimits {
+    /// Maximum lifetime append count; v4 never reclaims consumed capacity.
     max_transactions: u64,
 }
 
@@ -203,6 +211,11 @@ impl fmt::Debug for ReplayJournalContinuationLane {
     }
 }
 
+/// One immutable v1 transaction entry.
+///
+/// The continuation claim is an opaque digest that already binds its exact
+/// token expiry. This record carries neither an independently inspectable
+/// expiry bucket nor expiry metadata for the request claim.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalEntry {
     sequence: u64,
@@ -260,6 +273,11 @@ impl fmt::Debug for ReplayJournalComponentStateDigest {
     }
 }
 
+/// Monotonic v4 replay head reconstructed from every committed entry.
+///
+/// Both claim counts only increase. This state has no deletion base, live-count
+/// distinction, or maintenance watermark from which claims or capacity could
+/// be retired.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalState {
     limits: ReplayJournalLimits,
@@ -727,7 +745,13 @@ mod committed_advance {
         }
     }
 
-    /// Production move-only evidence minted after one live journal's durable boundary.
+    /// Move-only evidence minted after one replay transaction's durable
+    /// boundary.
+    ///
+    /// This receipt does not represent maintenance. A future maintenance-only
+    /// mutation needs a distinct receipt consumed through the serialized
+    /// replay-current -> outer-local -> witness coordinator path so it cannot
+    /// be mistaken for a request replay commit.
     pub(in crate::inner_codec) struct ReplayJournalAdvanceReceipt {
         instance_identity: ReplayJournalInstanceIdentity,
         previous_digest: ReplayJournalComponentStateDigest,
@@ -971,6 +995,9 @@ where
         let mut state = ReplayJournalState::empty(limits, expected_profile_id);
         let mut request_claims = HashSet::new();
         let mut continuation_claims = HashSet::new();
+        // Recovery rebuilds both exact claim sets from the complete authoritative
+        // prefix. Deleting a committed entry is therefore unsafe until a new
+        // authenticated base/checkpoint format replaces this invariant.
         for expected_sequence in 1..=persisted_state.committed_sequence {
             let entry = load_authoritative_entry(
                 &entries_directory,
@@ -1236,7 +1263,9 @@ where
 /// This is a fail-closed coordination protocol, not an atomic transaction
 /// across the journal, local snapshot, and external freshness witness. Once a
 /// replay commit succeeds, any unresolved outer advance latches this instance
-/// indeterminate and withholds the replay authority.
+/// indeterminate and withholds the replay authority. It coordinates only
+/// request-triggered replay commits; v4 has no maintenance-only receipt or
+/// coordinator transition.
 struct ReplaySnapshotCoordinator<P, W> {
     replay_journal: ReplayJournalStore<P>,
     security_state: SecurityStateStore<W>,

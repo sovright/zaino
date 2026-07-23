@@ -40,12 +40,15 @@ offline dependency experiment:
   recent-snapshot budgets, padded inputs, fixed response/envelope shapes,
   cover/token lifetime, timeout bucket, and a single-worker FIFO
   queue/overload policy, plus total committed replay-transaction capacity,
-  public trusted-time expiry-bucket width, and proactive fixed
-  garbage-collection interval. Runtime fixtures bind a nonzero recent-snapshot
-  shape and execute its complete ordinal-only scan through a concrete
-  runtime-owned `FrozenRecentSnapshot<N>`. Each frozen snapshot binds an
-  in-memory generation, exact finalized identity, recent tip height/hash, and
-  its internally computed fixed-slot commitment;
+  the parameter named public trusted-time expiry-bucket width, and the parameter
+  named proactive fixed garbage-collection interval. These replay-policy values
+  contribute to profile identity only; v4 does not provide trusted time or
+  execute expiry, garbage collection, deletion, or capacity reclamation.
+  Runtime fixtures bind a nonzero recent-snapshot shape and execute its complete
+  ordinal-only scan through a concrete runtime-owned
+  `FrozenRecentSnapshot<N>`. Each frozen snapshot binds an in-memory generation,
+  exact finalized identity, recent tip height/hash, and its internally computed
+  fixed-slot commitment;
 - a crate-internal versioned request/response codec that seals one
   complete-budget-derived profile ID, fixed checkpoint, prepared query,
   optional opaque 128-byte continuation field, session binding, protected
@@ -94,8 +97,9 @@ offline dependency experiment:
   inspects the later candidate; every retry uniformly replaces that
   non-authoritative path. Only a deterministic test protector exists. The
   store is not runtime-wired, its total committed-transaction bound is derived
-  from the compiled profile, and it assumes one live writer without a process
-  lock.
+  from the compiled profile and is lifetime cumulative. Committed entries are
+  not expired, deleted, compacted, or reclaimed, and request claims have no
+  expiry. The store assumes one live writer without a process lock.
   At this standalone-journal layer, an absent `current.bin` opens as empty so
   an initial pre-marker crash can retry; the journal alone cannot detect
   deletion of a previously committed marker. It supplies no rollback resistance,
@@ -115,12 +119,18 @@ offline dependency experiment:
   advance-then-error can fresh-open successfully when the witness did advance.
   No non-test runtime or security-owner caller constructs the coordinator in
   this slice. Replay, outer-snapshot, and witness advancement are not one atomic
-  transaction. Profile ID v4 binds total committed replay-transaction capacity,
-  public trusted-time expiry-bucket width, and proactive fixed
-  garbage-collection interval. Journal/coordinator construction derives the
-  persisted transaction bound from the compiled profile, and outer-sequence
-  exhaustion is rejected before replay commit. Runtime/owner wiring and
-  maintenance execution remain open;
+  transaction. Profile ID v4 binds total committed replay-transaction capacity
+  and the named expiry-bucket-width and garbage-collection-interval parameters
+  as identity inputs only. Journal/coordinator construction derives the
+  lifetime-cumulative transaction bound from the compiled profile, and
+  outer-sequence exhaustion is rejected before replay commit. There is no
+  trusted-time provider or maintenance, expiry, deletion, compaction, or
+  reclamation path. The next persisted maintenance format is profile v5 with
+  fresh provisioning; v4 state will not be reinterpreted in place. Its
+  continuation key and public expiry bucket must be one validated typed claim,
+  and maintenance must mint a dedicated receipt consumed through the serialized
+  replay-current -> outer-local -> witness path. Runtime/owner wiring remains
+  open;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -332,12 +342,18 @@ same instance; a hard witness rejection fresh-opens as
 fresh open. No non-test runtime or security-owner caller constructs the
 coordinator. The three ordered persistence/authority steps are not one atomic
 transaction.
-Profile ID v4 binds replay capacity, public trusted-time expiry-bucket width,
-and proactive fixed garbage-collection interval. The journal derives its
-persisted capacity from the compiled profile and seals that exact profile ID in
-its version-two current record, but does not execute expiry or garbage
-collection. V3 state has no dual-acceptance or in-place successor path and
-requires fresh v4 provisioning. The available
+Profile ID v4 binds replay capacity and the named public trusted-time
+expiry-bucket-width and proactive fixed garbage-collection-interval parameters
+as identity inputs only. The journal derives its lifetime-cumulative persisted
+capacity from the compiled profile and seals that exact profile ID in its
+version-two current record. It has no trusted-time provider, request-claim
+expiry, garbage collection, committed-entry deletion, compaction, or capacity
+reclamation. V3 state has no dual-acceptance or in-place successor path and
+requires fresh v4 provisioning. The next persisted maintenance format is
+profile v5 with fresh provisioning, not an in-place reinterpretation of v4
+state. Its continuation key and public expiry bucket must be one validated
+typed claim, and maintenance must mint a dedicated receipt consumed through the
+serialized replay-current -> outer-local -> witness path. The available
 XChaCha20-Poly1305 protectors are
 wired only through a private fixture-backed runtime composition, not a
 production key/session owner; the clock/material source and nonce/replay

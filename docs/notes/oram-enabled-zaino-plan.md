@@ -71,8 +71,12 @@ production durable replay, trusted clock, nonce ledger, key management,
 rollback resistance, TDX, listener, transport-write, or peer-delivery
 evidence. Profile ID v4 now additionally binds replay capacity, public
 trusted-time expiry-bucket width, and proactive garbage-collection interval;
-the existing ten-phase logical schedule is unchanged. The required joint owner,
-rollback, lifecycle, and response-release invariants are fixed by
+this is policy identity only. It executes no expiry, garbage collection,
+replay-entry deletion, claim-count reduction, or capacity reclamation, and
+request-nonce claims have no expiry. The runtime's bare host-supplied `u64`
+remains observed time rather than trusted-time authority. The existing
+ten-phase logical schedule is unchanged. The required joint owner, rollback,
+lifecycle, and response-release invariants are fixed by
 [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md), while
 production provider selections and evidence remain open. The private child
 runtime owns the modeled decode/token/replay/full-scan/issuance/encode sequence,
@@ -234,7 +238,16 @@ binds total committed replay-transaction capacity, public trusted-time
 expiry-bucket width, and proactive fixed garbage-collection interval.
 Journal/coordinator construction derives the persisted transaction bound from
 that profile and preflights outer-sequence exhaustion before replay commit.
-Expiry/garbage-collection execution remains deferred.
+Expiry/garbage-collection execution, replay-entry deletion, count reduction,
+and capacity reclamation remain deferred. Request claims have no expiry, so
+continuation expiry cannot retire the paired request claim. The next persisted
+replay format or semantic successor to v4 requires the distinct profile ID v5
+with fresh provisioning and no migration or dual acceptance; later incompatible
+successors likewise require new profile identities. A future persisted
+continuation record must carry its canonical key and public expiry bucket as
+one validated typed claim. A future maintenance mutation must mint its own
+typed receipt and use the serialized replay-current -> outer-local -> witness
+coordinator path rather than updating replay state out of band.
 
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
@@ -772,7 +785,13 @@ slice. These ordered steps are not one atomic transaction across the journal,
 snapshot, and witness.
 Nonce, trusted-time, and key state are not durably journaled or composed yet;
 runtime/owner wiring and profile-fixed expiry/garbage-collection execution
-remain open, and no production witness or rollback claim exists.
+remain open. The current host-supplied `u64` is observed time only, profile v4
+does not delete claims or reclaim capacity, and request claims have no expiry.
+Any persisted maintenance representation is a profile-v5,
+fresh-provisioning-only change. Its continuation key and public expiry bucket
+must form one validated typed claim, and a mutation must produce a dedicated
+typed receipt consumed through the serialized replay-current -> outer-local ->
+witness coordinator path. No production witness or rollback claim exists.
 
 ## Private wire contract
 
@@ -1004,12 +1023,20 @@ Deliverables:
 
 - a production monotonic freshness witness and security-state owner built on
   the fixed outer snapshot/reconciliation foundation;
-- execute the profile-v4 public expiry-bucket and garbage-collection schedule
-  under trusted time, then integrate the profile-derived local
-  request/continuation journal with runtime/owner construction;
+- define profile v5 with fresh provisioning for any persisted replay
+  maintenance format, with no migration or dual acceptance; construct each
+  continuation replay key and public expiry bucket as one validated typed
+  claim;
+- execute the public expiry-bucket and garbage-collection schedule only under
+  owner-authorized trusted time, without treating the host-supplied `u64` as
+  authority or expiring request claims that have no retirement proof, then
+  integrate the profile-derived local request/continuation journal with
+  runtime/owner construction;
 - integrate the module-local replay/snapshot/witness ordering with the
   production owner and external witness, then define a reviewed atomic or
-  recoverably staged recovery protocol for post-replay ambiguity;
+  recoverably staged recovery protocol for post-replay ambiguity; every
+  maintenance mutation uses a dedicated typed receipt through the serialized
+  replay-current -> outer-local -> witness path;
 - implement nonce-reservation and trusted-time journals, with every committed
   component feeding the outer digest;
 - production protector/material/key providers behind the internal
