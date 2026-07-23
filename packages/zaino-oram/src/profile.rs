@@ -1,4 +1,4 @@
-use std::{fmt, marker::PhantomData};
+use std::{fmt, marker::PhantomData, num::NonZeroU64};
 
 use blake2::{Blake2s256, Digest};
 
@@ -8,10 +8,13 @@ use crate::{
 };
 
 pub(super) const PROFILE_ID_BYTES: usize = 16;
-const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v3";
+const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v4";
 const UNARY_FIXED_ENVELOPE_TAG: u8 = 1;
 const SINGLE_WORKER_FIFO_TAG: u8 = 1;
 const REJECT_AT_CAPACITY_TAG: u8 = 1;
+const REPLAY_TRANSACTION_CAPACITY_TRANSACTIONS_TAG: u8 = 1;
+const REPLAY_EXPIRY_BUCKET_WIDTH_SECONDS_TAG: u8 = 2;
+const REPLAY_GARBAGE_COLLECTION_INTERVAL_SECONDS_TAG: u8 = 3;
 const SINGLE_WORKER_EXECUTION_LIMIT: usize = 1;
 
 /// Fixed public scheduling and overload behavior for one private profile.
@@ -56,6 +59,50 @@ impl ConcurrencyPolicy {
     }
 }
 
+/// Fixed public replay bounds compiled into one privacy profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CompiledReplayPolicy {
+    transaction_capacity: NonZeroU64,
+    expiry_bucket_width_seconds: NonZeroU64,
+    garbage_collection_interval_seconds: NonZeroU64,
+}
+
+impl CompiledReplayPolicy {
+    fn new(
+        transaction_capacity: u64,
+        expiry_bucket_width_seconds: u64,
+        garbage_collection_interval_seconds: u64,
+    ) -> Result<Self, PrivacyProfileError> {
+        let transaction_capacity = NonZeroU64::new(transaction_capacity)
+            .ok_or(PrivacyProfileError::ZeroReplayTransactionCapacity)?;
+        let expiry_bucket_width_seconds = NonZeroU64::new(expiry_bucket_width_seconds)
+            .ok_or(PrivacyProfileError::ZeroReplayExpiryBucketWidth)?;
+        let garbage_collection_interval_seconds =
+            NonZeroU64::new(garbage_collection_interval_seconds)
+                .ok_or(PrivacyProfileError::ZeroReplayGarbageCollectionInterval)?;
+        Ok(Self {
+            transaction_capacity,
+            expiry_bucket_width_seconds,
+            garbage_collection_interval_seconds,
+        })
+    }
+
+    /// Returns the maximum total committed replay transactions.
+    pub(super) const fn transaction_capacity(&self) -> u64 {
+        self.transaction_capacity.get()
+    }
+
+    /// Returns the public replay-expiry bucket width.
+    pub(super) const fn expiry_bucket_width_seconds(&self) -> u64 {
+        self.expiry_bucket_width_seconds.get()
+    }
+
+    /// Returns the fixed proactive garbage-collection interval.
+    pub(super) const fn garbage_collection_interval_seconds(&self) -> u64 {
+        self.garbage_collection_interval_seconds.get()
+    }
+}
+
 /// Unvalidated authoritative inputs for one compiled profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrivacyProfileDefinition {
@@ -69,6 +116,9 @@ struct PrivacyProfileDefinition {
     continuation_ttl_seconds: u64,
     timeout_bucket_millis: u64,
     concurrency_queue_limit: usize,
+    replay_transaction_capacity: u64,
+    replay_expiry_bucket_width_seconds: u64,
+    replay_garbage_collection_interval_seconds: u64,
 }
 
 /// A compiled privacy budget for one fixed query class.
@@ -88,6 +138,7 @@ pub(super) struct PrivacyProfile {
     continuation_ttl_seconds: u64,
     timeout_bucket_millis: u64,
     concurrency_policy: ConcurrencyPolicy,
+    replay_policy: CompiledReplayPolicy,
 }
 
 impl PrivacyProfile {
@@ -117,6 +168,11 @@ impl PrivacyProfile {
         if definition.timeout_bucket_millis == 0 {
             return Err(PrivacyProfileError::ZeroTimeoutBucket);
         }
+        let replay_policy = CompiledReplayPolicy::new(
+            definition.replay_transaction_capacity,
+            definition.replay_expiry_bucket_width_seconds,
+            definition.replay_garbage_collection_interval_seconds,
+        )?;
         let concurrency_policy =
             ConcurrencyPolicy::single_worker_fifo(definition.concurrency_queue_limit)?;
         let access_budget = QueryAccessBudget::read_only_unary_fixed_envelope(
@@ -128,17 +184,8 @@ impl PrivacyProfile {
             .store_reads
             .checked_add(definition.recent_snapshot_scan_slots)
             .ok_or(PrivacyProfileError::DimensionTooLarge)?;
-        let profile_id = derive_profile_id(
-            &access_budget,
-            definition.padded_input_slots,
-            definition.response_slots,
-            definition.cover_rounds,
-            definition.continuation_ttl_seconds,
-            definition.timeout_bucket_millis,
-            &concurrency_policy,
-        )?;
-        Ok(Self {
-            profile_id,
+        let mut profile = Self {
+            profile_id: [0; PROFILE_ID_BYTES],
             label: definition.label,
             access_budget,
             padded_input_slots: definition.padded_input_slots,
@@ -147,7 +194,10 @@ impl PrivacyProfile {
             continuation_ttl_seconds: definition.continuation_ttl_seconds,
             timeout_bucket_millis: definition.timeout_bucket_millis,
             concurrency_policy,
-        })
+            replay_policy,
+        };
+        profile.profile_id = derive_profile_id(&profile)?;
+        Ok(profile)
     }
 
     /// Returns the fixed identifier bound into protected request state.
@@ -212,6 +262,29 @@ impl PrivacyProfile {
         self.concurrency_policy
     }
 
+    /// Returns the fixed public replay bounds compiled into this profile.
+    pub(super) const fn replay_policy(&self) -> CompiledReplayPolicy {
+        self.replay_policy
+    }
+
+    /// Recompiles this fixture with explicit test-only replay bounds.
+    #[cfg(test)]
+    pub(super) fn with_test_replay_policy(
+        mut self,
+        transaction_capacity: u64,
+        expiry_bucket_width_seconds: u64,
+        garbage_collection_interval_seconds: u64,
+    ) -> Result<Self, PrivacyProfileError> {
+        let replay_policy = CompiledReplayPolicy::new(
+            transaction_capacity,
+            expiry_bucket_width_seconds,
+            garbage_collection_interval_seconds,
+        )?;
+        self.replay_policy = replay_policy;
+        self.profile_id = derive_profile_id(&self)?;
+        Ok(self)
+    }
+
     const fn validate_response_slots<const N: usize>(&self) -> Result<(), PrivacyProfileError> {
         if self.response_slots != N {
             return Err(PrivacyProfileError::ResponseShapeMismatch {
@@ -266,6 +339,12 @@ pub(super) enum PrivacyProfileError {
     ZeroContinuationTtl,
     /// Every profile must publish a nonzero timeout bucket.
     ZeroTimeoutBucket,
+    /// The replay journal must permit at least one committed transaction.
+    ZeroReplayTransactionCapacity,
+    /// Replay expiry buckets must have a nonzero public width.
+    ZeroReplayExpiryBucketWidth,
+    /// Proactive replay garbage collection must have a nonzero interval.
+    ZeroReplayGarbageCollectionInterval,
     /// The single-worker FIFO policy must reserve at least one queue slot.
     ZeroConcurrencyQueueLimit,
     /// A profile dimension cannot fit the canonical 64-bit identifier format.
@@ -315,6 +394,15 @@ impl fmt::Display for PrivacyProfileError {
                 f.write_str("privacy profile has zero continuation lifetime")
             }
             Self::ZeroTimeoutBucket => f.write_str("privacy profile has zero timeout bucket"),
+            Self::ZeroReplayTransactionCapacity => {
+                f.write_str("privacy profile has zero replay transaction capacity")
+            }
+            Self::ZeroReplayExpiryBucketWidth => {
+                f.write_str("privacy profile has zero replay expiry-bucket width")
+            }
+            Self::ZeroReplayGarbageCollectionInterval => {
+                f.write_str("privacy profile has zero replay garbage-collection interval")
+            }
             Self::ZeroConcurrencyQueueLimit => {
                 f.write_str("privacy profile has zero concurrency queue capacity")
             }
@@ -358,44 +446,53 @@ impl std::error::Error for PrivacyProfileError {}
 /// Derives the public profile identifier from the complete authoritative
 /// logical budget. The diagnostic label is deliberately excluded.
 fn derive_profile_id(
-    access_budget: &QueryAccessBudget,
-    padded_input_slots: usize,
-    response_slots: usize,
-    cover_rounds: usize,
-    continuation_ttl_seconds: u64,
-    timeout_bucket_millis: u64,
-    concurrency_policy: &ConcurrencyPolicy,
+    profile: &PrivacyProfile,
 ) -> Result<[u8; PROFILE_ID_BYTES], PrivacyProfileError> {
     let mut hasher = Blake2s256::new();
     Digest::update(&mut hasher, PROFILE_ID_DOMAIN);
     for dimension in [
-        access_budget.store_reads(),
-        access_budget.store_writes(),
-        access_budget.allocations(),
-        access_budget.source_calls(),
-        access_budget.recent_snapshot_reads(),
-        access_budget.replay_reads(),
-        access_budget.replay_writes(),
-        access_budget.request_frames(),
-        access_budget.response_frames(),
-        access_budget.request_bytes(),
-        access_budget.response_bytes(),
-        access_budget.runtime_phases(),
-        padded_input_slots,
-        response_slots,
-        cover_rounds,
-        concurrency_policy.execution_limit(),
-        concurrency_policy.queue_limit(),
-        concurrency_policy.max_in_flight(),
+        profile.access_budget.store_reads(),
+        profile.access_budget.store_writes(),
+        profile.access_budget.allocations(),
+        profile.access_budget.source_calls(),
+        profile.access_budget.recent_snapshot_reads(),
+        profile.access_budget.replay_reads(),
+        profile.access_budget.replay_writes(),
+        profile.access_budget.request_frames(),
+        profile.access_budget.response_frames(),
+        profile.access_budget.request_bytes(),
+        profile.access_budget.response_bytes(),
+        profile.access_budget.runtime_phases(),
+        profile.padded_input_slots,
+        profile.response_slots,
+        profile.cover_rounds,
+        profile.concurrency_policy.execution_limit(),
+        profile.concurrency_policy.queue_limit(),
+        profile.concurrency_policy.max_in_flight(),
     ] {
         update_profile_dimension(&mut hasher, dimension)?;
     }
     Digest::update(&mut hasher, RUNTIME_SCHEDULE_VERSION.to_be_bytes());
-    Digest::update(&mut hasher, continuation_ttl_seconds.to_be_bytes());
-    Digest::update(&mut hasher, timeout_bucket_millis.to_be_bytes());
+    Digest::update(&mut hasher, profile.continuation_ttl_seconds.to_be_bytes());
+    Digest::update(&mut hasher, profile.timeout_bucket_millis.to_be_bytes());
     Digest::update(&mut hasher, [UNARY_FIXED_ENVELOPE_TAG]);
-    Digest::update(&mut hasher, [concurrency_policy.scheduling_tag()]);
-    Digest::update(&mut hasher, [concurrency_policy.overload_tag()]);
+    Digest::update(&mut hasher, [profile.concurrency_policy.scheduling_tag()]);
+    Digest::update(&mut hasher, [profile.concurrency_policy.overload_tag()]);
+    update_profile_u64_dimension(
+        &mut hasher,
+        REPLAY_TRANSACTION_CAPACITY_TRANSACTIONS_TAG,
+        profile.replay_policy.transaction_capacity(),
+    );
+    update_profile_u64_dimension(
+        &mut hasher,
+        REPLAY_EXPIRY_BUCKET_WIDTH_SECONDS_TAG,
+        profile.replay_policy.expiry_bucket_width_seconds(),
+    );
+    update_profile_u64_dimension(
+        &mut hasher,
+        REPLAY_GARBAGE_COLLECTION_INTERVAL_SECONDS_TAG,
+        profile.replay_policy.garbage_collection_interval_seconds(),
+    );
     let digest = Digest::finalize(hasher);
     let mut profile_id = [0; PROFILE_ID_BYTES];
     profile_id.copy_from_slice(&digest[..PROFILE_ID_BYTES]);
@@ -410,6 +507,18 @@ fn update_profile_dimension(
     Digest::update(hasher, dimension.to_be_bytes());
     Ok(())
 }
+
+fn update_profile_u64_dimension(hasher: &mut Blake2s256, semantic_unit_tag: u8, dimension: u64) {
+    Digest::update(hasher, [semantic_unit_tag]);
+    Digest::update(hasher, dimension.to_be_bytes());
+}
+
+#[cfg(test)]
+const TEST_REPLAY_TRANSACTION_CAPACITY: u64 = 32;
+#[cfg(test)]
+const TEST_REPLAY_EXPIRY_BUCKET_WIDTH_SECONDS: u64 = 60;
+#[cfg(test)]
+const TEST_REPLAY_GARBAGE_COLLECTION_INTERVAL_SECONDS: u64 = 300;
 
 /// Builds an explicitly listener-free test profile with no recent-snapshot
 /// integration. The zero scan budget is bound into the identifier and must not
@@ -479,6 +588,9 @@ fn test_profile(
         continuation_ttl_seconds,
         timeout_bucket_millis: 1_000,
         concurrency_queue_limit: 1,
+        replay_transaction_capacity: TEST_REPLAY_TRANSACTION_CAPACITY,
+        replay_expiry_bucket_width_seconds: TEST_REPLAY_EXPIRY_BUCKET_WIDTH_SECONDS,
+        replay_garbage_collection_interval_seconds: TEST_REPLAY_GARBAGE_COLLECTION_INTERVAL_SECONDS,
     })
 }
 
@@ -545,6 +657,10 @@ mod tests {
             continuation_ttl_seconds: 60,
             timeout_bucket_millis: 1_000,
             concurrency_queue_limit: 2,
+            replay_transaction_capacity: TEST_REPLAY_TRANSACTION_CAPACITY,
+            replay_expiry_bucket_width_seconds: TEST_REPLAY_EXPIRY_BUCKET_WIDTH_SECONDS,
+            replay_garbage_collection_interval_seconds:
+                TEST_REPLAY_GARBAGE_COLLECTION_INTERVAL_SECONDS,
         }
     }
 
@@ -591,6 +707,19 @@ mod tests {
         assert_eq!(concurrency.max_in_flight(), 3);
         assert_eq!(concurrency.scheduling_tag(), SINGLE_WORKER_FIFO_TAG);
         assert_eq!(concurrency.overload_tag(), REJECT_AT_CAPACITY_TAG);
+        let replay = profile.replay_policy();
+        assert_eq!(
+            replay.transaction_capacity(),
+            TEST_REPLAY_TRANSACTION_CAPACITY
+        );
+        assert_eq!(
+            replay.expiry_bucket_width_seconds(),
+            TEST_REPLAY_EXPIRY_BUCKET_WIDTH_SECONDS
+        );
+        assert_eq!(
+            replay.garbage_collection_interval_seconds(),
+            TEST_REPLAY_GARBAGE_COLLECTION_INTERVAL_SECONDS
+        );
     }
 
     #[test]
@@ -652,6 +781,27 @@ mod tests {
         );
 
         let mut changed = definition();
+        changed.replay_transaction_capacity = 0;
+        assert_eq!(
+            PrivacyProfile::new(changed),
+            Err(PrivacyProfileError::ZeroReplayTransactionCapacity)
+        );
+
+        let mut changed = definition();
+        changed.replay_expiry_bucket_width_seconds = 0;
+        assert_eq!(
+            PrivacyProfile::new(changed),
+            Err(PrivacyProfileError::ZeroReplayExpiryBucketWidth)
+        );
+
+        let mut changed = definition();
+        changed.replay_garbage_collection_interval_seconds = 0;
+        assert_eq!(
+            PrivacyProfile::new(changed),
+            Err(PrivacyProfileError::ZeroReplayGarbageCollectionInterval)
+        );
+
+        let mut changed = definition();
         changed.concurrency_queue_limit = 0;
         assert_eq!(
             PrivacyProfile::new(changed),
@@ -679,7 +829,7 @@ mod tests {
         let baseline = profile();
         assert_eq!(
             baseline.profile_id(),
-            &[101, 165, 245, 178, 239, 202, 95, 122, 21, 92, 82, 183, 62, 123, 230, 21,]
+            &[186, 86, 204, 161, 207, 240, 191, 220, 170, 11, 25, 168, 107, 104, 66, 23,]
         );
         let mut relabeled = definition();
         relabeled.label = "renamed";
@@ -717,6 +867,18 @@ mod tests {
 
         let mut changed = definition();
         changed.timeout_bucket_millis = 1_001;
+        assert_definition_changes_id(&baseline, changed);
+
+        let mut changed = definition();
+        changed.replay_transaction_capacity += 1;
+        assert_definition_changes_id(&baseline, changed);
+
+        let mut changed = definition();
+        changed.replay_expiry_bucket_width_seconds += 1;
+        assert_definition_changes_id(&baseline, changed);
+
+        let mut changed = definition();
+        changed.replay_garbage_collection_interval_seconds += 1;
         assert_definition_changes_id(&baseline, changed);
 
         let mut changed = definition();

@@ -102,8 +102,8 @@ sequence candidate before the sole `current.bin` commit marker. Recovery
 rebuilds only the exact committed sequence range and never inspects a later
 candidate; retries replace that non-authoritative candidate uniformly. It is
 not connected to the runtime and has only a deterministic test protector. Its
-one public transaction bound is not profile-derived, and it assumes a single
-live writer without enforcing a process lock.
+total committed-transaction bound is derived from compiled profile v4, and it
+assumes a single live writer without enforcing a process lock.
 
 A module-private coordinator now joins those two local foundations. Initial
 provisioning is an explicit operation distinct from opening existing state, and
@@ -123,14 +123,22 @@ This protocol is not one atomic transaction across the replay journal, outer
 snapshot, and witness. No non-test runtime or security-owner caller constructs
 the coordinator in this slice; owner integration remains separate.
 
+The private profile identifier is now v4. It binds the total committed replay
+transaction capacity, public trusted-time expiry-bucket width, and proactive
+fixed garbage-collection interval. Replay journal and coordinator construction
+derive the persisted transaction bound from that compiled profile, and the
+coordinator rejects an exhausted outer sequence before committing replay.
+Expiry/garbage-collection execution is not implemented by this slice.
+There is no v3 dual-acceptance or in-place migration: v4 requires fresh
+profile-bound journal and outer-state provisioning.
+
 This is still source-level research evidence. A production protector/replay/
 material-provider bundle, generated route and listener, runtime-integrated
 witness-backed replay, trusted clock, nonce ledger, key management, production
-freshness-witness ownership and advancement, profile-v4 replay capacity and
-cadence binding, atomic combined persistence, rollback deployment evidence,
-TDX, access-oblivious qualification, and transport-write or peer-delivery
-evidence remain open. Profile ID v3 and the existing ten-phase logical schedule
-are unchanged. See the
+freshness-witness ownership and advancement, proactive replay maintenance,
+atomic combined persistence, rollback deployment evidence, TDX,
+access-oblivious qualification, and transport-write or peer-delivery evidence
+remain open. The existing ten-phase logical schedule is unchanged. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
 [feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and
 [runtime security-owner ADR](./docs/adr/0009-private-query-runtime-security-state-owner.md).

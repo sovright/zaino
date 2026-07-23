@@ -25,6 +25,7 @@ use crate::{
     persistence::fs_atomic::{
         create_unique_file, ensure_real_directory, sync_directory, RealDirectoryError,
     },
+    profile::{CompiledReplayPolicy, PrivacyProfile, PROFILE_ID_BYTES},
     protection::{AuthenticationDecision, ProtectionUnavailable},
     runtime_security::{
         ContinuationReplayPlan, ReplayCommitAuthority, ReplayCommitResult, ReplayCommitUnavailable,
@@ -34,8 +35,8 @@ use crate::{
 
 use super::{
     security_state_binding::{
-        provision_initial_snapshot, successor_after_replay_commit, verify_current,
-        SecurityStateBindingError,
+        preflight_successor, provision_initial_snapshot, successor_after_replay_commit,
+        verify_current, SecurityStateBindingError,
     },
     security_state_store::{
         SecurityFreshnessWitness, SecurityStateIdentity, SecurityStateSnapshot, SecurityStateStore,
@@ -43,7 +44,8 @@ use super::{
     },
 };
 
-const FORMAT_VERSION: u16 = 1;
+const CURRENT_FORMAT_VERSION: u16 = 2;
+const ENTRY_FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
 const U64_BYTES: usize = 8;
 const DIGEST_BYTES: usize = 32;
@@ -52,7 +54,7 @@ const PROTECTION_OVERHEAD_BYTES: usize = 40;
 const CURRENT_RESERVED_BYTES: usize = 48;
 const ENTRY_RESERVED_BYTES: usize = 23;
 
-const CURRENT_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJCUR1";
+const CURRENT_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJCUR2";
 const ENTRY_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJENT1";
 const CURRENT_STATE_FILE: &str = "current.bin";
 const ENTRIES_DIRECTORY: &str = "entries";
@@ -64,7 +66,8 @@ const ENTRY_CHAIN_DOMAIN: &[u8] = b"zaino-oram/replay-journal/entry-chain";
 const COMPONENT_STATE_DOMAIN: &[u8] = b"zaino-oram/replay-journal/component-state";
 
 const CURRENT_LIMIT_TRANSACTIONS_START: usize = 0;
-const CURRENT_SEQUENCE_START: usize = CURRENT_LIMIT_TRANSACTIONS_START + U64_BYTES;
+const CURRENT_PROFILE_ID_START: usize = CURRENT_LIMIT_TRANSACTIONS_START + U64_BYTES;
+const CURRENT_SEQUENCE_START: usize = CURRENT_PROFILE_ID_START + PROFILE_ID_BYTES;
 const CURRENT_REQUEST_COUNT_START: usize = CURRENT_SEQUENCE_START + U64_BYTES;
 const CURRENT_CONTINUATION_COUNT_START: usize = CURRENT_REQUEST_COUNT_START + U64_BYTES;
 const CURRENT_CHAIN_DIGEST_START: usize = CURRENT_CONTINUATION_COUNT_START + U64_BYTES;
@@ -87,8 +90,8 @@ const ENTRY_RECORD_BYTES: usize = ENTRY_PROTECTED_START + ENTRY_PROTECTED_BYTES;
 const CONTINUATION_COVER_TAG: u8 = 0;
 const CONTINUATION_CLAIM_TAG: u8 = 1;
 
-const _: [(); 112] = [(); CURRENT_BODY_BYTES];
-const _: [(); 162] = [(); CURRENT_RECORD_BYTES];
+const _: [(); 128] = [(); CURRENT_BODY_BYTES];
+const _: [(); 178] = [(); CURRENT_RECORD_BYTES];
 const _: [(); 96] = [(); ENTRY_BODY_BYTES];
 const _: [(); 146] = [(); ENTRY_RECORD_BYTES];
 
@@ -142,15 +145,22 @@ impl fmt::Debug for ReplayJournalProtectionContext {
 
 #[derive(Clone, Copy)]
 enum ReplayJournalRecordKind {
-    CurrentStateV1,
+    CurrentStateV2,
     ImmutableEntryV1,
 }
 
 impl ReplayJournalRecordKind {
     const fn tag(self) -> u8 {
         match self {
-            Self::CurrentStateV1 => 0,
+            Self::CurrentStateV2 => 0,
             Self::ImmutableEntryV1 => 1,
+        }
+    }
+
+    const fn format_version(self) -> u16 {
+        match self {
+            Self::CurrentStateV2 => CURRENT_FORMAT_VERSION,
+            Self::ImmutableEntryV1 => ENTRY_FORMAT_VERSION,
         }
     }
 }
@@ -166,6 +176,12 @@ impl ReplayJournalLimits {
             return Err(ReplayJournalValueError::ZeroLimit);
         }
         Ok(Self { max_transactions })
+    }
+
+    fn from_compiled_policy(policy: CompiledReplayPolicy) -> Self {
+        Self {
+            max_transactions: policy.transaction_capacity(),
+        }
     }
 }
 
@@ -214,7 +230,11 @@ impl ReplayJournalEntry {
     }
 
     fn payload_digest(&self) -> [u8; DIGEST_BYTES] {
-        versioned_digest(ENTRY_PAYLOAD_DOMAIN, &[&self.canonical_body()])
+        versioned_digest(
+            ENTRY_PAYLOAD_DOMAIN,
+            ENTRY_FORMAT_VERSION,
+            &[&self.canonical_body()],
+        )
     }
 }
 
@@ -243,6 +263,7 @@ impl fmt::Debug for ReplayJournalComponentStateDigest {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalState {
     limits: ReplayJournalLimits,
+    profile_id: [u8; PROFILE_ID_BYTES],
     committed_sequence: u64,
     claimed_request_count: u64,
     claimed_continuation_count: u64,
@@ -250,9 +271,10 @@ struct ReplayJournalState {
 }
 
 impl ReplayJournalState {
-    const fn empty(limits: ReplayJournalLimits) -> Self {
+    const fn empty(limits: ReplayJournalLimits, profile_id: [u8; PROFILE_ID_BYTES]) -> Self {
         Self {
             limits,
+            profile_id,
             committed_sequence: 0,
             claimed_request_count: 0,
             claimed_continuation_count: 0,
@@ -261,6 +283,9 @@ impl ReplayJournalState {
     }
 
     fn validate(&self) -> Result<(), ReplayJournalValueError> {
+        if all_zero(&self.profile_id) {
+            return Err(ReplayJournalValueError::ProfileIdIsEmpty);
+        }
         if self.committed_sequence > self.limits.max_transactions
             || self.claimed_request_count > self.committed_sequence
             || self.claimed_continuation_count > self.claimed_request_count
@@ -275,6 +300,22 @@ impl ReplayJournalState {
             return Err(ReplayJournalValueError::InvalidState);
         }
         Ok(())
+    }
+
+    fn canonical_current_body(&self) -> [u8; CURRENT_BODY_BYTES] {
+        let mut body = [0; CURRENT_BODY_BYTES];
+        body[CURRENT_LIMIT_TRANSACTIONS_START..CURRENT_PROFILE_ID_START]
+            .copy_from_slice(&self.limits.max_transactions.to_be_bytes());
+        body[CURRENT_PROFILE_ID_START..CURRENT_SEQUENCE_START].copy_from_slice(&self.profile_id);
+        body[CURRENT_SEQUENCE_START..CURRENT_REQUEST_COUNT_START]
+            .copy_from_slice(&self.committed_sequence.to_be_bytes());
+        body[CURRENT_REQUEST_COUNT_START..CURRENT_CONTINUATION_COUNT_START]
+            .copy_from_slice(&self.claimed_request_count.to_be_bytes());
+        body[CURRENT_CONTINUATION_COUNT_START..CURRENT_CHAIN_DIGEST_START]
+            .copy_from_slice(&self.claimed_continuation_count.to_be_bytes());
+        body[CURRENT_CHAIN_DIGEST_START..CURRENT_RESERVED_START]
+            .copy_from_slice(&self.entry_chain_digest);
+        body
     }
 
     fn preview_entry(
@@ -325,10 +366,12 @@ impl ReplayJournalState {
         let payload_digest = entry.payload_digest();
         let entry_chain_digest = versioned_digest(
             ENTRY_CHAIN_DOMAIN,
+            ENTRY_FORMAT_VERSION,
             &[&self.entry_chain_digest, &payload_digest],
         );
         let next = Self {
             limits: self.limits,
+            profile_id: self.profile_id,
             committed_sequence: entry.sequence,
             claimed_request_count,
             claimed_continuation_count,
@@ -368,13 +411,8 @@ impl ReplayJournalState {
     fn component_state_digest(&self) -> ReplayJournalComponentStateDigest {
         ReplayJournalComponentStateDigest(versioned_digest(
             COMPONENT_STATE_DOMAIN,
-            &[
-                &self.limits.max_transactions.to_be_bytes(),
-                &self.committed_sequence.to_be_bytes(),
-                &self.claimed_request_count.to_be_bytes(),
-                &self.claimed_continuation_count.to_be_bytes(),
-                &self.entry_chain_digest,
-            ],
+            CURRENT_FORMAT_VERSION,
+            &[&self.canonical_current_body()],
         ))
     }
 }
@@ -394,6 +432,7 @@ struct ReplayJournalDelta {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplayJournalValueError {
     ZeroLimit,
+    ProfileIdIsEmpty,
     InvalidState,
     InvalidContinuationTag,
     NonZeroReservedBytes,
@@ -430,9 +469,9 @@ impl fmt::Debug for ReplayJournalTransitionError {
     }
 }
 
-struct PersistentReplayJournalCurrentState([u8; CURRENT_RECORD_BYTES]);
+struct PersistentReplayJournalCurrentStateV2([u8; CURRENT_RECORD_BYTES]);
 
-impl PersistentReplayJournalCurrentState {
+impl PersistentReplayJournalCurrentStateV2 {
     fn from_business<P>(
         state: &ReplayJournalState,
         context: &ReplayJournalProtectionContext,
@@ -450,26 +489,16 @@ impl PersistentReplayJournalCurrentState {
             ));
         }
 
-        let mut body = [0; CURRENT_BODY_BYTES];
-        body[CURRENT_LIMIT_TRANSACTIONS_START..CURRENT_SEQUENCE_START]
-            .copy_from_slice(&state.limits.max_transactions.to_be_bytes());
-        body[CURRENT_SEQUENCE_START..CURRENT_REQUEST_COUNT_START]
-            .copy_from_slice(&state.committed_sequence.to_be_bytes());
-        body[CURRENT_REQUEST_COUNT_START..CURRENT_CONTINUATION_COUNT_START]
-            .copy_from_slice(&state.claimed_request_count.to_be_bytes());
-        body[CURRENT_CONTINUATION_COUNT_START..CURRENT_CHAIN_DIGEST_START]
-            .copy_from_slice(&state.claimed_continuation_count.to_be_bytes());
-        body[CURRENT_CHAIN_DIGEST_START..CURRENT_RESERVED_START]
-            .copy_from_slice(&state.entry_chain_digest);
+        let body = state.canonical_current_body();
 
         let mut bytes = [0; CURRENT_RECORD_BYTES];
         bytes[..RECORD_MAGIC_BYTES].copy_from_slice(&CURRENT_MAGIC);
         bytes[RECORD_MAGIC_BYTES..CURRENT_PROTECTED_START]
-            .copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+            .copy_from_slice(&CURRENT_FORMAT_VERSION.to_be_bytes());
         protector
             .seal(
                 context,
-                ReplayJournalRecordKind::CurrentStateV1,
+                ReplayJournalRecordKind::CurrentStateV2,
                 &body,
                 &mut bytes[CURRENT_PROTECTED_START..],
             )
@@ -485,12 +514,12 @@ impl PersistentReplayJournalCurrentState {
     where
         P: ReplayJournalRecordProtector,
     {
-        validate_header(&self.0, CURRENT_MAGIC)?;
+        validate_header(&self.0, CURRENT_MAGIC, CURRENT_FORMAT_VERSION)?;
         let mut body = [0; CURRENT_BODY_BYTES];
         match protector
             .open(
                 context,
-                ReplayJournalRecordKind::CurrentStateV1,
+                ReplayJournalRecordKind::CurrentStateV2,
                 &self.0[CURRENT_PROTECTED_START..],
                 &mut body,
             )
@@ -510,6 +539,7 @@ impl PersistentReplayJournalCurrentState {
             .map_err(ReplayJournalRecordError::InvalidValue)?;
         let state = ReplayJournalState {
             limits,
+            profile_id: read_array(&body, CURRENT_PROFILE_ID_START),
             committed_sequence: read_u64(&body, CURRENT_SEQUENCE_START),
             claimed_request_count: read_u64(&body, CURRENT_REQUEST_COUNT_START),
             claimed_continuation_count: read_u64(&body, CURRENT_CONTINUATION_COUNT_START),
@@ -531,9 +561,9 @@ impl PersistentReplayJournalCurrentState {
     }
 }
 
-impl fmt::Debug for PersistentReplayJournalCurrentState {
+impl fmt::Debug for PersistentReplayJournalCurrentStateV2 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("PersistentReplayJournalCurrentState([REDACTED])")
+        f.write_str("PersistentReplayJournalCurrentStateV2([REDACTED])")
     }
 }
 
@@ -557,7 +587,7 @@ impl PersistentReplayJournalEntry {
         let mut bytes = [0; ENTRY_RECORD_BYTES];
         bytes[..RECORD_MAGIC_BYTES].copy_from_slice(&ENTRY_MAGIC);
         bytes[RECORD_MAGIC_BYTES..ENTRY_PROTECTED_START]
-            .copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+            .copy_from_slice(&ENTRY_FORMAT_VERSION.to_be_bytes());
         protector
             .seal(
                 context,
@@ -577,7 +607,7 @@ impl PersistentReplayJournalEntry {
     where
         P: ReplayJournalRecordProtector,
     {
-        validate_header(&self.0, ENTRY_MAGIC)?;
+        validate_header(&self.0, ENTRY_MAGIC, ENTRY_FORMAT_VERSION)?;
         let mut body = [0; ENTRY_BODY_BYTES];
         match protector
             .open(
@@ -868,10 +898,29 @@ where
 {
     fn open(
         root: impl Into<PathBuf>,
-        limits: ReplayJournalLimits,
+        profile: &PrivacyProfile,
         protection_context: ReplayJournalProtectionContext,
         protector: P,
     ) -> Result<Self, ReplayJournalStoreError> {
+        Self::open_with_limits(
+            root,
+            ReplayJournalLimits::from_compiled_policy(profile.replay_policy()),
+            *profile.profile_id(),
+            protection_context,
+            protector,
+        )
+    }
+
+    fn open_with_limits(
+        root: impl Into<PathBuf>,
+        limits: ReplayJournalLimits,
+        expected_profile_id: [u8; PROFILE_ID_BYTES],
+        protection_context: ReplayJournalProtectionContext,
+        protector: P,
+    ) -> Result<Self, ReplayJournalStoreError> {
+        if all_zero(&expected_profile_id) {
+            return Err(ReplayJournalStoreError::ConfigurationMismatch);
+        }
         let recovery_directory = root.into();
         let instance_identity = ReplayJournalInstanceIdentity::new();
         validate_recovery_paths(&recovery_directory)?;
@@ -888,7 +937,7 @@ where
                     protection_context,
                     protector,
                     instance_identity,
-                    state: ReplayJournalState::empty(limits),
+                    state: ReplayJournalState::empty(limits, expected_profile_id),
                     request_claims: HashSet::new(),
                     continuation_claims: HashSet::new(),
                     health: ReplayJournalStoreHealth::Ready,
@@ -901,7 +950,7 @@ where
                 return Err(ReplayJournalStoreError::CurrentStateUnreadable);
             }
         };
-        let persisted_state = PersistentReplayJournalCurrentState(current_bytes)
+        let persisted_state = PersistentReplayJournalCurrentStateV2(current_bytes)
             .into_business(&protection_context, &protector);
         let persisted_state = match persisted_state {
             Ok(state) => state,
@@ -913,13 +962,13 @@ where
             }
             Err(_) => return Err(ReplayJournalStoreError::CurrentStateCorrupt),
         };
-        if persisted_state.limits != limits {
+        if persisted_state.limits != limits || persisted_state.profile_id != expected_profile_id {
             return Err(ReplayJournalStoreError::ConfigurationMismatch);
         }
 
         let entries_directory = recovery_directory.join(ENTRIES_DIRECTORY);
         validate_committed_entries_directory(&entries_directory)?;
-        let mut state = ReplayJournalState::empty(limits);
+        let mut state = ReplayJournalState::empty(limits, expected_profile_id);
         let mut request_claims = HashSet::new();
         let mut continuation_claims = HashSet::new();
         for expected_sequence in 1..=persisted_state.committed_sequence {
@@ -1094,7 +1143,7 @@ where
         &mut self,
         prepared: &PreparedReplayJournalCommit,
     ) -> Result<StagedReplayJournalCurrentState, ReplayJournalStoreError> {
-        let persistent = PersistentReplayJournalCurrentState::from_business(
+        let persistent = PersistentReplayJournalCurrentStateV2::from_business(
             &prepared.next_state,
             &self.protection_context,
             &self.protector,
@@ -1215,19 +1264,22 @@ where
     fn open_existing(
         replay_root: impl Into<PathBuf>,
         security_state_root: impl Into<PathBuf>,
-        limits: ReplayJournalLimits,
+        profile: &PrivacyProfile,
         protection_context: ReplayJournalProtectionContext,
         protector: P,
         witness: W,
     ) -> Result<Self, ReplaySnapshotCoordinatorOpenError> {
-        let replay_journal =
-            ReplayJournalStore::open(replay_root, limits, protection_context, protector)
-                .map_err(ReplaySnapshotCoordinatorOpenError::ReplayJournal)?;
         let mut security_state = SecurityStateStore::new(security_state_root, witness);
         let current_snapshot = security_state
             .current()
             .map_err(ReplaySnapshotCoordinatorOpenError::SecurityState)?
             .ok_or(ReplaySnapshotCoordinatorOpenError::OuterSnapshotMissing)?;
+        if current_snapshot.profile_id() != profile.profile_id() {
+            return Err(ReplaySnapshotCoordinatorOpenError::ProfileIdentityMismatch);
+        }
+        let replay_journal =
+            ReplayJournalStore::open(replay_root, profile, protection_context, protector)
+                .map_err(ReplaySnapshotCoordinatorOpenError::ReplayJournal)?;
         verify_current(&current_snapshot, &replay_journal)
             .map_err(ReplaySnapshotCoordinatorOpenError::SnapshotBinding)?;
 
@@ -1243,14 +1295,17 @@ where
     fn provision_initial(
         replay_root: impl Into<PathBuf>,
         security_state_root: impl Into<PathBuf>,
-        limits: ReplayJournalLimits,
+        profile: &PrivacyProfile,
         protection_context: ReplayJournalProtectionContext,
         protector: P,
         witness: W,
         initial_state: ReplaySnapshotInitialState,
     ) -> Result<Self, ReplaySnapshotCoordinatorOpenError> {
+        if initial_state.identity.profile_id() != profile.profile_id() {
+            return Err(ReplaySnapshotCoordinatorOpenError::ProfileIdentityMismatch);
+        }
         let replay_journal =
-            ReplayJournalStore::open(replay_root, limits, protection_context, protector)
+            ReplayJournalStore::open(replay_root, profile, protection_context, protector)
                 .map_err(ReplaySnapshotCoordinatorOpenError::ReplayJournal)?;
         let mut security_state = SecurityStateStore::new(security_state_root, witness);
         if security_state
@@ -1288,6 +1343,9 @@ where
         if self.health == ReplaySnapshotCoordinatorHealth::Indeterminate {
             return Err(ReplaySnapshotCoordinatorCommitError::LatchedIndeterminate);
         }
+
+        preflight_successor(&self.current_snapshot)
+            .map_err(ReplaySnapshotCoordinatorCommitError::OuterAdvancePreflight)?;
 
         let committed = match self.replay_journal.commit_transaction_and_capture(
             security_round,
@@ -1359,6 +1417,7 @@ enum ReplaySnapshotCoordinatorOpenError {
     SecurityState(SecurityStateStoreError),
     OuterSnapshotMissing,
     OuterSnapshotAlreadyProvisioned,
+    ProfileIdentityMismatch,
     SnapshotBinding(SecurityStateBindingError),
 }
 
@@ -1373,6 +1432,9 @@ impl fmt::Display for ReplaySnapshotCoordinatorOpenError {
             Self::OuterSnapshotAlreadyProvisioned => {
                 f.write_str("outer security snapshot is already provisioned")
             }
+            Self::ProfileIdentityMismatch => {
+                f.write_str("outer security snapshot does not match the compiled privacy profile")
+            }
             Self::SnapshotBinding(_) => {
                 f.write_str("outer security snapshot does not match the replay journal")
             }
@@ -1386,7 +1448,9 @@ impl std::error::Error for ReplaySnapshotCoordinatorOpenError {
             Self::ReplayJournal(error) => Some(error),
             Self::SecurityState(error) => Some(error),
             Self::SnapshotBinding(error) => Some(error),
-            Self::OuterSnapshotMissing | Self::OuterSnapshotAlreadyProvisioned => None,
+            Self::OuterSnapshotMissing
+            | Self::OuterSnapshotAlreadyProvisioned
+            | Self::ProfileIdentityMismatch => None,
         }
     }
 }
@@ -1394,6 +1458,7 @@ impl std::error::Error for ReplaySnapshotCoordinatorOpenError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplaySnapshotCoordinatorCommitError {
     LatchedIndeterminate,
+    OuterAdvancePreflight(SecurityStateBindingError),
     ReplayJournal(ReplayJournalStoreError),
     OuterAdvanceAfterReplay(ReplaySnapshotCoordinatorOuterAdvanceError),
 }
@@ -1404,6 +1469,7 @@ impl fmt::Display for ReplaySnapshotCoordinatorCommitError {
             Self::LatchedIndeterminate => {
                 f.write_str("replay snapshot coordinator is indeterminate")
             }
+            Self::OuterAdvancePreflight(_) => f.write_str("outer security snapshot cannot advance"),
             Self::ReplayJournal(_) => f.write_str("replay journal commit failed"),
             Self::OuterAdvanceAfterReplay(_) => {
                 f.write_str("outer security-state advance failed after replay commit")
@@ -1415,6 +1481,7 @@ impl fmt::Display for ReplaySnapshotCoordinatorCommitError {
 impl std::error::Error for ReplaySnapshotCoordinatorCommitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::OuterAdvancePreflight(error) => Some(error),
             Self::ReplayJournal(error) => Some(error),
             Self::OuterAdvanceAfterReplay(error) => Some(error),
             Self::LatchedIndeterminate => None,
@@ -1502,11 +1569,12 @@ enum ExactRecordReadError {
 fn validate_header<const N: usize>(
     bytes: &[u8; N],
     expected_magic: [u8; RECORD_MAGIC_BYTES],
+    expected_version: u16,
 ) -> Result<(), ReplayJournalRecordError> {
     if bytes[..RECORD_MAGIC_BYTES] != expected_magic {
         return Err(ReplayJournalRecordError::InvalidMagic);
     }
-    if read_u16(bytes, RECORD_MAGIC_BYTES) != FORMAT_VERSION {
+    if read_u16(bytes, RECORD_MAGIC_BYTES) != expected_version {
         return Err(ReplayJournalRecordError::UnsupportedVersion);
     }
     Ok(())
@@ -1666,10 +1734,10 @@ fn map_entry_record_for_commit(error: ReplayJournalRecordError) -> ReplayJournal
     }
 }
 
-fn versioned_digest(domain: &[u8], parts: &[&[u8]]) -> [u8; DIGEST_BYTES] {
+fn versioned_digest(domain: &[u8], version: u16, parts: &[&[u8]]) -> [u8; DIGEST_BYTES] {
     let mut hasher = Blake2s256::new();
     Digest::update(&mut hasher, domain);
-    Digest::update(&mut hasher, FORMAT_VERSION.to_be_bytes());
+    Digest::update(&mut hasher, version.to_be_bytes());
     for part in parts {
         Digest::update(&mut hasher, part);
     }
@@ -1708,10 +1776,12 @@ mod tests {
                 SecurityStateBindingError,
             },
             security_state_store::{
-                test_security_state_identity, PersistentSecurityState, SecurityFreshness,
+                test_security_state_identity, test_security_state_identity_with_profile_id,
+                PersistentSecurityState, SecurityFreshness, SecurityStateValueError,
                 STATE_DIGEST_BYTES,
             },
         },
+        profile::test_profile_without_recent_snapshot,
         runtime_security::{ContinuationReplayKey, ReplayNamespace, SecurityEpochTag},
     };
 
@@ -1837,6 +1907,7 @@ mod tests {
             {
                 let stream = versioned_digest(
                     TEST_STREAM_DOMAIN,
+                    kind.format_version(),
                     &[
                         &self.key,
                         context.as_bytes(),
@@ -1864,6 +1935,7 @@ mod tests {
         ) -> [u8; TEST_PROTECTION_AUTHENTICATION_BYTES] {
             let digest = versioned_digest(
                 TEST_AUTHENTICATION_DOMAIN,
+                kind.format_version(),
                 &[
                     &self.key,
                     context.as_bytes(),
@@ -1891,6 +1963,7 @@ mod tests {
             }
             let nonce_digest = versioned_digest(
                 TEST_NONCE_DOMAIN,
+                kind.format_version(),
                 &[&self.key, context.as_bytes(), &[kind.tag()], plaintext],
             );
             protected[..TEST_PROTECTION_NONCE_BYTES]
@@ -1963,6 +2036,29 @@ mod tests {
         ReplayJournalLimits::new(32).expect("fixture limit is nonzero")
     }
 
+    const fn test_profile_id() -> [u8; PROFILE_ID_BYTES] {
+        [0x81; PROFILE_ID_BYTES]
+    }
+
+    fn replay_profile() -> PrivacyProfile {
+        test_profile_without_recent_snapshot("replay-journal", 1, 1, 1, 1, 1)
+            .expect("fixture privacy profile is valid")
+    }
+
+    fn same_capacity_different_profile(profile: PrivacyProfile) -> PrivacyProfile {
+        let policy = profile.replay_policy();
+        profile
+            .with_test_replay_policy(
+                policy.transaction_capacity(),
+                policy
+                    .expiry_bucket_width_seconds()
+                    .checked_add(1)
+                    .expect("fixture replay expiry bucket leaves increment headroom"),
+                policy.garbage_collection_interval_seconds(),
+            )
+            .expect("fixture replay policy remains valid")
+    }
+
     fn protection_context() -> ReplayJournalProtectionContext {
         ReplayJournalProtectionContext::new([0x92; DIGEST_BYTES])
     }
@@ -1996,9 +2092,10 @@ mod tests {
     fn open_store(
         directory: &TempDir,
     ) -> Result<ReplayJournalStore<DeterministicTestProtector>, ReplayJournalStoreError> {
-        ReplayJournalStore::open(
+        ReplayJournalStore::open_with_limits(
             directory.path().join("journal"),
             limits(),
+            test_profile_id(),
             protection_context(),
             DeterministicTestProtector::available(),
         )
@@ -2013,15 +2110,34 @@ mod tests {
         ReplaySnapshotCoordinator<DeterministicTestProtector, CoordinatorWitness>,
         ReplaySnapshotCoordinatorOpenError,
     > {
+        provision_coordinator_with_profile(
+            replay_root,
+            security_state_root,
+            &replay_profile(),
+            protector,
+            witness,
+        )
+    }
+
+    fn provision_coordinator_with_profile(
+        replay_root: &Path,
+        security_state_root: &Path,
+        profile: &PrivacyProfile,
+        protector: DeterministicTestProtector,
+        witness: CoordinatorWitness,
+    ) -> Result<
+        ReplaySnapshotCoordinator<DeterministicTestProtector, CoordinatorWitness>,
+        ReplaySnapshotCoordinatorOpenError,
+    > {
         ReplaySnapshotCoordinator::provision_initial(
             replay_root.to_path_buf(),
             security_state_root.to_path_buf(),
-            limits(),
+            profile,
             protection_context(),
             protector,
             witness,
             ReplaySnapshotInitialState {
-                identity: test_security_state_identity(0x71)
+                identity: test_security_state_identity_with_profile_id(0x71, *profile.profile_id())
                     .expect("coordinator fixture security identity is valid"),
                 serving_identity_digest: [0x72; STATE_DIGEST_BYTES],
             },
@@ -2037,10 +2153,29 @@ mod tests {
         ReplaySnapshotCoordinator<DeterministicTestProtector, CoordinatorWitness>,
         ReplaySnapshotCoordinatorOpenError,
     > {
+        open_coordinator_with_profile(
+            replay_root,
+            security_state_root,
+            &replay_profile(),
+            protector,
+            witness,
+        )
+    }
+
+    fn open_coordinator_with_profile(
+        replay_root: &Path,
+        security_state_root: &Path,
+        profile: &PrivacyProfile,
+        protector: DeterministicTestProtector,
+        witness: CoordinatorWitness,
+    ) -> Result<
+        ReplaySnapshotCoordinator<DeterministicTestProtector, CoordinatorWitness>,
+        ReplaySnapshotCoordinatorOpenError,
+    > {
         ReplaySnapshotCoordinator::open_existing(
             replay_root.to_path_buf(),
             security_state_root.to_path_buf(),
-            limits(),
+            profile,
             protection_context(),
             protector,
             witness,
@@ -2065,7 +2200,7 @@ mod tests {
     ) -> ReplayJournalState {
         let mut requests = HashSet::new();
         let mut continuations = HashSet::new();
-        ReplayJournalState::empty(limits)
+        ReplayJournalState::empty(limits, test_profile_id())
             .apply_entry(&mut requests, &mut continuations, replay_entry)
             .expect("fixture entry is valid")
             .0
@@ -2077,7 +2212,7 @@ mod tests {
         protector: &DeterministicTestProtector,
     ) -> TestResult {
         fs::create_dir_all(root)?;
-        let persistent = PersistentReplayJournalCurrentState::from_business(
+        let persistent = PersistentReplayJournalCurrentStateV2::from_business(
             state,
             &protection_context(),
             protector,
@@ -2126,7 +2261,7 @@ mod tests {
         let persistent_entry =
             PersistentReplayJournalEntry::from_business(&replay_entry, &context, &protector)?;
         let persistent_current =
-            PersistentReplayJournalCurrentState::from_business(&state, &context, &protector)?;
+            PersistentReplayJournalCurrentStateV2::from_business(&state, &context, &protector)?;
 
         assert_eq!(persistent_entry.as_bytes().len(), ENTRY_RECORD_BYTES);
         assert_eq!(persistent_current.as_bytes().len(), CURRENT_RECORD_BYTES);
@@ -2138,10 +2273,22 @@ mod tests {
             &persistent_current.as_bytes()[..RECORD_MAGIC_BYTES],
             &CURRENT_MAGIC
         );
+        assert_eq!(
+            read_u16(persistent_entry.as_bytes(), RECORD_MAGIC_BYTES),
+            ENTRY_FORMAT_VERSION
+        );
+        assert_eq!(
+            read_u16(persistent_current.as_bytes(), RECORD_MAGIC_BYTES),
+            CURRENT_FORMAT_VERSION
+        );
         assert!(!persistent_entry
             .as_bytes()
             .windows(REPLAY_RECORD_KEY_BYTES)
             .any(|window| window == replay_entry.request_key));
+        assert!(!persistent_current
+            .as_bytes()
+            .windows(PROFILE_ID_BYTES)
+            .any(|window| window == state.profile_id));
         assert!(!persistent_current
             .as_bytes()
             .windows(DIGEST_BYTES)
@@ -2152,7 +2299,7 @@ mod tests {
             replay_entry
         );
         assert_eq!(
-            PersistentReplayJournalCurrentState(*persistent_current.as_bytes())
+            PersistentReplayJournalCurrentStateV2(*persistent_current.as_bytes())
                 .into_business(&context, &protector)?,
             state
         );
@@ -2166,6 +2313,11 @@ mod tests {
         let replay_entry = entry(1, 0x51, ReplayJournalContinuationLane::Cover);
         let persistent =
             PersistentReplayJournalEntry::from_business(&replay_entry, &context, &protector)?;
+        let current = PersistentReplayJournalCurrentStateV2::from_business(
+            &one_entry_state(limits(), &replay_entry),
+            &context,
+            &protector,
+        )?;
 
         let mut wrong_magic = *persistent.as_bytes();
         wrong_magic[0] ^= 1;
@@ -2180,6 +2332,31 @@ mod tests {
             PersistentReplayJournalEntry(wrong_version).into_business(&context, &protector),
             Err(ReplayJournalRecordError::UnsupportedVersion)
         ));
+
+        let mut wrong_current_magic = *current.as_bytes();
+        wrong_current_magic[0] ^= 1;
+        assert!(matches!(
+            PersistentReplayJournalCurrentStateV2(wrong_current_magic)
+                .into_business(&context, &protector),
+            Err(ReplayJournalRecordError::InvalidMagic)
+        ));
+
+        let mut wrong_current_version = *current.as_bytes();
+        wrong_current_version[RECORD_MAGIC_BYTES + 1] ^= 1;
+        assert!(matches!(
+            PersistentReplayJournalCurrentStateV2(wrong_current_version)
+                .into_business(&context, &protector),
+            Err(ReplayJournalRecordError::UnsupportedVersion)
+        ));
+
+        for index in CURRENT_PROTECTED_START..CURRENT_RECORD_BYTES {
+            let mut tampered = *current.as_bytes();
+            tampered[index] ^= 1;
+            assert!(matches!(
+                PersistentReplayJournalCurrentStateV2(tampered).into_business(&context, &protector),
+                Err(ReplayJournalRecordError::AuthenticationFailed)
+            ));
+        }
 
         for index in ENTRY_PROTECTED_START..ENTRY_RECORD_BYTES {
             let mut tampered = *persistent.as_bytes();
@@ -2218,7 +2395,7 @@ mod tests {
         let mut tag_record = [0; ENTRY_RECORD_BYTES];
         tag_record[..RECORD_MAGIC_BYTES].copy_from_slice(&ENTRY_MAGIC);
         tag_record[RECORD_MAGIC_BYTES..ENTRY_PROTECTED_START]
-            .copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+            .copy_from_slice(&ENTRY_FORMAT_VERSION.to_be_bytes());
         protector.seal(
             &context,
             ReplayJournalRecordKind::ImmutableEntryV1,
@@ -2238,7 +2415,7 @@ mod tests {
         let mut cover_record = [0; ENTRY_RECORD_BYTES];
         cover_record[..RECORD_MAGIC_BYTES].copy_from_slice(&ENTRY_MAGIC);
         cover_record[RECORD_MAGIC_BYTES..ENTRY_PROTECTED_START]
-            .copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+            .copy_from_slice(&ENTRY_FORMAT_VERSION.to_be_bytes());
         protector.seal(
             &context,
             ReplayJournalRecordKind::ImmutableEntryV1,
@@ -2344,7 +2521,7 @@ mod tests {
         let swapped_second = entry(2, 0x51, ReplayJournalContinuationLane::Cover);
         let mut requests = HashSet::new();
         let mut continuations = HashSet::new();
-        let (first_state, _) = ReplayJournalState::empty(limits())
+        let (first_state, _) = ReplayJournalState::empty(limits(), test_profile_id())
             .apply_entry(&mut requests, &mut continuations, &first)
             .expect("first fixture entry is valid");
         let (ordered, _) = first_state
@@ -2353,7 +2530,7 @@ mod tests {
 
         let mut swapped_requests = HashSet::new();
         let mut swapped_continuations = HashSet::new();
-        let (swapped_first_state, _) = ReplayJournalState::empty(limits())
+        let (swapped_first_state, _) = ReplayJournalState::empty(limits(), test_profile_id())
             .apply_entry(
                 &mut swapped_requests,
                 &mut swapped_continuations,
@@ -2381,6 +2558,12 @@ mod tests {
         );
         changed = ordered;
         changed.limits.max_transactions += 1;
+        assert_ne!(
+            ordered.component_state_digest(),
+            changed.component_state_digest()
+        );
+        changed = ordered;
+        changed.profile_id[0] ^= 1;
         assert_ne!(
             ordered.component_state_digest(),
             changed.component_state_digest()
@@ -2804,6 +2987,185 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_preflights_outer_sequence_before_replay_commit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness,
+        )?;
+        let initial_snapshot = coordinator.current_snapshot;
+        let replay_before = coordinator.replay_journal.state;
+        coordinator.current_snapshot = initial_snapshot.test_with_sequence(u64::MAX)?;
+        let (_, round) = security_round();
+
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(1),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("outer sequence exhaustion must precede replay persistence"),
+            ReplaySnapshotCoordinatorCommitError::OuterAdvancePreflight(
+                SecurityStateBindingError::InvalidSnapshot(
+                    SecurityStateValueError::SequenceOverflow,
+                ),
+            )
+        );
+        assert_eq!(coordinator.replay_journal.state, replay_before);
+        assert_eq!(
+            coordinator.replay_journal.health,
+            ReplayJournalStoreHealth::Ready
+        );
+        assert_eq!(coordinator.health, ReplaySnapshotCoordinatorHealth::Ready);
+        assert_eq!(
+            coordinator.security_state.current()?,
+            Some(initial_snapshot)
+        );
+
+        coordinator.current_snapshot = initial_snapshot;
+        let result = coordinator.commit_request_and_snapshot(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::Cover,
+        )?;
+        assert_eq!(result.into_parts().1, ReplayDuplicateDecision::Fresh);
+        assert_eq!(coordinator.current_snapshot.test_sequence(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_rejects_a_same_capacity_different_profile() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let profile = replay_profile();
+        let different_profile = same_capacity_different_profile(profile);
+        assert_ne!(different_profile.profile_id(), profile.profile_id());
+        assert_eq!(
+            different_profile.replay_policy().transaction_capacity(),
+            profile.replay_policy().transaction_capacity()
+        );
+        let rejected_replay_root = directory.path().join("rejected-replay");
+        let rejected_security_state_root = directory.path().join("rejected-security-state");
+        assert!(matches!(
+            ReplaySnapshotCoordinator::provision_initial(
+                &rejected_replay_root,
+                &rejected_security_state_root,
+                &profile,
+                protection_context(),
+                DeterministicTestProtector::unavailable(),
+                CoordinatorWitness::empty(),
+                ReplaySnapshotInitialState {
+                    identity: test_security_state_identity_with_profile_id(
+                        0x71,
+                        *different_profile.profile_id(),
+                    )?,
+                    serving_identity_digest: [0x72; STATE_DIGEST_BYTES],
+                },
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::ProfileIdentityMismatch)
+        ));
+        assert!(!rejected_replay_root.exists());
+        assert!(!rejected_security_state_root.exists());
+
+        let coordinator = provision_coordinator_with_profile(
+            &replay_root,
+            &security_state_root,
+            &profile,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        drop(coordinator);
+
+        assert!(matches!(
+            open_coordinator_with_profile(
+                &replay_root,
+                &security_state_root,
+                &different_profile,
+                DeterministicTestProtector::unavailable(),
+                witness,
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::ProfileIdentityMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn provision_rejects_nonempty_journal_from_same_capacity_different_profile() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let profile_a = replay_profile();
+        let profile_b = same_capacity_different_profile(profile_a);
+        assert_eq!(
+            profile_a.replay_policy().transaction_capacity(),
+            profile_b.replay_policy().transaction_capacity()
+        );
+        assert_ne!(profile_a.profile_id(), profile_b.profile_id());
+        let protector = DeterministicTestProtector::available();
+        let mut journal = ReplayJournalStore::open(
+            &replay_root,
+            &profile_a,
+            protection_context(),
+            protector.clone(),
+        )?;
+        let (_, round) = security_round();
+        journal.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        drop(journal);
+
+        let open_calls_before_rejected_provision = protector.open_calls();
+        assert!(matches!(
+            ReplaySnapshotCoordinator::provision_initial(
+                &replay_root,
+                &security_state_root,
+                &profile_b,
+                protection_context(),
+                protector.clone(),
+                CoordinatorWitness::empty(),
+                ReplaySnapshotInitialState {
+                    identity: test_security_state_identity_with_profile_id(
+                        0x71,
+                        *profile_b.profile_id(),
+                    )?,
+                    serving_identity_digest: [0x72; STATE_DIGEST_BYTES],
+                },
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::ReplayJournal(
+                ReplayJournalStoreError::ConfigurationMismatch,
+            ))
+        ));
+        assert_eq!(
+            protector.open_calls() - open_calls_before_rejected_provision,
+            1,
+            "profile mismatch must reject after current-state open and before entry reconstruction"
+        );
+        assert!(!security_state_root.exists());
+
+        let journal = ReplayJournalStore::open(
+            &replay_root,
+            &profile_a,
+            protection_context(),
+            protector.clone(),
+        )?;
+        assert_eq!(journal.state.committed_sequence, 1);
+        assert_eq!(journal.state.profile_id, *profile_a.profile_id());
+        drop(journal);
+        assert_eq!(
+            ReplayJournalStore::open(&replay_root, &profile_b, protection_context(), protector,)
+                .expect_err("rejected provisioning must not rebind the persisted journal"),
+            ReplayJournalStoreError::ConfigurationMismatch
+        );
+        Ok(())
+    }
+
+    #[test]
     fn replay_component_binding_is_exact_across_commit_and_replay_reopen() -> TestResult {
         let directory = tempfile::tempdir()?;
         let mut store = open_store(&directory)?;
@@ -2821,9 +3183,9 @@ mod tests {
         assert_eq!(
             initial.component_state_digest(),
             [
-                0xf8, 0xa6, 0x2a, 0x85, 0xb0, 0x15, 0x7e, 0x96, 0xf6, 0x27, 0x26, 0xf1, 0xd7, 0xd8,
-                0x5a, 0xa3, 0xc5, 0x30, 0xf5, 0xe2, 0xee, 0xd3, 0xcc, 0xf0, 0xe2, 0xb8, 0x12, 0x17,
-                0x5f, 0xeb, 0xf2, 0xac,
+                0xf2, 0x06, 0x75, 0xbc, 0x27, 0x14, 0x83, 0x68, 0x70, 0xbe, 0x7f, 0xba, 0xcd, 0x40,
+                0xfa, 0xb3, 0x10, 0xf8, 0x0d, 0x85, 0x2e, 0x14, 0x40, 0x16, 0x02, 0x72, 0x2c, 0x0f,
+                0x67, 0xad, 0x45, 0xbe,
             ]
         );
         verify_current(&initial, &store)?;
@@ -3081,6 +3443,7 @@ mod tests {
         write_entry(&root, &second, &protector)?;
         let noncanonical_state = ReplayJournalState {
             limits: limits(),
+            profile_id: test_profile_id(),
             committed_sequence: 2,
             claimed_request_count: 2,
             claimed_continuation_count: 1,
@@ -3089,20 +3452,26 @@ mod tests {
         write_current(&root, &noncanonical_state, &protector)?;
 
         assert_eq!(
-            ReplayJournalStore::open(root, limits(), protection_context(), protector)
-                .expect_err("duplicate continuation must be recorded as cover"),
+            ReplayJournalStore::open_with_limits(
+                root,
+                limits(),
+                test_profile_id(),
+                protection_context(),
+                protector,
+            )
+            .expect_err("duplicate continuation must be recorded as cover"),
             ReplayJournalStoreError::CommittedEntryCorrupt
         );
         Ok(())
     }
 
     #[test]
-    fn transaction_capacity_failure_leaves_state_ready_and_unchanged() -> TestResult {
+    fn profile_transaction_capacity_failure_leaves_state_ready_and_unchanged() -> TestResult {
         let directory = tempfile::tempdir()?;
-        let limited = ReplayJournalLimits::new(1)?;
+        let limited_profile = replay_profile().with_test_replay_policy(1, 60, 300)?;
         let mut store = ReplayJournalStore::open(
             directory.path().join("journal"),
-            limited,
+            &limited_profile,
             protection_context(),
             DeterministicTestProtector::available(),
         )?;
@@ -3193,9 +3562,10 @@ mod tests {
             if let Some(bytes) = candidate {
                 fs::write(root.join(ENTRIES_DIRECTORY).join(entry_filename(1)), bytes)?;
             }
-            let mut store = ReplayJournalStore::open(
+            let mut store = ReplayJournalStore::open_with_limits(
                 &root,
                 limits(),
+                test_profile_id(),
                 protection_context(),
                 DeterministicTestProtector::available(),
             )?;
@@ -3221,8 +3591,13 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("journal");
         let protector = DeterministicTestProtector::available();
-        let mut store =
-            ReplayJournalStore::open(&root, limits(), protection_context(), protector.clone())?;
+        let mut store = ReplayJournalStore::open_with_limits(
+            &root,
+            limits(),
+            test_profile_id(),
+            protection_context(),
+            protector.clone(),
+        )?;
         let (_, round) = security_round();
         store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
         drop(store);
@@ -3233,8 +3608,13 @@ mod tests {
         )?;
         let calls_before_open = protector.open_calls();
 
-        let reopened =
-            ReplayJournalStore::open(root, limits(), protection_context(), protector.clone())?;
+        let reopened = ReplayJournalStore::open_with_limits(
+            root,
+            limits(),
+            test_profile_id(),
+            protection_context(),
+            protector.clone(),
+        )?;
         assert_eq!(reopened.state.committed_sequence, 1);
         assert_eq!(protector.open_calls() - calls_before_open, 2);
         Ok(())
@@ -3334,13 +3714,17 @@ mod tests {
         )?;
         fs::write(root.join(STAGING_DIRECTORY).join("stale.tmp"), [0x33; 9])?;
 
-        let store = ReplayJournalStore::open(
+        let store = ReplayJournalStore::open_with_limits(
             root,
             limits(),
+            test_profile_id(),
             protection_context(),
             DeterministicTestProtector::available(),
         )?;
-        assert_eq!(store.state, ReplayJournalState::empty(limits()));
+        assert_eq!(
+            store.state,
+            ReplayJournalState::empty(limits(), test_profile_id())
+        );
         Ok(())
     }
 
@@ -3354,9 +3738,10 @@ mod tests {
 
         let different_limits = ReplayJournalLimits::new(31)?;
         assert_eq!(
-            ReplayJournalStore::open(
+            ReplayJournalStore::open_with_limits(
                 directory.path().join("journal"),
                 different_limits,
+                test_profile_id(),
                 protection_context(),
                 DeterministicTestProtector::available()
             )
@@ -3375,9 +3760,10 @@ mod tests {
         drop(store);
 
         assert_eq!(
-            ReplayJournalStore::open(
+            ReplayJournalStore::open_with_limits(
                 directory.path().join("journal"),
                 limits(),
+                test_profile_id(),
                 ReplayJournalProtectionContext::new([0x93; DIGEST_BYTES]),
                 DeterministicTestProtector::available(),
             )
@@ -3397,8 +3783,14 @@ mod tests {
         fs::create_dir(root.join(ENTRIES_DIRECTORY))?;
 
         assert_eq!(
-            ReplayJournalStore::open(root, limits(), protection_context(), protector)
-                .expect_err("current requires every authoritative entry"),
+            ReplayJournalStore::open_with_limits(
+                root,
+                limits(),
+                test_profile_id(),
+                protection_context(),
+                protector,
+            )
+            .expect_err("current requires every authoritative entry"),
             ReplayJournalStoreError::CommittedEntryMissing
         );
         Ok(())
@@ -3416,8 +3808,14 @@ mod tests {
         write_current(&root, &mismatched, &protector)?;
 
         assert_eq!(
-            ReplayJournalStore::open(root, limits(), protection_context(), protector)
-                .expect_err("current must equal reconstructed entries"),
+            ReplayJournalStore::open_with_limits(
+                root,
+                limits(),
+                test_profile_id(),
+                protection_context(),
+                protector,
+            )
+            .expect_err("current must equal reconstructed entries"),
             ReplayJournalStoreError::CurrentStateMismatch
         );
         Ok(())
@@ -3435,9 +3833,10 @@ mod tests {
         current.push(0);
         fs::write(root.join(CURRENT_STATE_FILE), current)?;
         assert_eq!(
-            ReplayJournalStore::open(
+            ReplayJournalStore::open_with_limits(
                 root.clone(),
                 limits(),
+                test_profile_id(),
                 protection_context(),
                 protector.clone(),
             )
@@ -3453,8 +3852,14 @@ mod tests {
         entry_bytes.push(0);
         fs::write(entry_path, entry_bytes)?;
         assert_eq!(
-            ReplayJournalStore::open(root, limits(), protection_context(), protector)
-                .expect_err("oversized authoritative entry is corrupt"),
+            ReplayJournalStore::open_with_limits(
+                root,
+                limits(),
+                test_profile_id(),
+                protection_context(),
+                protector,
+            )
+            .expect_err("oversized authoritative entry is corrupt"),
             ReplayJournalStoreError::CommittedEntryCorrupt
         );
         Ok(())
@@ -3464,9 +3869,10 @@ mod tests {
     fn protection_unavailability_fails_without_authority() -> TestResult {
         let directory = tempfile::tempdir()?;
         let protector = DeterministicTestProtector::available();
-        let mut store = ReplayJournalStore::open(
+        let mut store = ReplayJournalStore::open_with_limits(
             directory.path().join("journal"),
             limits(),
+            test_profile_id(),
             protection_context(),
             protector.clone(),
         )?;
@@ -3499,9 +3905,10 @@ mod tests {
         drop(store);
 
         assert_eq!(
-            ReplayJournalStore::open(
+            ReplayJournalStore::open_with_limits(
                 directory.path().join("journal"),
                 limits(),
+                test_profile_id(),
                 protection_context(),
                 DeterministicTestProtector::unavailable()
             )
@@ -3515,9 +3922,10 @@ mod tests {
     fn missing_parent_is_rejected_on_first_commit() -> TestResult {
         let directory = tempfile::tempdir()?;
         let missing_parent = directory.path().join("missing").join("journal");
-        let mut store = ReplayJournalStore::open(
+        let mut store = ReplayJournalStore::open_with_limits(
             &missing_parent,
             limits(),
+            test_profile_id(),
             protection_context(),
             DeterministicTestProtector::available(),
         )?;
@@ -3543,9 +3951,10 @@ mod tests {
         let linked_root = directory.path().join("linked-root");
         symlink(&real, &linked_root)?;
         assert_eq!(
-            ReplayJournalStore::open(
+            ReplayJournalStore::open_with_limits(
                 linked_root,
                 limits(),
+                test_profile_id(),
                 protection_context(),
                 DeterministicTestProtector::available()
             )
@@ -3557,9 +3966,10 @@ mod tests {
         fs::create_dir(&root)?;
         symlink(&real, root.join(ENTRIES_DIRECTORY))?;
         assert_eq!(
-            ReplayJournalStore::open(
+            ReplayJournalStore::open_with_limits(
                 root,
                 limits(),
+                test_profile_id(),
                 protection_context(),
                 DeterministicTestProtector::available(),
             )
@@ -3585,9 +3995,10 @@ mod tests {
         let candidate = entries.join(entry_filename(1));
         symlink(&target, &candidate)?;
 
-        let mut store = ReplayJournalStore::open(
+        let mut store = ReplayJournalStore::open_with_limits(
             &root,
             limits(),
+            test_profile_id(),
             protection_context(),
             DeterministicTestProtector::available(),
         )?;

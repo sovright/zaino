@@ -273,14 +273,16 @@ sequence.
 The crate now also contains a local replay component-store foundation. A
 crate-private journal records each request lane together with its applied
 real-or-cover continuation lane in one ordered transaction. Exact fixed-size
-version-one record bodies are sealed through an injected protector and opaque
-journal context; replay identities, lane tags, counters, and the entry chain
-are not plaintext record fields. Sequential entry filenames still expose the
-public transaction sequence. The next sequence candidate is synchronized before
-the atomic `current.bin` replacement, and only `current.bin` defines the locally
-committed prefix. Startup opens exactly that prefix, reconstructs both claim
-sets and the chain digest, and requires an exact match with the sealed current
-state. It never opens `head + 1`; every retry replaces that non-authoritative
+version-two current-state and version-one entry record bodies are sealed through
+an injected protector and opaque journal context; the current state also binds
+the exact compiled profile ID. Replay identities, lane tags, counters, and the
+entry chain are not plaintext record fields. Sequential entry filenames still
+expose the public transaction sequence. The next sequence candidate is
+synchronized before the atomic `current.bin` replacement, and only
+`current.bin` defines the locally committed prefix. Startup opens exactly that
+profile-bound prefix, reconstructs both claim sets and the chain digest, and
+requires an exact match with the sealed current state. It never opens
+`head + 1`; every retry replaces that non-authoritative
 candidate without inspecting its contents, while entries at or below the
 committed head remain immutable. Duplicate requests and duplicate continuations
 both persist cover, and a noncanonical duplicate claim fails closed on recovery.
@@ -326,11 +328,17 @@ protector, and no non-test runtime or security-owner caller constructs the
 coordinator. The replay-journal commit, outer-snapshot replacement, and witness
 advancement are not one atomic transaction: replay may be durably ahead after
 an outer failure, and the protocol responds by latching rather than claiming
-automatic repair. Its transaction bound and maintenance cadence are not bound
-by a compiled profile; that work is deferred to profile v4, while profile ID v3
-remains unchanged. It assumes exactly one live writer without enforcing a
-process lock. There is no production freshness witness, production replay
-protector/key/nonce owner,
+automatic repair. Profile ID v4 binds the total committed replay-transaction
+capacity, public trusted-time expiry-bucket width, and proactive fixed
+garbage-collection interval. Journal/coordinator construction derives the
+persisted transaction bound from the compiled profile, and outer-sequence
+exhaustion is rejected before replay commit. The journal does not yet execute
+expiry or garbage collection, and the exact trusted-time authority remains
+unselected. V3 envelopes, tokens, replay namespaces, leases, journal heads, and
+outer identities have no dual-acceptance or in-place successor path; v4
+requires fresh provisioning. It assumes exactly one live writer without
+enforcing a process lock. There is no production freshness witness, production
+replay protector/key/nonce owner,
 nonce-reservation journal, trusted-time journal, key persistence, attestation
 binding, owner construction path, or service caller.
 At the standalone-journal layer, a missing `current.bin` is locally

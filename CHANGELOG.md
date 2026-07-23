@@ -23,16 +23,20 @@ and this library adheres to Rust's notion of
   binding never infers transition direction or repairs either component
   automatically. This is a construction and reconciliation foundation, not
   coordinated witness advancement or an atomic combined transaction.
-  No non-test runtime or security-owner caller can construct and coordinate both
-  private stores in this slice; that owner integration, profile-v4 replay
-  capacity and cadence binding, production protector/nonce/time/key ownership,
-  and rollback, TDX, and access-oblivious qualification remain deferred.
-  Profile ID v3 is unchanged.
+  Profile ID v4 now binds total committed replay-transaction capacity, public
+  trusted-time expiry-bucket width, and proactive fixed garbage-collection
+  interval. Journal/coordinator construction derives the persisted transaction
+  bound from the compiled profile, and outer-sequence exhaustion is rejected
+  before replay commit. No non-test runtime or security-owner caller can
+  construct and coordinate both private stores in this slice; owner integration,
+  maintenance execution, production protector/nonce/time/key ownership, and
+  rollback, TDX, and access-oblivious qualification remain deferred.
 - `zaino-oram`: add a crate-private crash-durable local replay-journal
   foundation for the atomic request plus real-or-cover continuation contract.
-  Version-one current-state and immutable-entry records have exact fixed sizes
-  and keep replay identities, lane tags, counters, and chain state inside an
-  context-bound sealed-record boundary; this slice supplies only a
+  Version-two current-state and version-one immutable-entry records have exact
+  fixed sizes and keep the compiled profile ID, replay identities, lane tags,
+  counters, and chain state inside a context-bound sealed-record boundary; this
+  slice supplies only a
   deterministic test protector. The next sequence candidate is synchronized
   before `current.bin`, which remains the sole local commit marker; committed
   entries are then immutable. Restart reads only the exact authoritative
@@ -42,7 +46,8 @@ and this library adheres to Rust's notion of
   public transaction bound, authentication, exact-size reads, restart,
   candidate overwrite, direct-component path rejection, and crash prefixes.
   The store implements the existing replay-guard seam but is not wired into the
-  runtime. Its transaction bound is not yet profile-derived, and there is no
+  runtime. At this earlier journal-only step, its transaction bound was not yet
+  profile-derived, and there is no
   production protector/key/nonce owner, coordinated external freshness-witness
   advancement, rollback resistance, nonce or trusted-time journal,
   single-writer process lock, access-oblivious memory or persistence, listener

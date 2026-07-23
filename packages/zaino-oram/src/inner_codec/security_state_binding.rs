@@ -89,6 +89,16 @@ where
     }
 }
 
+/// Rejects an exhausted outer sequence before a replay commit can become durable.
+pub(super) fn preflight_successor(
+    expected_snapshot: &SecurityStateSnapshot,
+) -> Result<(), SecurityStateBindingError> {
+    expected_snapshot
+        .checked_successor_sequence()
+        .map(|_| ())
+        .map_err(SecurityStateBindingError::InvalidSnapshot)
+}
+
 /// Constructs a successor from one durably committed replay transaction.
 ///
 /// The move-only receipt proves that the replay journal minted the transition

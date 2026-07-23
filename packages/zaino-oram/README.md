@@ -36,14 +36,16 @@ offline dependency experiment:
   boundary correctness only—not physical table exhaustion, random or
   adversarial target-load behavior, performance, recovery, TDX, or mainnet
   readiness;
-- compiled privacy-profile-v3 validation that binds the logical store and
+- compiled privacy-profile-v4 validation that binds the logical store and
   recent-snapshot budgets, padded inputs, fixed response/envelope shapes,
   cover/token lifetime, timeout bucket, and a single-worker FIFO
-  queue/overload policy. Runtime fixtures bind a nonzero recent-snapshot shape
-  and execute its complete ordinal-only scan through a concrete runtime-owned
-  `FrozenRecentSnapshot<N>`. Each frozen snapshot binds an in-memory generation,
-  exact finalized identity, recent tip height/hash, and its internally computed
-  fixed-slot commitment;
+  queue/overload policy, plus total committed replay-transaction capacity,
+  public trusted-time expiry-bucket width, and proactive fixed
+  garbage-collection interval. Runtime fixtures bind a nonzero recent-snapshot
+  shape and execute its complete ordinal-only scan through a concrete
+  runtime-owned `FrozenRecentSnapshot<N>`. Each frozen snapshot binds an
+  in-memory generation, exact finalized identity, recent tip height/hash, and
+  its internally computed fixed-slot commitment;
 - a crate-internal versioned request/response codec that seals one
   complete-budget-derived profile ID, fixed checkpoint, prepared query,
   optional opaque 128-byte continuation field, session binding, protected
@@ -83,14 +85,17 @@ offline dependency experiment:
   runtime caller for this foundation;
 - a module-private crash-durable local replay-journal foundation. It implements
   the existing atomic request plus real-or-cover continuation guard seam using
-  fixed-size sealed current-state and entry records. Protection binds an opaque
-  journal context. The next sequence candidate becomes durable before
+  a fixed-size sealed version-two current-state record and version-one entry
+  records. The authenticated current record binds the exact compiled profile
+  ID; protection also binds an opaque journal context. The next sequence
+  candidate becomes durable before
   `current.bin`, the sole local commit marker, and committed entries are then
   immutable. Startup opens only the exact committed sequence paths and never
   inspects the later candidate; every retry uniformly replaces that
   non-authoritative path. Only a deterministic test protector exists. The
-  store is not runtime-wired, its one public transaction bound is not
-  profile-derived, and it assumes one live writer without a process lock.
+  store is not runtime-wired, its total committed-transaction bound is derived
+  from the compiled profile, and it assumes one live writer without a process
+  lock.
   At this standalone-journal layer, an absent `current.bin` opens as empty so
   an initial pre-marker crash can retry; the journal alone cannot detect
   deletion of a previously committed marker. It supplies no rollback resistance,
@@ -110,8 +115,12 @@ offline dependency experiment:
   advance-then-error can fresh-open successfully when the witness did advance.
   No non-test runtime or security-owner caller constructs the coordinator in
   this slice. Replay, outer-snapshot, and witness advancement are not one atomic
-  transaction. Runtime/owner wiring and profile-v4 replay capacity/cadence
-  binding remain open, while profile ID v3 is unchanged;
+  transaction. Profile ID v4 binds total committed replay-transaction capacity,
+  public trusted-time expiry-bucket width, and proactive fixed
+  garbage-collection interval. Journal/coordinator construction derives the
+  persisted transaction bound from the compiled profile, and outer-sequence
+  exhaustion is rejected before replay commit. Runtime/owner wiring and
+  maintenance execution remain open;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -323,8 +332,12 @@ same instance; a hard witness rejection fresh-opens as
 fresh open. No non-test runtime or security-owner caller constructs the
 coordinator. The three ordered persistence/authority steps are not one atomic
 transaction.
-Profile-v4 replay capacity/cadence binding is deferred; profile ID v3 is
-unchanged. The available
+Profile ID v4 binds replay capacity, public trusted-time expiry-bucket width,
+and proactive fixed garbage-collection interval. The journal derives its
+persisted capacity from the compiled profile and seals that exact profile ID in
+its version-two current record, but does not execute expiry or garbage
+collection. V3 state has no dual-acceptance or in-place successor path and
+requires fresh v4 provisioning. The available
 XChaCha20-Poly1305 protectors are
 wired only through a private fixture-backed runtime composition, not a
 production key/session owner; the clock/material source and nonce/replay

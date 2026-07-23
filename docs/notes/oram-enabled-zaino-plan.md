@@ -69,9 +69,10 @@ release; unavailable or retired state fails closed.
 This remains deterministic in-process fixture evidence. It provides no
 production durable replay, trusted clock, nonce ledger, key management,
 rollback resistance, TDX, listener, transport-write, or peer-delivery
-evidence. Profile ID v3 and the existing ten-phase logical schedule are
-unchanged. The required joint owner, rollback, lifecycle, and response-release
-invariants are fixed by
+evidence. Profile ID v4 now additionally binds replay capacity, public
+trusted-time expiry-bucket width, and proactive garbage-collection interval;
+the existing ten-phase logical schedule is unchanged. The required joint owner,
+rollback, lifecycle, and response-release invariants are fixed by
 [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md), while
 production provider selections and evidence remain open. The private child
 runtime owns the modeled decode/token/replay/full-scan/issuance/encode sequence,
@@ -83,14 +84,15 @@ records the same ordered ten-phase logical trace for successful protected
 outcomes. Token protector context binds the checkpoint and codec session, and
 every replay path models one lookup plus one write-back while cover writes stay
 outside the real-token namespace.
-The profile-v3 ID binds that schedule, the continuation lifetime, padded input
-and response shapes, the recent-snapshot scan budget, the timeout bucket, and
-an explicit single-worker FIFO execution/queue/reject-at-capacity policy. The
-listener-free runtime now executes a nonzero, profile-bound, ordinal-only full
-scan through a concrete runtime-owned `FrozenRecentSnapshot<N>`. The frozen type
-computes its fixed-slot content commitment internally rather than accepting a
-generic source-reported digest; its fault and post-construction corruption hooks
-are `#[cfg(test)]` only and absent from the production API. The runtime binds the
+The profile-v4 ID binds that schedule, the continuation lifetime, padded input
+and response shapes, the recent-snapshot scan budget, the timeout bucket, an
+explicit single-worker FIFO execution/queue/reject-at-capacity policy, and the
+three public replay-policy dimensions. The listener-free runtime now executes a
+nonzero, profile-bound, ordinal-only full scan through a concrete runtime-owned
+`FrozenRecentSnapshot<N>`. The frozen type computes its fixed-slot content
+commitment internally rather than accepting a generic source-reported digest;
+its fault and post-construction corruption hooks are `#[cfg(test)]` only and
+absent from the production API. The runtime binds the
 snapshot's in-memory generation, exact finalized identity, recent tip
 height/hash, and content commitment into one lineage digest. Continuation query
 binding v2 uses that digest, and each round completes the configured scan before
@@ -205,9 +207,9 @@ only its exact sequence prefix. Recovery never opens the later candidate;
 every retry replaces it uniformly, while committed entries remain immutable.
 Duplicate requests and continuations both record cover, and one public
 transaction bound is enforced before any secret-dependent claim condition.
-The journal has only a deterministic test protector, a transaction bound not
-yet derived from the compiled profile, no process lock for its assumed single
-writer, and no runtime caller.
+The journal has only a deterministic test protector, derives its total
+transaction bound from compiled profile v4, has no process lock for its assumed
+single writer, and has no runtime caller.
 
 A module-private coordinator now binds the replay journal into the outer
 security-state snapshot. Explicit initial provisioning is distinct from opening
@@ -227,9 +229,12 @@ slice.
 These foundations are not a concrete production witness or protector, a nonce
 or trusted-time journal, a key/nonce owner, runtime/owner construction path, an
 atomic combined replay/snapshot/witness transaction, deployed rollback result,
-or access-oblivious memory/page/storage/timing implementation. Profile-v4
-replay capacity and maintenance-cadence binding is deferred; profile ID v3
-remains unchanged.
+or access-oblivious memory/page/storage/timing implementation. Profile ID v4
+binds total committed replay-transaction capacity, public trusted-time
+expiry-bucket width, and proactive fixed garbage-collection interval.
+Journal/coordinator construction derives the persisted transaction bound from
+that profile and preflights outer-sequence exhaustion before replay commit.
+Expiry/garbage-collection execution remains deferred.
 
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
@@ -584,8 +589,9 @@ distinct non-`Clone` reservation and replay-commit authorities minted under
 that lease for one opaque round capture. The security release witness checks
 both authorities and the active security epoch together, so unavailable,
 retired, equal-value reminted, or cross-round state fails closed.
-This ownership refactor changes neither profile ID v3 nor the ten-phase logical
-schedule.
+That ownership refactor did not itself change the then-current profile ID or
+the ten-phase logical schedule. The later profile-v4 replay-policy binding also
+leaves the ten-phase schedule unchanged.
 
 A listener-free response-release gate retains one completed response behind a
 non-`Clone` permit and rejects handle, refresh, and explicit shutdown before
@@ -765,9 +771,8 @@ non-test runtime or security-owner caller constructs the coordinator in this
 slice. These ordered steps are not one atomic transaction across the journal,
 snapshot, and witness.
 Nonce, trusted-time, and key state are not durably journaled or composed yet;
-runtime/owner wiring and profile-v4 replay capacity/cadence binding remain
-open, profile ID v3 is unchanged, and no production witness or rollback claim
-exists.
+runtime/owner wiring and profile-fixed expiry/garbage-collection execution
+remain open, and no production witness or rollback claim exists.
 
 ## Private wire contract
 
@@ -999,8 +1004,8 @@ Deliverables:
 
 - a production monotonic freshness witness and security-state owner built on
   the fixed outer snapshot/reconciliation foundation;
-- extend the current replay-only composite digest in profile v4 to bind replay
-  capacity and maintenance cadence, then integrate the local
+- execute the profile-v4 public expiry-bucket and garbage-collection schedule
+  under trusted time, then integrate the profile-derived local
   request/continuation journal with runtime/owner construction;
 - integrate the module-local replay/snapshot/witness ordering with the
   production owner and external witness, then define a reviewed atomic or

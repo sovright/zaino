@@ -5019,10 +5019,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rejects_lease_bound_to_different_same_size_profile(
+    fn runtime_rejects_lease_bound_to_different_replay_policy(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let profile_a = test_profile_with_recent_snapshot(
-            "runtime-profile-a",
+            "runtime-replay-policy",
             4,
             RECENT_SNAPSHOT_SLOTS,
             RESPONSE_SLOTS,
@@ -5030,15 +5030,31 @@ mod tests {
             3,
             TOKEN_TTL_SECONDS,
         )?;
-        let profile_b = test_profile_with_recent_snapshot(
-            "runtime-profile-b",
-            4,
-            RECENT_SNAPSHOT_SLOTS,
-            RESPONSE_SLOTS,
-            ENVELOPE_BYTES,
-            3,
-            TOKEN_TTL_SECONDS + 1,
+        let replay_policy_a = profile_a.replay_policy();
+        let profile_b = profile_a.with_test_replay_policy(
+            replay_policy_a
+                .transaction_capacity()
+                .checked_add(1)
+                .expect("fixture replay capacity leaves increment headroom"),
+            replay_policy_a.expiry_bucket_width_seconds(),
+            replay_policy_a.garbage_collection_interval_seconds(),
         )?;
+        assert_ne!(
+            profile_a.replay_policy().transaction_capacity(),
+            profile_b.replay_policy().transaction_capacity()
+        );
+        assert_eq!(
+            profile_a.replay_policy().expiry_bucket_width_seconds(),
+            profile_b.replay_policy().expiry_bucket_width_seconds()
+        );
+        assert_eq!(
+            profile_a
+                .replay_policy()
+                .garbage_collection_interval_seconds(),
+            profile_b
+                .replay_policy()
+                .garbage_collection_interval_seconds()
+        );
         let shape_a = CompiledQueryShape::new(profile_a)?;
         let shape_b = CompiledQueryShape::new(profile_b)?;
         assert_ne!(
