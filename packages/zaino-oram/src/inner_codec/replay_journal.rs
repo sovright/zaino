@@ -32,6 +32,17 @@ use crate::{
     },
 };
 
+use super::{
+    security_state_binding::{
+        provision_initial_snapshot, successor_after_replay_commit, verify_current,
+        SecurityStateBindingError,
+    },
+    security_state_store::{
+        SecurityFreshnessWitness, SecurityStateIdentity, SecurityStateSnapshot, SecurityStateStore,
+        SecurityStateStoreError, STATE_DIGEST_BYTES,
+    },
+};
+
 const FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
 const U64_BYTES: usize = 8;
@@ -668,6 +679,117 @@ impl fmt::Debug for PreparedReplayJournalCommit {
     }
 }
 
+mod committed_advance {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[derive(Clone)]
+    pub(super) struct ReplayJournalInstanceIdentity(Arc<()>);
+
+    impl ReplayJournalInstanceIdentity {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(()))
+        }
+
+        fn matches(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.0, &other.0)
+        }
+    }
+
+    /// Production move-only evidence minted after one live journal's durable boundary.
+    pub(in crate::inner_codec) struct ReplayJournalAdvanceReceipt {
+        instance_identity: ReplayJournalInstanceIdentity,
+        previous_digest: ReplayJournalComponentStateDigest,
+        committed_digest: ReplayJournalComponentStateDigest,
+    }
+
+    impl ReplayJournalAdvanceReceipt {
+        pub(in crate::inner_codec) fn into_digests(
+            self,
+        ) -> (
+            ReplayJournalComponentStateDigest,
+            ReplayJournalComponentStateDigest,
+        ) {
+            (self.previous_digest, self.committed_digest)
+        }
+
+        pub(super) fn was_minted_for(
+            &self,
+            instance_identity: &ReplayJournalInstanceIdentity,
+        ) -> bool {
+            self.instance_identity.matches(instance_identity)
+        }
+    }
+
+    impl fmt::Debug for ReplayJournalAdvanceReceipt {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("ReplayJournalAdvanceReceipt { ..REDACTED.. }")
+        }
+    }
+
+    pub(super) struct ReplayJournalCommittedAdvance {
+        pub(super) result: ReplayCommitResult,
+        pub(super) receipt: ReplayJournalAdvanceReceipt,
+    }
+
+    impl ReplayJournalCommittedAdvance {
+        pub(super) fn into_parts(self) -> (ReplayCommitResult, ReplayJournalAdvanceReceipt) {
+            (self.result, self.receipt)
+        }
+    }
+
+    impl fmt::Debug for ReplayJournalCommittedAdvance {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("ReplayJournalCommittedAdvance { ..REDACTED.. }")
+        }
+    }
+
+    impl<P> ReplayJournalStore<P>
+    where
+        P: ReplayJournalRecordProtector,
+    {
+        pub(super) fn commit_transaction_and_capture(
+            &mut self,
+            security_round: &SecurityRoundCapture,
+            request_key: &RequestReplayKey,
+            continuation_plan: &ContinuationReplayPlan,
+        ) -> Result<ReplayJournalCommittedAdvance, ReplayJournalStoreError> {
+            let previous_digest = self.state.component_state_digest();
+            let prepared = self.prepare_commit(request_key, continuation_plan)?;
+            let staged_entry = self.stage_entry_file(&prepared)?;
+            let replaced_entry = self.replace_entry_file(staged_entry, &prepared)?;
+            self.confirm_entry_file_durable(replaced_entry)?;
+            let staged_current = self.stage_current_state(&prepared)?;
+            let replaced_current = self.replace_current_state(staged_current)?;
+            self.confirm_current_state_durable(replaced_current)?;
+            let result = self.apply_prepared_commit_in_memory(security_round, prepared);
+            let receipt = ReplayJournalAdvanceReceipt {
+                instance_identity: self.instance_identity.clone(),
+                previous_digest,
+                committed_digest: self.state.component_state_digest(),
+            };
+            Ok(ReplayJournalCommittedAdvance { result, receipt })
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_receipt_for_digests(
+            &self,
+            previous_digest: ReplayJournalComponentStateDigest,
+            committed_digest: ReplayJournalComponentStateDigest,
+        ) -> ReplayJournalAdvanceReceipt {
+            ReplayJournalAdvanceReceipt {
+                instance_identity: self.instance_identity.clone(),
+                previous_digest,
+                committed_digest,
+            }
+        }
+    }
+}
+
+pub(super) use committed_advance::ReplayJournalAdvanceReceipt;
+use committed_advance::ReplayJournalInstanceIdentity;
+
 struct StagedReplayJournalEntry {
     file: NamedTempFile,
 }
@@ -708,12 +830,15 @@ pub(super) trait ReplayJournalComponentState: sealed::Sealed {
     fn component_state_digest(
         &self,
     ) -> Result<ReplayJournalComponentStateDigest, ReplayJournalComponentStateUnavailable>;
+
+    fn recognizes_receipt(&self, receipt: &ReplayJournalAdvanceReceipt) -> bool;
 }
 
 struct ReplayJournalStore<P> {
     recovery_directory: PathBuf,
     protection_context: ReplayJournalProtectionContext,
     protector: P,
+    instance_identity: ReplayJournalInstanceIdentity,
     state: ReplayJournalState,
     request_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
     continuation_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
@@ -731,6 +856,10 @@ impl<P> ReplayJournalComponentState for ReplayJournalStore<P> {
             ReplayJournalStoreHealth::Indeterminate => Err(ReplayJournalComponentStateUnavailable),
         }
     }
+
+    fn recognizes_receipt(&self, receipt: &ReplayJournalAdvanceReceipt) -> bool {
+        receipt.was_minted_for(&self.instance_identity)
+    }
 }
 
 impl<P> ReplayJournalStore<P>
@@ -744,6 +873,7 @@ where
         protector: P,
     ) -> Result<Self, ReplayJournalStoreError> {
         let recovery_directory = root.into();
+        let instance_identity = ReplayJournalInstanceIdentity::new();
         validate_recovery_paths(&recovery_directory)?;
         let current_path = recovery_directory.join(CURRENT_STATE_FILE);
         let current_bytes = match read_exact_record::<CURRENT_RECORD_BYTES>(&current_path) {
@@ -757,6 +887,7 @@ where
                     recovery_directory,
                     protection_context,
                     protector,
+                    instance_identity,
                     state: ReplayJournalState::empty(limits),
                     request_claims: HashSet::new(),
                     continuation_claims: HashSet::new(),
@@ -810,6 +941,7 @@ where
             recovery_directory,
             protection_context,
             protector,
+            instance_identity,
             state,
             request_claims,
             continuation_claims,
@@ -1023,14 +1155,10 @@ where
         request_key: &RequestReplayKey,
         continuation_plan: &ContinuationReplayPlan,
     ) -> Result<ReplayCommitResult, ReplayJournalStoreError> {
-        let prepared = self.prepare_commit(request_key, continuation_plan)?;
-        let staged_entry = self.stage_entry_file(&prepared)?;
-        let replaced_entry = self.replace_entry_file(staged_entry, &prepared)?;
-        self.confirm_entry_file_durable(replaced_entry)?;
-        let staged_current = self.stage_current_state(&prepared)?;
-        let replaced_current = self.replace_current_state(staged_current)?;
-        self.confirm_current_state_durable(replaced_current)?;
-        Ok(self.apply_prepared_commit_in_memory(security_round, prepared))
+        let (result, _receipt) = self
+            .commit_transaction_and_capture(security_round, request_key, continuation_plan)?
+            .into_parts();
+        Ok(result)
     }
 
     fn latch(&mut self, error: ReplayJournalStoreError) -> ReplayJournalStoreError {
@@ -1051,6 +1179,272 @@ where
     ) -> Result<ReplayCommitResult, ReplayCommitUnavailable> {
         self.commit_transaction(security_round, request_key, continuation_plan)
             .map_err(|_| ReplayCommitUnavailable)
+    }
+}
+
+/// Module-local owner of one replay journal and its exact outer snapshot.
+///
+/// This is a fail-closed coordination protocol, not an atomic transaction
+/// across the journal, local snapshot, and external freshness witness. Once a
+/// replay commit succeeds, any unresolved outer advance latches this instance
+/// indeterminate and withholds the replay authority.
+struct ReplaySnapshotCoordinator<P, W> {
+    replay_journal: ReplayJournalStore<P>,
+    security_state: SecurityStateStore<W>,
+    current_snapshot: SecurityStateSnapshot,
+    health: ReplaySnapshotCoordinatorHealth,
+}
+
+struct ReplaySnapshotInitialState {
+    identity: SecurityStateIdentity,
+    serving_identity_digest: [u8; STATE_DIGEST_BYTES],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaySnapshotCoordinatorHealth {
+    Ready,
+    Indeterminate,
+}
+
+impl<P, W> ReplaySnapshotCoordinator<P, W>
+where
+    P: ReplayJournalRecordProtector,
+    W: SecurityFreshnessWitness,
+{
+    /// Opens only a previously provisioned pair that matches exactly.
+    fn open_existing(
+        replay_root: impl Into<PathBuf>,
+        security_state_root: impl Into<PathBuf>,
+        limits: ReplayJournalLimits,
+        protection_context: ReplayJournalProtectionContext,
+        protector: P,
+        witness: W,
+    ) -> Result<Self, ReplaySnapshotCoordinatorOpenError> {
+        let replay_journal =
+            ReplayJournalStore::open(replay_root, limits, protection_context, protector)
+                .map_err(ReplaySnapshotCoordinatorOpenError::ReplayJournal)?;
+        let mut security_state = SecurityStateStore::new(security_state_root, witness);
+        let current_snapshot = security_state
+            .current()
+            .map_err(ReplaySnapshotCoordinatorOpenError::SecurityState)?
+            .ok_or(ReplaySnapshotCoordinatorOpenError::OuterSnapshotMissing)?;
+        verify_current(&current_snapshot, &replay_journal)
+            .map_err(ReplaySnapshotCoordinatorOpenError::SnapshotBinding)?;
+
+        Ok(Self {
+            replay_journal,
+            security_state,
+            current_snapshot,
+            health: ReplaySnapshotCoordinatorHealth::Ready,
+        })
+    }
+
+    /// Explicitly provisions an absent outer snapshot for the current journal.
+    fn provision_initial(
+        replay_root: impl Into<PathBuf>,
+        security_state_root: impl Into<PathBuf>,
+        limits: ReplayJournalLimits,
+        protection_context: ReplayJournalProtectionContext,
+        protector: P,
+        witness: W,
+        initial_state: ReplaySnapshotInitialState,
+    ) -> Result<Self, ReplaySnapshotCoordinatorOpenError> {
+        let replay_journal =
+            ReplayJournalStore::open(replay_root, limits, protection_context, protector)
+                .map_err(ReplaySnapshotCoordinatorOpenError::ReplayJournal)?;
+        let mut security_state = SecurityStateStore::new(security_state_root, witness);
+        if security_state
+            .current()
+            .map_err(ReplaySnapshotCoordinatorOpenError::SecurityState)?
+            .is_some()
+        {
+            return Err(ReplaySnapshotCoordinatorOpenError::OuterSnapshotAlreadyProvisioned);
+        }
+
+        let current_snapshot = provision_initial_snapshot(
+            initial_state.identity,
+            initial_state.serving_identity_digest,
+            &replay_journal,
+        )
+        .map_err(ReplaySnapshotCoordinatorOpenError::SnapshotBinding)?;
+        security_state
+            .compare_and_advance(None, current_snapshot)
+            .map_err(ReplaySnapshotCoordinatorOpenError::SecurityState)?;
+
+        Ok(Self {
+            replay_journal,
+            security_state,
+            current_snapshot,
+            health: ReplaySnapshotCoordinatorHealth::Ready,
+        })
+    }
+
+    fn commit_request_and_snapshot(
+        &mut self,
+        security_round: &SecurityRoundCapture,
+        request_key: &RequestReplayKey,
+        continuation_plan: &ContinuationReplayPlan,
+    ) -> Result<ReplayCommitResult, ReplaySnapshotCoordinatorCommitError> {
+        if self.health == ReplaySnapshotCoordinatorHealth::Indeterminate {
+            return Err(ReplaySnapshotCoordinatorCommitError::LatchedIndeterminate);
+        }
+
+        let committed = match self.replay_journal.commit_transaction_and_capture(
+            security_round,
+            request_key,
+            continuation_plan,
+        ) {
+            Ok(committed) => committed,
+            Err(error) => {
+                if self.replay_journal.health == ReplayJournalStoreHealth::Indeterminate {
+                    self.health = ReplaySnapshotCoordinatorHealth::Indeterminate;
+                }
+                return Err(ReplaySnapshotCoordinatorCommitError::ReplayJournal(error));
+            }
+        };
+
+        let next_snapshot = match successor_after_replay_commit(
+            &self.current_snapshot,
+            committed.receipt,
+            &self.replay_journal,
+        ) {
+            Ok(next_snapshot) => next_snapshot,
+            Err(error) => {
+                return Err(self.latch_after_replay(
+                    ReplaySnapshotCoordinatorOuterAdvanceError::SnapshotBinding(error),
+                ));
+            }
+        };
+        if let Err(error) = self
+            .security_state
+            .compare_and_advance(Some(self.current_snapshot), next_snapshot)
+        {
+            return Err(self.latch_after_replay(
+                ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(error),
+            ));
+        }
+
+        self.current_snapshot = next_snapshot;
+        Ok(committed.result)
+    }
+
+    fn latch_after_replay(
+        &mut self,
+        error: ReplaySnapshotCoordinatorOuterAdvanceError,
+    ) -> ReplaySnapshotCoordinatorCommitError {
+        self.health = ReplaySnapshotCoordinatorHealth::Indeterminate;
+        ReplaySnapshotCoordinatorCommitError::OuterAdvanceAfterReplay(error)
+    }
+}
+
+impl<P, W> ContinuationReplayGuard for ReplaySnapshotCoordinator<P, W>
+where
+    P: ReplayJournalRecordProtector,
+    W: SecurityFreshnessWitness,
+{
+    fn commit_request_and_continuation(
+        &mut self,
+        security_round: &SecurityRoundCapture,
+        request_key: &RequestReplayKey,
+        continuation_plan: &ContinuationReplayPlan,
+    ) -> Result<ReplayCommitResult, ReplayCommitUnavailable> {
+        self.commit_request_and_snapshot(security_round, request_key, continuation_plan)
+            .map_err(|_| ReplayCommitUnavailable)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaySnapshotCoordinatorOpenError {
+    ReplayJournal(ReplayJournalStoreError),
+    SecurityState(SecurityStateStoreError),
+    OuterSnapshotMissing,
+    OuterSnapshotAlreadyProvisioned,
+    SnapshotBinding(SecurityStateBindingError),
+}
+
+impl fmt::Display for ReplaySnapshotCoordinatorOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReplayJournal(_) => f.write_str("replay journal could not be opened"),
+            Self::SecurityState(_) => f.write_str("outer security state could not be reconciled"),
+            Self::OuterSnapshotMissing => {
+                f.write_str("outer security snapshot has not been provisioned")
+            }
+            Self::OuterSnapshotAlreadyProvisioned => {
+                f.write_str("outer security snapshot is already provisioned")
+            }
+            Self::SnapshotBinding(_) => {
+                f.write_str("outer security snapshot does not match the replay journal")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplaySnapshotCoordinatorOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReplayJournal(error) => Some(error),
+            Self::SecurityState(error) => Some(error),
+            Self::SnapshotBinding(error) => Some(error),
+            Self::OuterSnapshotMissing | Self::OuterSnapshotAlreadyProvisioned => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaySnapshotCoordinatorCommitError {
+    LatchedIndeterminate,
+    ReplayJournal(ReplayJournalStoreError),
+    OuterAdvanceAfterReplay(ReplaySnapshotCoordinatorOuterAdvanceError),
+}
+
+impl fmt::Display for ReplaySnapshotCoordinatorCommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LatchedIndeterminate => {
+                f.write_str("replay snapshot coordinator is indeterminate")
+            }
+            Self::ReplayJournal(_) => f.write_str("replay journal commit failed"),
+            Self::OuterAdvanceAfterReplay(_) => {
+                f.write_str("outer security-state advance failed after replay commit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplaySnapshotCoordinatorCommitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReplayJournal(error) => Some(error),
+            Self::OuterAdvanceAfterReplay(error) => Some(error),
+            Self::LatchedIndeterminate => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaySnapshotCoordinatorOuterAdvanceError {
+    SnapshotBinding(SecurityStateBindingError),
+    SecurityState(SecurityStateStoreError),
+}
+
+impl fmt::Display for ReplaySnapshotCoordinatorOuterAdvanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SnapshotBinding(_) => {
+                f.write_str("replay commit receipt did not match the outer snapshot")
+            }
+            Self::SecurityState(_) => f.write_str("outer security-state transition is unresolved"),
+        }
+    }
+}
+
+impl std::error::Error for ReplaySnapshotCoordinatorOuterAdvanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SnapshotBinding(error) => Some(error),
+            Self::SecurityState(error) => Some(error),
+        }
     }
 }
 
@@ -1302,7 +1696,7 @@ fn read_array<const N: usize>(bytes: &[u8], start: usize) -> [u8; N] {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, error::Error, fs, rc::Rc};
+    use std::{cell::Cell, error::Error, fs, path::Path, rc::Rc};
 
     use tempfile::TempDir;
 
@@ -1310,11 +1704,12 @@ mod tests {
     use crate::{
         inner_codec::{
             security_state_binding::{
-                provision_initial_snapshot, successor_after_live_replay_advance, verify_current,
+                provision_initial_snapshot, successor_after_replay_commit, verify_current,
                 SecurityStateBindingError,
             },
             security_state_store::{
-                test_security_state_identity, PersistentSecurityState, STATE_DIGEST_BYTES,
+                test_security_state_identity, PersistentSecurityState, SecurityFreshness,
+                STATE_DIGEST_BYTES,
             },
         },
         runtime_security::{ContinuationReplayKey, ReplayNamespace, SecurityEpochTag},
@@ -1328,6 +1723,72 @@ mod tests {
     const TEST_KEY: [u8; DIGEST_BYTES] = [0x91; DIGEST_BYTES];
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CoordinatorWitnessError {
+        Conflict,
+        Rejected,
+        AdvanceUnresolved,
+    }
+
+    impl fmt::Display for CoordinatorWitnessError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("coordinator witness rejected the transition")
+        }
+    }
+
+    impl Error for CoordinatorWitnessError {}
+
+    #[derive(Clone)]
+    struct CoordinatorWitness {
+        state: Rc<Cell<Option<SecurityFreshness>>>,
+        reject_advance: Rc<Cell<bool>>,
+        advance_then_fail: Rc<Cell<bool>>,
+    }
+
+    impl CoordinatorWitness {
+        fn empty() -> Self {
+            Self {
+                state: Rc::new(Cell::new(None)),
+                reject_advance: Rc::new(Cell::new(false)),
+                advance_then_fail: Rc::new(Cell::new(false)),
+            }
+        }
+
+        fn set_reject_advance(&self, reject: bool) {
+            self.reject_advance.set(reject);
+        }
+
+        fn set_advance_then_fail(&self) {
+            self.advance_then_fail.set(true);
+        }
+    }
+
+    impl SecurityFreshnessWitness for CoordinatorWitness {
+        type Error = CoordinatorWitnessError;
+
+        fn current(&mut self) -> Result<Option<SecurityFreshness>, Self::Error> {
+            Ok(self.state.get())
+        }
+
+        fn compare_and_advance(
+            &mut self,
+            expected: Option<SecurityFreshness>,
+            next: SecurityFreshness,
+        ) -> Result<(), Self::Error> {
+            if self.reject_advance.get() {
+                return Err(CoordinatorWitnessError::Rejected);
+            }
+            if self.state.get() != expected {
+                return Err(CoordinatorWitnessError::Conflict);
+            }
+            self.state.set(Some(next));
+            if self.advance_then_fail.replace(false) {
+                return Err(CoordinatorWitnessError::AdvanceUnresolved);
+            }
+            Ok(())
+        }
+    }
 
     // Non-cryptographic fixture: its plaintext-derived nonce is deterministic
     // and deliberately does not satisfy the production uniqueness contract.
@@ -1540,6 +2001,49 @@ mod tests {
             limits(),
             protection_context(),
             DeterministicTestProtector::available(),
+        )
+    }
+
+    fn provision_coordinator(
+        replay_root: &Path,
+        security_state_root: &Path,
+        protector: DeterministicTestProtector,
+        witness: CoordinatorWitness,
+    ) -> Result<
+        ReplaySnapshotCoordinator<DeterministicTestProtector, CoordinatorWitness>,
+        ReplaySnapshotCoordinatorOpenError,
+    > {
+        ReplaySnapshotCoordinator::provision_initial(
+            replay_root.to_path_buf(),
+            security_state_root.to_path_buf(),
+            limits(),
+            protection_context(),
+            protector,
+            witness,
+            ReplaySnapshotInitialState {
+                identity: test_security_state_identity(0x71)
+                    .expect("coordinator fixture security identity is valid"),
+                serving_identity_digest: [0x72; STATE_DIGEST_BYTES],
+            },
+        )
+    }
+
+    fn open_coordinator(
+        replay_root: &Path,
+        security_state_root: &Path,
+        protector: DeterministicTestProtector,
+        witness: CoordinatorWitness,
+    ) -> Result<
+        ReplaySnapshotCoordinator<DeterministicTestProtector, CoordinatorWitness>,
+        ReplaySnapshotCoordinatorOpenError,
+    > {
+        ReplaySnapshotCoordinator::open_existing(
+            replay_root.to_path_buf(),
+            security_state_root.to_path_buf(),
+            limits(),
+            protection_context(),
+            protector,
+            witness,
         )
     }
 
@@ -1917,6 +2421,389 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_separates_initial_provisioning_from_existing_open() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+
+        assert!(matches!(
+            open_coordinator(
+                &replay_root,
+                &security_state_root,
+                DeterministicTestProtector::available(),
+                witness.clone(),
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::OuterSnapshotMissing)
+        ));
+
+        let coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        assert_eq!(coordinator.current_snapshot.test_sequence(), 1);
+        verify_current(&coordinator.current_snapshot, &coordinator.replay_journal)?;
+        drop(coordinator);
+
+        assert!(matches!(
+            provision_coordinator(
+                &replay_root,
+                &security_state_root,
+                DeterministicTestProtector::available(),
+                witness.clone(),
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::OuterSnapshotAlreadyProvisioned)
+        ));
+
+        let reopened = open_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness,
+        )?;
+        assert_eq!(reopened.current_snapshot.test_sequence(), 1);
+        verify_current(&reopened.current_snapshot, &reopened.replay_journal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_advances_outer_snapshot_for_fresh_and_duplicate_commits() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        let (_, round) = security_round();
+        let request = request_key(1);
+
+        let first = coordinator.commit_request_and_snapshot(
+            &round,
+            &request,
+            &ContinuationReplayPlan::Cover,
+        )?;
+        let (_authority, first_decision) = first.into_parts();
+        assert_eq!(first_decision, ReplayDuplicateDecision::Fresh);
+        assert_eq!(coordinator.current_snapshot.test_sequence(), 2);
+
+        let duplicate = coordinator.commit_request_and_snapshot(
+            &round,
+            &request,
+            &ContinuationReplayPlan::Cover,
+        )?;
+        let (_authority, duplicate_decision) = duplicate.into_parts();
+        assert_eq!(
+            duplicate_decision,
+            ReplayDuplicateDecision::RequestDuplicate
+        );
+        assert_eq!(coordinator.current_snapshot.test_sequence(), 3);
+        verify_current(&coordinator.current_snapshot, &coordinator.replay_journal)?;
+        drop(coordinator);
+
+        let reopened = open_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness,
+        )?;
+        assert_eq!(reopened.current_snapshot.test_sequence(), 3);
+        verify_current(&reopened.current_snapshot, &reopened.replay_journal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_latches_when_witness_rejects_after_replay_commit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        witness.set_reject_advance(true);
+        let (_, round) = security_round();
+
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(1),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("rejected witness must withhold replay authority"),
+            ReplaySnapshotCoordinatorCommitError::OuterAdvanceAfterReplay(
+                ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(
+                    SecurityStateStoreError::WitnessAdvanceUnresolved,
+                ),
+            )
+        );
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(2),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("coordinator must remain latched"),
+            ReplaySnapshotCoordinatorCommitError::LatchedIndeterminate
+        );
+        assert!(matches!(
+            coordinator.commit_request_and_continuation(
+                &round,
+                &request_key(3),
+                &ContinuationReplayPlan::Cover,
+            ),
+            Err(ReplayCommitUnavailable)
+        ));
+
+        witness.set_reject_advance(false);
+        drop(coordinator);
+        assert!(matches!(
+            open_coordinator(
+                &replay_root,
+                &security_state_root,
+                DeterministicTestProtector::available(),
+                witness,
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::SecurityState(
+                SecurityStateStoreError::WitnessLocalMismatch,
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_reopens_when_witness_advanced_before_ambiguous_error() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        witness.set_advance_then_fail();
+        let (_, round) = security_round();
+
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(1),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("ambiguous witness result must withhold replay authority"),
+            ReplaySnapshotCoordinatorCommitError::OuterAdvanceAfterReplay(
+                ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(
+                    SecurityStateStoreError::WitnessAdvanceUnresolved,
+                ),
+            )
+        );
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(2),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("coordinator must remain latched"),
+            ReplaySnapshotCoordinatorCommitError::LatchedIndeterminate
+        );
+        drop(coordinator);
+
+        let reopened = open_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness,
+        )?;
+        assert_eq!(reopened.current_snapshot.test_sequence(), 2);
+        verify_current(&reopened.current_snapshot, &reopened.replay_journal)?;
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_latches_on_stale_cached_snapshot_after_replay_commit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        let (_, round) = security_round();
+        drop(coordinator.replay_journal.commit_transaction(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::Cover,
+        )?);
+
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(2),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("snapshot mismatch after replay must withhold authority"),
+            ReplaySnapshotCoordinatorCommitError::OuterAdvanceAfterReplay(
+                ReplaySnapshotCoordinatorOuterAdvanceError::SnapshotBinding(
+                    SecurityStateBindingError::ReplayComponentMismatch,
+                ),
+            )
+        );
+        assert_eq!(
+            coordinator.health,
+            ReplaySnapshotCoordinatorHealth::Indeterminate
+        );
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(3),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("coordinator must remain latched"),
+            ReplaySnapshotCoordinatorCommitError::LatchedIndeterminate
+        );
+        drop(coordinator);
+
+        assert!(matches!(
+            open_coordinator(
+                &replay_root,
+                &security_state_root,
+                DeterministicTestProtector::available(),
+                witness,
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::SnapshotBinding(
+                SecurityStateBindingError::ReplayComponentMismatch,
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_latches_on_outer_stage_failure_after_replay_commit() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            DeterministicTestProtector::available(),
+            witness.clone(),
+        )?;
+        let outer_staging_directory = security_state_root.join(STAGING_DIRECTORY);
+        fs::remove_dir(&outer_staging_directory)?;
+        fs::write(&outer_staging_directory, b"not a directory")?;
+        let (_, round) = security_round();
+
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(1),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("outer stage failure after replay must withhold authority"),
+            ReplaySnapshotCoordinatorCommitError::OuterAdvanceAfterReplay(
+                ReplaySnapshotCoordinatorOuterAdvanceError::SecurityState(
+                    SecurityStateStoreError::UnsafeRecoveryPath,
+                ),
+            )
+        );
+        assert_eq!(
+            coordinator.health,
+            ReplaySnapshotCoordinatorHealth::Indeterminate
+        );
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(2),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("coordinator must remain latched"),
+            ReplaySnapshotCoordinatorCommitError::LatchedIndeterminate
+        );
+        drop(coordinator);
+
+        assert!(matches!(
+            open_coordinator(
+                &replay_root,
+                &security_state_root,
+                DeterministicTestProtector::available(),
+                witness,
+            ),
+            Err(ReplaySnapshotCoordinatorOpenError::SnapshotBinding(
+                SecurityStateBindingError::ReplayComponentMismatch,
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_safe_pre_authority_failure_keeps_pair_ready() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("replay");
+        let security_state_root = directory.path().join("security-state");
+        let witness = CoordinatorWitness::empty();
+        let protector = DeterministicTestProtector::available();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            protector.clone(),
+            witness,
+        )?;
+        let initial_snapshot = coordinator.current_snapshot;
+        let (_, round) = security_round();
+
+        protector.set_available(false);
+        assert_eq!(
+            coordinator
+                .commit_request_and_snapshot(
+                    &round,
+                    &request_key(1),
+                    &ContinuationReplayPlan::Cover,
+                )
+                .expect_err("protector failure must not mint replay authority"),
+            ReplaySnapshotCoordinatorCommitError::ReplayJournal(
+                ReplayJournalStoreError::CommittedEntryProtectionUnavailable,
+            )
+        );
+        assert_eq!(coordinator.health, ReplaySnapshotCoordinatorHealth::Ready);
+        assert_eq!(coordinator.current_snapshot, initial_snapshot);
+        verify_current(&coordinator.current_snapshot, &coordinator.replay_journal)?;
+
+        protector.set_available(true);
+        let result = coordinator.commit_request_and_snapshot(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::Cover,
+        )?;
+        let (_authority, decision) = result.into_parts();
+        assert_eq!(decision, ReplayDuplicateDecision::Fresh);
+        assert_eq!(coordinator.current_snapshot.test_sequence(), 2);
+        verify_current(&coordinator.current_snapshot, &coordinator.replay_journal)?;
+        Ok(())
+    }
+
+    #[test]
     fn replay_component_binding_is_exact_across_commit_and_replay_reopen() -> TestResult {
         let directory = tempfile::tempdir()?;
         let mut store = open_store(&directory)?;
@@ -1940,8 +2827,10 @@ mod tests {
             ]
         );
         verify_current(&initial, &store)?;
+        let no_op_receipt =
+            store.test_receipt_for_digests(previous_replay_digest, previous_replay_digest);
         assert_eq!(
-            successor_after_live_replay_advance(&initial, previous_replay_digest, &store),
+            successor_after_replay_commit(&initial, no_op_receipt, &store),
             Err(SecurityStateBindingError::ReplayComponentDidNotAdvance)
         );
         assert_eq!(
@@ -1950,18 +2839,27 @@ mod tests {
         );
 
         let (_, round) = security_round();
-        store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        let committed = store.commit_transaction_and_capture(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::Cover,
+        )?;
+        assert_eq!(
+            format!("{committed:?}"),
+            "ReplayJournalCommittedAdvance { ..REDACTED.. }"
+        );
+        let (_result, receipt) = committed.into_parts();
+        assert_eq!(
+            format!("{receipt:?}"),
+            "ReplayJournalAdvanceReceipt { ..REDACTED.. }"
+        );
         assert_eq!(
             verify_current(&initial, &store),
             Err(SecurityStateBindingError::ReplayComponentMismatch)
         );
-        assert_eq!(
-            successor_after_live_replay_advance(&initial, store.component_state_digest()?, &store,),
-            Err(SecurityStateBindingError::ReplayComponentMismatch)
-        );
 
-        let successor =
-            successor_after_live_replay_advance(&initial, previous_replay_digest, &store)?;
+        let successor = successor_after_replay_commit(&initial, receipt, &store)?;
+        assert_ne!(successor, initial);
         verify_current(&successor, &store)?;
         assert_eq!(
             PersistentSecurityState::from_business(&successor).into_business()?,
@@ -1975,6 +2873,68 @@ mod tests {
             verify_current(&initial, &reopened),
             Err(SecurityStateBindingError::ReplayComponentMismatch)
         );
+
+        let mut reopened = reopened;
+        let second_committed = reopened.commit_transaction_and_capture(
+            &round,
+            &request_key(2),
+            &ContinuationReplayPlan::Cover,
+        )?;
+        let (_result, second_receipt) = second_committed.into_parts();
+        assert_eq!(
+            successor_after_replay_commit(&initial, second_receipt, &reopened),
+            Err(SecurityStateBindingError::ReplayComponentMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_receipt_requires_its_live_instance_and_current_head() -> TestResult {
+        let first_directory = tempfile::tempdir()?;
+        let second_directory = tempfile::tempdir()?;
+        let mut first_store = open_store(&first_directory)?;
+        let mut second_store = open_store(&second_directory)?;
+        let initial = provision_initial_snapshot(
+            test_security_state_identity(0x62)?,
+            [0x66; STATE_DIGEST_BYTES],
+            &first_store,
+        )?;
+        let (_, round) = security_round();
+
+        let first_advance = first_store.commit_transaction_and_capture(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::Cover,
+        )?;
+        second_store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        assert_eq!(
+            first_store.component_state_digest()?,
+            second_store.component_state_digest()?
+        );
+        let (_result, first_receipt) = first_advance.into_parts();
+        assert_eq!(
+            successor_after_replay_commit(&initial, first_receipt, &second_store),
+            Err(SecurityStateBindingError::ReplayJournalInstanceMismatch)
+        );
+
+        let stale_directory = tempfile::tempdir()?;
+        let mut stale_store = open_store(&stale_directory)?;
+        let stale_initial = provision_initial_snapshot(
+            test_security_state_identity(0x63)?,
+            [0x67; STATE_DIGEST_BYTES],
+            &stale_store,
+        )?;
+        let stale_advance = stale_store.commit_transaction_and_capture(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::Cover,
+        )?;
+        stale_store.commit_transaction(&round, &request_key(2), &ContinuationReplayPlan::Cover)?;
+        let (_result, stale_receipt) = stale_advance.into_parts();
+        assert_eq!(
+            successor_after_replay_commit(&stale_initial, stale_receipt, &stale_store),
+            Err(SecurityStateBindingError::ReplayReceiptNotCurrent)
+        );
         Ok(())
     }
 
@@ -1982,12 +2942,12 @@ mod tests {
     fn indeterminate_replay_store_cannot_bind_an_outer_snapshot() -> TestResult {
         let directory = tempfile::tempdir()?;
         let mut store = open_store(&directory)?;
-        let previous_replay_digest = store.component_state_digest()?;
         let initial = provision_initial_snapshot(
             test_security_state_identity(0x71)?,
             [0x75; STATE_DIGEST_BYTES],
             &store,
         )?;
+        let (_, round) = security_round();
         let prepared = store.prepare_commit(&request_key(1), &ContinuationReplayPlan::Cover)?;
         let staged_entry = store.stage_entry_file(&prepared)?;
         let replaced_entry = store.replace_entry_file(staged_entry, &prepared)?;
@@ -2016,10 +2976,14 @@ mod tests {
             verify_current(&initial, &store),
             Err(SecurityStateBindingError::ReplayComponentUnavailable)
         );
-        assert_eq!(
-            successor_after_live_replay_advance(&initial, previous_replay_digest, &store),
-            Err(SecurityStateBindingError::ReplayComponentUnavailable)
-        );
+        assert!(matches!(
+            store.commit_transaction_and_capture(
+                &round,
+                &request_key(2),
+                &ContinuationReplayPlan::Cover,
+            ),
+            Err(ReplayJournalStoreError::LatchedIndeterminate)
+        ));
 
         drop(store);
         let reopened = open_store(&directory)?;

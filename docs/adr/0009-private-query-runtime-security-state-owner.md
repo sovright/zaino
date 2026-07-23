@@ -287,50 +287,64 @@ both persist cover, and a noncanonical duplicate claim fails closed on recovery.
 One public transaction bound is checked before any secret-dependent claim
 condition.
 
-A module-private construction and verification foundation now defines how that
-replay state feeds the outer security-state commitment. A versioned,
-domain-separated composite security-component digest currently commits the
-replay-journal component digest. Initial provisioning is an explicit operation
-that constructs the outer snapshot from the journal's current digest. The
-restart-verification seam recomputes the current replay digest and accepts only
-an exact match with the outer snapshot; a mismatch fails closed. A journal
-latched indeterminate after an ambiguous durability result cannot supply
-component state to this layer.
+A module-private coordinator now defines how that replay state feeds the outer
+security-state commitment. Its versioned, domain-separated composite
+security-component digest currently commits the replay-journal component
+digest. Initial provisioning is an explicit operation that constructs the
+first outer snapshot from the journal's current digest; it is distinct from
+opening existing state, and refuses an already provisioned outer store. An
+existing open refuses a missing outer snapshot and accepts only an exact match
+between that snapshot and the current replay digest. A journal latched
+indeterminate after an ambiguous durability result cannot supply component
+state.
 
-Live advancement is intentionally directional at the API boundary. The caller
-must retain the replay digest from before the live advance and pass that
-retained value together with a ready concrete journal when constructing the
-outer successor. The binding first requires the current outer snapshot to
-commit the retained pre-advance digest, reads the real current digest from that
-journal, then constructs the successor from the post-advance digest. Supplying
-the same authoritative journal instance and enforcing the allowed commit count
-remain coordinator obligations. The binding does not infer whether the journal
-or snapshot is ahead, rewrite either component, or provide an automatic repair
-path.
+Live advancement remains intentionally directional. A successful replay
+commit's sealed durable path mints one move-only receipt whose private fields
+bind the journal's opaque per-open instance identity and the component digests
+immediately before and after that commit. Production receipt construction is
+confined to that durable path; a synthetic constructor exists only under
+`#[cfg(test)]` for rejection cases. The coordinator consumes a receipt only
+after the same live journal recognizes the instance identity and confirms that
+the post-advance digest is still its current head. It also requires that its
+cached outer snapshot commits the pre-advance digest, then constructs the exact
+successor from the post-advance digest. It advances the outer local snapshot and
+injected witness in the security-state store's local-before-witness order. The
+coordinator does not infer whether the journal or snapshot is ahead, rewrite
+either component, or provide an automatic repair path.
 
-These are ordering and local recovery foundations, not provider selections or
+If replay commits but successor construction, outer replacement, or witness
+advancement returns an error, the same coordinator instance latches
+indeterminate and releases no replay-commit authority to its caller. A hard
+witness rejection occurs after local replacement, so a fresh open fails with
+`WitnessLocalMismatch`. If the witness advances and then returns an error, the
+same instance still latches, but a fresh instance can reconcile the exact
+advanced local and witness state and open successfully.
+
+These are ordered local recovery foundations, not provider selections or
 production rollback claims. The replay journal has only a deterministic test
-protector, and no runtime or security-owner caller uses the component binding.
-No non-test caller can yet construct and coordinate both private stores; their
-ownership and any compiler-required visibility widening belong to the later
-owner-integration slice.
-The replay-journal commit, outer-snapshot replacement, and witness advancement
-are not one atomic transaction and are not yet coordinated. Its transaction
-bound and maintenance cadence are not bound by a compiled profile; that work
-is deferred to profile v4, while profile ID v3 remains unchanged. It assumes
-exactly one live writer without enforcing a process lock. There is no concrete
-freshness witness, production replay protector/key/nonce owner,
+protector, and no non-test runtime or security-owner caller constructs the
+coordinator. The replay-journal commit, outer-snapshot replacement, and witness
+advancement are not one atomic transaction: replay may be durably ahead after
+an outer failure, and the protocol responds by latching rather than claiming
+automatic repair. Its transaction bound and maintenance cadence are not bound
+by a compiled profile; that work is deferred to profile v4, while profile ID v3
+remains unchanged. It assumes exactly one live writer without enforcing a
+process lock. There is no production freshness witness, production replay
+protector/key/nonce owner,
 nonce-reservation journal, trusted-time journal, key persistence, attestation
 binding, owner construction path, or service caller.
-Consequently, a missing `current.bin` is locally indistinguishable from first
-initialization and opens as empty so an initial pre-marker crash can retry; loss
-or deletion of a previously committed marker is not detected until the journal
-and outer snapshot are coordinated with an external freshness witness.
+At the standalone-journal layer, a missing `current.bin` is locally
+indistinguishable from first initialization and opens as empty so an initial
+pre-marker crash can retry. An existing coordinator open detects loss or
+deletion of a previously committed replay marker when the outer snapshot
+remains, because the resulting digests do not match. Rollback or deletion of
+both local stores still requires a production external freshness witness to
+detect.
 The path-based filesystem helpers reject direct symlink components but do not
 provide dirfd-based no-follow traversal or adversarial-host TOCTOU protection.
 The journal makes no access-oblivious memory, page, storage, or timing claim.
-The component binding does not establish production rollback resistance, TDX
-security, or access-oblivious qualification.
+The coordinator does not establish production rollback resistance, TDX
+security, mainnet readiness, or access-oblivious qualification.
 The first qualified deployment remains single-owner as required below.
 
 ### Lifecycle and response-release ordering

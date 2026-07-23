@@ -209,24 +209,27 @@ The journal has only a deterministic test protector, a transaction bound not
 yet derived from the compiled profile, no process lock for its assumed single
 writer, and no runtime caller.
 
-A module-private construction and verification foundation now defines a
-versioned, domain-separated composite security-component digest that currently
-commits the replay-journal component digest. Initial provisioning is explicit;
-its restart-verification seam accepts only an exact
-outer-snapshot/current-replay match and otherwise fails closed. A journal
-latched indeterminate cannot supply component state. Live successor
-construction requires the caller to retain the pre-advance replay digest and
-reads the real post-advance digest from a ready concrete journal. Supplying the
-same authoritative instance and allowed commit count remains a coordinator
-obligation. The binding performs no automatic direction inference or repair.
-No non-test caller can construct and coordinate both private stores in this
+A module-private coordinator now binds the replay journal into the outer
+security-state snapshot. Explicit initial provisioning is distinct from opening
+existing state; an existing open accepts only an exact
+outer-snapshot/current-replay match. A successful replay commit's sealed durable
+path mints one move-only receipt binding its opaque per-open journal identity
+and pre- and post-commit component digests. The coordinator accepts it only from
+the same live journal and while its post-commit digest remains current, then
+advances the outer local snapshot and injected witness without inferring
+transition direction or repairing either store. Any outer failure after the
+replay commit latches that coordinator instance fail closed. A hard witness
+rejection leaves local state
+ahead and makes a fresh open fail with `WitnessLocalMismatch`; an
+advance-then-error can fresh-open successfully when the witness did advance.
+No non-test runtime or security-owner caller constructs the coordinator in this
 slice.
 These foundations are not a concrete production witness or protector, a nonce
-or trusted-time journal, a key/nonce owner, runtime/owner construction path,
-coordinated witness advancement, an atomic combined replay/snapshot
-transaction, deployed rollback result, or access-oblivious
-memory/page/storage/timing implementation. Profile-v4 replay capacity and
-maintenance-cadence binding is deferred; profile ID v3 remains unchanged.
+or trusted-time journal, a key/nonce owner, runtime/owner construction path, an
+atomic combined replay/snapshot/witness transaction, deployed rollback result,
+or access-oblivious memory/page/storage/timing implementation. Profile-v4
+replay capacity and maintenance-cadence binding is deferred; profile ID v3
+remains unchanged.
 
 The adjacent publishable `zaino-state` crate now exposes the ORAM-agnostic
 `ChainIndexSnapshot::canonical_recent_chain` seam. It value-binds a
@@ -746,18 +749,21 @@ locally before an injected witness compare-and-advance, and startup accepts only
 an exact local sequence/digest match. Staging files are ignored, and ambiguous
 local or witness commits fail closed until a fresh reconciliation.
 
-The module-private construction and verification foundation now defines the
-first concrete input to that boundary: a versioned, domain-separated composite
-security-component digest currently commits the local replay-journal digest.
-Provisioning is explicit, its restart-verification seam requires the outer
-snapshot to match the current replay state exactly, and live successor
-construction requires both the retained pre-advance replay digest and the real
-current digest read from a ready post-advance journal. Mismatch or indeterminate
-journal health fails closed, with no direction inference or repair. The future
-coordinator must supply the same authoritative instance and enforce the allowed
-commit count. No non-test caller can construct and coordinate both private
-stores in this slice. This is neither coordinated witness advancement nor an
-atomic transaction across the journal and snapshot.
+The module-private coordinator now supplies the first concrete composition at
+that boundary. Explicit initial provisioning constructs the outer snapshot;
+opening existing state instead requires an exact match with the current
+versioned, domain-separated replay-component digest. A successful replay
+commit's sealed durable path mints a move-only receipt binding its opaque
+per-open journal identity and pre/post digests. The coordinator accepts it only
+from the same live journal and while its post-digest remains current, then
+advances the outer local snapshot and injected witness. Mismatch or indeterminate
+journal health fails closed, with no direction inference or repair. Any
+post-replay outer error latches that coordinator instance. A hard
+witness rejection fresh-opens as `WitnessLocalMismatch`; witness
+advance-then-error can fresh-open successfully when the witness advanced. No
+non-test runtime or security-owner caller constructs the coordinator in this
+slice. These ordered steps are not one atomic transaction across the journal,
+snapshot, and witness.
 Nonce, trusted-time, and key state are not durably journaled or composed yet;
 runtime/owner wiring and profile-v4 replay capacity/cadence binding remain
 open, profile ID v3 is unchanged, and no production witness or rollback claim
@@ -996,8 +1002,9 @@ Deliverables:
 - extend the current replay-only composite digest in profile v4 to bind replay
   capacity and maintenance cadence, then integrate the local
   request/continuation journal with runtime/owner construction;
-- coordinate replay commit, outer-snapshot replacement, and witness advancement
-  under a reviewed atomic or recoverably staged protocol;
+- integrate the module-local replay/snapshot/witness ordering with the
+  production owner and external witness, then define a reviewed atomic or
+  recoverably staged recovery protocol for post-replay ambiguity;
 - implement nonce-reservation and trusted-time journals, with every committed
   component feeding the outer digest;
 - production protector/material/key providers behind the internal

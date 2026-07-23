@@ -91,8 +91,8 @@ foundation. It binds the complete security identity to opaque serving and
 component-state digests, commits local state durably before advancing an
 injected exact freshness witness, and accepts startup state only when the local
 sequence/digest exactly matches that witness. Ambiguous replacement or witness
-advancement fails closed. No concrete witness or runtime owner uses this store
-yet.
+advancement fails closed. No production witness or runtime owner uses this
+store yet.
 
 Alongside it, a crate-private local replay-journal foundation durably orders
 one request lane with one real-or-cover continuation lane. Its fixed-size
@@ -105,21 +105,23 @@ not connected to the runtime and has only a deterministic test protector. Its
 one public transaction bound is not profile-derived, and it assumes a single
 live writer without enforcing a process lock.
 
-A module-private construction and verification foundation now joins the value
-contracts of those two local foundations. Its versioned, domain-separated
-composite security-component digest currently commits the replay-journal
-component digest. Initial provisioning is explicit. Its restart-verification
-seam recomputes the current replay digest and accepts only an exact match with
-the outer snapshot; a mismatch fails closed. A journal latched indeterminate
-cannot supply component state. Live successor construction requires an
-explicitly retained pre-advance replay digest and reads the real post-advance
-digest from a ready concrete journal, with no automatic direction inference or
-repair. The future coordinator must supply the same authoritative journal
-instance and enforce the allowed commit count.
-The layer does not coordinate freshness-witness advancement and is not an
-atomic transaction spanning the journal and outer snapshot.
-No non-test runtime or security-owner caller can construct and coordinate both
-private stores in this slice; that owner integration remains separate.
+A module-private coordinator now joins those two local foundations. Initial
+provisioning is an explicit operation distinct from opening existing state, and
+an existing open accepts only an exact match between the outer snapshot and the
+current versioned, domain-separated replay-component digest. Each successful
+replay commit's sealed durable path produces one move-only receipt binding its
+opaque per-open journal identity and pre- and post-commit digests. Before
+advancing the outer local snapshot and injected witness, the coordinator checks
+that the same live journal recognizes the receipt and its post-commit digest is
+still current. It never infers transition direction or repairs either store.
+Any outer failure after the replay commit latches that coordinator instance fail
+closed. After a hard witness rejection, a fresh open rejects the
+durable-local/witness mismatch with `WitnessLocalMismatch`; if the witness
+advanced before returning an error, a fresh open can reconcile and succeed.
+
+This protocol is not one atomic transaction across the replay journal, outer
+snapshot, and witness. No non-test runtime or security-owner caller constructs
+the coordinator in this slice; owner integration remains separate.
 
 This is still source-level research evidence. A production protector/replay/
 material-provider bundle, generated route and listener, runtime-integrated
