@@ -11,7 +11,8 @@
 use crate::{
     continuation_token::{
         ContinuationExpectation, ContinuationReplayGuard, ContinuationState, ContinuationToken,
-        ContinuationTokenProtector, ContinuationUse, CONTINUATION_VERSION,
+        ContinuationTokenProtector, ContinuationUse, CONTINUATION_TOKEN_BYTES,
+        CONTINUATION_VERSION,
     },
     engine::PrivateQueryEngine,
     envelope::FixedEnvelope,
@@ -49,7 +50,10 @@ use std::sync::{
 };
 
 #[cfg(test)]
-use crate::recent_snapshot::{ServingEpochObservation, ServingEpochUnavailable};
+use crate::{
+    protection::{AuthenticationDecision, ProtectionUnavailable},
+    recent_snapshot::{ServingEpochObservation, ServingEpochUnavailable},
+};
 
 use super::{
     EnvelopeProtector, InnerCodecError, PrivateQueryCheckpoint, PrivateQueryCodec,
@@ -609,10 +613,14 @@ where
         >,
         envelope: &FixedEnvelope<ENVELOPE_BYTES>,
     ) -> Result<RuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
-        let (request, request_nonce) = self
+        let decoded_request = self
             .codec
-            .decode_request_with_nonce(envelope, &self.envelope_protector)
-            .map_err(InnerCodecError::into_uniform_external_failure)?;
+            .decode_request_with_nonce(envelope, &self.envelope_protector);
+        let (request, request_nonce) = match decoded_request {
+            Ok(request) => request,
+            Err(InnerCodecError::ProtectionUnavailable) => return Err(self.latch_failure()),
+            Err(error) => return Err(error.into_uniform_external_failure()),
+        };
 
         let profile = *epoch.engine.profile();
         let mut trace = TraceRecorder::new();
@@ -678,22 +686,29 @@ where
 
         let was_healthy = self.healthy;
         let checkpoint_matches = request.checkpoint == epoch.checkpoint;
-        let (cursor, continuation_expiry, invalid_continuation, replay_unavailable) =
-            match continuation_use {
-                ContinuationUse::Initial => (0, initial_expiry, false, false),
-                ContinuationUse::Continue {
-                    cursor,
-                    expires_at_unix_seconds,
-                } => (
-                    usize::try_from(cursor).map_err(|_| self.latch_failure())?,
-                    expires_at_unix_seconds,
-                    false,
-                    false,
-                ),
-                ContinuationUse::InvalidContinuation => (0, initial_expiry, true, false),
-                ContinuationUse::ProjectionNotReady => (0, initial_expiry, false, true),
-            };
-        if replay_unavailable {
+        let (
+            cursor,
+            continuation_expiry,
+            invalid_continuation,
+            replay_unavailable,
+            mut token_protection_unavailable,
+        ) = match continuation_use {
+            ContinuationUse::Initial => (0, initial_expiry, false, false, false),
+            ContinuationUse::Continue {
+                cursor,
+                expires_at_unix_seconds,
+            } => (
+                usize::try_from(cursor).map_err(|_| self.latch_failure())?,
+                expires_at_unix_seconds,
+                false,
+                false,
+                false,
+            ),
+            ContinuationUse::InvalidContinuation => (0, initial_expiry, true, false, false),
+            ContinuationUse::ProjectionNotReady => (0, initial_expiry, false, true, false),
+            ContinuationUse::ProtectionUnavailable => (0, initial_expiry, false, false, true),
+        };
+        if replay_unavailable || token_protection_unavailable {
             self.healthy = false;
         }
         trace
@@ -750,6 +765,7 @@ where
             || !was_healthy
             || !checkpoint_matches
             || replay_unavailable
+            || token_protection_unavailable
         {
             QueryOutcome::ProjectionNotReady
         } else if invalid_continuation {
@@ -779,7 +795,15 @@ where
             continuation_expiry,
             material.token_nonce,
         );
-        let issued = ContinuationToken::issue(&issue_state, &token_context, &self.token_protector);
+        let issued =
+            match ContinuationToken::issue(&issue_state, &token_context, &self.token_protector) {
+                Ok(token) => token,
+                Err(_) => {
+                    self.healthy = false;
+                    token_protection_unavailable = true;
+                    ContinuationToken::from_opaque_bytes([0; CONTINUATION_TOKEN_BYTES])
+                }
+            };
         trace
             .record_runtime_phase(RuntimePhase::TokenIssue)
             .map_err(|_| self.latch_failure())?;
@@ -813,6 +837,9 @@ where
         let trace = trace
             .finish(profile.access_budget())
             .map_err(|_| self.latch_failure())?;
+        if token_protection_unavailable {
+            return Err(self.latch_failure());
+        }
         Ok(RuntimeRound { envelope, trace })
     }
 
@@ -1694,9 +1721,19 @@ mod tests {
     struct DeterministicEnvelopeProtector {
         opens: Cell<usize>,
         seals: Cell<usize>,
+        open_unavailable: Cell<bool>,
+        seal_unavailable: Cell<bool>,
     }
 
     impl DeterministicEnvelopeProtector {
+        fn make_open_unavailable(&self) {
+            self.open_unavailable.set(true);
+        }
+
+        fn make_seal_unavailable(&self) {
+            self.seal_unavailable.set(true);
+        }
+
         fn authentication(
             &self,
             context: &super::super::EnvelopeProtectionContext,
@@ -1724,9 +1761,12 @@ mod tests {
             context: &super::super::EnvelopeProtectionContext,
             nonce: &[u8; ENVELOPE_NONCE_BYTES],
             body: &mut [u8],
-        ) -> [u8; 16] {
+        ) -> Result<[u8; 16], ProtectionUnavailable> {
             self.seals.set(self.seals.get() + 1);
-            self.authentication(context, nonce, body)
+            if self.seal_unavailable.get() {
+                return Err(ProtectionUnavailable);
+            }
+            Ok(self.authentication(context, nonce, body))
         }
 
         fn open(
@@ -1735,9 +1775,18 @@ mod tests {
             nonce: &[u8; ENVELOPE_NONCE_BYTES],
             body: &mut [u8],
             authentication: &[u8; 16],
-        ) -> bool {
+        ) -> Result<AuthenticationDecision, ProtectionUnavailable> {
             self.opens.set(self.opens.get() + 1);
-            constant_time_equal(&self.authentication(context, nonce, body), authentication)
+            if self.open_unavailable.get() {
+                return Err(ProtectionUnavailable);
+            }
+            Ok(
+                if constant_time_equal(&self.authentication(context, nonce, body), authentication) {
+                    AuthenticationDecision::Accepted
+                } else {
+                    AuthenticationDecision::Rejected
+                },
+            )
         }
     }
 
@@ -1745,9 +1794,19 @@ mod tests {
     struct CountingTokenProtector {
         opens: Cell<usize>,
         seals: Cell<usize>,
+        open_unavailable: Cell<bool>,
+        seal_unavailable: Cell<bool>,
     }
 
     impl CountingTokenProtector {
+        fn make_open_unavailable(&self) {
+            self.open_unavailable.set(true);
+        }
+
+        fn make_seal_unavailable(&self) {
+            self.seal_unavailable.set(true);
+        }
+
         fn authentication(
             &self,
             context: &ContinuationProtectionContext,
@@ -1767,9 +1826,12 @@ mod tests {
             context: &ContinuationProtectionContext,
             nonce: &[u8; ENVELOPE_NONCE_BYTES],
             body: &mut [u8; 88],
-        ) -> [u8; 16] {
+        ) -> Result<[u8; 16], ProtectionUnavailable> {
             self.seals.set(self.seals.get() + 1);
-            self.authentication(context, nonce, body)
+            if self.seal_unavailable.get() {
+                return Err(ProtectionUnavailable);
+            }
+            Ok(self.authentication(context, nonce, body))
         }
 
         fn open(
@@ -1778,9 +1840,18 @@ mod tests {
             nonce: &[u8; ENVELOPE_NONCE_BYTES],
             body: &mut [u8; 88],
             authentication: &[u8; 16],
-        ) -> bool {
+        ) -> Result<AuthenticationDecision, ProtectionUnavailable> {
             self.opens.set(self.opens.get() + 1);
-            constant_time_equal(&self.authentication(context, nonce, body), authentication)
+            if self.open_unavailable.get() {
+                return Err(ProtectionUnavailable);
+            }
+            Ok(
+                if constant_time_equal(&self.authentication(context, nonce, body), authentication) {
+                    AuthenticationDecision::Accepted
+                } else {
+                    AuthenticationDecision::Rejected
+                },
+            )
         }
     }
 
@@ -2323,13 +2394,26 @@ mod tests {
         }
 
         fn assert_complete_round(&self, runtime: &TestRuntime) {
+            self.assert_fixed_work_counts(runtime, 1, 1);
+        }
+
+        fn assert_fixed_work_before_release_failure(&self, runtime: &TestRuntime) {
+            self.assert_fixed_work_counts(runtime, 1, 0);
+        }
+
+        fn assert_fixed_work_counts(
+            &self,
+            runtime: &TestRuntime,
+            response_seal_attempts: usize,
+            expected_currentness_observations: usize,
+        ) {
             assert_eq!(
                 runtime.envelope_protector.opens.get() - self.envelope_opens,
                 1
             );
             assert_eq!(
                 runtime.envelope_protector.seals.get() - self.envelope_seals,
-                1
+                response_seal_attempts
             );
             assert_eq!(runtime.token_protector.opens.get() - self.token_opens, 1);
             assert_eq!(runtime.token_protector.seals.get() - self.token_seals, 1);
@@ -2339,7 +2423,7 @@ mod tests {
             assert_eq!(runtime.material_source.calls - self.material_calls, 1);
             assert_eq!(
                 serving_epoch_observations(runtime) - self.serving_epoch_observations,
-                1
+                expected_currentness_observations
             );
             assert_eq!(
                 runtime.epoch_for_tests().recent_snapshot.read_calls() - self.recent_snapshot_reads,
@@ -2391,6 +2475,37 @@ mod tests {
             Err(UniformExternalFailure)
         ));
         counters.assert_complete_round(runtime);
+        assert!(!runtime.healthy);
+        Ok(())
+    }
+
+    fn uniform_failure<T>(result: Result<T, UniformExternalFailure>) -> UniformExternalFailure {
+        match result {
+            Ok(_) => panic!("protection failure cannot produce a runtime round"),
+            Err(failure) => failure,
+        }
+    }
+
+    fn assert_protection_failure_completes_fixed_work(
+        entries: &[(usize, TransparentUtxo)],
+        make_unavailable: impl FnOnce(&TestRuntime),
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = runtime(4, entries)?;
+        let request = request_envelope(
+            &runtime,
+            checkpoint(),
+            UtxoQuery::new(address(1), 0),
+            None,
+            1,
+        )?;
+        let counters = RuntimeCounters::capture(&runtime);
+        make_unavailable(&runtime);
+
+        let failure = uniform_failure(runtime.handle(&request));
+
+        assert_eq!(failure.to_string(), "private query failed");
+        counters.assert_fixed_work_before_release_failure(&runtime);
+        assert_eq!(runtime.replay_guard.real_claim_attempts, 0);
         assert!(!runtime.healthy);
         Ok(())
     }
@@ -3147,7 +3262,7 @@ mod tests {
             ),
             &token_context,
             &runtime.token_protector,
-        );
+        )?;
         let counters_before_replacement = FinalizedProcessCounters::capture(&runtime);
 
         let (replacement_epoch, _, replacement_store_reads) =
@@ -3985,7 +4100,7 @@ mod tests {
                 .codec
                 .continuation_protection_context(&checkpoint())?,
             &cursor_runtime.token_protector,
-        );
+        )?;
         let cursor_request =
             request_envelope(&cursor_runtime, checkpoint(), query, Some(cursor_token), 7)?;
         let (cursor_trace, cursor_response) =
@@ -4016,7 +4131,7 @@ mod tests {
                     .codec
                     .continuation_protection_context(&checkpoint())?,
                 &binding_runtime.token_protector,
-            );
+            )?;
             let binding_request = request_envelope(
                 &binding_runtime,
                 checkpoint(),
@@ -4457,6 +4572,79 @@ mod tests {
     }
 
     #[test]
+    fn envelope_open_unavailability_latches_before_private_work(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = runtime(4, &[(0, utxo(1, 10))])?;
+        let request = request_envelope(
+            &runtime,
+            checkpoint(),
+            UtxoQuery::new(address(1), 0),
+            None,
+            1,
+        )?;
+        let counters = RuntimeCounters::capture(&runtime);
+        runtime.envelope_protector.make_open_unavailable();
+
+        let failure = uniform_failure(runtime.handle(&request));
+
+        assert_eq!(failure.to_string(), "private query failed");
+        assert_eq!(
+            runtime.envelope_protector.opens.get() - counters.envelope_opens,
+            1
+        );
+        assert_eq!(
+            runtime.envelope_protector.seals.get() - counters.envelope_seals,
+            0
+        );
+        assert_eq!(
+            runtime.token_protector.opens.get() - counters.token_opens,
+            0
+        );
+        assert_eq!(
+            runtime.token_protector.seals.get() - counters.token_seals,
+            0
+        );
+        assert_eq!(runtime.replay_guard.calls - counters.replay_calls, 0);
+        assert_eq!(runtime.material_source.calls - counters.material_calls, 0);
+        assert_eq!(
+            runtime.epoch_for_tests().recent_snapshot.read_calls() - counters.recent_snapshot_reads,
+            0
+        );
+        assert_eq!(finalized_store_reads(&runtime) - counters.store_reads, 0);
+        assert_eq!(
+            serving_epoch_observations(&runtime) - counters.serving_epoch_observations,
+            0
+        );
+        assert!(!runtime.healthy);
+        Ok(())
+    }
+
+    #[test]
+    fn token_open_unavailability_completes_fixed_work_and_withholds_round(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_protection_failure_completes_fixed_work(&[(0, utxo(1, 10))], |runtime| {
+            runtime.token_protector.make_open_unavailable()
+        })
+    }
+
+    #[test]
+    fn token_seal_unavailability_completes_capped_fixed_work_and_withholds_round(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_protection_failure_completes_fixed_work(
+            &[(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))],
+            |runtime| runtime.token_protector.make_seal_unavailable(),
+        )
+    }
+
+    #[test]
+    fn envelope_seal_unavailability_completes_fixed_work_and_withholds_round(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_protection_failure_completes_fixed_work(&[(0, utxo(1, 10))], |runtime| {
+            runtime.envelope_protector.make_seal_unavailable()
+        })
+    }
+
+    #[test]
     fn material_failure_precedes_replay_claim_and_outer_failures_are_uniform(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let entries = [(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))];
@@ -4531,7 +4719,7 @@ mod tests {
                 .protection_context(super::super::EnvelopeDirection::Request),
             nonce,
             body,
-        );
+        )?;
         let failure = match noncanonical_runtime.handle(&FixedEnvelope::from_array(bytes)) {
             Ok(_) => panic!("authenticated noncanonical envelope cannot enter private work"),
             Err(failure) => failure,

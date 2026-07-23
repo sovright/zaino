@@ -36,6 +36,7 @@ mod profile;
 mod projection;
 #[cfg(feature = "corpus-zaino")]
 mod projection_owner;
+mod protection;
 #[cfg(feature = "corpus-zaino")]
 mod qualification;
 mod recent_snapshot;

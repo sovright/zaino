@@ -1,6 +1,9 @@
 use std::{fmt, mem::size_of};
 
-use crate::profile::PROFILE_ID_BYTES;
+use crate::{
+    profile::PROFILE_ID_BYTES,
+    protection::{AuthenticationDecision, ProtectionUnavailable},
+};
 
 const QUERY_DIGEST_BYTES: usize = 32;
 const NONCE_BYTES: usize = 24;
@@ -164,17 +167,17 @@ impl ContinuationToken {
         state: &ContinuationState,
         context: &ContinuationProtectionContext,
         protector: &P,
-    ) -> Self
+    ) -> Result<Self, ProtectionUnavailable>
     where
         P: ContinuationTokenProtector,
     {
         let mut body = encode_state(state);
-        let authentication = protector.seal(context, &state.nonce, &mut body);
+        let authentication = protector.seal(context, &state.nonce, &mut body)?;
         let mut token = [0; CONTINUATION_TOKEN_BYTES];
         token[..NONCE_BYTES].copy_from_slice(&state.nonce);
         token[PROTECTED_BODY_TOKEN_START..AUTHENTICATION_TOKEN_START].copy_from_slice(&body);
         token[AUTHENTICATION_TOKEN_START..].copy_from_slice(&authentication);
-        Self(token)
+        Ok(Self(token))
     }
 
     fn try_from_bytes(bytes: &[u8]) -> Result<Self, ContinuationTokenError> {
@@ -245,7 +248,12 @@ impl ContinuationToken {
         let mut authentication = [0; AUTHENTICATION_BYTES];
         authentication.copy_from_slice(&candidate.0[AUTHENTICATION_TOKEN_START..]);
 
-        let authenticated = protector.open(context, &nonce, &mut body, &authentication);
+        let (authenticated, protection_unavailable) =
+            match protector.open(context, &nonce, &mut body, &authentication) {
+                Ok(AuthenticationDecision::Accepted) => (true, false),
+                Ok(AuthenticationDecision::Rejected) => (false, false),
+                Err(ProtectionUnavailable) => (false, true),
+            };
         let (state, reserved_zero) = if authenticated {
             (decode_state(&body, nonce), reserved_bytes_are_zero(&body))
         } else {
@@ -253,8 +261,14 @@ impl ContinuationToken {
             let cover_body = encode_state(&state);
             (state, reserved_bytes_are_zero(&cover_body))
         };
-        let failure = semantic_failure(authenticated, reserved_zero, &state, expectation);
-        let disposition = if !present {
+        let failure = if protection_unavailable {
+            Some(ContinuationTokenError::ProtectionUnavailable)
+        } else {
+            semantic_failure(authenticated, reserved_zero, &state, expectation)
+        };
+        let disposition = if protection_unavailable {
+            ContinuationDisposition::ProtectionUnavailable
+        } else if !present {
             ContinuationDisposition::Initial
         } else if failure.is_none() {
             ContinuationDisposition::Continue
@@ -270,7 +284,11 @@ impl ContinuationToken {
             state,
             replay_binding,
             disposition,
-            failure: if present { failure } else { None },
+            failure: if present || protection_unavailable {
+                failure
+            } else {
+                None
+            },
         }
     }
 }
@@ -288,6 +306,7 @@ enum ContinuationDisposition {
     Initial,
     Continue,
     Invalid,
+    ProtectionUnavailable,
 }
 
 /// Authenticated token work awaiting its one real-or-cover replay operation.
@@ -306,17 +325,19 @@ impl ContinuationInspection {
         R: ContinuationReplayGuard,
     {
         let claim = matches!(self.disposition, ContinuationDisposition::Continue);
-        match replay_guard.claim_or_cover(&self.replay_binding, claim) {
-            Ok(()) => match self.disposition {
-                ContinuationDisposition::Initial => ContinuationUse::Initial,
-                ContinuationDisposition::Continue => ContinuationUse::Continue {
-                    cursor: self.state.cursor,
-                    expires_at_unix_seconds: self.state.expires_at_unix_seconds,
-                },
-                ContinuationDisposition::Invalid => ContinuationUse::InvalidContinuation,
+        let replay_result = replay_guard.claim_or_cover(&self.replay_binding, claim);
+        match (self.disposition, replay_result) {
+            (ContinuationDisposition::ProtectionUnavailable, _) => {
+                ContinuationUse::ProtectionUnavailable
+            }
+            (_, Err(ReplayGuardError::AlreadyClaimed)) => ContinuationUse::InvalidContinuation,
+            (_, Err(ReplayGuardError::Unavailable)) => ContinuationUse::ProjectionNotReady,
+            (ContinuationDisposition::Initial, Ok(())) => ContinuationUse::Initial,
+            (ContinuationDisposition::Continue, Ok(())) => ContinuationUse::Continue {
+                cursor: self.state.cursor,
+                expires_at_unix_seconds: self.state.expires_at_unix_seconds,
             },
-            Err(ReplayGuardError::AlreadyClaimed) => ContinuationUse::InvalidContinuation,
-            Err(ReplayGuardError::Unavailable) => ContinuationUse::ProjectionNotReady,
+            (ContinuationDisposition::Invalid, Ok(())) => ContinuationUse::InvalidContinuation,
         }
     }
 }
@@ -331,6 +352,7 @@ pub(super) enum ContinuationUse {
     },
     InvalidContinuation,
     ProjectionNotReady,
+    ProtectionUnavailable,
 }
 
 impl fmt::Debug for ContinuationUse {
@@ -348,20 +370,22 @@ impl fmt::Debug for ContinuationUse {
 /// concrete production implementation until the private service selects and
 /// audits an AEAD construction.
 pub(super) trait ContinuationTokenProtector {
+    /// Protects `body`, or reports that no token can be issued.
     fn seal(
         &self,
         context: &ContinuationProtectionContext,
         nonce: &[u8; NONCE_BYTES],
         body: &mut [u8; PROTECTED_BODY_BYTES],
-    ) -> [u8; AUTHENTICATION_BYTES];
+    ) -> Result<[u8; AUTHENTICATION_BYTES], ProtectionUnavailable>;
 
+    /// Authenticates `body` without exposing plaintext on rejection or error.
     fn open(
         &self,
         context: &ContinuationProtectionContext,
         nonce: &[u8; NONCE_BYTES],
         body: &mut [u8; PROTECTED_BODY_BYTES],
         authentication: &[u8; AUTHENTICATION_BYTES],
-    ) -> bool;
+    ) -> Result<AuthenticationDecision, ProtectionUnavailable>;
 }
 
 /// The complete authenticated identity of one token use.
@@ -422,6 +446,7 @@ pub(super) enum ReplayGuardError {
 enum ContinuationTokenError {
     WrongLength { expected: usize, actual: usize },
     AuthenticationFailed,
+    ProtectionUnavailable,
     MalformedEncoding,
     VersionMismatch,
     ProfileMismatch,
@@ -604,8 +629,8 @@ mod tests {
             context: &ContinuationProtectionContext,
             nonce: &[u8; NONCE_BYTES],
             body: &mut [u8; PROTECTED_BODY_BYTES],
-        ) -> [u8; AUTHENTICATION_BYTES] {
-            self.authentication(context, nonce, body)
+        ) -> Result<[u8; AUTHENTICATION_BYTES], ProtectionUnavailable> {
+            Ok(self.authentication(context, nonce, body))
         }
 
         fn open(
@@ -614,15 +639,43 @@ mod tests {
             nonce: &[u8; NONCE_BYTES],
             body: &mut [u8; PROTECTED_BODY_BYTES],
             authentication: &[u8; AUTHENTICATION_BYTES],
-        ) -> bool {
+        ) -> Result<AuthenticationDecision, ProtectionUnavailable> {
             let expected = self.authentication(context, nonce, body);
-            expected
+            let accepted = expected
                 .iter()
                 .zip(authentication)
                 .fold(0_u8, |difference, (left, right)| {
                     difference | (left ^ right)
                 })
-                == 0
+                == 0;
+            Ok(if accepted {
+                AuthenticationDecision::Accepted
+            } else {
+                AuthenticationDecision::Rejected
+            })
+        }
+    }
+
+    struct UnavailableTestProtector;
+
+    impl ContinuationTokenProtector for UnavailableTestProtector {
+        fn seal(
+            &self,
+            _context: &ContinuationProtectionContext,
+            _nonce: &[u8; NONCE_BYTES],
+            _body: &mut [u8; PROTECTED_BODY_BYTES],
+        ) -> Result<[u8; AUTHENTICATION_BYTES], ProtectionUnavailable> {
+            Err(ProtectionUnavailable)
+        }
+
+        fn open(
+            &self,
+            _context: &ContinuationProtectionContext,
+            _nonce: &[u8; NONCE_BYTES],
+            _body: &mut [u8; PROTECTED_BODY_BYTES],
+            _authentication: &[u8; AUTHENTICATION_BYTES],
+        ) -> Result<AuthenticationDecision, ProtectionUnavailable> {
+            Err(ProtectionUnavailable)
         }
     }
 
@@ -683,10 +736,15 @@ mod tests {
         DeterministicTestProtector::new(TEST_KEY)
     }
 
+    fn issue(state: &ContinuationState) -> ContinuationToken {
+        ContinuationToken::issue(state, &context(), &protector())
+            .expect("deterministic test protection is available")
+    }
+
     #[test]
     fn token_round_trip_preserves_state_and_exact_size() -> Result<(), ContinuationTokenError> {
         let state = state();
-        let token = ContinuationToken::issue(&state, &context(), &protector());
+        let token = issue(&state);
         let encoded = ContinuationToken::try_from_bytes(token.opaque_bytes())?;
         let decoded = encoded.validate(
             &protector(),
@@ -720,8 +778,36 @@ mod tests {
     }
 
     #[test]
+    fn protection_unavailability_returns_no_token_and_uses_cover_replay() {
+        assert_eq!(
+            ContinuationToken::issue(&state(), &context(), &UnavailableTestProtector),
+            Err(ProtectionUnavailable)
+        );
+
+        let token = issue(&state());
+        let inspection = ContinuationToken::inspect_optional(
+            Some(&token),
+            &UnavailableTestProtector,
+            &context(),
+            &expectation(),
+            [0x55; NONCE_BYTES],
+        );
+        assert_eq!(
+            inspection.failure,
+            Some(ContinuationTokenError::ProtectionUnavailable)
+        );
+        let mut replay_guard = OneUseReplayGuard::available();
+        assert_eq!(
+            inspection.claim_or_cover(&mut replay_guard),
+            ContinuationUse::ProtectionUnavailable
+        );
+        assert!(replay_guard.claimed.is_empty());
+        assert!(replay_guard.cover_slot.is_some());
+    }
+
+    #[test]
     fn every_token_byte_is_authenticated() -> Result<(), ContinuationTokenError> {
-        let token = ContinuationToken::issue(&state(), &context(), &protector());
+        let token = issue(&state());
 
         for index in 0..CONTINUATION_TOKEN_BYTES {
             let mut tampered = *token.opaque_bytes();
@@ -747,7 +833,9 @@ mod tests {
         let protector = protector();
         let mut body = encode_state(&state);
         body[RESERVED_START] = 1;
-        let authentication = protector.seal(&context(), &state.nonce, &mut body);
+        let authentication = protector
+            .seal(&context(), &state.nonce, &mut body)
+            .expect("deterministic test protection is available");
         let mut bytes = [0; CONTINUATION_TOKEN_BYTES];
         bytes[..NONCE_BYTES].copy_from_slice(&state.nonce);
         bytes[PROTECTED_BODY_TOKEN_START..AUTHENTICATION_TOKEN_START].copy_from_slice(&body);
@@ -768,7 +856,7 @@ mod tests {
 
     #[test]
     fn token_rejects_version_profile_query_and_epoch_mismatches() {
-        let token = ContinuationToken::issue(&state(), &context(), &protector());
+        let token = issue(&state());
 
         let mut wrong_version = expectation();
         wrong_version.version += 1;
@@ -801,7 +889,7 @@ mod tests {
 
     #[test]
     fn token_expires_at_its_declared_boundary() {
-        let token = ContinuationToken::issue(&state(), &context(), &protector());
+        let token = issue(&state());
         let mut expired = expectation();
         expired.now_unix_seconds = 1_000;
         assert_validation_error(&token, &expired, ContinuationTokenError::Expired);
@@ -809,7 +897,7 @@ mod tests {
 
     #[test]
     fn token_binds_checkpoint_context_and_cursor_domain() {
-        let token = ContinuationToken::issue(&state(), &context(), &protector());
+        let token = issue(&state());
         let mut changed_context = [0x44; CONTINUATION_CONTEXT_BYTES];
         changed_context[17] ^= 1;
         assert_eq!(
@@ -833,7 +921,7 @@ mod tests {
 
     #[test]
     fn token_can_be_claimed_only_once() -> Result<(), ContinuationTokenError> {
-        let token = ContinuationToken::issue(&state(), &context(), &protector());
+        let token = issue(&state());
         let mut replay_guard = OneUseReplayGuard::available();
 
         token.validate(&protector(), &context(), &expectation(), &mut replay_guard)?;
@@ -846,7 +934,7 @@ mod tests {
 
     #[test]
     fn token_fails_closed_when_replay_guard_is_unavailable() {
-        let token = ContinuationToken::issue(&state(), &context(), &protector());
+        let token = issue(&state());
         assert_eq!(
             token.validate(
                 &protector(),
@@ -861,7 +949,7 @@ mod tests {
     #[test]
     fn debug_output_redacts_token_state_and_replay_binding() {
         let state = state();
-        let token = ContinuationToken::issue(&state, &context(), &protector());
+        let token = issue(&state);
 
         assert_eq!(format!("{state:?}"), "ContinuationState { ..REDACTED.. }");
         assert_eq!(format!("{token:?}"), "ContinuationToken { len: 128, .. }");
