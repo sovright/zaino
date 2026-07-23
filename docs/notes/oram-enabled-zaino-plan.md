@@ -54,12 +54,26 @@ associated data. A private opaque dependency composer now exercises those
 providers end to end through the listener-free runtime: wrong request keys fail
 before material/replay work, while encrypted pagination, token tampering, a
 valid continuation claim, and replay rejection retain the complete modeled
-trace. The test still uses deterministic material and counting replay fixtures;
-session key establishment, key provisioning/rotation, trusted nonce and clock
-ownership, durable replay, and attestation binding are open. The required joint
-owner, rollback, lifecycle, and response-release invariants are now fixed by
+trace. A later internal security-contract slice replaces the independent
+material/counting-replay fixture seams in that composition with one
+crate-private, fixture-only owner. Canonical versioned identities distinguish
+authenticated request-nonce replay from continuation replay. One atomic
+in-memory transaction always completes the request lane together with a cover
+or claim-or-cover continuation lane and returns a semantic duplicate decision
+plus a non-`Clone` replay-commit authority. Material acquisition returns a
+separate non-`Clone` reservation authority for the exact fixture time and
+nonces. An opaque process-local security epoch binds both authorities to the
+same round and validates them together with epoch currentness at response
+release; unavailable or retired state fails closed.
+
+This remains deterministic in-process fixture evidence. It provides no
+production durable replay, trusted clock, nonce ledger, key management,
+rollback resistance, TDX, listener, transport-write, or peer-delivery
+evidence. Profile ID v3 and the existing ten-phase logical schedule are
+unchanged. The required joint owner, rollback, lifecycle, and response-release
+invariants are fixed by
 [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md), while
-concrete provider selections and evidence remain open. The private child
+production provider selections and evidence remain open. The private child
 runtime owns the modeled decode/token/replay/full-scan/issuance/encode sequence,
 validates combined finalized-plus-recent cursors, preserves token expiry across
 pages, maps semantic token failures to one protected fixed
@@ -518,7 +532,16 @@ finalized store checkpoint to capture, pins the controller-published lease, and
 derives its protected checkpoint internally before activating the replacement.
 Its protection, replay/material, session/profile, and monotonic health state
 survive epoch swaps; failed refresh or activation has no stale fallback. A
-listener-free response-release gate retains one completed response behind a
+crate-private fixture owner now makes the security side of that lifetime
+contract explicit: it retains the opaque process security epoch, canonical
+request and continuation replay namespace, protection providers, atomic
+two-lane replay seam, and material source. Each encoded round carries distinct
+non-`Clone` reservation and replay-commit authorities for one opaque round
+capture. The security release witness checks both authorities and the active
+security epoch together, so unavailable, retired, equal-value reminted, or
+cross-round state fails closed.
+
+A listener-free response-release gate retains one completed response behind a
 non-`Clone` permit and rejects handle, refresh, and explicit shutdown before
 mutating retained owner or runtime state while that permit is held. Permit drop
 reopens the gate unless it is already closed; a successful stop or owner drop
@@ -544,8 +567,10 @@ public opaque factory also remains deferred until non-test production
 key/session/nonce ownership plus durable replay and trusted-material providers
 exist and satisfy
 [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md); the
-crate-internal XChaCha20-Poly1305 primitives alone do not satisfy that ownership
-boundary.
+crate-internal XChaCha20-Poly1305 primitives and process-local fixture security
+owner do not satisfy that production ownership boundary or establish durable
+replay, trusted time, nonce-ledger, rollback, TDX, listener, or transport
+evidence.
 
 `zaino-oram` is a new non-published crate containing the private engine, fixed business/persistent types, padding, tokens, ingest, checkpointing, and attestation providers. Keeping the x86_64/TEE/alpha dependency outside `zaino-state` avoids making the stable state crate platform-specific and isolates security review. Only the engine handle, configuration, projection-source interface, and attestation-provider interface should be public; all other items begin private and widen only as compilation requires.
 

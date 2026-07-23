@@ -75,6 +75,25 @@ LICENSE                            Apache-2.0 license text
 .gitignore                         Git ignore patterns
 ```
 
+## ORAM research-fork status
+
+The non-published `zaino-oram` research crate now includes a crate-private,
+fixture-only runtime security contract API. It defines versioned opaque
+identities for authenticated request-nonce replay and continuation replay,
+models their real-or-cover lanes as one atomic in-memory fixture transaction,
+and retains distinct non-`Clone` round-material reservation and replay-commit
+authorities. An opaque in-process security-epoch owner validates both
+authorities together with epoch currentness before releasing a completed
+response; unavailable or retired state fails closed.
+
+This is source-level fixture evidence only. It provides no production durable
+replay, trusted clock, nonce ledger, key management, rollback resistance, TDX,
+listener, transport-write, or peer-delivery evidence. Profile ID v3 and the
+existing ten-phase logical schedule are unchanged. See the
+[implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
+[feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and
+[runtime security-owner ADR](./docs/adr/0009-private-query-runtime-security-state-owner.md).
+
 ## Server network exposure
 
 Zaino exposes two servers, with different defaults reflecting their transport

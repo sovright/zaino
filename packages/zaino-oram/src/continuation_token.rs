@@ -1,8 +1,15 @@
 use std::{fmt, mem::size_of};
 
+use blake2::{Blake2s256, Digest};
+
 use crate::{
     profile::PROFILE_ID_BYTES,
     protection::{AuthenticationDecision, ProtectionUnavailable},
+    runtime_security::{
+        ContinuationReplayKey, ContinuationReplayPlan, ReplayCommitAuthority, ReplayCommitResult,
+        ReplayCommitUnavailable, ReplayDuplicateDecision, ReplayNamespace, RequestReplayKey,
+        SecurityRoundCapture,
+    },
 };
 
 mod xchacha20;
@@ -11,6 +18,8 @@ const QUERY_DIGEST_BYTES: usize = 32;
 const NONCE_BYTES: usize = 24;
 const AUTHENTICATION_BYTES: usize = 16;
 const PROTECTED_BODY_BYTES: usize = 88;
+const CONTINUATION_CONTEXT_DIGEST_VERSION: u16 = 1;
+const CONTINUATION_CONTEXT_DIGEST_DOMAIN: &[u8] = b"zaino-oram/continuation-token/context-digest";
 pub(super) const CONTINUATION_VERSION: u16 = 1;
 pub(super) const CONTINUATION_CONTEXT_BYTES: usize = 89;
 pub(super) const CONTINUATION_TOKEN_BYTES: usize =
@@ -83,18 +92,6 @@ impl ContinuationState {
             cursor,
             expires_at_unix_seconds,
             nonce,
-        }
-    }
-
-    const fn replay_binding(&self) -> ReplayBinding {
-        ReplayBinding {
-            version: self.version,
-            profile_id: self.profile_id,
-            query_digest: self.query_digest,
-            projection_epoch: self.projection_epoch,
-            cursor: self.cursor,
-            expires_at_unix_seconds: self.expires_at_unix_seconds,
-            nonce: self.nonce,
         }
     }
 }
@@ -199,31 +196,29 @@ impl ContinuationToken {
         &self.0
     }
 
-    fn validate<P, R>(
+    fn validate_semantics<P>(
         &self,
         protector: &P,
         context: &ContinuationProtectionContext,
         expectation: &ContinuationExpectation,
-        replay_guard: &mut R,
     ) -> Result<ContinuationState, ContinuationTokenError>
     where
         P: ContinuationTokenProtector,
-        R: ContinuationReplayGuard,
     {
-        let inspection = Self::inspect_optional(
+        match inspect_candidate(
             Some(self),
             protector,
             context,
             expectation,
             [0; NONCE_BYTES],
-        );
-        if let Some(error) = inspection.failure {
-            return Err(error);
+        ) {
+            InspectedContinuation::Continue(state) => Ok(state),
+            InspectedContinuation::Invalid(error) => Err(error),
+            InspectedContinuation::ProtectionUnavailable => {
+                Err(ContinuationTokenError::ProtectionUnavailable)
+            }
+            InspectedContinuation::Initial => Err(ContinuationTokenError::AuthenticationFailed),
         }
-        replay_guard
-            .claim_or_cover(&inspection.replay_binding, true)
-            .map_err(ContinuationTokenError::from_replay_guard)?;
-        Ok(inspection.state)
     }
 
     /// Performs exactly one real-or-cover open and every semantic comparison.
@@ -234,63 +229,41 @@ impl ContinuationToken {
         protector: &P,
         context: &ContinuationProtectionContext,
         expectation: &ContinuationExpectation,
-        request_nonce: [u8; NONCE_BYTES],
+        replay_namespace: &ReplayNamespace,
+        authenticated_request_nonce: [u8; NONCE_BYTES],
     ) -> ContinuationInspection
     where
         P: ContinuationTokenProtector,
     {
-        let present = token.is_some();
-        let candidate = token
-            .cloned()
-            .unwrap_or(Self([0; CONTINUATION_TOKEN_BYTES]));
-        let mut nonce = [0; NONCE_BYTES];
-        nonce.copy_from_slice(&candidate.0[..NONCE_BYTES]);
-        let mut body = [0; PROTECTED_BODY_BYTES];
-        body.copy_from_slice(&candidate.0[PROTECTED_BODY_TOKEN_START..AUTHENTICATION_TOKEN_START]);
-        let mut authentication = [0; AUTHENTICATION_BYTES];
-        authentication.copy_from_slice(&candidate.0[AUTHENTICATION_TOKEN_START..]);
-
-        let (authenticated, protection_unavailable) =
-            match protector.open(context, &nonce, &mut body, &authentication) {
-                Ok(AuthenticationDecision::Accepted) => (true, false),
-                Ok(AuthenticationDecision::Rejected) => (false, false),
-                Err(ProtectionUnavailable) => (false, true),
-            };
-        let (state, reserved_zero) = if authenticated {
-            (decode_state(&body, nonce), reserved_bytes_are_zero(&body))
-        } else {
-            let state = cover_state(expectation, request_nonce);
-            let cover_body = encode_state(&state);
-            (state, reserved_bytes_are_zero(&cover_body))
-        };
-        let failure = if protection_unavailable {
-            Some(ContinuationTokenError::ProtectionUnavailable)
-        } else {
-            semantic_failure(authenticated, reserved_zero, &state, expectation)
-        };
-        let disposition = if protection_unavailable {
-            ContinuationDisposition::ProtectionUnavailable
-        } else if !present {
-            ContinuationDisposition::Initial
-        } else if failure.is_none() {
-            ContinuationDisposition::Continue
-        } else {
-            ContinuationDisposition::Invalid
-        };
-        let replay_binding = if matches!(disposition, ContinuationDisposition::Continue) {
-            state.replay_binding()
-        } else {
-            ReplayBinding::cover(expectation, request_nonce)
+        let disposition = inspect_candidate(
+            token,
+            protector,
+            context,
+            expectation,
+            authenticated_request_nonce,
+        );
+        let context_digest = continuation_context_digest(context);
+        let continuation_plan = match disposition {
+            InspectedContinuation::Continue(state) => {
+                ContinuationReplayPlan::ClaimOrCover(ContinuationReplayKey::new(
+                    replay_namespace,
+                    state.projection_epoch,
+                    state.query_digest,
+                    state.cursor,
+                    state.expires_at_unix_seconds,
+                    state.nonce,
+                    context_digest,
+                ))
+            }
+            InspectedContinuation::Initial
+            | InspectedContinuation::Invalid(_)
+            | InspectedContinuation::ProtectionUnavailable => ContinuationReplayPlan::Cover,
         };
         ContinuationInspection {
-            state,
-            replay_binding,
+            replay_namespace: *replay_namespace,
+            authenticated_request_nonce,
+            continuation_plan,
             disposition,
-            failure: if present || protection_unavailable {
-                failure
-            } else {
-                None
-            },
         }
     }
 }
@@ -304,43 +277,93 @@ impl fmt::Debug for ContinuationToken {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ContinuationDisposition {
+enum InspectedContinuation {
     Initial,
-    Continue,
-    Invalid,
+    Continue(ContinuationState),
+    Invalid(ContinuationTokenError),
     ProtectionUnavailable,
 }
 
 /// Authenticated token work awaiting its one real-or-cover replay operation.
 pub(super) struct ContinuationInspection {
-    state: ContinuationState,
-    replay_binding: ReplayBinding,
-    disposition: ContinuationDisposition,
-    failure: Option<ContinuationTokenError>,
+    replay_namespace: ReplayNamespace,
+    authenticated_request_nonce: [u8; NONCE_BYTES],
+    continuation_plan: ContinuationReplayPlan,
+    disposition: InspectedContinuation,
 }
 
 impl ContinuationInspection {
-    /// Performs exactly one replay-guard operation and collapses token details
-    /// into the protected runtime outcome classes.
-    pub(super) fn claim_or_cover<R>(self, replay_guard: &mut R) -> ContinuationUse
+    /// Performs exactly one combined request-and-continuation replay commit.
+    pub(super) fn finish_replay<R>(
+        self,
+        security_round: &SecurityRoundCapture,
+        replay_guard: &mut R,
+    ) -> ContinuationReplayOutcome
     where
         R: ContinuationReplayGuard,
     {
-        let claim = matches!(self.disposition, ContinuationDisposition::Continue);
-        let replay_result = replay_guard.claim_or_cover(&self.replay_binding, claim);
-        match (self.disposition, replay_result) {
-            (ContinuationDisposition::ProtectionUnavailable, _) => {
-                ContinuationUse::ProtectionUnavailable
+        let request_key =
+            RequestReplayKey::new(&self.replay_namespace, self.authenticated_request_nonce);
+        match replay_guard.commit_request_and_continuation(
+            security_round,
+            &request_key,
+            &self.continuation_plan,
+        ) {
+            Ok(result) => {
+                let (authority, decision) = result.into_parts();
+                let continuation_use = match decision {
+                    ReplayDuplicateDecision::Fresh => match self.disposition {
+                        InspectedContinuation::Initial => ContinuationUse::Initial,
+                        InspectedContinuation::Continue(state) => ContinuationUse::Continue {
+                            cursor: state.cursor,
+                            expires_at_unix_seconds: state.expires_at_unix_seconds,
+                        },
+                        InspectedContinuation::Invalid(_) => ContinuationUse::InvalidContinuation,
+                        InspectedContinuation::ProtectionUnavailable => {
+                            ContinuationUse::ProtectionUnavailable
+                        }
+                    },
+                    ReplayDuplicateDecision::RequestDuplicate => {
+                        ContinuationUse::ProjectionNotReady
+                    }
+                    ReplayDuplicateDecision::ContinuationDuplicate => {
+                        ContinuationUse::InvalidContinuation
+                    }
+                };
+                ContinuationReplayOutcome::committed(continuation_use, authority)
             }
-            (_, Err(ReplayGuardError::AlreadyClaimed)) => ContinuationUse::InvalidContinuation,
-            (_, Err(ReplayGuardError::Unavailable)) => ContinuationUse::ProjectionNotReady,
-            (ContinuationDisposition::Initial, Ok(())) => ContinuationUse::Initial,
-            (ContinuationDisposition::Continue, Ok(())) => ContinuationUse::Continue {
-                cursor: self.state.cursor,
-                expires_at_unix_seconds: self.state.expires_at_unix_seconds,
-            },
-            (ContinuationDisposition::Invalid, Ok(())) => ContinuationUse::InvalidContinuation,
+            Err(ReplayCommitUnavailable) => ContinuationReplayOutcome::unavailable(),
         }
+    }
+}
+
+/// Runtime-safe replay decision plus its commit capability when committed.
+pub(super) struct ContinuationReplayOutcome {
+    continuation_use: ContinuationUse,
+    replay_commit_authority: Option<ReplayCommitAuthority>,
+}
+
+impl ContinuationReplayOutcome {
+    fn committed(
+        continuation_use: ContinuationUse,
+        replay_commit_authority: ReplayCommitAuthority,
+    ) -> Self {
+        Self {
+            continuation_use,
+            replay_commit_authority: Some(replay_commit_authority),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            continuation_use: ContinuationUse::ProjectionNotReady,
+            replay_commit_authority: None,
+        }
+    }
+
+    /// Transfers the semantic decision and any completed commit capability.
+    pub(super) fn into_parts(self) -> (ContinuationUse, Option<ReplayCommitAuthority>) {
+        (self.continuation_use, self.replay_commit_authority)
     }
 }
 
@@ -398,57 +421,26 @@ pub(super) fn xchacha20_token_protector(
     xchacha20::token_protector(key)
 }
 
-/// The complete authenticated identity of one token use.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct ReplayBinding {
-    version: u16,
-    profile_id: [u8; PROFILE_ID_BYTES],
-    query_digest: [u8; QUERY_DIGEST_BYTES],
-    projection_epoch: u64,
-    cursor: u64,
-    expires_at_unix_seconds: u64,
-    nonce: [u8; NONCE_BYTES],
-}
-
-impl ReplayBinding {
-    const fn cover(
-        expectation: &ContinuationExpectation,
-        request_nonce: [u8; NONCE_BYTES],
-    ) -> Self {
-        Self {
-            version: expectation.version,
-            profile_id: expectation.profile_id,
-            query_digest: expectation.query_digest,
-            projection_epoch: expectation.projection_epoch,
-            cursor: 0,
-            expires_at_unix_seconds: expectation.now_unix_seconds,
-            nonce: request_nonce,
-        }
-    }
-}
-
-impl fmt::Debug for ReplayBinding {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ReplayBinding { ..REDACTED.. }")
-    }
-}
-
-/// Atomically claims a successfully authenticated, unexpired token use.
+/// Atomically commits the request lane and continuation real-or-cover lane.
 pub(super) trait ContinuationReplayGuard {
-    /// Executes one fixed logical lookup and one write-back for every binding.
-    /// `claim = false` writes only a non-durable cover slot and must not mutate
-    /// the durable real-token namespace.
-    fn claim_or_cover(
+    /// Executes one indivisible logical transaction over both lanes.
+    ///
+    /// A fresh request commits its request key, then either commits cover or
+    /// claims the requested continuation and commits cover on a duplicate. An
+    /// already-committed request must execute continuation cover regardless of
+    /// `continuation_plan`; it must never consume a fresh continuation key.
+    /// Fresh, request-duplicate, and continuation-duplicate decisions are all
+    /// authoritative commits and return a capability for `security_round`.
+    /// Only unavailable or ambiguous completion returns an error, with no
+    /// authority and no partial externally visible mutation in either lane.
+    /// This is one profile-visible logical access; the contract makes no claim
+    /// about a provider's physical access count.
+    fn commit_request_and_continuation(
         &mut self,
-        binding: &ReplayBinding,
-        claim: bool,
-    ) -> Result<(), ReplayGuardError>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ReplayGuardError {
-    AlreadyClaimed,
-    Unavailable,
+        security_round: &SecurityRoundCapture,
+        request_key: &RequestReplayKey,
+        continuation_plan: &ContinuationReplayPlan,
+    ) -> Result<ReplayCommitResult, ReplayCommitUnavailable>;
 }
 
 /// A continuation token was malformed or invalid for the current request.
@@ -464,22 +456,11 @@ enum ContinuationTokenError {
     ProjectionEpochMismatch,
     Expired,
     CursorOutOfRange,
-    ReplayDetected,
-    ReplayGuardUnavailable,
 }
 
 impl fmt::Debug for ContinuationTokenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ContinuationTokenError([REDACTED])")
-    }
-}
-
-impl ContinuationTokenError {
-    const fn from_replay_guard(error: ReplayGuardError) -> Self {
-        match error {
-            ReplayGuardError::AlreadyClaimed => Self::ReplayDetected,
-            ReplayGuardError::Unavailable => Self::ReplayGuardUnavailable,
-        }
     }
 }
 
@@ -490,6 +471,67 @@ impl fmt::Display for ContinuationTokenError {
 }
 
 impl std::error::Error for ContinuationTokenError {}
+
+fn inspect_candidate<P>(
+    token: Option<&ContinuationToken>,
+    protector: &P,
+    context: &ContinuationProtectionContext,
+    expectation: &ContinuationExpectation,
+    authenticated_request_nonce: [u8; NONCE_BYTES],
+) -> InspectedContinuation
+where
+    P: ContinuationTokenProtector,
+{
+    let present = token.is_some();
+    let candidate = match token {
+        Some(token) => token.clone(),
+        None => ContinuationToken([0; CONTINUATION_TOKEN_BYTES]),
+    };
+    let mut nonce = [0; NONCE_BYTES];
+    nonce.copy_from_slice(&candidate.0[..NONCE_BYTES]);
+    let mut body = [0; PROTECTED_BODY_BYTES];
+    body.copy_from_slice(&candidate.0[PROTECTED_BODY_TOKEN_START..AUTHENTICATION_TOKEN_START]);
+    let mut authentication = [0; AUTHENTICATION_BYTES];
+    authentication.copy_from_slice(&candidate.0[AUTHENTICATION_TOKEN_START..]);
+
+    let (authenticated, protection_unavailable) =
+        match protector.open(context, &nonce, &mut body, &authentication) {
+            Ok(AuthenticationDecision::Accepted) => (true, false),
+            Ok(AuthenticationDecision::Rejected) => (false, false),
+            Err(ProtectionUnavailable) => (false, true),
+        };
+    let (state, reserved_zero) = if authenticated {
+        (decode_state(&body, nonce), reserved_bytes_are_zero(&body))
+    } else {
+        let state = cover_state(expectation, authenticated_request_nonce);
+        let cover_body = encode_state(&state);
+        (state, reserved_bytes_are_zero(&cover_body))
+    };
+    let failure = semantic_failure(authenticated, reserved_zero, &state, expectation);
+
+    if protection_unavailable {
+        InspectedContinuation::ProtectionUnavailable
+    } else if !present {
+        InspectedContinuation::Initial
+    } else if let Some(error) = failure {
+        InspectedContinuation::Invalid(error)
+    } else {
+        InspectedContinuation::Continue(state)
+    }
+}
+
+fn continuation_context_digest(
+    context: &ContinuationProtectionContext,
+) -> [u8; QUERY_DIGEST_BYTES] {
+    let mut hasher = Blake2s256::new();
+    Digest::update(&mut hasher, CONTINUATION_CONTEXT_DIGEST_DOMAIN);
+    Digest::update(
+        &mut hasher,
+        CONTINUATION_CONTEXT_DIGEST_VERSION.to_be_bytes(),
+    );
+    Digest::update(&mut hasher, context.as_bytes());
+    Digest::finalize(hasher).into()
+}
 
 fn cover_state(
     expectation: &ContinuationExpectation,
@@ -597,6 +639,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::runtime_security::SecurityEpochTag;
 
     const TEST_KEY: [u8; AUTHENTICATION_BYTES] = [0x6b; AUTHENTICATION_BYTES];
 
@@ -691,42 +734,111 @@ mod tests {
 
     #[derive(Default)]
     struct OneUseReplayGuard {
-        claimed: HashSet<ReplayBinding>,
-        cover_slot: Option<ReplayBinding>,
+        claimed_requests: HashSet<[u8; QUERY_DIGEST_BYTES]>,
+        claimed_continuations: HashSet<[u8; QUERY_DIGEST_BYTES]>,
+        cover_commits: usize,
         available: bool,
     }
 
     impl OneUseReplayGuard {
         fn available() -> Self {
             Self {
-                claimed: HashSet::new(),
-                cover_slot: None,
+                claimed_requests: HashSet::new(),
+                claimed_continuations: HashSet::new(),
+                cover_commits: 0,
                 available: true,
             }
         }
     }
 
     impl ContinuationReplayGuard for OneUseReplayGuard {
-        fn claim_or_cover(
+        fn commit_request_and_continuation(
             &mut self,
-            binding: &ReplayBinding,
-            claim: bool,
-        ) -> Result<(), ReplayGuardError> {
-            let already_claimed = self.claimed.contains(binding);
+            security_round: &SecurityRoundCapture,
+            request_key: &RequestReplayKey,
+            continuation_plan: &ContinuationReplayPlan,
+        ) -> Result<ReplayCommitResult, ReplayCommitUnavailable> {
             if !self.available {
-                self.cover_slot = Some(*binding);
-                return Err(ReplayGuardError::Unavailable);
+                self.cover_commits += 1;
+                return Err(ReplayCommitUnavailable);
             }
-            if claim && already_claimed {
-                self.cover_slot = Some(*binding);
-                return Err(ReplayGuardError::AlreadyClaimed);
-            }
-            if claim {
-                self.claimed.insert(*binding);
+
+            let request_key = *request_key.as_bytes();
+            let decision = if !self.claimed_requests.insert(request_key) {
+                self.cover_commits += 1;
+                ReplayDuplicateDecision::RequestDuplicate
             } else {
-                self.cover_slot = Some(*binding);
+                match continuation_plan {
+                    ContinuationReplayPlan::Cover => {
+                        self.cover_commits += 1;
+                        ReplayDuplicateDecision::Fresh
+                    }
+                    ContinuationReplayPlan::ClaimOrCover(continuation_key) => {
+                        if self
+                            .claimed_continuations
+                            .insert(*continuation_key.as_bytes())
+                        {
+                            ReplayDuplicateDecision::Fresh
+                        } else {
+                            self.cover_commits += 1;
+                            ReplayDuplicateDecision::ContinuationDuplicate
+                        }
+                    }
+                }
+            };
+            Ok(ReplayCommitResult::new(
+                ReplayCommitAuthority::new(security_round),
+                decision,
+            ))
+        }
+    }
+
+    fn replay_namespace() -> ReplayNamespace {
+        ReplayNamespace::new(
+            [0x71; 16],
+            1,
+            2,
+            3,
+            [0x11; PROFILE_ID_BYTES],
+            [0x72; QUERY_DIGEST_BYTES],
+        )
+    }
+
+    fn security_epoch() -> SecurityEpochTag {
+        SecurityEpochTag::new([0x73; QUERY_DIGEST_BYTES])
+    }
+
+    fn finish(
+        inspection: ContinuationInspection,
+        replay_guard: &mut OneUseReplayGuard,
+    ) -> (
+        ContinuationUse,
+        Option<ReplayCommitAuthority>,
+        SecurityEpochTag,
+        SecurityRoundCapture,
+    ) {
+        let epoch = security_epoch();
+        let round = SecurityRoundCapture::new(&epoch);
+        let (continuation_use, authority) =
+            inspection.finish_replay(&round, replay_guard).into_parts();
+        (continuation_use, authority, epoch, round)
+    }
+
+    fn assert_committed_for_round(
+        authority: Option<ReplayCommitAuthority>,
+        epoch: &SecurityEpochTag,
+        round: &SecurityRoundCapture,
+    ) {
+        let authority = authority.expect("fixture replay commit returned an authority");
+        assert!(authority.matches(epoch, round));
+    }
+
+    fn continuation_plan_key(plan: &ContinuationReplayPlan) -> &[u8; QUERY_DIGEST_BYTES] {
+        match plan {
+            ContinuationReplayPlan::ClaimOrCover(key) => key.as_bytes(),
+            ContinuationReplayPlan::Cover => {
+                panic!("valid fixture token must select a real continuation claim")
             }
-            Ok(())
         }
     }
 
@@ -756,12 +868,7 @@ mod tests {
         let state = state();
         let token = issue(&state);
         let encoded = ContinuationToken::try_from_bytes(token.opaque_bytes())?;
-        let decoded = encoded.validate(
-            &protector(),
-            &context(),
-            &expectation(),
-            &mut OneUseReplayGuard::available(),
-        )?;
+        let decoded = encoded.validate_semantics(&protector(), &context(), &expectation())?;
 
         assert_eq!(decoded, state);
         assert_eq!(token.opaque_bytes().len(), CONTINUATION_TOKEN_BYTES);
@@ -800,19 +907,15 @@ mod tests {
             &UnavailableTestProtector,
             &context(),
             &expectation(),
+            &replay_namespace(),
             [0x55; NONCE_BYTES],
         );
-        assert_eq!(
-            inspection.failure,
-            Some(ContinuationTokenError::ProtectionUnavailable)
-        );
         let mut replay_guard = OneUseReplayGuard::available();
-        assert_eq!(
-            inspection.claim_or_cover(&mut replay_guard),
-            ContinuationUse::ProtectionUnavailable
-        );
-        assert!(replay_guard.claimed.is_empty());
-        assert!(replay_guard.cover_slot.is_some());
+        let (continuation_use, authority, epoch, round) = finish(inspection, &mut replay_guard);
+        assert_eq!(continuation_use, ContinuationUse::ProtectionUnavailable);
+        assert_committed_for_round(authority, &epoch, &round);
+        assert!(replay_guard.claimed_continuations.is_empty());
+        assert_eq!(replay_guard.cover_commits, 1);
     }
 
     #[test]
@@ -824,17 +927,44 @@ mod tests {
             tampered[index] ^= 0x80;
             let tampered = ContinuationToken::try_from_bytes(&tampered)?;
             assert_eq!(
-                tampered.validate(
-                    &protector(),
-                    &context(),
-                    &expectation(),
-                    &mut OneUseReplayGuard::available(),
-                ),
+                tampered.validate_semantics(&protector(), &context(), &expectation()),
                 Err(ContinuationTokenError::AuthenticationFailed),
                 "byte {index} was not authenticated"
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn absent_and_invalid_tokens_select_typed_cover_replay() {
+        let namespace = replay_namespace();
+        let absent = ContinuationToken::inspect_optional(
+            None,
+            &protector(),
+            &context(),
+            &expectation(),
+            &namespace,
+            [0x56; NONCE_BYTES],
+        );
+        let mut tampered = *issue(&state()).opaque_bytes();
+        tampered[AUTHENTICATION_TOKEN_START] ^= 1;
+        let invalid = ContinuationToken::inspect_optional(
+            Some(&ContinuationToken::from_opaque_bytes(tampered)),
+            &protector(),
+            &context(),
+            &expectation(),
+            &namespace,
+            [0x57; NONCE_BYTES],
+        );
+
+        assert!(matches!(
+            absent.continuation_plan,
+            ContinuationReplayPlan::Cover
+        ));
+        assert!(matches!(
+            invalid.continuation_plan,
+            ContinuationReplayPlan::Cover
+        ));
     }
 
     #[test]
@@ -853,12 +983,7 @@ mod tests {
         let token = ContinuationToken::try_from_bytes(&bytes)?;
 
         assert_eq!(
-            token.validate(
-                &protector,
-                &context(),
-                &expectation(),
-                &mut OneUseReplayGuard::available(),
-            ),
+            token.validate_semantics(&protector, &context(), &expectation()),
             Err(ContinuationTokenError::MalformedEncoding)
         );
         Ok(())
@@ -911,11 +1036,10 @@ mod tests {
         let mut changed_context = [0x44; CONTINUATION_CONTEXT_BYTES];
         changed_context[17] ^= 1;
         assert_eq!(
-            token.validate(
+            token.validate_semantics(
                 &protector(),
                 &ContinuationProtectionContext::new(changed_context),
                 &expectation(),
-                &mut OneUseReplayGuard::available(),
             ),
             Err(ContinuationTokenError::AuthenticationFailed)
         );
@@ -930,43 +1054,148 @@ mod tests {
     }
 
     #[test]
-    fn token_can_be_claimed_only_once() -> Result<(), ContinuationTokenError> {
+    fn combined_replay_commit_preserves_duplicate_authority_and_token_use() {
         let token = issue(&state());
         let mut replay_guard = OneUseReplayGuard::available();
+        let namespace = replay_namespace();
 
-        token.validate(&protector(), &context(), &expectation(), &mut replay_guard)?;
-        assert_eq!(
-            token.validate(&protector(), &context(), &expectation(), &mut replay_guard),
-            Err(ContinuationTokenError::ReplayDetected)
+        let duplicate_request_nonce = [0x81; NONCE_BYTES];
+        let initial = ContinuationToken::inspect_optional(
+            None,
+            &protector(),
+            &context(),
+            &expectation(),
+            &namespace,
+            duplicate_request_nonce,
         );
-        Ok(())
+        let (initial_use, initial_authority, initial_epoch, initial_round) =
+            finish(initial, &mut replay_guard);
+        assert_eq!(initial_use, ContinuationUse::Initial);
+        assert_committed_for_round(initial_authority, &initial_epoch, &initial_round);
+
+        let duplicate_request = ContinuationToken::inspect_optional(
+            Some(&token),
+            &protector(),
+            &context(),
+            &expectation(),
+            &namespace,
+            duplicate_request_nonce,
+        );
+        let (duplicate_request_use, request_authority, request_epoch, request_round) =
+            finish(duplicate_request, &mut replay_guard);
+        assert_eq!(duplicate_request_use, ContinuationUse::ProjectionNotReady);
+        assert_committed_for_round(request_authority, &request_epoch, &request_round);
+        assert!(
+            replay_guard.claimed_continuations.is_empty(),
+            "a duplicate request must not consume its valid continuation"
+        );
+
+        let fresh_request = ContinuationToken::inspect_optional(
+            Some(&token),
+            &protector(),
+            &context(),
+            &expectation(),
+            &namespace,
+            [0x82; NONCE_BYTES],
+        );
+        let (fresh_use, fresh_authority, fresh_epoch, fresh_round) =
+            finish(fresh_request, &mut replay_guard);
+        assert_eq!(
+            fresh_use,
+            ContinuationUse::Continue {
+                cursor: 7,
+                expires_at_unix_seconds: 1_000,
+            }
+        );
+        assert_committed_for_round(fresh_authority, &fresh_epoch, &fresh_round);
+        assert_eq!(replay_guard.claimed_continuations.len(), 1);
+
+        let duplicate_continuation = ContinuationToken::inspect_optional(
+            Some(&token),
+            &protector(),
+            &context(),
+            &expectation(),
+            &namespace,
+            [0x83; NONCE_BYTES],
+        );
+        let (duplicate_use, duplicate_authority, duplicate_epoch, duplicate_round) =
+            finish(duplicate_continuation, &mut replay_guard);
+        assert_eq!(duplicate_use, ContinuationUse::InvalidContinuation);
+        assert_committed_for_round(duplicate_authority, &duplicate_epoch, &duplicate_round);
+        assert_eq!(replay_guard.cover_commits, 3);
     }
 
     #[test]
-    fn token_fails_closed_when_replay_guard_is_unavailable() {
+    fn replay_commit_unavailability_maps_to_projection_not_ready_without_authority() {
         let token = issue(&state());
+        let inspection = ContinuationToken::inspect_optional(
+            Some(&token),
+            &protector(),
+            &context(),
+            &expectation(),
+            &replay_namespace(),
+            [0x84; NONCE_BYTES],
+        );
+        let mut replay_guard = OneUseReplayGuard::default();
+        let (continuation_use, authority, _, _) = finish(inspection, &mut replay_guard);
+
+        assert_eq!(continuation_use, ContinuationUse::ProjectionNotReady);
+        assert!(authority.is_none());
+        assert!(replay_guard.claimed_requests.is_empty());
+        assert!(replay_guard.claimed_continuations.is_empty());
+        assert_eq!(replay_guard.cover_commits, 1);
+    }
+
+    #[test]
+    fn valid_continuation_key_binds_canonical_context_digest() {
+        let state = state();
+        let original_context = context();
+        let original_token = issue(&state);
+        let mut changed_context_bytes = *original_context.as_bytes();
+        changed_context_bytes[17] ^= 1;
+        let changed_context = ContinuationProtectionContext::new(changed_context_bytes);
+        let changed_token = ContinuationToken::issue(&state, &changed_context, &protector())
+            .expect("deterministic test protection is available");
+        let namespace = replay_namespace();
+
+        let original = ContinuationToken::inspect_optional(
+            Some(&original_token),
+            &protector(),
+            &original_context,
+            &expectation(),
+            &namespace,
+            [0x85; NONCE_BYTES],
+        );
+        let changed = ContinuationToken::inspect_optional(
+            Some(&changed_token),
+            &protector(),
+            &changed_context,
+            &expectation(),
+            &namespace,
+            [0x85; NONCE_BYTES],
+        );
+
         assert_eq!(
-            token.validate(
-                &protector(),
-                &context(),
-                &expectation(),
-                &mut OneUseReplayGuard::default(),
-            ),
-            Err(ContinuationTokenError::ReplayGuardUnavailable)
+            continuation_context_digest(&original_context),
+            continuation_context_digest(&context())
+        );
+        assert_ne!(
+            continuation_context_digest(&original_context),
+            continuation_context_digest(&changed_context)
+        );
+        assert_ne!(
+            continuation_plan_key(&original.continuation_plan),
+            continuation_plan_key(&changed.continuation_plan)
         );
     }
 
     #[test]
-    fn debug_output_redacts_token_state_and_replay_binding() {
+    fn debug_output_redacts_token_state_and_decisions() {
         let state = state();
         let token = issue(&state);
 
         assert_eq!(format!("{state:?}"), "ContinuationState { ..REDACTED.. }");
         assert_eq!(format!("{token:?}"), "ContinuationToken { len: 128, .. }");
-        assert_eq!(
-            format!("{:?}", state.replay_binding()),
-            "ReplayBinding { ..REDACTED.. }"
-        );
         assert_eq!(
             format!("{:?}", expectation()),
             "ContinuationExpectation { ..REDACTED.. }"
@@ -997,12 +1226,7 @@ mod tests {
         expected: ContinuationTokenError,
     ) {
         assert_eq!(
-            token.validate(
-                &protector(),
-                &context(),
-                expectation,
-                &mut OneUseReplayGuard::available(),
-            ),
+            token.validate_semantics(&protector(), &context(), expectation),
             Err(expected)
         );
     }

@@ -42,6 +42,7 @@ mod protection;
 mod qualification;
 mod recent_snapshot;
 mod records;
+mod runtime_security;
 mod sizing;
 mod store;
 #[cfg(feature = "corpus-zaino")]

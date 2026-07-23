@@ -9,6 +9,17 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- `zaino-oram`: add a crate-private, fixture-only runtime security contract
+  API. Canonical versioned identities separate authenticated request-nonce
+  replay from continuation replay, while one atomic in-memory seam completes
+  both the request lane and its real-or-cover continuation lane. Distinct
+  non-`Clone` round-material reservation and replay-commit authorities are
+  retained through response construction and validated together under an
+  opaque in-process security epoch at release; unavailable or retired state
+  fails closed. This does not change profile ID v3 or the existing ten-phase
+  logical schedule, and it supplies no production durable replay, trusted
+  clock, nonce ledger, key management, rollback resistance, TDX, listener,
+  transport-write, or peer-delivery evidence.
 - `zaino-oram` / `zaino-state`: add a private generation-bound serving-epoch
   contract. The refresh controller invalidates publication before its sole
   await, validates one coherent transparent-projection capture, activates the
