@@ -6631,8 +6631,7 @@ dependencies = [
 [[package]]
 name = "zebra-rpc"
 version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb180542f1ffc0f66c20e1cd66c7741662053ccda588e3847a8ed2df8c83dae7"
+source = "git+https://github.com/sovright/zebra.git?rev=2e8eb6327182b0a1fe0fa67bed089e91c5ab3db5#2e8eb6327182b0a1fe0fa67bed089e91c5ab3db5"
 dependencies = [
  "base64",
  "chrono",
