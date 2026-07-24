@@ -394,6 +394,8 @@ impl CorpusSizeArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    zaino_common::logging::init();
+
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
