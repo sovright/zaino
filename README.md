@@ -169,6 +169,8 @@ mainnet, target-load, access-oblivious qualification, and transport-write or
 peer-delivery evidence remain open. The existing ten-phase logical schedule is
 unchanged. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
+[implementation status](./docs/notes/oram-implementation-status.md),
+[Phase 0 kill-gate report](./docs/notes/oram-phase0-kill-gates-2026-07-23.md),
 [feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and
 [runtime security-owner ADR](./docs/adr/0009-private-query-runtime-security-state-owner.md).
 

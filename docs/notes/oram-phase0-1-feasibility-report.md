@@ -1,6 +1,12 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-15
+- Phase 0 stop-gate update (2026-07-23): later feature slices are frozen at
+  `3a84280c3b727b434f26b424c4abad90f192d909`. The concise
+  [kill-gate report](oram-phase0-kill-gates-2026-07-23.md) records the live
+  mainnet-source sync, a compiled secret-dependent branch in the exact-source
+  deterministic release, the unresolved `rostl` redistribution evidence, and
+  the conditional-fork decision.
 - Evaluated fresh-worker rebuild code head:
   `feat/oram-source-bound-cold-rebuild` at
   `15f60d3014428e04e7a42779c9a8c2c7cc7a583d`, stacked on recovery evidence
@@ -88,6 +94,7 @@
 mainnet/host-oblivious privacy claim.**
 
 **Offline research may continue** in the non-published `zaino-oram` package.
+It is now limited to work that answers or remediates a Phase 0 kill gate.
 The implemented work is useful evidence for API shape, fixed records, aggregate
 corpus accounting, logical schedules using a concrete runtime-owned
 `FrozenRecentSnapshot<N>` with an internally computed content commitment bound
@@ -677,12 +684,12 @@ The following statements are **not** established by that evidence:
 | Compiler pin | Pass for the current ORAM release procedure | Repository pins Rust 1.96.0; the receipt fixes the Linux-musl release profile, feature set, Rust flags, and source-date epoch | Independently pin and verify the complete builder image, LLVM behavior, and native-tool closure |
 | Release artifact identity/repeatability | Partial generic-builder pass | At exact head `a7172384`, two rootless-Podman no-cache builds matched and the published binary/receipt pair passed final verification; the receipt binds local source and build inputs plus binary identity | Repeat on an independent builder, add trusted CI and signed/attested provenance, and keep physical-trace, mainnet, target-CPU, and TDX gates separate |
 | CPU/target/TDX pin | Partial target-class gate | An Ubuntu 24.04 x86_64 CI lane with immutable action pins executes the real adapter; the hosted image, CPU generation, TDX instance, firmware/TCB, DOIT, and memory remain unset | Select CPU generations, exact target/release flags, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
-| Pinned ORAM dependency | Partial | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock` | Resolve API/failure/recovery concerns and decide upstream, fork, or replacement |
+| Pinned ORAM dependency | Upstream unchanged is NO-GO | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock`; the selected path is affected by compiler-preservation, stash-recovery, and failure-bound gaps | After license clearance, own those gaps in a Sovright fork or replace the backend |
 | Dependency/license inventory | Blocked | Manifest declarations recorded below; `rostl` checkout has no root license text | Obtain authoritative license files/confirmation and complete automated transitive audit |
 | Random full-map experiments | Partial builder foundation | Fixed `SmokeV1` covers a 64-step mixed workload, while separate `FullMapSaturationV1` workers exercise exact logical admission failures. Source-bound `BuilderFoundationV1` adds a deterministic shuffled 256-command hot/cold read/unique-append workload that fills both sizing-derived logical admission limits inside a fixed builder envelope and requires logical occupied-probe collisions. It is neither random/adversarial physical full-map load nor a long-run benchmark | Run mixed random reads/inserts and adversarial collisions at measured full-mainnet target capacity/load; keep that result schema separate from all deterministic profiles |
 | Memory/RSS gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` samples process-wide `VmRSS` before spawn, after spawn, after warmup, and after the measured phase, plus process-lifetime `VmHWM`, on Linux x86_64. The HWM includes driver/runtime memory predating the run. This is whole-process generic-builder evidence, not backend-only memory or intended-TDX headroom | Measure peak RSS, initialization pressure, page faults, and swapping on intended TDX hardware with at least 30% headroom |
 | Latency/stash/queue gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` records synchronous typed-worker call latency and mixed-phase wall-clock completion rates with a single caller and queue capacity one. Synthetic input preparation and verification are outside command latency but inside the phase wall; per-class rates are not isolated throughput. It also records clean-shutdown lifecycle/queue counters, while queue contention is unmeasured and stash/physical access is backend-unobservable | Record target-hardware latency distribution, sustained QPS, stash pressure, loaded queue depth, update contention, and failure behavior |
-| Assembly/compiler-preservation experiment | Missing | No release assembly or instruction trace | Resolve the concern tracked by [`rostl` issue #8](https://github.com/obliviouslabs/rostl/issues/8) for the pinned binary/toolchain |
+| Assembly/compiler-preservation experiment | Static release disassembly: FAIL | At exact evidence source `3a84280c`, both 38-byte and 82-byte insertion monomorphizations branch on the private hit/miss result before reconverging for the second ORAM access | Remediate the branch, rerun exact-source static review, then obtain dynamic instruction/memory/page/timing traces on a suitable host |
 | Failure probability | Missing | No long-run or analytical bound | Address [`rostl` issue #24](https://github.com/obliviouslabs/rostl/issues/24) and document node-year risk |
 | Typed capacity/stash/queue failure | Partial | Local validation is typed; the research worker has nonblocking bounded admission, a typed identifier-free `QueueFull`, no fallback, and terminal backend/panic latching. `SmokeV1` checks the per-address limit. Separate `FullMapSaturationV1` workers reach the directory and event admission bounds independently, fail closed on the next append, and latch terminal state. `BuilderFoundationV1` reaches both source-sized admission limits in one healthy run and requires a clean stopped snapshot, but its single caller does not load the queue and the backend exposes no stash telemetry | Replace panic-based upstream boundaries, type stash exhaustion, and prove capacity/stash/queue behavior under native target load |
 | Persistence/recovery/RTO | Partial public-rebuild, private outer-commit, replay-journal, and module-private coordinator foundations; production gate blocked | Fixed authenticated public manifests, exact digest-bound external freshness transitions, deterministic crash-boundary tests, and fresh-worker genesis replay establish a fail-closed public publication/rebuild contract. A separate private fixed-width snapshot commits stable security identity plus opaque serving/component digests locally before an injected exact witness. The local replay journal reconstructs the exact committed prefix from fixed-size context-sealed records. Profile v6 keeps entry v2 (`ZORJENT2`) unchanged and selects current v3 (`ZORJCUR3`); all record widths remain fixed. Entry v2 persists each real continuation's opaque replay key and nonzero ceiling expiry-bucket ordinal. Current v3 persists a `u64` watermark whose zero sentinel means no classified bucket and whose nonzero value records the inclusive highest fully expired continuation expiry bucket for future maintenance classification. The raw recorded value is not authority. Lower proposals reject; equal returns typed `NoAdvance` without a write, receipt, or outer sequence advance; greater durably advances replay-current without appending entries or changing claim sets/counts. Query replay and maintenance mint distinct move-only receipts before the module-private coordinator applies replay-current -> outer-local -> witness ordering. Hard witness rejection fresh-opens as `WitnessLocalMismatch`; witness advance-then-error can reconcile. Profile v6 requires fresh provisioning and neither migrates nor dual-accepts profile-v5/current-v2 or earlier state. The surface has no non-test caller or trusted-time/epoch/profile grant; runtime wiring or visibility widening first requires a live epoch/profile/currentness-bound move-only grant. There is no request expiry, deletion, count reduction, compaction, reclamation, bounded retention, or garbage-collection execution; capacity remains lifetime cumulative. It remains runtime-unwired, single-writer without a lock, and protected only by a test fixture. The three advancement steps are ordered but not one atomic transaction. No production witness/key/nonce owner, nonce/time journal, qualified integrated replay, composite ORAM-state commit, full-corpus result, controlled-cache result, or full-service RTO exists | Supply the production trusted-time and retirement authority plus a live epoch/profile/currentness-bound grant, complete replay/snapshot/witness ownership under the production freshness protocol, add nonce/time roots, and preserve the explicit no-deletion/no-reclamation boundary until a separately reviewed retention protocol exists; then either implement authenticated atomic ORAM persistence or run a controlled target-hardware rebuild and publish an accepted full-service RTO |
@@ -1083,18 +1090,25 @@ generic Ubuntu 24.04 x86_64; the bounded builder profile does not change that
 host qualification boundary. The private projection owner consumes that
 constructor, but has no runtime/service caller. The
 tables, synchronous executor, and outer worker boundary catch panics and latch
-coarse failed-closed state, but Rust's process-wide panic hook still runs and
-this is not recovery. Upstream open work includes Circuit ORAM stash recovery
-([#13](https://github.com/obliviouslabs/rostl/issues/13)) and map queue recovery
-([#32](https://github.com/obliviouslabs/rostl/issues/32)).
+  coarse failed-closed state, but Rust's process-wide panic hook still runs and
+  this is not recovery. Circuit ORAM stash recovery
+  ([#13](https://github.com/obliviouslabs/rostl/issues/13)) is directly relevant.
+  Map queue recovery
+  ([#32](https://github.com/obliviouslabs/rostl/issues/32)) applies only if
+  `rostl-datastructures` is adopted.
 
 ## Assembly and trace blocker
 
-An exact Linux x86_64-musl release artifact and its unsigned self-reported
-receipt now exist at head `a7172384`, but no release-binary assembly or
-physical trace experiment exists. Before a privacy claim, that exact artifact
-must be examined under the pinned compiler and target CPU policy for
-contrasting secret cases. At minimum, record and compare:
+Static disassembly of the exact evidence-source Linux x86_64-musl release at
+`3a84280c` fails this gate. In both record monomorphizations, the private
+hit/miss result directly controls a conditional jump before the paths
+reconverge for the second ORAM access. This is enough to reject the current
+binary; it is not a dynamic instruction, memory-address, page, allocation, or
+timing experiment.
+
+After the branch is remediated, examine the new exact artifact under the pinned
+compiler and target CPU policy for contrasting secret cases. At minimum, record
+and compare:
 
 - relevant instructions and secret-dependent branches;
 - memory addresses, page accesses/page faults, and allocations;
@@ -1196,53 +1210,44 @@ must not exist, or must remain unready in a later offline prototype.
 
 ## Work allowed under the NO-GO
 
-The following work remains in scope because it reduces uncertainty without
-exposing a private server:
+Only work that answers or remediates a Phase 0 kill question remains in scope:
 
-1. execute `zainod-oram corpus capture` at an explicit public mainnet checkpoint
-   and publish only its identifier-free, digest-bound artifact;
-2. produce and review the full-mainnet distribution and calibrated sizing
-   artifact;
-3. execute the fixed source-bound `BuilderFoundationV1` profile on the generic
-   Linux x86_64 builder, retain its three-file artifact, and harden the new
-   same-host release procedure with an independent rebuild, immutable builder
-   inputs, and signed or attested provenance without calling any intermediate
-   result a target-hardware or privacy qualification;
-4. select target CPU/TDX instances and measure random full-map performance,
-   stash/queue behavior, RSS, swapping, and rebuild time;
-5. extend the logical trace into release-binary source, allocator, physical
-   storage, instruction/memory/page, and real transport-frame instrumentation;
-6. implement production key/freshness-witness ownership and either obtain typed
-   durable upstream recovery behavior or qualify the authenticated
-   genesis-forward rebuild protocol against a declared target-hardware RTO;
-7. resolve git-dependency and TDX/verifier licensing with an exact SBOM;
-8. extend the completed logical token/runtime and injected mock scan/merge model
-   by supplying the production finalized-outpoint resolver, implementing a live
-   refresh controller that begins the update before conversion, wiring live
-   source/NFS acquisition into the existing owner-mediated candidate activation,
-   binding the owner-generated `FrozenRecentSnapshot` into atomic canonical
-   whole-serving epochs, and adding private schema, transport, allocator,
-   instruction/memory/page, timing, and outer-status evidence without opening a
-   production listener prematurely;
-   retain the legacy schema golden;
-9. obtain independent security review of the evidence and then revisit this
-   decision.
+1. complete one explicit-checkpoint full-mainnet capture, report the hot tail,
+   run the current-corpus logical-floor diagnostic, and obtain approved growth,
+   backend-calibration, and target-TDX measurements if that necessary condition
+   passes;
+2. remediate the exact-source secret-dependent branch, then rerun static
+   disassembly and dynamic instruction/memory/page/timing qualification;
+3. obtain authoritative `rostl` license confirmation and canonical license and
+   notice texts for the exact distribution closure;
+4. after license clearance, size and review the conditional Sovright fork or
+   select a replacement, explicitly owning recovery, failure bounds, and the
+   ongoing compiler/backend qualification matrix; and
+5. obtain written independent review of those four results before resuming any
+   service, provider, replay, controller, schema, transport, or artifact-plumbing
+   slice.
 
 ## Conditions to change the decision
 
-Changing from NO-GO requires all of the following, not a subset:
+Authorization to resume the frozen later research slices requires all of the
+following, not a subset:
 
-- a reproducible full-mainnet aggregate report at a public checkpoint;
-- approved growth and profile constants derived from that report;
-- measured target-TDX capacity with at least 30% RSS headroom and no swapping;
-- target-load latency/stash/queue/failure results with typed fail-closed
-  behavior;
-- reviewed assembly and physical trace evidence for the pinned release binary;
-- a credible authenticated persistence/recovery design and measured RTO;
-- resolved licenses for the exact distribution closure;
-- an accepted leakage matrix and client cover-round contract;
-- completion of the Phase 1 fixed-work/wire/source/legacy parity evidence; and
-- a written review that explicitly authorizes the next integration phase.
+- a reproducible full-mainnet aggregate report at a public checkpoint, approved
+  growth and backend-calibration inputs, and measured target-TDX capacity with
+  at least 30% RSS headroom and no swapping;
+- remediated secret-dependent release codegen followed by passing static and
+  dynamic physical-trace review;
+- authoritative license evidence for the exact distribution closure;
+- an accepted licensed-fork or replacement decision that owns recovery,
+  failure bounds, and ongoing compiler/backend qualification; and
+- a written review that explicitly lifts the slice freeze.
+
+Private-server integration is a separate, stricter decision. It additionally
+requires target-load latency/stash/queue/failure results with typed fail-closed
+behavior, a credible authenticated persistence/recovery design and measured
+RTO, an accepted leakage matrix and client cover-round contract, completion of
+the fixed-work/wire/source/legacy parity evidence, and a written review that
+explicitly authorizes integration.
 
 Until then, the accurate description is: **experimental offline ORAM research
 for a possible Zaino private-query subsystem**.
