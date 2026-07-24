@@ -3,13 +3,22 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fmt, num::NonZeroU32, path::PathBuf, process::ExitCode};
+use std::{
+    error::Error,
+    fmt,
+    future::Future,
+    num::{NonZeroU32, NonZeroUsize},
+    ops::RangeInclusive,
+    path::PathBuf,
+    process::ExitCode,
+};
 #[cfg(feature = "typed-qualification")]
 use std::{num::NonZeroU64, time::Duration};
 
 #[cfg(feature = "typed-qualification")]
 use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
+use futures::{stream, StreamExt};
 use zaino_common::Network;
 #[cfg(feature = "typed-qualification")]
 use zaino_oram::{
@@ -66,6 +75,8 @@ mod stress_qualification_artifact;
 mod target_load_artifact;
 
 type RunnerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+const MAX_CAPTURE_FETCH_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -298,6 +309,14 @@ struct CorpusCaptureArgs {
     /// Emit aggregate progress every this many public block heights.
     #[arg(long, default_value = "10000")]
     progress_interval: NonZeroU32,
+
+    /// Maximum indexed-block fetches in flight; results are always reduced by height.
+    #[arg(
+        long,
+        default_value = "1",
+        value_parser = parse_capture_fetch_concurrency
+    )]
+    fetch_concurrency: NonZeroUsize,
 
     /// Public height to capture instead of the snapshot's serviceable tip.
     #[arg(long, requires = "target_hash")]
@@ -715,6 +734,7 @@ async fn run_corpus_capture(args: CorpusCaptureArgs) -> RunnerResult<()> {
     let scan_result = scan_fixed_snapshot(
         &service,
         args.progress_interval,
+        args.fetch_concurrency,
         args.target_height,
         args.target_hash.as_deref(),
     )
@@ -744,6 +764,7 @@ const fn backend_kind(backend: BackendType) -> BackendKind {
 async fn scan_fixed_snapshot(
     service: &NodeBackedIndexerService,
     progress_interval: NonZeroU32,
+    fetch_concurrency: NonZeroUsize,
     target_height: Option<u32>,
     target_hash: Option<&str>,
 ) -> RunnerResult<CaptureScan> {
@@ -768,24 +789,39 @@ async fn scan_fixed_snapshot(
     let mut scanner = MainnetCorpusScanner::new();
 
     eprintln!(
-        "corpus_capture_start=mainnet,target_height:{fixed_tip},serviceable_height:{serviceable_height}"
+        "corpus_capture_start=mainnet,target_height:{fixed_tip},serviceable_height:{serviceable_height},fetch_concurrency:{}",
+        fetch_concurrency.get()
     );
-    for raw_height in 0..=fixed_tip {
-        let height = Height::try_from(raw_height)
-            .map_err(|_| RunnerError::HeightOutOfRange { height: raw_height })?;
-        let block = subscriber
-            .indexer
-            .get_indexed_block_by_height(&snapshot, &height)
-            .await?
-            .ok_or(RunnerError::MissingCanonicalBlock { height: raw_height })?;
-        scanner.push(&block)?;
+    let fetch_indexer = subscriber.indexer.clone();
+    let fetch_snapshot = snapshot.clone();
+    reduce_ordered_range(
+        0..=fixed_tip,
+        fetch_concurrency,
+        move |raw_height| {
+            let indexer = fetch_indexer.clone();
+            let snapshot = fetch_snapshot.clone();
+            async move {
+                let height = Height::try_from(raw_height)
+                    .map_err(|_| RunnerError::HeightOutOfRange { height: raw_height })?;
+                let block = indexer
+                    .get_indexed_block_by_height(&snapshot, &height)
+                    .await?
+                    .ok_or(RunnerError::MissingCanonicalBlock { height: raw_height })?;
+                Ok::<_, Box<dyn Error + Send + Sync>>(block)
+            }
+        },
+        |raw_height, block| {
+            scanner.push(&block)?;
 
-        if raw_height % progress_interval.get() == 0 || raw_height == fixed_tip {
-            eprintln!(
-                "corpus_capture_progress=mainnet,current_height:{raw_height},target_height:{fixed_tip}"
-            );
-        }
-    }
+            if raw_height % progress_interval.get() == 0 || raw_height == fixed_tip {
+                eprintln!(
+                    "corpus_capture_progress=mainnet,current_height:{raw_height},target_height:{fixed_tip}"
+                );
+            }
+            Ok(())
+        },
+    )
+    .await?;
 
     let measurement = scanner.finish()?;
     measurement.validate()?;
@@ -805,6 +841,47 @@ async fn scan_fixed_snapshot(
         serviceable_height,
         selection_mode,
     })
+}
+
+/// Fetches a bounded number of items concurrently while reducing them in range order.
+async fn reduce_ordered_range<T, E, Fetch, FetchFuture, Reduce>(
+    heights: RangeInclusive<u32>,
+    concurrency: NonZeroUsize,
+    fetch: Fetch,
+    mut reduce: Reduce,
+) -> Result<(), E>
+where
+    Fetch: Fn(u32) -> FetchFuture,
+    FetchFuture: Future<Output = Result<T, E>>,
+    Reduce: FnMut(u32, T) -> Result<(), E>,
+{
+    let fetched = stream::iter(heights)
+        .map(|height| {
+            let future = fetch(height);
+            async move { future.await.map(|item| (height, item)) }
+        })
+        .buffered(concurrency.get());
+    futures::pin_mut!(fetched);
+
+    while let Some(result) = fetched.next().await {
+        let (height, item) = result?;
+        reduce(height, item)?;
+    }
+    Ok(())
+}
+
+fn parse_capture_fetch_concurrency(value: &str) -> Result<NonZeroUsize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "fetch concurrency must be a positive integer".to_owned())?;
+    let concurrency = NonZeroUsize::new(parsed)
+        .ok_or_else(|| "fetch concurrency must be at least 1".to_owned())?;
+    if concurrency.get() > MAX_CAPTURE_FETCH_CONCURRENCY {
+        return Err(format!(
+            "fetch concurrency must not exceed {MAX_CAPTURE_FETCH_CONCURRENCY}"
+        ));
+    }
+    Ok(concurrency)
 }
 
 fn validate_checkpoint_hash(hash: &str) -> Result<(), RunnerError> {
@@ -956,9 +1033,24 @@ impl Error for RunnerError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, collections::BTreeSet, ffi::OsString, fs, path::Path};
+    use blake2::{Blake2s256, Digest};
+    use std::{
+        collections::BTreeMap,
+        collections::BTreeSet,
+        ffi::OsString,
+        fs,
+        path::Path,
+        sync::{Arc, Mutex},
+        task::Poll,
+    };
 
     use crate::corpus_artifact::typed_test_measurement;
+
+    #[derive(Debug, PartialEq, Eq, serde::Serialize)]
+    struct OrderedFetchFixture {
+        height: u32,
+        payload: [u8; 4],
+    }
 
     fn valid_args() -> [&'static str; 7] {
         [
@@ -1016,6 +1108,56 @@ mod tests {
             "--sizing-dir",
             "/tmp/oram-sizing",
         ]
+    }
+
+    async fn collect_ordered_fetch_fixture(
+        concurrency: NonZeroUsize,
+    ) -> RunnerResult<(Vec<OrderedFetchFixture>, Vec<u32>)> {
+        const FINAL_HEIGHT: u32 = 7;
+
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        let fetch_completion_order = Arc::clone(&completion_order);
+        let mut reduced = Vec::new();
+        reduce_ordered_range(
+            0..=FINAL_HEIGHT,
+            concurrency,
+            move |height| {
+                let completion_order = Arc::clone(&fetch_completion_order);
+                async move {
+                    let mut remaining_polls = FINAL_HEIGHT - height;
+                    futures::future::poll_fn(move |context| {
+                        if remaining_polls == 0 {
+                            Poll::Ready(())
+                        } else {
+                            remaining_polls -= 1;
+                            context.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    completion_order
+                        .lock()
+                        .expect("fixture completion-order mutex poisoned")
+                        .push(height);
+                    Ok::<_, Box<dyn Error + Send + Sync>>(OrderedFetchFixture {
+                        height,
+                        payload: height.to_le_bytes(),
+                    })
+                }
+            },
+            |height, item| {
+                assert_eq!(item.height, height);
+                reduced.push(item);
+                Ok(())
+            },
+        )
+        .await?;
+
+        let completion_order = completion_order
+            .lock()
+            .expect("fixture completion-order mutex poisoned")
+            .clone();
+        Ok((reduced, completion_order))
     }
 
     #[cfg(feature = "typed-qualification")]
@@ -1676,8 +1818,54 @@ mod tests {
 
         assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-capture"));
         assert_eq!(args.progress_interval.get(), 10_000);
+        assert_eq!(args.fetch_concurrency.get(), 1);
         assert_eq!(args.target_height, None);
         assert_eq!(args.target_hash, None);
+
+        let mut pipelined = valid_args().to_vec();
+        pipelined.extend(["--fetch-concurrency", "8"]);
+        let args = match parsed_corpus(Cli::try_parse_from(pipelined)?).command {
+            CorpusSubcommand::Capture(args) => args,
+            CorpusSubcommand::Size(_) => panic!("capture arguments parsed as sizing arguments"),
+            CorpusSubcommand::ValidateSizing(_) => {
+                panic!("capture arguments parsed as sizing-validation arguments")
+            }
+        };
+        assert_eq!(args.fetch_concurrency.get(), 8);
+
+        for invalid in ["0", "33"] {
+            let mut command = valid_args().to_vec();
+            command.extend(["--fetch-concurrency", invalid]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_pipelining_preserves_fixture_bytes_and_digest() -> RunnerResult<()> {
+        let sequential_concurrency =
+            NonZeroUsize::new(1).expect("fixture sequential concurrency is nonzero");
+        let pipelined_concurrency =
+            NonZeroUsize::new(4).expect("fixture pipelined concurrency is nonzero");
+        let (sequential, sequential_completion_order) =
+            collect_ordered_fetch_fixture(sequential_concurrency).await?;
+        let (pipelined, pipelined_completion_order) =
+            collect_ordered_fetch_fixture(pipelined_concurrency).await?;
+
+        assert_eq!(sequential_completion_order, (0..=7).collect::<Vec<_>>());
+        assert_ne!(pipelined_completion_order, sequential_completion_order);
+        assert_eq!(
+            pipelined.iter().map(|item| item.height).collect::<Vec<_>>(),
+            (0..=7).collect::<Vec<_>>()
+        );
+
+        let sequential_bytes = serde_json::to_vec(&sequential)?;
+        let pipelined_bytes = serde_json::to_vec(&pipelined)?;
+        assert_eq!(pipelined_bytes, sequential_bytes);
+        assert_eq!(
+            Blake2s256::digest(&pipelined_bytes),
+            Blake2s256::digest(&sequential_bytes)
+        );
         Ok(())
     }
 
