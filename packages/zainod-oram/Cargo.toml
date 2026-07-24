@@ -23,6 +23,7 @@ typed-qualification = ["zaino-oram/rostl-experimental"]
 [dependencies]
 blake2.workspace = true
 clap = { workspace = true, features = ["derive"] }
+futures.workspace = true
 hex.workspace = true
 http-body = { version = "1", optional = true }
 prost = { workspace = true, optional = true }
