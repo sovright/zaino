@@ -87,20 +87,29 @@ root or prove the exact candidate hash already canonical before skipping it;
 suppressing contextual validation or skipping by height would be unsafe. No
 direct capture was represented as corpus evidence.
 
-The full release RPC capture started at 2026-07-24 02:52:31 UTC against explicit
-checkpoint 3,423,024 with RPC-order hash
+The first full release RPC trace started on the builder at 2026-07-24 02:52:31
+UTC against explicit checkpoint 3,423,024 with RPC-order hash
 `00000000001de8639497d8903942f3a0e3130082977e0d23c578cf542533773f`.
-The connected validator reported serviceable height 3,423,025 at capture
-start. The final elapsed time, measurement files, artifact digests, corpus
-counts, hot tail, and sizing result belong here only after atomic publication
-and read-back validation complete. Until then, Gate 1 stays **IN PROGRESS** and
-no capacity claim is permitted.
+It reached height 290,000 with a 3.0 GiB cgroup memory peak and zero swap before
+being intentionally stopped; no partial artifact was published.
+
+The authoritative run uses the same binary and checkpoint on
+`zaino-oram-tdx-c3-44-20260724-v2`, a `c3-standard-44` instance that Google
+Cloud reports as configured for Intel TDX with terminate-on-maintenance. The
+Ubuntu 24.04 host's 10,001-block smoke scanned in 65.54 seconds. The full run
+started at 2026-07-24 03:20:49 UTC and reported serviceable height 3,423,046.
+At height 100,000 it had a 3.002 GiB cgroup memory peak and zero swap. These
+configuration and runtime counters are not a TDX attestation. The final elapsed
+time, measurement files, artifact digests, corpus counts, hot tail, and sizing
+result belong here only after atomic publication and read-back validation
+complete. Until then, Gate 1 stays **IN PROGRESS** and no capacity claim is
+permitted.
 
 Google Cloud currently supports Intel TDX in `us-central1-a`, `-b`, and `-c`
 only on regular `c3-standard-*` instances. The existing `n2` VM cannot be
 converted in place. The first two candidate qualification targets are:
 
-| Target | RAM | Maximum measured peak RSS with 30% headroom |
+| Target | RAM | Maximum allowed peak RSS with 30% headroom |
 | --- | ---: | ---: |
 | `c3-standard-22` | 88 GiB | 61.6 GiB |
 | `c3-standard-44` | 176 GiB | 123.2 GiB |
