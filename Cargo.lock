@@ -6631,7 +6631,7 @@ dependencies = [
 [[package]]
 name = "zebra-rpc"
 version = "11.0.0"
-source = "git+https://github.com/sovright/zebra.git?rev=2e8eb6327182b0a1fe0fa67bed089e91c5ab3db5#2e8eb6327182b0a1fe0fa67bed089e91c5ab3db5"
+source = "git+https://github.com/sovright/zebra.git?rev=68ba61488a3c4386e6a3bd0370583f4ead153770#68ba61488a3c4386e6a3bd0370583f4ead153770"
 dependencies = [
  "base64",
  "chrono",
