@@ -397,14 +397,17 @@ commitment, but does not authenticate that metadata or prove its canonical
 ancestry. Neither commitment is an authenticated canonical/live Zaino snapshot
 root. This slice supplies no durable persistence, authenticated provenance,
 production cryptographic ownership, physical-obliviousness, allocator or timing
-equivalence, rollback resistance, TDX, target-load, or mainnet evidence.
+equivalence, rollback resistance, TDX, or target-load evidence.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline
 `zainod-oram corpus size` command revalidates that complete artifact and applies
-one explicit model into a separate digest-bound atomic qualification. No
-full-mainnet capture or sizing artifact exists yet. Static fixture parity is
-not live-backend, finalised-database, reorg, or mainnet shadow evidence.
+one explicit model into a separate digest-bound atomic qualification. A
+full-Mainnet aggregate capture and current-corpus logical sizing now exist; see
+the
+[dated capture log](../../docs/notes/oram-phase0-mainnet-capture-log-2026-07-26.md).
+Static fixture parity is not live-backend, finalised-database, reorg, or mainnet
+shadow evidence.
 The follow-on load-foundation slice adds read-only access to the explicit table
 capacity and admission inputs. The companion `zainod-oram corpus
 validate-sizing` command reopens an existing capture and sizing directory,
@@ -412,8 +415,9 @@ revalidates both existing bundles, and recomputes the sizing qualification
 against the captured measurement. This creates no artifact and instantiates no
 ORAM backend, store, or worker; it does not execute a load, measure performance,
 or provide mainnet evidence.
-Upstream `rostl` panic/recovery, persistence, side-channel, and licensing gates
-remain unresolved.
+Upstream `rostl` panic/recovery, persistence, and side-channel gates remain
+unresolved. Its license/notice inventory is a tracked distribution-readiness
+concern, not a Phase 0 blocker.
 The event coordinator is a portable sink/checkpoint ordering model. A private
 offline owner composes it with the business-command worker and, on supported
 hosts, the typed `rostl` stores, but no runtime or service calls that owner. The

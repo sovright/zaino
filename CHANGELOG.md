@@ -11,9 +11,9 @@ and this library adheres to Rust's notion of
 
 - ORAM research: freeze later feature slices behind the Phase 0 stop gate,
   split implementation chronology out of the normative architecture plan, and
-  add a concise kill-gate report covering the live mainnet-source sync,
-  compiled secret-dependent branch finding, unresolved redistribution
-  evidence, TDX target candidates, and conditional `rostl` fork decision.
+  add a concise kill-gate report covering the completed Mainnet capture,
+  compiled secret-dependent branch finding, tracked redistribution-license
+  concern, TDX target candidates, and `rostl` fork-or-replace decision.
 - `zaino-oram`: supersede profile ID v5 with v6 and replay-current v2 with
   fixed-width v3 (`ZORJCUR3`) for fresh replay-journal provisioning. Entry v2
   (`ZORJENT2`) and every current/entry record width remain unchanged. Current

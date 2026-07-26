@@ -3,26 +3,27 @@
 - Evidence baseline: `3a84280c3b727b434f26b424c4abad90f192d909`.
 - Completed mainnet-capture source:
   `d35d158a9826c75a4ec1c31932c29b43cf4c7163`.
-- Decision: **NO-GO for private-server integration and ORAM-enabled
-  redistribution**.
-- Execution policy: later feature slices and qualification-artifact plumbing
-  are frozen. Only work that answers or remediates a Phase 0 kill question is
-  in scope.
+- Decision: **NO-GO for private-server integration** on the unresolved
+  technical gates below.
+- Execution policy: later service, provider, replay, and qualification-artifact
+  slices remain frozen. Work that answers or remediates the technical Phase 0
+  gates may continue; licensing adds no separate implementation freeze.
 - Evidence boundary: nothing in this report is a TDX attestation, an
   independent rebuild, a legal opinion, or proof of semantic obliviousness.
 
 ## Gate summary
 
-| Gate | Current result | Consequence |
+| Item | Current result | Consequence |
 | --- | --- | --- |
 | Full-mainnet corpus, hot tail, and 30% TDX RSS headroom | **IN PROGRESS** | The reproducible full capture and current-corpus logical sizing completed. Growth, insertion/failure bounds, backend calibration, and target-TDX RSS/no-swap qualification remain open. |
 | Compiled `rostl` access-path obliviousness | **FAIL at the exact evidence source** | A secret hit/miss result directly controls conditional jumps even though both cases perform two logical ORAM accesses. The current path cannot make a host-obliviousness claim. |
-| Redistribution licensing | **NO-GO: evidence unavailable** | The selected `rostl` crates declare permissive SPDX metadata but the pinned repository contains no authoritative license/notice file. This is not a finding that the code is unlicensed; keep the feature internal and default-off until the rights holder confirms the grant and supplies the required texts. |
-| Use upstream versus own the ORAM library | **DECIDED: do not ship upstream unchanged** | A production path requires a licensed Sovright fork or a replacement. Forking is conditional on license clearance and explicit ownership of compiler, recovery, and failure-bound work. |
+| Redistribution licensing | **TRACKED RELEASE CONCERN** | The selected `rostl` crates declare permissive SPDX metadata but the pinned repository contains no authoritative license/notice file. This is not a finding that the code is unlicensed and does not block technical-gate remediation or creation of a Sovright fork; resolve the evidence gap before external release. |
+| Use upstream versus own the ORAM library | **DECIDED: do not ship upstream unchanged** | A production path requires a Sovright-owned fork or replacement that owns compiler, recovery, and failure-bound work. License/notice evidence is a parallel release-readiness item. |
 
-One failed kill gate is sufficient to keep the project at NO-GO. The completed
-mainnet capture answers an independent feasibility question and bounds any
-replacement backend.
+Only the technical Gate 1 and Gate 2 results determine the current Phase 0
+NO-GO. The completed mainnet capture answers an independent feasibility
+question and bounds any replacement backend; licensing is tracked separately
+for release readiness.
 
 ## Gate 1: mainnet corpus and TDX fit
 
@@ -120,7 +121,7 @@ remains open. Spot checks of its cited bitwise expressions compiled to
 `setcc`/bitwise/`cmov` sequences, but that was not an exhaustive review and does
 not negate the concrete branch in the Zaino insertion wrapper.
 
-## Gate 3: redistribution license
+## Release-readiness concern: redistribution license
 
 The exact selected dependency is
 [`obliviouslabs/rostl@8c3a12d2`](https://github.com/obliviouslabs/rostl/commit/8c3a12d2febf17b024f2e949428b3bc526d74172),
@@ -135,10 +136,10 @@ currently also upstream `main`.
   `typed-qualification` / `rostl-experimental` path does.
 
 This is not a finding that upstream has no license. It is a finding that the
-project's redistribution-evidence standard is not met. A fork cannot repair
-missing permission. The gate requires written rights-holder confirmation plus
-the authoritative license and notice texts at the pinned or successor
-revision.
+project's redistribution-evidence standard is not yet met. It does not block
+technical-gate remediation or creation of a Sovright fork. Before external
+release, obtain written rights-holder confirmation and add the authoritative
+license and notice texts at the pinned or successor revision.
 
 `tdx_easy_https` is reference-only. It and `tdx_quote_verifier` are absent from
 Zaino manifests, `Cargo.lock`, and all-feature Cargo trees, so their AGPL
@@ -152,11 +153,12 @@ Primary evidence:
 - [`rostl` pinned recursive tree](https://api.github.com/repos/obliviouslabs/rostl/git/trees/8c3a12d2febf17b024f2e949428b3bc526d74172?recursive=1)
 - [`tdx_quote_verifier` manifest](https://github.com/obliviouslabs/tdx_easy_https/blob/bd48faebeb21a385b8cd7e4451c107e5c60df02c/client/tdx_quote_verifier/Cargo.toml)
 
-## Gate 4: use versus fork
+## ORAM ownership decision: use versus fork
 
-Do not use upstream unchanged for a redistributable or production-intended
-service. It remains acceptable only for internal, default-off, volatile
-research while the license question is open.
+Do not use upstream unchanged for a production-intended service. Use a
+Sovright-owned fork or a replacement that explicitly owns the technical work
+below. Track the license/notice evidence gap in parallel as release due
+diligence.
 
 The current Cargo path is narrower than the original risk row:
 
@@ -170,8 +172,8 @@ The current Cargo path is narrower than the original risk row:
   queue recovery, is not in the selected crate path. It becomes relevant only
   if `rostl-datastructures` is adopted.
 
-The decision is a **conditional Sovright fork** after license clearance, with
-replacement as the fallback if clearance is not prompt. A fork must own at
+The decision is a **Sovright-owned fork or replacement**. Licensing does not
+condition when that technical work may start. The selected backend must own at
 least:
 
 1. a branchless/error-coarsened API and exact release-codegen gates;
@@ -196,9 +198,10 @@ patches.
    target with at least 30% headroom.
 2. Remediate the exact-source compiled branch finding, then rerun static and
    dynamic qualification.
-3. Ask the `rostl` rights holder for license confirmation and canonical texts;
-   no maintainer has been contacted yet.
+3. In parallel, ask the `rostl` rights holder for license confirmation and
+   canonical texts; no maintainer has been contacted yet.
 4. Provision a PMU-enabled host for the post-remediation instruction, branch,
    memory-address, page, and timing experiment.
-5. Do not resume service/provider/replay/artifact slices until a written review
-   explicitly changes the Phase 0 NO-GO.
+5. Do not resume unrelated service, provider, replay, or artifact-plumbing
+   slices until a written review explicitly changes the technical Phase 0
+   NO-GO.

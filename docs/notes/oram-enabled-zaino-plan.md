@@ -405,7 +405,7 @@ The client verifies evidence before trusting the connection and re-attests after
 
 Attestation proves measurement and binding. It does not prove that the measured program is semantically oblivious; trace testing, assembly review, and external audit remain separate gates.
 
-The reference `tdx_easy_https` deployment can inform verifier behavior, but its pinned quote-verifier crate is AGPL-3.0-or-later and the submodule lacks a clear root license. Resolve the licensing/integration boundary before redistribution.
+The reference `tdx_easy_https` deployment can inform verifier behavior, but its pinned quote-verifier crate is AGPL-3.0-or-later and the submodule lacks a clear root license. Keep that verifier outside Zaino's dependency and copied-code closure unless separately reviewed; resolve the boundary before external release.
 
 ## Configuration and features
 
@@ -482,10 +482,15 @@ Authorization to resume the frozen later research slices requires:
   RSS headroom and no host swapping;
 - remediation of secret-dependent release codegen followed by passing static
   and dynamic physical-trace review;
-- authoritative license evidence for the exact distribution closure;
-- an explicit licensed-fork or replacement decision that owns recovery,
-  failure bounds, and ongoing compiler/backend qualification; and
+- a Sovright fork or replacement that owns recovery, failure bounds, and
+  ongoing compiler/backend qualification; and
 - written review that explicitly lifts the slice freeze.
+
+Work that answers or remediates those technical gates may continue while they
+remain open. Licensing is a parallel release-readiness concern, not a Phase 0
+kill gate: preserve the exact dependency inventory, pursue authoritative
+license and notice texts for the distribution closure, and review any AGPL
+verifier boundary as part of external-release due diligence.
 
 Server integration remains a separate, stricter go/no-go. It additionally
 requires:
@@ -670,7 +675,7 @@ Deliverables:
 - p50/p95/p99/p999 latency, sustained QPS, queueing, update contention, peak RSS, stash pressure, bandwidth, rebuild/RTO, and key-rotation results;
 - release-binary instruction, page/memory-access, allocation, timing, frame, log, and admin-traffic traces across contrasting secret cases;
 - independent cryptographic/side-channel, Rust memory-safety, TEE/deployment, and leakage-claim audit;
-- resolved dependency licenses and pinned SHAs/compiler.
+- recorded dependency-license/SBOM inventory and pinned SHAs/compiler.
 
 Acceptance:
 
@@ -751,14 +756,14 @@ Every new persistent/wire round trip lives next to the conversion. Production co
 | storage rollback | valid measurement serves stale state | attest epoch/root, client freshness/height policy, rollback witness or rebuild |
 | logging/metrics | direct or outcome side channel | allowlisted aggregate schema and automated trace/log review |
 | TDX/DOIT overclaim | unmodeled side channels | narrow published claim, attest DOIT state, multi-CPU test, independent audit |
-| licensing ambiguity | redistribution/compliance blocker | obtain root license confirmation; isolate/replace AGPL verifier boundary |
+| licensing ambiguity | release-readiness and compliance concern | obtain root license confirmation before external release; keep the AGPL verifier isolated unless separately reviewed |
 | upstream fork drift | expensive rebases/security fixes missed | isolate new crate/proto, minimize edits to legacy paths, regularly rebase on `dev` |
 
 ## Upstream dependency assessment
 
 ### `rostl`
 
-Reviewed at [`8c3a12d2`](https://github.com/obliviouslabs/rostl/commit/8c3a12d2febf17b024f2e949428b3bc526d74172): research-quality building blocks, not a turnkey persistent Zaino backend. The selected path is directly affected by compiler-preserved obliviousness ([#8](https://github.com/obliviouslabs/rostl/issues/8)), Circuit ORAM stash recovery ([#13](https://github.com/obliviouslabs/rostl/issues/13)), and failure-probability testing ([#24](https://github.com/obliviouslabs/rostl/issues/24)). Map queue recovery ([#32](https://github.com/obliviouslabs/rostl/issues/32)) applies only if `rostl-datastructures` is adopted. Do not ship upstream unchanged: after license clearance, use a Sovright fork that owns these risks or replace the backend. The manifest declares `MIT OR Apache-2.0`, but a root license file was not recognized during review; confirm before distribution.
+Reviewed at [`8c3a12d2`](https://github.com/obliviouslabs/rostl/commit/8c3a12d2febf17b024f2e949428b3bc526d74172): research-quality building blocks, not a turnkey persistent Zaino backend. The selected path is directly affected by compiler-preserved obliviousness ([#8](https://github.com/obliviouslabs/rostl/issues/8)), Circuit ORAM stash recovery ([#13](https://github.com/obliviouslabs/rostl/issues/13)), and failure-probability testing ([#24](https://github.com/obliviouslabs/rostl/issues/24)). Map queue recovery ([#32](https://github.com/obliviouslabs/rostl/issues/32)) applies only if `rostl-datastructures` is adopted. Do not ship upstream unchanged: proceed with a Sovright fork that owns these risks or replace the backend. The manifest declares `MIT OR Apache-2.0`, but a root license file was not recognized during review; pursue canonical license and notice texts in parallel and resolve the evidence gap before external release.
 
 ### `oblivious_node`
 

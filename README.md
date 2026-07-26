@@ -78,11 +78,13 @@ LICENSE                            Apache-2.0 license text
 ## ORAM research-fork status
 
 The ORAM work is an experimental, non-published, default-off research
-subsystem. Phase 0 remains **NO-GO for private-server integration and
-redistribution**. A reproducible full-Mainnet aggregate capture and honest
-current-corpus logical sizing now exist, but target-TDX RSS/headroom, growth,
-backend calibration, insertion/failure bounds, compiled obliviousness, and
-redistribution licensing remain unresolved.
+subsystem. Phase 0 remains **NO-GO for private-server integration** on technical
+grounds. A reproducible full-Mainnet aggregate capture and honest current-corpus
+logical sizing now exist, but target-TDX RSS/headroom, growth, backend
+calibration, insertion/failure bounds, and compiled obliviousness remain
+unresolved. The pinned dependency manifests declare `MIT OR Apache-2.0`, while
+authoritative repository license and notice files remain unconfirmed; this is
+tracked as distribution-readiness due diligence, not a Phase 0 blocker.
 
 Detailed implementation chronology belongs outside this README. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),

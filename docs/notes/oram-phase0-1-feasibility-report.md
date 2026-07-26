@@ -1,12 +1,15 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-15
-- Phase 0 stop-gate update (2026-07-23): later feature slices are frozen at
+- Phase 0 technical stop-gate update (2026-07-23): private-server integration
+  and deployment remain closed at
   `3a84280c3b727b434f26b424c4abad90f192d909`. The concise
   [kill-gate report](oram-phase0-kill-gates-2026-07-23.md) records the live
   mainnet-source sync, a compiled secret-dependent branch in the exact-source
-  deterministic release, the unresolved `rostl` redistribution evidence, and
-  the conditional-fork decision.
+  deterministic release, the `rostl` redistribution concern, and the
+  fork-or-replace decision. Licensing is now tracked as pre-distribution due
+  diligence, not as a Phase 0 blocker or a restriction on technical-gate
+  remediation and backend-fork work.
 - Gate 1 capture update (2026-07-26): the reproducible full-Mainnet aggregate
   capture and current-corpus logical sizing completed at combined source
   `d35d158a9826c75a4ec1c31932c29b43cf4c7163`. The
@@ -100,8 +103,13 @@
 **Current decision: NO-GO for private-server integration, deployment, or any
 mainnet/host-oblivious privacy claim.**
 
-**Offline research may continue** in the non-published `zaino-oram` package.
-It is now limited to work that answers or remediates a Phase 0 kill gate.
+Technical Gate 1 remains incomplete on growth, backend calibration,
+insertion/failure bounds, and measured target-TDX RSS. Technical Gate 2 remains
+failed on the compiled secret-dependent branch.
+
+**Offline implementation and research that answers or remediates the technical
+Phase 0 gates may continue** in the non-published `zaino-oram` package.
+Licensing is tracked in parallel and adds no separate implementation freeze.
 The implemented work is useful evidence for API shape, fixed records, aggregate
 corpus accounting, logical schedules using a concrete runtime-owned
 `FrozenRecentSnapshot<N>` with an internally computed content commitment bound
@@ -159,9 +167,10 @@ expiry, garbage-collection execution, deletion, count reduction, compaction,
 reclamation, or bounded retention; capacity remains lifetime cumulative and
 the ten-phase schedule is unchanged.
 
-This is a gate decision, not a conclusion that ORAM is infeasible. Server work
-must remain closed until the Phase 0 blockers in this report have measured,
-reviewable results and the decision is revisited.
+This is a technical gate decision, not a conclusion that ORAM is infeasible.
+Private-server integration, deployment, and host-oblivious privacy claims must
+remain closed until the technical Phase 0 blockers in this report have
+measured, reviewable results and the decision is revisited.
 
 The completed full-Mainnet capture clears the corpus-availability part of
 Gate 1, but does not change this decision. Its two offline models are logical
@@ -677,7 +686,8 @@ The following statements are **not** established by that evidence:
   finalization feed remains open;
 - static fixture parity is not live-backend shadow parity, finalised-database
   parity, reorg/seam coverage, a source-call trace, or mainnet evidence;
-- dependency licensing is not cleared for the intended distribution.
+- dependency licensing remains a pre-distribution due-diligence concern, not a
+  Phase 0 feasibility blocker.
 
 ## Gate scorecard
 
@@ -696,8 +706,8 @@ The following statements are **not** established by that evidence:
 | Compiler pin | Pass for the current ORAM release procedure | Repository pins Rust 1.96.0; the receipt fixes the Linux-musl release profile, feature set, Rust flags, and source-date epoch | Independently pin and verify the complete builder image, LLVM behavior, and native-tool closure |
 | Release artifact identity/repeatability | Partial generic-builder pass | At exact head `a7172384`, two rootless-Podman no-cache builds matched and the published binary/receipt pair passed final verification; the receipt binds local source and build inputs plus binary identity | Repeat on an independent builder, add trusted CI and signed/attested provenance, and keep physical-trace, mainnet, target-CPU, and TDX gates separate |
 | CPU/target/TDX pin | Partial target-class gate | An Ubuntu 24.04 x86_64 CI lane with immutable action pins executes the real adapter; the hosted image, CPU generation, TDX instance, firmware/TCB, DOIT, and memory remain unset | Select CPU generations, exact target/release flags, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
-| Pinned ORAM dependency | Upstream unchanged is NO-GO | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock`; the selected path is affected by compiler-preservation, stash-recovery, and failure-bound gaps | After license clearance, own those gaps in a Sovright fork or replace the backend |
-| Dependency/license inventory | Blocked | Manifest declarations recorded below; `rostl` checkout has no root license text | Obtain authoritative license files/confirmation and complete automated transitive audit |
+| Pinned ORAM dependency | Upstream unchanged is technical NO-GO | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock`; the selected path is affected by compiler-preservation, stash-recovery, and failure-bound gaps | Own those technical gaps in a Sovright fork or replace the backend; run license diligence in parallel |
+| Dependency/license inventory | Concern; not a Phase 0 gate | Manifest declarations recorded below; `rostl` checkout has no root license text | Obtain authoritative license files/confirmation and complete an automated transitive audit before redistribution |
 | Random full-map experiments | Partial builder foundation | Fixed `SmokeV1` covers a 64-step mixed workload, while separate `FullMapSaturationV1` workers exercise exact logical admission failures. Source-bound `BuilderFoundationV1` adds a deterministic shuffled 256-command hot/cold read/unique-append workload that fills both sizing-derived logical admission limits inside a fixed builder envelope and requires logical occupied-probe collisions. It is neither random/adversarial physical full-map load nor a long-run benchmark | Run mixed random reads/inserts and adversarial collisions at measured full-mainnet target capacity/load; keep that result schema separate from all deterministic profiles |
 | Memory/RSS gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` samples process-wide `VmRSS` before spawn, after spawn, after warmup, and after the measured phase, plus process-lifetime `VmHWM`, on Linux x86_64. The HWM includes driver/runtime memory predating the run. This is whole-process generic-builder evidence, not backend-only memory or intended-TDX headroom | Measure peak RSS, initialization pressure, page faults, and swapping on intended TDX hardware with at least 30% headroom |
 | Latency/stash/queue gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` records synchronous typed-worker call latency and mixed-phase wall-clock completion rates with a single caller and queue capacity one. Synthetic input preparation and verification are outside command latency but inside the phase wall; per-class rates are not isolated throughput. It also records clean-shutdown lifecycle/queue counters, while queue contention is unmeasured and stash/physical access is backend-unobservable | Record target-hardware latency distribution, sustained QPS, stash pressure, loaded queue depth, update contention, and failure behavior |
@@ -708,8 +718,9 @@ The following statements are **not** established by that evidence:
 | Go/no-go stakeholder acceptance | Missing | No accepted numeric profile or client contract | Security, operator, and client teams approve the exact leakage budget |
 
 Phase 0 does not pass. Mainnet capacity, hardware memory, physical behavior,
-recovery, and licensing are independent blockers; satisfying only one does not
-open the server gate.
+and recovery remain independent technical blockers; satisfying only one does
+not open the server gate. Licensing remains separate pre-distribution due
+diligence and does not block technical-gate remediation or backend-fork work.
 
 ### Phase 1 — deterministic contract
 
@@ -833,20 +844,23 @@ behavior, target CPU features, or TDX isolation.
 | `zaino-state` | Local/version `0.3.1`, optional, no default features | Indexed-block corpus adapter | Workspace Apache-2.0 | Enabled only by `corpus-zaino` |
 | `bytemuck` | `1.25.1`, derive/min-const-generics | Exact `Pod` record proof | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
 | `bytemuck_derive` | `1.11.0` | Derive transitive | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
-| `rostl-oram` | `0.1.0-alpha9`, [`8c3a12d2...`](https://github.com/obliviouslabs/rostl/commit/8c3a12d2febf17b024f2e949428b3bc526d74172) | Volatile candidate Circuit ORAM | Workspace manifest: `MIT OR Apache-2.0`; no root `LICENSE`/`COPYING` file found in pinned checkout | Distribution blocker pending authoritative text/confirmation |
-| `rostl-primitives` | Same alpha/version/commit | `Cmov` trait and primitives | Same inherited manifest declaration; same missing root license text | Distribution blocker |
-| `rostl-sort` | Same alpha/version/commit, transitive | `rostl-oram` transitive | Same inherited manifest declaration; same missing root license text | Distribution blocker |
+| `rostl-oram` | `0.1.0-alpha9`, [`8c3a12d2...`](https://github.com/obliviouslabs/rostl/commit/8c3a12d2febf17b024f2e949428b3bc526d74172) | Volatile candidate Circuit ORAM and current optional dependency | Workspace manifest: `MIT OR Apache-2.0`; no root `LICENSE`/`COPYING` file found in pinned checkout | Pre-distribution diligence; not a Phase 0 blocker |
+| `rostl-primitives` | Same alpha/version/commit | Current optional `Cmov` dependency | Same inherited manifest declaration; same missing root license text | Pre-distribution diligence; not a Phase 0 blocker |
+| `rostl-sort` | Same alpha/version/commit, transitive | Current optional `rostl-oram` transitive dependency | Same inherited manifest declaration; same missing root license text | Pre-distribution diligence; not a Phase 0 blocker |
 | `assume` | `0.5.0`, transitive | `rostl` primitive support | Manifest: `MIT OR Apache-2.0` | Include in final automated audit |
 | `static_assertions` | `1.1.0`, transitive | `rostl` compile-time checks | Manifest: `MIT OR Apache-2.0` | Include in final automated audit |
 | `rand` family | Direct optional `rand 0.9.4` plus locked transitives | Uniform experimental remap-position sampling and upstream randomness | `rand` manifest: `MIT OR Apache-2.0` | Entropy source remains subject to TDX review; full transitive audit still required |
 | `rostl-datastructures` | Assessed at the same commit; not linked | Possible map layer | Same manifest family; macOS build is blocked by Linux-specific affinity code | Excluded from current dependency graph |
 | [`oblivious_node`](https://github.com/obliviouslabs/oblivious_node/commit/d00718dfdfd38dd50ec2e315e35ab54f25cd5067) | Reference only | Architecture/TDX precedent | Not a dependency and not cleared for redistribution here | Do not copy or ship |
-| TDX runtime and quote verifier | None selected | Attestation and TLS binding | No approved dependency inventory; the reference verifier boundary noted in the plan remains license-sensitive | Blocker before TDX integration |
+| [`tdx_easy_https` / `tdx_quote_verifier`](https://github.com/obliviouslabs/tdx_easy_https/blob/bd48faebeb21a385b8cd7e4451c107e5c60df02c/client/tdx_quote_verifier/Cargo.toml) | Reference only; not selected | Possible attestation-verifier precedent | The reference crate declares `AGPL-3.0-or-later`; it is absent from Zaino manifests, `Cargo.lock`, and all-feature Cargo trees | Separate license/integration review if considered; no current dependency-closure or Phase 0 blocker |
 
-The table is an engineering inventory, not legal advice. The final gate needs
-an automated license/SBOM review of the exact release closure plus authoritative
-license texts for git dependencies. A manifest string alone is insufficient for
-the intended redistribution decision.
+The table is an engineering inventory, not legal advice. Before redistribution,
+the exact release closure needs an automated license/SBOM review plus
+authoritative license texts for git dependencies. A manifest string alone is
+insufficient for that decision. This is pre-distribution due diligence, not a
+Phase 0 feasibility gate or reason to pause technical-gate remediation. The
+AGPL-declared verifier above is reference-only and is not part of the current
+dependency closure; adopting or copying it would trigger a separate review.
 
 ## Verification evidence
 
@@ -1216,23 +1230,26 @@ Until one of the persistence options in the delivery plan is implemented and
 tested—or a measured cold rebuild meets the accepted RTO—the private endpoint
 must not exist, or must remain unready in a later offline prototype.
 
-## Work allowed under the NO-GO
+## Work under the technical NO-GO
 
-Only work that answers or remediates a Phase 0 kill question remains in scope:
+Work that answers or remediates a technical Phase 0 gate may continue under
+accurate experimental labeling. The priorities are:
 
 1. apply approved growth and backend-calibration inputs to the completed
    explicit-checkpoint Mainnet capture, define insertion/failure bounds, and
    obtain target-TDX RSS/no-swap measurements with at least 30% headroom;
 2. remediate the exact-source secret-dependent branch, then rerun static
    disassembly and dynamic instruction/memory/page/timing qualification;
-3. obtain authoritative `rostl` license confirmation and canonical license and
-   notice texts for the exact distribution closure;
-4. after license clearance, size and review the conditional Sovright fork or
-   select a replacement, explicitly owning recovery, failure bounds, and the
-   ongoing compiler/backend qualification matrix; and
-5. obtain written independent review of those four results before resuming any
-   service, provider, replay, controller, schema, transport, or artifact-plumbing
-   slice.
+3. size and review a Sovright-owned fork or select a replacement,
+   explicitly owning recovery, failure bounds, and the ongoing compiler/backend
+   qualification matrix; and
+4. obtain written independent review of the technical gate results before
+   private-server integration, deployment, or a host-oblivious privacy claim.
+
+In parallel, obtain authoritative `rostl` license confirmation and canonical
+license and notice texts for the exact distribution closure. That work is
+release due diligence, not a Phase 0 kill question, and does not add to the
+technical slice freeze.
 
 ## Conditions to change the decision
 
@@ -1244,10 +1261,14 @@ following, not a subset:
   at least 30% RSS headroom and no swapping;
 - remediated secret-dependent release codegen followed by passing static and
   dynamic physical-trace review;
-- authoritative license evidence for the exact distribution closure;
-- an accepted licensed-fork or replacement decision that owns recovery,
-  failure bounds, and ongoing compiler/backend qualification; and
-- a written review that explicitly lifts the slice freeze.
+- an accepted fork or replacement decision that owns recovery, failure bounds,
+  and ongoing compiler/backend qualification; and
+- a written review that explicitly lifts the technical slice freeze.
+
+Authoritative license evidence and the exact-closure license/SBOM review remain
+required before redistribution. They are not conditions for technical-gate
+remediation, backend-fork work, or changing this technical feasibility
+decision.
 
 Private-server integration is a separate, stricter decision. It additionally
 requires target-load latency/stash/queue/failure results with typed fail-closed

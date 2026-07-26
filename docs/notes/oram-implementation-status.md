@@ -5,6 +5,9 @@
 - Evidence ledger: [Phase 0/1 feasibility report](oram-phase0-1-feasibility-report.md).
 - Current stop-gate result:
   [Phase 0 kill-gate report](oram-phase0-kill-gates-2026-07-23.md).
+- Current project decision: Phase 0 remains NO-GO for private-server integration
+  on technical measurement and compiled-obliviousness grounds. Licensing
+  remains a tracked distribution-readiness concern, not a Phase 0 blocker.
 - Completed Gate 1 capture operation:
   [2026-07-26 mainnet capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
 
@@ -489,4 +492,6 @@ readiness evidence.
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the
-mainnet/RSS, recovery, side-channel, hardware, and licensing gates are open.
+mainnet/RSS, recovery, side-channel, and hardware gates are open. The missing
+authoritative repository license and notice evidence remains tracked as
+distribution-readiness due diligence, not a Phase 0 blocker.
