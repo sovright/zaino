@@ -1,10 +1,8 @@
 # ORAM Phase 0 kill-gate report — 2026-07-23
 
 - Evidence baseline: `3a84280c3b727b434f26b424c4abad90f192d909`.
-- Mainnet-capture compatibility source:
-  `c72beedf4761851a892d56bbea0564eae3e4f92e`.
-- Observable release-runner source:
-  `a53e3269a52567ff11b035dce10fa6ae21b265ad`.
+- Completed mainnet-capture source:
+  `d35d158a9826c75a4ec1c31932c29b43cf4c7163`.
 - Decision: **NO-GO for private-server integration and ORAM-enabled
   redistribution**.
 - Execution policy: later feature slices and qualification-artifact plumbing
@@ -17,114 +15,43 @@
 
 | Gate | Current result | Consequence |
 | --- | --- | --- |
-| Full-mainnet corpus, hot tail, and 30% TDX RSS headroom | **IN PROGRESS** | A release RPC benchmark made the full scan viable and the explicit-checkpoint run is active, but no full capture or sizing artifact exists yet. No capacity claim is permitted. |
+| Full-mainnet corpus, hot tail, and 30% TDX RSS headroom | **IN PROGRESS** | The reproducible full capture and current-corpus logical sizing completed. Growth, insertion/failure bounds, backend calibration, and target-TDX RSS/no-swap qualification remain open. |
 | Compiled `rostl` access-path obliviousness | **FAIL at the exact evidence source** | A secret hit/miss result directly controls conditional jumps even though both cases perform two logical ORAM accesses. The current path cannot make a host-obliviousness claim. |
-| Redistribution licensing | **BLOCKED** | The selected `rostl` crates declare permissive SPDX metadata but the pinned repository contains no authoritative license/notice file. Keep the feature internal and default-off until the rights holder confirms the grant and supplies the required texts. |
+| Redistribution licensing | **NO-GO: evidence unavailable** | The selected `rostl` crates declare permissive SPDX metadata but the pinned repository contains no authoritative license/notice file. This is not a finding that the code is unlicensed; keep the feature internal and default-off until the rights holder confirms the grant and supplies the required texts. |
 | Use upstream versus own the ORAM library | **DECIDED: do not ship upstream unchanged** | A production path requires a licensed Sovright fork or a replacement. Forking is conditional on license clearance and explicit ownership of compiler, recovery, and failure-bound work. |
 
-One failed kill gate is sufficient to keep the project at NO-GO. The mainnet
-capture remains worth completing because it answers an independent feasibility
-question and bounds any replacement backend.
+One failed kill gate is sufficient to keep the project at NO-GO. The completed
+mainnet capture answers an independent feasibility question and bounds any
+replacement backend.
 
 ## Gate 1: mainnet corpus and TDX fit
 
-The bootstrap project had no mainnet source. A read-only inventory found an
-existing unpruned Zebra 6.2.0 canary in `sovright-bedrock-mainnet`; no production
-configuration, process, disk, or snapshot was changed. The existing hourly
-snapshot `zebra-auto-hourly-20260723-000120` was cloned into
-`sovright-testnet`, mounted on the retained `zaino-oram-build-20260713`
-builder, and opened successfully by Zebra 6.2.1 at database format 28.0.0.
-The builder is `n2-standard-16`, with 16 vCPU, approximately 62 GiB RAM, and no
-swap; it is not a Confidential VM.
+The reproducible direct-backend run at combined source `d35d158a` completed
+against explicit Mainnet checkpoint 3,425,046, hash
+`0000000000a1014e9564513f1d5e5ddaba027c032857a236ca3178e9a8983ad4`.
+Its atomic three-file artifact passed semantic and digest read-back validation.
+The measurement covers 3,425,047 blocks, 17,909,015 transactions, 9,193,009
+distinct standard addresses, and 351,872,272 lifetime standard-address events.
+The hottest address has 3,360,022 events.
 
-The snapshot tip was 3,421,740. A bounded gap feeder supplied only missing
-public blocks, each of which the local Zebra consensus verifier accepted. It
-stopped after checkpoint 3,422,700, then the node completed ordinary peer sync.
-Checkpoint 3,422,700 has RPC-order hash
-`0000000000b0632dd891632ddfca4ce4c849cd478036651f64403d6b05e492c7`;
-the isolated node, the existing canary, and Blockchair independently agreed.
-The research node remains unpruned Mainnet and binds its RPC, health, and
-metrics endpoints to host loopback.
+The smallest supported strict power-of-two capacities are 16,777,216 directory
+entries and 536,870,912 event entries. The measured hot tail forces
+13,440,092 logical accesses per fixed-work request under the current formula.
+The compiled-record logical allocation is 46,875,541,504 bytes
+(approximately 43.66 GiB).
 
-The exact-baseline runner failed closed before scanning: the validator reported
-NU6.3 at height 3,428,143 while the lockfile's Zebra Chain 11.0 Mainnet schedule
-returned `None`. The dedicated compatibility commit `c72beedf` raises only the
-workspace `zebra-chain` floor to 11.1, resolves its required stable Zcash
-dependency cohort, and adds a regression test at the failing
-`verify_reported_upgrades` seam. The targeted test passed on the builder with
-255 unrelated tests filtered. The rebuilt 641,161,392-byte debug runner has
-SHA-256
-`e532fc45137e76db57ade0b26dea74b6589b501eee0babb9e86560c0b636cf94`.
-It completed a genesis artifact, exercising the corrected live handshake and
-the successful atomic-publication path.
+Both the 88 GiB and 176 GiB offline models report current-corpus logical fit
+with 30% reserved headroom. They also honestly report
+`insertion_bound = false`, `backend_calibrated = false`, and
+`rss_measured = false`, with zero growth horizon and zero annual growth.
+Therefore the necessary-condition corpus result passes, but Gate 1 remains
+**IN PROGRESS**. It still requires approved growth inputs, insertion/failure
+bounds, calibrated backend expansion, and target-TDX peak RSS with no swap and
+at least 30% measured headroom.
 
-The initial RPC throughput result was an unoptimized debug-build diagnostic:
-an explicit 10,000 checkpoint sample scanned 10,001 blocks in 689.82 seconds
-at 316,200 KiB peak RSS. The exact release runner from `a53e3269` changes that
-operational conclusion. Its 33,097,360-byte binary has SHA-256
-`2872b1dbb59582f4f98ae38722f1de9be6203b81e6137093401029dc7c7dd572`.
-It scanned the same 10,001-block checkpoint in 72.47 seconds after capture
-start, or 86.13 seconds including process startup. The systemd cgroup reported
-19.8 MiB peak memory and zero swap. This is still only a throughput diagnostic,
-not corpus or TDX evidence.
-
-The direct-backend experiment remains useful but is no longer on the critical
-path. Stock `zfnd/zebra:6.2.1` was built without Zebra's compile-time `indexer`
-feature, so the exact v6.2.1 tag
-(`f3edc40601b4a377693a32c982d4cddf1795fb6f`) was rebuilt with that one feature.
-The 184,103,736-byte binary has SHA-256
-`e827a35ff84a3d52928d0820340aa61c4d08e2295524c97e707fad2af7c7db31`.
-The indexer-only migration completed on a disposable clone and a genesis
-capture exercised the direct handshake. A later live replay held the local
-read state at 3,421,784 while the stable validator stayed at 3,422,784. The
-first streamed hash,
-`00000000003aa2bdeedc6917c1455370a46823135b0305c70fac9d8e8e03fc7a`,
-was already the secondary database's finalized tip; `zebra-rpc` then reported
-`NotReadyToBeCommitted` for that same hash and retried the stream every second.
-This is a stale non-finalized-snapshot root-boundary interoperability defect,
-not evidence of successful replay. A safe repair must exclude a known finalized
-root or prove the exact candidate hash already canonical before skipping it;
-suppressing contextual validation or skipping by height would be unsafe. No
-direct capture was represented as corpus evidence.
-
-The first full release RPC trace started on the builder at 2026-07-24 02:52:31
-UTC against explicit checkpoint 3,423,024 with RPC-order hash
-`00000000001de8639497d8903942f3a0e3130082977e0d23c578cf542533773f`.
-It reached height 290,000 with a 3.0 GiB cgroup memory peak and zero swap before
-being intentionally stopped; no partial artifact was published.
-
-The authoritative run uses the same binary and checkpoint on
-`zaino-oram-tdx-c3-44-20260724-v2`, a `c3-standard-44` instance that Google
-Cloud reports as configured for Intel TDX with terminate-on-maintenance. The
-Ubuntu 24.04 host's 10,001-block smoke scanned in 65.54 seconds. The full run
-started at 2026-07-24 03:20:49 UTC and reported serviceable height 3,423,046.
-At height 100,000 it had a 3.002 GiB cgroup memory peak and zero swap. These
-configuration and runtime counters are not a TDX attestation. The final elapsed
-time, measurement files, artifact digests, corpus counts, hot tail, and sizing
-result belong here only after atomic publication and read-back validation
-complete. Until then, Gate 1 stays **IN PROGRESS** and no capacity claim is
-permitted.
-
-Google Cloud currently supports Intel TDX in `us-central1-a`, `-b`, and `-c`
-only on regular `c3-standard-*` instances. The existing `n2` VM cannot be
-converted in place. The first two candidate qualification targets are:
-
-| Target | RAM | Maximum allowed peak RSS with 30% headroom |
-| --- | ---: | ---: |
-| `c3-standard-22` | 88 GiB | 61.6 GiB |
-| `c3-standard-44` | 176 GiB | 123.2 GiB |
-
-Use `c3-standard-22` only if the full-capacity result stays below 61.6 GiB with
-no swapping. Otherwise qualify `c3-standard-44`. The offline sizing model is
-not an RSS measurement: it still requires explicit growth, capacity,
-admission, hot-address, position-map-width, and backend-expansion assumptions,
-then a target-TDX run must measure peak RSS and swapping.
-
-References:
-
-- [Zebra system requirements](https://zebra.zfnd.org/user/requirements.html)
-- [Supported Confidential VM configurations](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/supported-configurations)
-- [Creating an Intel TDX Confidential VM](https://docs.cloud.google.com/confidential-computing/confidential-vm/docs/create-a-confidential-vm-instance)
+The exact build identities, runtime counters, artifact sizes, counts, digests,
+and sizing limitations are recorded in the
+[dated capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
 
 ## Gate 2: compiled access-path obliviousness
 
@@ -264,9 +191,9 @@ patches.
 
 ## Next allowed work
 
-1. Finish the active explicit-checkpoint release RPC capture, validate its
-   three-file publication and digests, then run the honest current-corpus
-   logical-floor sizing check before any growth or RSS claim.
+1. Obtain approved growth and backend-calibration inputs, define the
+   insertion/failure bound, and measure peak RSS plus swap on the intended TDX
+   target with at least 30% headroom.
 2. Remediate the exact-source compiled branch finding, then rerun static and
    dynamic qualification.
 3. Ask the `rostl` rights holder for license confirmation and canonical texts;

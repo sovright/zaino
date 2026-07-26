@@ -7,6 +7,13 @@
   mainnet-source sync, a compiled secret-dependent branch in the exact-source
   deterministic release, the unresolved `rostl` redistribution evidence, and
   the conditional-fork decision.
+- Gate 1 capture update (2026-07-26): the reproducible full-Mainnet aggregate
+  capture and current-corpus logical sizing completed at combined source
+  `d35d158a9826c75a4ec1c31932c29b43cf4c7163`. The
+  [dated capture log](oram-phase0-mainnet-capture-log-2026-07-26.md) records
+  exact inputs, runtime counters, aggregates, digests, and limitations. Gate 1
+  remains open because growth, insertion/failure bounds, backend calibration,
+  and target-TDX RSS/no-swap headroom are unmeasured.
 - Evaluated fresh-worker rebuild code head:
   `feat/oram-source-bound-cold-rebuild` at
   `15f60d3014428e04e7a42779c9a8c2c7cc7a583d`, stacked on recovery evidence
@@ -88,7 +95,7 @@
 - Delivery plan: [ORAM-enabled Zaino plan](oram-enabled-zaino-plan.md)
 - Design seed: [TEE-backed Zaino/lightwalletd sketch](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3)
 
-## Decision
+## Current Phase 0 decision
 
 **Current decision: NO-GO for private-server integration, deployment, or any
 mainnet/host-oblivious privacy claim.**
@@ -155,6 +162,10 @@ the ten-phase schedule is unchanged.
 This is a gate decision, not a conclusion that ORAM is infeasible. Server work
 must remain closed until the Phase 0 blockers in this report have measured,
 reviewable results and the decision is revisited.
+
+The completed full-Mainnet capture clears the corpus-availability part of
+Gate 1, but does not change this decision. Its two offline models are logical
+necessary-condition checks, not measured ORAM or target-TDX capacity results.
 
 ## Evidence boundary
 
@@ -470,9 +481,10 @@ The following statements are **not** established by that evidence:
   capacity, or final workload;
 - the 72-byte record has not been benchmarked at mainnet capacity;
 - no production privacy profile or accepted profile constants exist;
-- no mainnet corpus report, target-TDX RSS or latency result, stash result,
-  target-load queue-contention result, assembly result, or physical trace result
-  exists. `BuilderFoundationV1` measures process-wide RSS plus process-lifetime
+- the full-Mainnet aggregate report now exists, but no target-TDX RSS or
+  latency result, stash result, target-load queue-contention result, passing
+  assembly result, or physical trace result exists. `BuilderFoundationV1`
+  measures process-wide RSS plus process-lifetime
   HWM, typed-worker call latency, mixed-phase completion rates, and lifecycle
   counters only on a generic builder;
   it exposes neither backend stash state nor physical accesses and is not
@@ -676,11 +688,11 @@ The following statements are **not** established by that evidence:
 | Recorded fork baseline | Pass | Branch merge-base is `c94ae247`; fork remote is `sovright/zaino` | Keep the baseline/current rebases recorded |
 | Threat model and architecture ADR | Pass for research | ADR-0007 is accepted for the research fork | Security and client teams must still accept final constants and claim |
 | Explicit leakage matrix | Draft in this report | Categories are enumerated below | Assign fixed budgets, owners, tests, and formal acceptance |
-| Aggregate corpus implementation | Partial | Identifier-free measurement, mainnet-only capture runner, fixed indexed snapshot, explicit checkpoint verification, semantic and digest read-back validation, atomic three-file publication, nonempty fixture, same-block spend, standard/nonstandard accounting | Execute the runner and produce a reproducible full-mainnet artifact |
-| Mainnet counts/distributions and growth | Missing | No mainnet output artifact exists | Measure distinct standard scripts, lifetime events, live/peak UTXOs, hot tails, script classes, record sizes, and selected growth horizon |
+| Aggregate corpus implementation | Pass for aggregate capture | The source-bound direct runner completed a full-Mainnet scan at checkpoint 3,425,046 and atomically published exactly three read-back-validated files. The measurement digest is `aba46f64da0113d9b0e93209ab4a8a98626d6d5bc7973444c8bf766a1922b127` | Preserve the artifact and reproduce independently when required |
+| Mainnet counts/distributions and growth | Partial | The artifact reports 9,193,009 distinct standard addresses, 351,872,272 lifetime standard-address events, 27,500,704 live standard UTXOs, 73,552 live nonstandard outputs, and a 3,360,022-event hot tail. No approved growth horizon or annual growth input exists | Approve and model a defensible growth horizon, including a potentially worsening hot-address tail |
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov`; generic native Linux CI constructs separate real 38/82-byte backend monomorphizations and exercises both | Measure the target-capacity profile on the selected CPU/TDX platform |
 | Fixed-probe table layout | Partial real integration | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, a complete bounded-history preflight, and a bounded worker with no raw storage bypass. A private offline owner validates exact projection/layout identity and admission limits before composing the coordinator and worker; generic native Linux CI runs 8/16-entry typed stores and the worker-owned exact executor | Add authenticated generation ownership and crash-safe commit/rebuild; select measured capacities/probe counts and trace the backend on target hardware |
-| Full-capacity logical sizing | Partial pass | Version-2 reports bind compiled 38/82-byte cells to shared directory/event allocation validation, charge both full table and position-map domains, keep modeled bytes fixed across occupancy/growth, and expose load/admission/hot-address/modeled-memory flags plus explicit negative evidence markers. Offline `corpus size` consumes a complete validated capture, recomputes every row, and atomically binds measurement/model/result digests. Read-only `corpus validate-sizing` can reopen the existing bundles and require the same source-bound recomputation without emitting another artifact | Calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and runtime working set on target hardware; select an accepted mainnet profile |
+| Full-capacity logical sizing | Partial pass | Strict current-corpus capacities are 16,777,216 directory and 536,870,912 event entries. The compiled-record logical allocation is 46,875,541,504 bytes and the hot tail forces 13,440,092 logical accesses per request. Validated 88/176 GiB models report logical fit with 30% reserved headroom, but also `insertion_bound = false`, `backend_calibrated = false`, `rss_measured = false`, and zero growth | Add approved growth and insertion/failure bounds; calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and working set; measure the accepted target-TDX profile |
 | Compiler pin | Pass for the current ORAM release procedure | Repository pins Rust 1.96.0; the receipt fixes the Linux-musl release profile, feature set, Rust flags, and source-date epoch | Independently pin and verify the complete builder image, LLVM behavior, and native-tool closure |
 | Release artifact identity/repeatability | Partial generic-builder pass | At exact head `a7172384`, two rootless-Podman no-cache builds matched and the published binary/receipt pair passed final verification; the receipt binds local source and build inputs plus binary identity | Repeat on an independent builder, add trusted CI and signed/attested provenance, and keep physical-trace, mainnet, target-CPU, and TDX gates separate |
 | CPU/target/TDX pin | Partial target-class gate | An Ubuntu 24.04 x86_64 CI lane with immutable action pins executes the real adapter; the hosted image, CPU generation, TDX instance, firmware/TCB, DOIT, and memory remain unset | Select CPU generations, exact target/release flags, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
@@ -775,7 +787,7 @@ yet stakeholder-approved.
 | Client IP/network metadata | Permitted | Outside initial claim | No service exists | Not applicable yet |
 | Service/schema/profile ID | Permitted | Bound into attestation and publicly versioned | The inner codec carries a fixed test-only format version and a canonical 16-byte ID derived from the complete logical budget; there is no approved profile table, private schema, or attestation | Open |
 | Coarse network/chain epoch/height/hash/sync lag | Permitted | Public checkpoint and freshness policy | Corpus report plus offline oracle bind network, height/hash, schema, and key epoch with replay/rebuild decisions | Partial; authoritative live feed and serving policy absent |
-| Database capacity and projected growth | Permitted | Aggregate only, never identifier-bearing | Aggregate report types and redacted debug exist | Partial; no mainnet artifact |
+| Database capacity and projected growth | Permitted | Aggregate only, never identifier-bearing | Full-Mainnet aggregate report exists at checkpoint 3,425,046; growth horizon remains unapproved | Partial; measured current corpus, unmeasured growth |
 | Aggregate QPS/queue/health | Permitted within allowlist | No outcome/cardinality labels | An internal snapshot exists; no service metrics exporter or fixed-cadence aggregation/suppression policy exists | Open |
 | Logs, errors, traces, metric labels | Must exclude private values/outcomes | Allowlisted aggregate/public fields only | New sensitive types use redacted debug; no end-to-end log audit | Open |
 | CPU instructions/branches/timing | Must not distinguish secret cases above accepted threshold | Pinned release build, assembly review, classifier/trace gate | Not measured | Blocker |
@@ -982,51 +994,46 @@ is benchmark, mainnet, TDX, network, recovery, or side-channel evidence.
 
 ## Mainnet corpus and capacity blocker
 
-The scanner core now has useful safety properties: it requires a nonempty
-height-zero start, validates the network-bound canonical genesis hash and null
-genesis parent, checks contiguous heights and parent hashes, resolves spends
-from a genesis-forward live-output map, and returns an aggregate measurement
-bound to a public network/final height/hash checkpoint. Its returned measurement
-retains no address, transaction, or outpoint identifiers. Growth, table,
-backend-expansion, and memory assumptions are applied only after measurement and
-can be changed without rescanning.
+The full-Mainnet aggregate measurement is complete. The source-bound direct
+runner scanned genesis through explicit checkpoint 3,425,046 and atomically
+published exactly three read-back-validated files. The measurement retains no
+address, transaction, or outpoint identifiers. Its canonical compact-JSON
+BLAKE2s-256 digest is
+`aba46f64da0113d9b0e93209ab4a8a98626d6d5bc7973444c8bf766a1922b127`.
 
-It is not yet a mainnet measurement:
+The measured corpus contains 9,193,009 distinct standard addresses,
+351,872,272 lifetime standard-address events, 27,500,704 live standard UTXOs,
+and 73,552 live nonstandard outputs. The hottest two address histories contain
+3,360,022 and 3,360,020 events. Exact identities remain limited to standard
+P2PKH/P2SH scripts; nonstandard compact outputs are counted by class without
+inventing a false address identity.
 
-- the public `ChainIndex::get_indexed_block_by_height` point source and
-  `zainod-oram corpus capture` runner are implemented, including fixed-snapshot
-  checkpoint verification and atomic read-back-verified publication, but the
-  runner has not been executed against a full mainnet checkpoint and no output
-  artifact exists;
-- no mainnet checkpoint, counts, histogram, hot-address tail, or growth output
-  is checked in or otherwise attached to this branch;
-- exact identities are available only for standard P2PKH/P2SH scripts;
-  nonstandard compact outputs are counted by class without inventing a false
-  address identity;
-- the separate sizing model charges every compiled 38-byte directory and
-  82-byte event cell across the full configured table capacities plus both full
-  position-map domains; projected occupancy affects only explicit
-  load/admission/hot-address flags, never allocated bytes;
-- the position-map entry width and backend expansion remain uncalibrated
-  operator assumptions. The model does not calculate the pinned backend's
-  actual tree blocks, recursive map levels, stash, initialization temporaries,
-  allocator overhead, or runtime working set, and admission fit is not a bound
-  on fixed-probe insertion success or collision probability;
-- proportional growth currently multiplies address counts within existing
-  histogram buckets; it does not forecast a worsening hot-address tail;
-- no growth horizon or target TDX memory size has been approved.
+The smallest supported power-of-two capacities strictly greater than measured
+occupancy are 16,777,216 directory entries and 536,870,912 event entries. The
+current hot tail makes the logical fixed-work floor
+`4 + 4H = 13,440,092` accesses per request. Charging the compiled 38-byte
+directory and 82-byte event cells plus four-byte position-map entries gives
+46,875,541,504 logical bytes, approximately 43.66 GiB.
 
-Therefore `fits_modeled_memory` and `fits_modeled_constraints` are model results
-only. Neither may be used as the 30%-RSS go/no-go result. Those projections are
-not part of the captured measurement artifact; the offline `corpus size`
-command recomputes them from explicit assumptions into a separate artifact.
-No full-mainnet sizing artifact has been produced yet.
-The load-foundation slice adds a read-only `corpus validate-sizing` command that
-reopens and revalidates those existing capture and sizing inputs and requires
-the same source-bound recomputation. It emits no additional artifact, accepts no
-runtime or workload tuning, instantiates no ORAM backend, store, or worker, and
-supplies no load measurement, performance result, hardware result, or mainnet
-result.
+The separately validated 88 GiB and 176 GiB sizing bundles report
+current-corpus logical fit with 30% reserved headroom and bind qualification
+digests
+`ac8ff6f13e00e63c1c6a49e377f2b9908074be247cb7319404cdfe4abf051ea8`
+and
+`7c16856d25d363e9409a05408f6c6e4b6c668236e2851abcb1eb47763cd0b0f2`.
+They also explicitly report `insertion_bound = false`,
+`backend_calibrated = false`, and `rss_measured = false`, with zero growth
+horizon and annual growth.
+
+Therefore `fits_modeled_memory` and `fits_modeled_constraints` remain logical
+model results only. They are not the 30%-RSS go/no-go result. The model does
+not calculate the pinned backend's actual tree blocks, recursive map levels,
+stash, initialization temporaries, allocator overhead, or runtime working set;
+admission fit is not a bound on insertion success or collision probability.
+Approved growth must also consider a worsening hot-address tail rather than
+only proportionally scaling existing histogram buckets. The exact operational
+evidence is in the
+[dated capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
 
 ## RSS, benchmark, stash, and queue blockers
 
@@ -1069,7 +1076,8 @@ persistence/recovery, a `10^9`-operation failure bound, signed or attested
 execution, backend physical-obliviousness, or mainnet readiness. Required
 evidence still includes:
 
-1. a full mainnet build at an explicit public checkpoint and growth horizon;
+1. an approved growth horizon applied to the completed explicit-checkpoint
+   Mainnet measurement;
 2. random full-map mixed reads/inserts, adversarial collision patterns, and
    realistic update/query interleaving;
 3. p50/p95/p99/p999 latency, throughput, queueing, and update contention;
@@ -1212,10 +1220,9 @@ must not exist, or must remain unready in a later offline prototype.
 
 Only work that answers or remediates a Phase 0 kill question remains in scope:
 
-1. complete one explicit-checkpoint full-mainnet capture, report the hot tail,
-   run the current-corpus logical-floor diagnostic, and obtain approved growth,
-   backend-calibration, and target-TDX measurements if that necessary condition
-   passes;
+1. apply approved growth and backend-calibration inputs to the completed
+   explicit-checkpoint Mainnet capture, define insertion/failure bounds, and
+   obtain target-TDX RSS/no-swap measurements with at least 30% headroom;
 2. remediate the exact-source secret-dependent branch, then rerun static
    disassembly and dynamic instruction/memory/page/timing qualification;
 3. obtain authoritative `rostl` license confirmation and canonical license and

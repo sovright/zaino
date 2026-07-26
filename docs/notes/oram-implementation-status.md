@@ -5,6 +5,8 @@
 - Evidence ledger: [Phase 0/1 feasibility report](oram-phase0-1-feasibility-report.md).
 - Current stop-gate result:
   [Phase 0 kill-gate report](oram-phase0-kill-gates-2026-07-23.md).
+- Completed Gate 1 capture operation:
+  [2026-07-26 mainnet capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
 
 This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or

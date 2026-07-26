@@ -4,16 +4,19 @@
   for server integration** pending the measured blockers in
   [the feasibility report](oram-phase0-1-feasibility-report.md).
 - Prepared: 2026-07-12.
-- Updated: 2026-07-23.
+- Updated: 2026-07-26.
 - Target fork point: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d), the live `origin/dev` head inspected for this plan.
 - Design seed: [TEE-backed lightwalletd / Zaino with `rostl` and `oblivious_node`](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3).
 
-## Current gate status
+## Current Phase 0 decision
 
 Phase 0 remains a stop gate and is **NO-GO for server integration** until the
 measured blockers in the concise
 [kill-gate report](oram-phase0-kill-gates-2026-07-23.md) and complete
 [feasibility report](oram-phase0-1-feasibility-report.md) clear.
+The full-Mainnet aggregate capture and current-corpus logical sizing are
+complete, but Gate 1 remains open for growth, backend calibration,
+insertion/failure bounds, and measured target-TDX RSS/no-swap headroom.
 Implementation chronology belongs in the
 [separate status log](oram-implementation-status.md), not in this normative
 architecture and delivery plan.
