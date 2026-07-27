@@ -6,7 +6,9 @@
 //! its pinned serving epoch is still current after response encoding. It does
 //! not provide a production key/session owner, nonce source, trusted clock,
 //! replay database, listener, transport-write guard, physical ORAM trace,
-//! timing result, or TDX claim.
+//! timing result, or TDX claim. The round's Unix-seconds value is only observed
+//! host/fixture input used by token issue and validation; it does not authorize
+//! replay-journal maintenance or claim retirement.
 
 use crate::{
     continuation_token::{
@@ -671,6 +673,9 @@ where
                 .map_err(|_| self.latch_failure())?,
         )
         .map_err(|_| self.latch_failure())?;
+        // This observed round value drives token semantics only. Matching it to
+        // the reservation later prevents cross-round mixing, but does not turn
+        // it into a trusted clock or an eviction/maintenance cutoff.
         let initial_expiry = material
             .now_unix_seconds()
             .checked_add(profile.continuation_ttl_seconds())
@@ -684,7 +689,7 @@ where
             })?;
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             query_digest,
             epoch.checkpoint.projection_epoch,
             material.now_unix_seconds(),
@@ -1577,7 +1582,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        continuation_token::ContinuationProtectionContext,
+        continuation_token::{ContinuationProtectionContext, ContinuationReplayPlan},
         profile::test_profile_with_recent_snapshot,
         recent_snapshot::{
             serving_epoch_for_tests, FrozenRecentSnapshot, RecentSnapshotLineage,
@@ -1585,9 +1590,9 @@ mod tests {
         },
         records::{AddressKey, TransparentUtxo, UtxoQuery, ADDRESS_KEY_BYTES, TXID_BYTES},
         runtime_security::{
-            ContinuationReplayKey, ContinuationReplayPlan, ReplayCommitAuthority,
-            ReplayCommitResult, ReplayCommitUnavailable, ReplayDuplicateDecision, RequestReplayKey,
-            RoundReservationAuthority, SecurityEpochTag, SecurityRoundCapture,
+            ReplayCommitAuthority, ReplayCommitResult, ReplayCommitUnavailable,
+            ReplayDuplicateDecision, RequestReplayKey, RoundReservationAuthority, SecurityEpochTag,
+            SecurityRoundCapture, REPLAY_RECORD_KEY_BYTES,
         },
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
@@ -1974,7 +1979,7 @@ mod tests {
 
     struct CountingReplayGuard {
         claimed_requests: [Option<RequestReplayKey>; 16],
-        claimed: [Option<ContinuationReplayKey>; 16],
+        claimed: [Option<[u8; REPLAY_RECORD_KEY_BYTES]>; 16],
         calls: usize,
         real_claim_attempts: usize,
         logical_reads: usize,
@@ -2026,12 +2031,13 @@ mod tests {
             } else {
                 match continuation_plan {
                     ContinuationReplayPlan::Cover => (None, false),
-                    ContinuationReplayPlan::ClaimOrCover(key) => {
+                    ContinuationReplayPlan::ClaimOrCover(claim) => {
                         self.real_claim_attempts += 1;
+                        let key = *claim.replay_key_bytes();
                         let duplicate = self
                             .claimed
                             .iter()
-                            .any(|candidate| candidate.as_ref() == Some(key));
+                            .any(|candidate| candidate.as_ref() == Some(&key));
                         (Some(key), duplicate)
                     }
                 }
@@ -2062,7 +2068,7 @@ mod tests {
                 };
                 self.claimed_requests[request_slot] = Some(*request_key);
                 if let (Some(slot), Some(key)) = (continuation_slot, continuation_key) {
-                    self.claimed[slot] = Some(*key);
+                    self.claimed[slot] = Some(key);
                 }
             }
 
@@ -4218,7 +4224,7 @@ mod tests {
         let profile = *runtime.epoch_for_tests().engine.profile();
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             102,
@@ -4524,7 +4530,7 @@ mod tests {
         let profile = *runtime.epoch_for_tests().engine.profile();
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             102,
@@ -5019,10 +5025,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rejects_lease_bound_to_different_same_size_profile(
+    fn runtime_rejects_lease_bound_to_different_replay_policy(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let profile_a = test_profile_with_recent_snapshot(
-            "runtime-profile-a",
+            "runtime-replay-policy",
             4,
             RECENT_SNAPSHOT_SLOTS,
             RESPONSE_SLOTS,
@@ -5030,15 +5036,31 @@ mod tests {
             3,
             TOKEN_TTL_SECONDS,
         )?;
-        let profile_b = test_profile_with_recent_snapshot(
-            "runtime-profile-b",
-            4,
-            RECENT_SNAPSHOT_SLOTS,
-            RESPONSE_SLOTS,
-            ENVELOPE_BYTES,
-            3,
-            TOKEN_TTL_SECONDS + 1,
+        let replay_policy_a = profile_a.replay_policy();
+        let profile_b = profile_a.with_test_replay_policy(
+            replay_policy_a
+                .transaction_capacity()
+                .checked_add(1)
+                .expect("fixture replay capacity leaves increment headroom"),
+            replay_policy_a.expiry_bucket_width_seconds(),
+            replay_policy_a.garbage_collection_interval_seconds(),
         )?;
+        assert_ne!(
+            profile_a.replay_policy().transaction_capacity(),
+            profile_b.replay_policy().transaction_capacity()
+        );
+        assert_eq!(
+            profile_a.replay_policy().expiry_bucket_width_seconds(),
+            profile_b.replay_policy().expiry_bucket_width_seconds()
+        );
+        assert_eq!(
+            profile_a
+                .replay_policy()
+                .garbage_collection_interval_seconds(),
+            profile_b
+                .replay_policy()
+                .garbage_collection_interval_seconds()
+        );
         let shape_a = CompiledQueryShape::new(profile_a)?;
         let shape_b = CompiledQueryShape::new(profile_b)?;
         assert_ne!(
