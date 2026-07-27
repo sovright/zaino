@@ -4,8 +4,13 @@ use std::{
     mem::size_of,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    records::{AddressKey, PersistentTransparentUtxo, TransparentUtxo},
+    records::{
+        AddressKey, PersistentAddressDirectory, PersistentAddressEventPage,
+        PersistentTransparentUtxo, PersistentUtxoEvent, TransparentUtxo,
+    },
     sizing::{SizingError, SizingParameters, StorageEstimate},
     store::StoreSlot,
 };
@@ -113,7 +118,8 @@ struct AddressStats {
     peak_live_utxos: u64,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScriptClassTotals {
     outputs: u64,
     spends: u64,
@@ -126,7 +132,7 @@ enum LiveOutputOwner {
     NonStandard,
 }
 
-/// Stateful, genesis-forward accumulator whose emitted report contains only
+/// Stateful, genesis-forward accumulator whose emitted measurement contains only
 /// identifier-free aggregate values.
 pub(super) struct CorpusAccumulator {
     blocks: u64,
@@ -282,15 +288,12 @@ impl CorpusAccumulator {
         Ok(())
     }
 
-    /// Consumes all identifier-bearing state and produces an aggregate report.
-    pub(super) fn finish(
-        self,
-        growth: GrowthAssumption,
-        sizing: SizingParameters,
-    ) -> Result<CorpusReport, CorpusError> {
+    /// Consumes all identifier-bearing state and produces aggregate measurements.
+    pub(super) fn finish(self) -> Result<CorpusMeasurement, CorpusError> {
         let mut events_per_address = BTreeMap::new();
         let mut live_utxos_per_address = BTreeMap::new();
         let mut peak_live_utxos_per_address = BTreeMap::new();
+        let mut address_state_counts = BTreeMap::new();
         let mut event_counts = Vec::with_capacity(self.addresses.len());
         let mut live_counts = Vec::with_capacity(self.addresses.len());
         let mut peak_counts = Vec::with_capacity(self.addresses.len());
@@ -299,6 +302,7 @@ impl CorpusAccumulator {
             increment_histogram(&mut events_per_address, stats.events)?;
             increment_histogram(&mut live_utxos_per_address, stats.live_utxos)?;
             increment_histogram(&mut peak_live_utxos_per_address, stats.peak_live_utxos)?;
+            increment_address_state(&mut address_state_counts, *stats)?;
             event_counts.push(stats.events);
             live_counts.push(stats.live_utxos);
             peak_counts.push(stats.peak_live_utxos);
@@ -323,14 +327,7 @@ impl CorpusAccumulator {
                 quantity: CounterQuantity::StandardLiveUtxos,
             })?;
         let live_nonstandard_utxos = self.script_totals[2].live_utxos;
-        let projections = build_projections(
-            &events_per_address,
-            growth,
-            sizing,
-            distinct_standard_addresses,
-        )?;
-
-        Ok(CorpusReport {
+        Ok(CorpusMeasurement {
             blocks: self.blocks,
             transactions: self.transactions,
             outputs: self.outputs,
@@ -342,14 +339,22 @@ impl CorpusAccumulator {
             events_per_address,
             live_utxos_per_address,
             peak_live_utxos_per_address,
+            address_state_histogram: address_state_counts
+                .into_iter()
+                .map(
+                    |((events, live_utxos, peak_live_utxos), address_count)| AddressStateBucket {
+                        events,
+                        live_utxos,
+                        peak_live_utxos,
+                        address_count,
+                    },
+                )
+                .collect(),
             event_distribution,
             live_distribution,
             peak_live_distribution,
             hottest_event_counts,
-            record_sizes: CandidateRecordSizes::compiled(sizing.event_record_bytes()),
-            growth,
-            sizing,
-            projections,
+            record_sizes: CandidateRecordSizes::compiled(),
         })
     }
 }
@@ -380,7 +385,8 @@ impl GrowthAssumption {
 }
 
 /// Aggregate quantiles without retaining the address at any rank.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DistributionSummary {
     p50: u64,
     p90: u64,
@@ -401,31 +407,46 @@ impl DistributionSummary {
     }
 }
 
-/// Compiled and configured record widths included in every corpus report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Compiled record widths included in every corpus measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CandidateRecordSizes {
     address_key_bytes: u64,
     business_utxo_bytes: u64,
     persistent_utxo_bytes: u64,
+    persistent_event_bytes: u64,
     logical_store_slot_bytes: u64,
-    configured_event_record_bytes: u64,
+    directory_cell_bytes: u64,
+    event_cell_bytes: u64,
+}
+
+/// One identifier-free joint address-state bucket retained for exact validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddressStateBucket {
+    events: u64,
+    live_utxos: u64,
+    peak_live_utxos: u64,
+    address_count: u64,
 }
 
 impl CandidateRecordSizes {
-    fn compiled(configured_event_record_bytes: u64) -> Self {
+    fn compiled() -> Self {
         Self {
             address_key_bytes: size_of::<AddressKey>() as u64,
             business_utxo_bytes: size_of::<TransparentUtxo>() as u64,
             persistent_utxo_bytes: size_of::<PersistentTransparentUtxo>() as u64,
+            persistent_event_bytes: size_of::<PersistentUtxoEvent>() as u64,
             logical_store_slot_bytes: size_of::<StoreSlot>() as u64,
-            configured_event_record_bytes,
+            directory_cell_bytes: size_of::<PersistentAddressDirectory>() as u64,
+            event_cell_bytes: size_of::<PersistentAddressEventPage>() as u64,
         }
     }
 }
 
 /// One identifier-free current or projected storage point.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct CorpusProjection {
+pub(super) struct CorpusProjection {
     year: u16,
     standard_addresses: u64,
     estimate: StorageEstimate,
@@ -437,11 +458,24 @@ impl fmt::Debug for CorpusProjection {
     }
 }
 
+#[cfg(feature = "corpus-zaino")]
+impl CorpusProjection {
+    pub(super) const fn year(&self) -> u16 {
+        self.year
+    }
+
+    pub(super) const fn estimate(&self) -> &StorageEstimate {
+        &self.estimate
+    }
+}
+
 /// Aggregate-only output of a complete genesis-forward corpus scan.
 ///
 /// This type cannot expose address, transaction, or outpoint identifiers: it
-/// owns only counts, distributions, record widths, and modeled projections.
-pub(super) struct CorpusReport {
+/// owns only observed counts, distributions, and compiled record widths.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CorpusMeasurement {
     blocks: u64,
     transactions: u64,
     outputs: u64,
@@ -450,20 +484,31 @@ pub(super) struct CorpusReport {
     live_standard_utxos: u64,
     live_nonstandard_utxos: u64,
     script_totals: [ScriptClassTotals; 3],
+    #[serde(with = "histogram_serde")]
     events_per_address: BTreeMap<u64, u64>,
+    #[serde(with = "histogram_serde")]
     live_utxos_per_address: BTreeMap<u64, u64>,
+    #[serde(with = "histogram_serde")]
     peak_live_utxos_per_address: BTreeMap<u64, u64>,
+    address_state_histogram: Vec<AddressStateBucket>,
     event_distribution: DistributionSummary,
     live_distribution: DistributionSummary,
     peak_live_distribution: DistributionSummary,
     hottest_event_counts: [u64; HOTTEST_TAIL_SLOTS],
     record_sizes: CandidateRecordSizes,
-    growth: GrowthAssumption,
-    sizing: SizingParameters,
-    projections: Vec<CorpusProjection>,
 }
 
-impl CorpusReport {
+impl CorpusMeasurement {
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn block_count(&self) -> u64 {
+        self.blocks
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn output_count(&self) -> u64 {
+        self.outputs
+    }
+
     pub(super) const fn distinct_standard_addresses(&self) -> u64 {
         self.distinct_standard_addresses
     }
@@ -484,22 +529,37 @@ impl CorpusReport {
         &self.live_utxos_per_address
     }
 
-    fn projections(&self) -> &[CorpusProjection] {
-        &self.projections
+    pub(super) fn validate(&self) -> Result<(), CorpusError> {
+        validate_measurement(self)
+    }
+
+    pub(super) fn qualify(
+        &self,
+        growth: GrowthAssumption,
+        sizing: SizingParameters,
+    ) -> Result<CorpusSizingQualification, CorpusError> {
+        self.validate()?;
+        let projections = build_projections(
+            &self.events_per_address,
+            growth,
+            sizing,
+            self.distinct_standard_addresses,
+        )?;
+        Ok(CorpusSizingQualification { projections })
     }
 }
 
-impl fmt::Debug for CorpusReport {
+impl fmt::Debug for CorpusMeasurement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("CorpusReport { aggregates_only: true, .. }")
+        f.write_str("CorpusMeasurement { aggregates_only: true, .. }")
     }
 }
 
-impl fmt::Display for CorpusReport {
+impl fmt::Display for CorpusMeasurement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "schema=oram-corpus-v1\naggregate_only=true\nblocks={}\ntransactions={}\noutputs={}\nspends={}\ndistinct_standard_addresses={}\nlive_standard_utxos={}\nlive_nonstandard_utxos={}\n",
+            "schema=oram-corpus-measurement-v1\naggregate_only=true\nblocks={}\ntransactions={}\noutputs={}\nspends={}\ndistinct_standard_addresses={}\nlive_standard_utxos={}\nlive_nonstandard_utxos={}\n",
             self.blocks,
             self.transactions,
             self.outputs,
@@ -516,39 +576,40 @@ impl fmt::Display for CorpusReport {
             "peak_live_utxos_per_address",
             &self.peak_live_utxos_per_address,
         )?;
+        write_address_state_histogram(f, &self.address_state_histogram)?;
         write_distribution(f, "event_distribution", self.event_distribution)?;
         write_distribution(f, "live_distribution", self.live_distribution)?;
         write_distribution(f, "peak_live_distribution", self.peak_live_distribution)?;
         write_array(f, "hottest_event_counts", &self.hottest_event_counts)?;
         writeln!(
             f,
-            "record_sizes=address_key:{},business_utxo:{},persistent_utxo:{},logical_store_slot:{},configured_event:{}",
+            "record_sizes=address_key:{},business_utxo:{},persistent_utxo:{},persistent_event:{},logical_store_slot:{},directory_cell:{},event_cell:{}",
             self.record_sizes.address_key_bytes,
             self.record_sizes.business_utxo_bytes,
             self.record_sizes.persistent_utxo_bytes,
+            self.record_sizes.persistent_event_bytes,
             self.record_sizes.logical_store_slot_bytes,
-            self.record_sizes.configured_event_record_bytes,
+            self.record_sizes.directory_cell_bytes,
+            self.record_sizes.event_cell_bytes,
         )?;
-        writeln!(
-            f,
-            "growth_assumption=horizon_years:{},annual_growth_bps:{}",
-            self.growth.horizon_years, self.growth.annual_growth_bps,
-        )?;
-        write!(f, "{}", self.sizing)?;
-        for projection in &self.projections {
-            writeln!(
-                f,
-                "projection=year:{},standard_addresses:{},events:{},pages:{},modeled_bytes:{},usable_memory_bytes:{},fits_memory:{}",
-                projection.year,
-                projection.standard_addresses,
-                projection.estimate.event_count(),
-                projection.estimate.page_count(),
-                projection.estimate.backend_expanded_bytes(),
-                projection.estimate.usable_memory_bytes(),
-                projection.estimate.fits_memory(),
-            )?;
-        }
         Ok(())
+    }
+}
+
+/// Operator-selected sizing assumptions and projections derived from one measurement.
+pub(super) struct CorpusSizingQualification {
+    projections: Vec<CorpusProjection>,
+}
+
+impl CorpusSizingQualification {
+    pub(super) fn projections(&self) -> &[CorpusProjection] {
+        &self.projections
+    }
+}
+
+impl fmt::Debug for CorpusSizingQualification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CorpusSizingQualification { aggregates_only: true, .. }")
     }
 }
 
@@ -562,6 +623,7 @@ pub(super) enum CorpusError {
     LiveUtxoUnderflow,
     CounterOverflow { quantity: CounterQuantity },
     GrowthHorizonTooLarge { requested: u16, maximum: u16 },
+    InvalidMeasurement { invariant: MeasurementInvariant },
     Sizing(SizingError),
 }
 
@@ -588,6 +650,9 @@ impl fmt::Display for CorpusError {
                 f,
                 "growth horizon {requested} years exceeds the supported maximum {maximum}"
             ),
+            Self::InvalidMeasurement { invariant } => {
+                write!(f, "corpus measurement invariant failed: {invariant}")
+            }
             Self::Sizing(error) => write!(f, "corpus sizing failed: {error}"),
         }
     }
@@ -603,8 +668,54 @@ impl std::error::Error for CorpusError {
             | Self::MissingAddressState
             | Self::LiveUtxoUnderflow
             | Self::CounterOverflow { .. }
-            | Self::GrowthHorizonTooLarge { .. } => None,
+            | Self::GrowthHorizonTooLarge { .. }
+            | Self::InvalidMeasurement { .. } => None,
         }
+    }
+}
+
+/// Identifier-free semantic check for a persisted aggregate measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MeasurementInvariant {
+    HistogramShape,
+    AddressStateHistogram,
+    EventHistogramAddressCount,
+    LiveHistogramAddressCount,
+    PeakHistogramAddressCount,
+    StandardLiveUtxos,
+    ScriptTotals,
+    ScriptClassBalance,
+    OutputSpendBalance,
+    StandardEventCount,
+    EventDistribution,
+    LiveDistribution,
+    PeakDistribution,
+    HottestEventCounts,
+    AddressMarginals,
+    RecordSizes,
+}
+
+impl fmt::Display for MeasurementInvariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let description = match self {
+            Self::HistogramShape => "histogram shape",
+            Self::AddressStateHistogram => "joint address-state histogram",
+            Self::EventHistogramAddressCount => "event histogram address count",
+            Self::LiveHistogramAddressCount => "live histogram address count",
+            Self::PeakHistogramAddressCount => "peak histogram address count",
+            Self::StandardLiveUtxos => "standard live UTXO count",
+            Self::ScriptTotals => "script totals",
+            Self::ScriptClassBalance => "script-class output and spend balance",
+            Self::OutputSpendBalance => "output and spend balance",
+            Self::StandardEventCount => "standard event count",
+            Self::EventDistribution => "event distribution",
+            Self::LiveDistribution => "live distribution",
+            Self::PeakDistribution => "peak distribution",
+            Self::HottestEventCounts => "hottest event counts",
+            Self::AddressMarginals => "per-address event, peak, and live marginals",
+            Self::RecordSizes => "compiled record sizes",
+        };
+        f.write_str(description)
     }
 }
 
@@ -664,6 +775,17 @@ fn increment_histogram(histogram: &mut BTreeMap<u64, u64>, value: u64) -> Result
     Ok(())
 }
 
+fn increment_address_state(
+    histogram: &mut BTreeMap<(u64, u64, u64), u64>,
+    stats: AddressStats,
+) -> Result<(), CorpusError> {
+    let state = (stats.events, stats.live_utxos, stats.peak_live_utxos);
+    let current = histogram.get(&state).copied().unwrap_or(0);
+    let next = checked_add(current, 1, CounterQuantity::HistogramBucket)?;
+    histogram.insert(state, next);
+    Ok(())
+}
+
 fn nearest_rank(sorted: &[u64], percentile_bps: u64) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -682,6 +804,322 @@ fn hottest_tail(sorted: &[u64]) -> [u64; HOTTEST_TAIL_SLOTS] {
     let mut tail = [0; HOTTEST_TAIL_SLOTS];
     for (target, value) in tail.iter_mut().zip(sorted.iter().rev()) {
         *target = *value;
+    }
+    tail
+}
+
+fn validate_measurement(measurement: &CorpusMeasurement) -> Result<(), CorpusError> {
+    if !histogram_shape_is_valid(&measurement.events_per_address, false)
+        || !histogram_shape_is_valid(&measurement.live_utxos_per_address, true)
+        || !histogram_shape_is_valid(&measurement.peak_live_utxos_per_address, false)
+    {
+        return invalid_measurement(MeasurementInvariant::HistogramShape);
+    }
+    let Some([joint_events, joint_live, joint_peak]) =
+        joint_address_state_marginals(&measurement.address_state_histogram)
+    else {
+        return invalid_measurement(MeasurementInvariant::AddressStateHistogram);
+    };
+    if joint_events != measurement.events_per_address
+        || joint_live != measurement.live_utxos_per_address
+        || joint_peak != measurement.peak_live_utxos_per_address
+    {
+        return invalid_measurement(MeasurementInvariant::AddressStateHistogram);
+    }
+
+    let address_count = u128::from(measurement.distinct_standard_addresses);
+    if histogram_count(&measurement.events_per_address) != Some(address_count) {
+        return invalid_measurement(MeasurementInvariant::EventHistogramAddressCount);
+    }
+    if histogram_count(&measurement.live_utxos_per_address) != Some(address_count) {
+        return invalid_measurement(MeasurementInvariant::LiveHistogramAddressCount);
+    }
+    if histogram_count(&measurement.peak_live_utxos_per_address) != Some(address_count) {
+        return invalid_measurement(MeasurementInvariant::PeakHistogramAddressCount);
+    }
+    if histogram_weighted_sum(&measurement.live_utxos_per_address)
+        != Some(u128::from(measurement.live_standard_utxos))
+    {
+        return invalid_measurement(MeasurementInvariant::StandardLiveUtxos);
+    }
+
+    let output_total = measurement
+        .script_totals
+        .iter()
+        .map(|totals| u128::from(totals.outputs))
+        .sum::<u128>();
+    let spend_total = measurement
+        .script_totals
+        .iter()
+        .map(|totals| u128::from(totals.spends))
+        .sum::<u128>();
+    let standard_live = u128::from(measurement.script_totals[0].live_utxos)
+        + u128::from(measurement.script_totals[1].live_utxos);
+    if output_total != u128::from(measurement.outputs)
+        || spend_total != u128::from(measurement.spends)
+        || standard_live != u128::from(measurement.live_standard_utxos)
+        || measurement.script_totals[2].live_utxos != measurement.live_nonstandard_utxos
+    {
+        return invalid_measurement(MeasurementInvariant::ScriptTotals);
+    }
+    if measurement
+        .script_totals
+        .iter()
+        .any(|totals| totals.outputs.checked_sub(totals.spends) != Some(totals.live_utxos))
+    {
+        return invalid_measurement(MeasurementInvariant::ScriptClassBalance);
+    }
+
+    let live_total = u128::from(measurement.live_standard_utxos)
+        + u128::from(measurement.live_nonstandard_utxos);
+    if output_total.checked_sub(spend_total) != Some(live_total) {
+        return invalid_measurement(MeasurementInvariant::OutputSpendBalance);
+    }
+
+    let standard_events = measurement.script_totals[..2]
+        .iter()
+        .map(|totals| u128::from(totals.outputs) + u128::from(totals.spends))
+        .sum::<u128>();
+    if histogram_weighted_sum(&measurement.events_per_address) != Some(standard_events) {
+        return invalid_measurement(MeasurementInvariant::StandardEventCount);
+    }
+    if distribution_from_histogram(&measurement.events_per_address)
+        != measurement.event_distribution
+    {
+        return invalid_measurement(MeasurementInvariant::EventDistribution);
+    }
+    if distribution_from_histogram(&measurement.live_utxos_per_address)
+        != measurement.live_distribution
+    {
+        return invalid_measurement(MeasurementInvariant::LiveDistribution);
+    }
+    if distribution_from_histogram(&measurement.peak_live_utxos_per_address)
+        != measurement.peak_live_distribution
+    {
+        return invalid_measurement(MeasurementInvariant::PeakDistribution);
+    }
+    if hottest_tail_from_histogram(&measurement.events_per_address)
+        != measurement.hottest_event_counts
+    {
+        return invalid_measurement(MeasurementInvariant::HottestEventCounts);
+    }
+    let peak_sum = histogram_weighted_sum(&measurement.peak_live_utxos_per_address);
+    let standard_outputs = measurement.script_totals[..2]
+        .iter()
+        .map(|totals| u128::from(totals.outputs))
+        .sum::<u128>();
+    if !histogram_values_are_bounded(
+        &measurement.live_utxos_per_address,
+        &measurement.peak_live_utxos_per_address,
+    ) || !histogram_values_are_bounded(
+        &measurement.peak_live_utxos_per_address,
+        &measurement.events_per_address,
+    ) || peak_sum.is_none_or(|peak_sum| peak_sum > standard_outputs)
+        || histogram_parity_counts(&measurement.events_per_address)
+            != histogram_parity_counts(&measurement.live_utxos_per_address)
+    {
+        return invalid_measurement(MeasurementInvariant::AddressMarginals);
+    }
+    if measurement.record_sizes != CandidateRecordSizes::compiled() {
+        return invalid_measurement(MeasurementInvariant::RecordSizes);
+    }
+    Ok(())
+}
+
+fn joint_address_state_marginals(
+    buckets: &[AddressStateBucket],
+) -> Option<[BTreeMap<u64, u64>; 3]> {
+    let mut marginals = std::array::from_fn(|_| BTreeMap::new());
+    let mut previous = None;
+    for bucket in buckets {
+        let state = (bucket.events, bucket.live_utxos, bucket.peak_live_utxos);
+        let valid_state = bucket.address_count != 0
+            && bucket.events != 0
+            && bucket.peak_live_utxos != 0
+            && bucket.events >= bucket.live_utxos
+            && (bucket.events - bucket.live_utxos) % 2 == 0
+            && bucket.live_utxos <= bucket.peak_live_utxos
+            && u128::from(bucket.peak_live_utxos) * 2
+                <= u128::from(bucket.events) + u128::from(bucket.live_utxos)
+            && previous.is_none_or(|previous| state > previous);
+        if !valid_state {
+            return None;
+        }
+        previous = Some(state);
+        for (histogram, value) in
+            marginals
+                .iter_mut()
+                .zip([bucket.events, bucket.live_utxos, bucket.peak_live_utxos])
+        {
+            let next = histogram
+                .get(&value)
+                .copied()
+                .unwrap_or(0_u64)
+                .checked_add(bucket.address_count)?;
+            histogram.insert(value, next);
+        }
+    }
+    Some(marginals)
+}
+
+fn histogram_shape_is_valid(histogram: &BTreeMap<u64, u64>, zero_value_allowed: bool) -> bool {
+    histogram
+        .iter()
+        .all(|(value, count)| *count != 0 && (zero_value_allowed || *value != 0))
+}
+
+/// Returns whether two equally-sized marginal populations can be paired so
+/// every value in `lower` is less than or equal to its value in `upper`.
+fn histogram_values_are_bounded(lower: &BTreeMap<u64, u64>, upper: &BTreeMap<u64, u64>) -> bool {
+    if histogram_count(lower) != histogram_count(upper) {
+        return false;
+    }
+
+    let mut lower_cumulative = 0_u128;
+    let mut upper_cumulative = 0_u128;
+    let mut values = lower
+        .keys()
+        .chain(upper.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    for value in values {
+        lower_cumulative += u128::from(lower.get(&value).copied().unwrap_or(0));
+        upper_cumulative += u128::from(upper.get(&value).copied().unwrap_or(0));
+        if lower_cumulative < upper_cumulative {
+            return false;
+        }
+    }
+    true
+}
+
+fn invalid_measurement(invariant: MeasurementInvariant) -> Result<(), CorpusError> {
+    Err(CorpusError::InvalidMeasurement { invariant })
+}
+
+fn histogram_count(histogram: &BTreeMap<u64, u64>) -> Option<u128> {
+    histogram
+        .values()
+        .try_fold(0_u128, |total, count| total.checked_add(u128::from(*count)))
+}
+
+mod histogram_serde {
+    use std::collections::BTreeMap;
+
+    use serde::{
+        de::Error as _, ser::SerializeSeq as _, Deserialize, Deserializer, Serialize, Serializer,
+    };
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HistogramBucket {
+        value: u64,
+        count: u64,
+    }
+
+    pub(super) fn serialize<S>(
+        histogram: &BTreeMap<u64, u64>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(histogram.len()))?;
+        for (&value, &count) in histogram {
+            sequence.serialize_element(&HistogramBucket { value, count })?;
+        }
+        sequence.end()
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<u64, u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let buckets = Vec::<HistogramBucket>::deserialize(deserializer)?;
+        let mut histogram = BTreeMap::new();
+        let mut previous = None;
+        for bucket in buckets {
+            if bucket.count == 0 {
+                return Err(D::Error::custom("histogram bucket count must be nonzero"));
+            }
+            if previous.is_some_and(|value| bucket.value <= value) {
+                return Err(D::Error::custom(
+                    "histogram bucket values must be strictly increasing",
+                ));
+            }
+            previous = Some(bucket.value);
+            histogram.insert(bucket.value, bucket.count);
+        }
+        Ok(histogram)
+    }
+}
+
+fn histogram_weighted_sum(histogram: &BTreeMap<u64, u64>) -> Option<u128> {
+    histogram.iter().try_fold(0_u128, |total, (value, count)| {
+        let contribution = u128::from(*value).checked_mul(u128::from(*count))?;
+        total.checked_add(contribution)
+    })
+}
+
+fn histogram_parity_counts(histogram: &BTreeMap<u64, u64>) -> [u128; 2] {
+    let mut counts = [0_u128; 2];
+    for (value, count) in histogram {
+        counts[usize::from(value % 2 != 0)] += u128::from(*count);
+    }
+    counts
+}
+
+fn distribution_from_histogram(histogram: &BTreeMap<u64, u64>) -> DistributionSummary {
+    let total = histogram_count(histogram).unwrap_or(0);
+    DistributionSummary {
+        p50: nearest_rank_from_histogram(histogram, total, 5_000),
+        p90: nearest_rank_from_histogram(histogram, total, 9_000),
+        p99: nearest_rank_from_histogram(histogram, total, 9_900),
+        p999: nearest_rank_from_histogram(histogram, total, 9_990),
+        maximum: histogram
+            .iter()
+            .rev()
+            .find_map(|(value, count)| (*count != 0).then_some(*value))
+            .unwrap_or(0),
+    }
+}
+
+fn nearest_rank_from_histogram(
+    histogram: &BTreeMap<u64, u64>,
+    total: u128,
+    percentile_bps: u64,
+) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let rank = total
+        .saturating_mul(u128::from(percentile_bps))
+        .div_ceil(u128::from(BASIS_POINTS_DENOMINATOR))
+        .max(1);
+    let mut cumulative = 0_u128;
+    for (value, count) in histogram {
+        cumulative = cumulative.saturating_add(u128::from(*count));
+        if cumulative >= rank {
+            return *value;
+        }
+    }
+    0
+}
+
+fn hottest_tail_from_histogram(histogram: &BTreeMap<u64, u64>) -> [u64; HOTTEST_TAIL_SLOTS] {
+    let mut tail = [0; HOTTEST_TAIL_SLOTS];
+    let mut index = 0_usize;
+    for (value, count) in histogram.iter().rev() {
+        let available = HOTTEST_TAIL_SLOTS.saturating_sub(index);
+        let copies = u64::try_from(available).map_or(*count, |available| (*count).min(available));
+        for _ in 0..copies {
+            tail[index] = *value;
+            index += 1;
+        }
+        if index == HOTTEST_TAIL_SLOTS {
+            break;
+        }
     }
     tail
 }
@@ -764,6 +1202,24 @@ fn write_histogram(
     f.write_str("\n")
 }
 
+fn write_address_state_histogram(
+    f: &mut fmt::Formatter<'_>,
+    buckets: &[AddressStateBucket],
+) -> fmt::Result {
+    f.write_str("address_state_histogram=")?;
+    for (index, bucket) in buckets.iter().enumerate() {
+        if index != 0 {
+            f.write_str(",")?;
+        }
+        write!(
+            f,
+            "{}:{}:{}:{}",
+            bucket.events, bucket.live_utxos, bucket.peak_live_utxos, bucket.address_count
+        )?;
+    }
+    f.write_str("\n")
+}
+
 fn write_distribution(
     f: &mut fmt::Formatter<'_>,
     name: &str,
@@ -805,11 +1261,39 @@ mod tests {
     }
 
     fn sizing() -> Result<SizingParameters, SizingError> {
-        SizingParameters::new(2, 16, 32, 4, 20_000, 1_000_000, 3_000)
+        SizingParameters::new(8, 6, 16, 12, 8, 4, 20_000, 1_000_000, 3_000)
     }
 
     fn growth() -> Result<GrowthAssumption, CorpusError> {
         GrowthAssumption::new(2, 1_000)
+    }
+
+    #[test]
+    fn growth_keeps_fixed_allocation_and_exposes_admission_crossings() -> Result<(), CorpusError> {
+        let sizing = SizingParameters::new(8, 5, 16, 10, 3, 4, 10_000, 10_000, 0)
+            .map_err(CorpusError::Sizing)?;
+        let projections = build_projections(
+            &BTreeMap::from([(1, 3)]),
+            GrowthAssumption::new(2, 10_000)?,
+            sizing,
+            3,
+        )?;
+
+        assert_eq!(projections.len(), 3);
+        assert!(projections[0].estimate.fits_modeled_constraints());
+        assert!(!projections[1].estimate.fits_directory_admission());
+        assert!(projections[1].estimate.fits_event_admission());
+        assert!(!projections[2].estimate.fits_event_admission());
+        assert_eq!(projections[0].estimate.maximum_events_per_address(), 1);
+        assert_eq!(projections[2].estimate.maximum_events_per_address(), 1);
+        assert!(projections.windows(2).all(|pair| {
+            pair[0].estimate.allocated_table_bytes() == pair[1].estimate.allocated_table_bytes()
+                && pair[0].estimate.logical_position_map_bytes()
+                    == pair[1].estimate.logical_position_map_bytes()
+                && pair[0].estimate.backend_expanded_bytes()
+                    == pair[1].estimate.backend_expanded_bytes()
+        }));
+        Ok(())
     }
 
     #[test]
@@ -833,7 +1317,8 @@ mod tests {
         })?;
         accumulator.apply(CorpusEvent::Spent { previous: first })?;
 
-        let report = accumulator.finish(growth()?, sizing()?)?;
+        let report = accumulator.finish()?;
+        report.validate()?;
         assert_eq!(report.distinct_standard_addresses(), 2);
         assert_eq!(report.live_standard_utxos(), 1);
         assert_eq!(
@@ -844,14 +1329,39 @@ mod tests {
             report.live_utxos_per_address(),
             &BTreeMap::from([(0, 1), (1, 1)])
         );
-        assert_eq!(report.projections().len(), 3);
+        let qualification = report.qualify(growth()?, sizing()?)?;
+        assert_eq!(qualification.projections().len(), 3);
 
         let output = report.to_string();
-        assert!(output.contains("aggregate_only=true"));
-        assert!(output.contains("hottest_event_counts=2,1"));
-        assert!(output.contains(
-            "sizing_parameters=events_per_page:2,event_record_bytes:72,page_overhead_bytes:16,directory_entry_bytes:32,position_map_entry_bytes:4,backend_expansion_bps:20000,tdx_memory_bytes:1000000,required_headroom_bps:3000"
-        ));
+        assert_eq!(
+            output,
+            concat!(
+                "schema=oram-corpus-measurement-v1\n",
+                "aggregate_only=true\n",
+                "blocks=1\n",
+                "transactions=2\n",
+                "outputs=2\n",
+                "spends=1\n",
+                "distinct_standard_addresses=2\n",
+                "live_standard_utxos=1\n",
+                "live_nonstandard_utxos=0\n",
+                "script_class=p2pkh,outputs:1,spends:1,live_utxos:0\n",
+                "script_class=p2sh,outputs:1,spends:0,live_utxos:1\n",
+                "script_class=nonstandard,outputs:0,spends:0,live_utxos:0\n",
+                "events_per_address=1:1,2:1\n",
+                "live_utxos_per_address=0:1,1:1\n",
+                "peak_live_utxos_per_address=1:2\n",
+                "address_state_histogram=1:1:1:1,2:0:1:1\n",
+                "event_distribution=p50:1,p90:2,p99:2,p999:2,max:2\n",
+                "live_distribution=p50:0,p90:1,p99:1,p999:1,max:1\n",
+                "peak_live_distribution=p50:1,p90:1,p99:1,p999:1,max:1\n",
+                "hottest_event_counts=2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n",
+                "record_sizes=address_key:32,business_utxo:88,persistent_utxo:88,persistent_event:72,logical_store_slot:96,directory_cell:38,event_cell:82\n",
+            )
+        );
+        assert!(!output.contains("growth_assumption"));
+        assert!(!output.contains("tdx_memory_bytes"));
+        assert!(!output.contains("projection="));
         assert!(!output.contains("11111111"));
         assert!(!output.contains("22222222"));
         assert!(!output.contains("aaaaaaaa"));
@@ -870,7 +1380,7 @@ mod tests {
             address: None,
             script_class: CorpusScriptClass::NonStandard,
         })?;
-        let report = accumulator.finish(GrowthAssumption::new(0, 0)?, sizing()?)?;
+        let report = accumulator.finish()?;
 
         assert_eq!(report.distinct_standard_addresses(), 0);
         assert_eq!(report.live_standard_utxos(), 0);
@@ -937,10 +1447,94 @@ mod tests {
             address: Some(address),
             script_class: CorpusScriptClass::PayToPublicKeyHash,
         })?;
-        let report = accumulator.finish(GrowthAssumption::new(0, 0)?, sizing()?)?;
+        let report = accumulator.finish()?;
         assert_eq!(
             format!("{report:?}"),
-            "CorpusReport { aggregates_only: true, .. }"
+            "CorpusMeasurement { aggregates_only: true, .. }"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn measurement_json_round_trip_is_deterministic_and_validated(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let previous = outpoint(0x77, 0);
+        let address = address(0xee, CorpusScriptClass::PayToPublicKeyHash);
+        let mut accumulator = CorpusAccumulator::from_genesis();
+        accumulator.record_block(1)?;
+        accumulator.apply(CorpusEvent::Created {
+            outpoint: previous,
+            address: Some(address),
+            script_class: CorpusScriptClass::PayToPublicKeyHash,
+        })?;
+        let measurement = accumulator.finish()?;
+
+        let json = serde_json::to_string(&measurement)?;
+        let decoded: CorpusMeasurement = serde_json::from_str(&json)?;
+        decoded.validate()?;
+
+        assert_eq!(decoded, measurement);
+        assert_eq!(serde_json::to_string(&decoded)?, json);
+        assert!(json.contains("\"events_per_address\":[{\"value\":1,\"count\":1}]"));
+
+        let duplicate_bucket = json.replace(
+            "\"events_per_address\":[{\"value\":1,\"count\":1}]",
+            "\"events_per_address\":[{\"value\":1,\"count\":1},{\"value\":1,\"count\":1}]",
+        );
+        assert!(serde_json::from_str::<CorpusMeasurement>(&duplicate_bucket).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn validation_rejects_per_class_balance_and_impossible_marginals(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let previous = outpoint(0x88, 0);
+        let second = outpoint(0x89, 0);
+        let address = address(0xff, CorpusScriptClass::PayToPublicKeyHash);
+        let mut accumulator = CorpusAccumulator::from_genesis();
+        accumulator.record_block(1)?;
+        accumulator.apply(CorpusEvent::Created {
+            outpoint: previous,
+            address: Some(address),
+            script_class: CorpusScriptClass::PayToPublicKeyHash,
+        })?;
+        accumulator.apply(CorpusEvent::Created {
+            outpoint: second,
+            address: Some(address),
+            script_class: CorpusScriptClass::PayToPublicKeyHash,
+        })?;
+        accumulator.apply(CorpusEvent::Spent { previous })?;
+        let measurement = accumulator.finish()?;
+
+        let mut invalid_balance = measurement.clone();
+        invalid_balance.script_totals[0].live_utxos = 0;
+        invalid_balance.script_totals[1].live_utxos = 1;
+        assert!(matches!(
+            invalid_balance.validate(),
+            Err(CorpusError::InvalidMeasurement {
+                invariant: MeasurementInvariant::ScriptClassBalance,
+            })
+        ));
+
+        let mut impossible_marginals = measurement;
+        impossible_marginals.peak_live_utxos_per_address = BTreeMap::from([(3, 1)]);
+        impossible_marginals.address_state_histogram = vec![AddressStateBucket {
+            events: 3,
+            live_utxos: 1,
+            peak_live_utxos: 3,
+            address_count: 1,
+        }];
+        impossible_marginals.peak_live_distribution =
+            distribution_from_histogram(&impossible_marginals.peak_live_utxos_per_address);
+        assert!(matches!(
+            impossible_marginals.validate(),
+            Err(CorpusError::InvalidMeasurement {
+                invariant: MeasurementInvariant::AddressStateHistogram,
+            })
+        ));
+        assert_ne!(
+            histogram_parity_counts(&BTreeMap::from([(1, 2)])),
+            histogram_parity_counts(&BTreeMap::from([(0, 1), (2, 1)])),
         );
         Ok(())
     }

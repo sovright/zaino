@@ -117,6 +117,7 @@
 use super::{
     capability::{DbCore, DbMetadata, DbRead, DbWrite},
     finalised_source::FinalisedSource,
+    SchemaAdmissionGuard,
 };
 
 use crate::{
@@ -127,10 +128,10 @@ use crate::{
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use std::sync::{
-    atomic::{AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, sync::Mutex as AsyncMutex, task::JoinHandle};
 
 /// Ephemeral routing policy used when installing or reusing the ephemeral backend.
 ///
@@ -330,6 +331,26 @@ pub(crate) struct Router<T: BlockchainSource> {
     /// [`FinalisedState::wait_until_synced`], which waits for finalised-state sync/migration to finish
     /// without conflating it with serving-readiness ([`StatusType::Ready`]).
     background_ops: AtomicUsize,
+
+    /// Serialises shutdown so concurrent callers cannot shut down backends while another caller is
+    /// still awaiting the schema-migration task.
+    shutdown_lock: AsyncMutex<()>,
+
+    /// Set before shutdown waits for schema migration. A completed migration checks this flag and
+    /// does not start a validator that shutdown would immediately tear down.
+    shutdown_requested: AtomicBool,
+
+    /// Owned schema-migration task, if startup selected one.
+    ///
+    /// Shutdown takes and awaits this handle before closing either backend, so migration cannot
+    /// continue mutating LMDB after backend shutdown.
+    schema_migration_task: Mutex<Option<JoinHandle<()>>>,
+
+    /// Process-lifetime exclusive lease for this network's finalised-state namespace.
+    ///
+    /// This field is deliberately declared after the backend fields so normal router destruction
+    /// drops its owned backends before releasing schema admission.
+    schema_admission_guard: Mutex<Option<SchemaAdmissionGuard>>,
 }
 
 /// Database capability router.
@@ -361,7 +382,44 @@ impl<T: BlockchainSource> Router<T> {
             primary_mask: AtomicU32::new(cap.bits()),
             ephemeral_mask: AtomicU32::new(0),
             background_ops: AtomicUsize::new(0),
+            shutdown_lock: AsyncMutex::new(()),
+            shutdown_requested: AtomicBool::new(false),
+            schema_migration_task: Mutex::new(None),
+            schema_admission_guard: Mutex::new(None),
         }
+    }
+
+    /// Creates a persistent router that owns schema admission for its full lifetime.
+    pub(super) fn new_with_schema_admission(
+        primary: Arc<FinalisedSource<T>>,
+        schema_admission_guard: SchemaAdmissionGuard,
+    ) -> Self {
+        let mut router = Self::new(primary);
+        router.schema_admission_guard = Mutex::new(Some(schema_admission_guard));
+        router
+    }
+
+    /// Installs the one startup migration task that shutdown must await.
+    pub(super) fn install_schema_migration_task(
+        &self,
+        task: JoinHandle<()>,
+    ) -> Result<(), FinalisedStateError> {
+        let mut slot = self
+            .schema_migration_task
+            .lock()
+            .expect("schema migration task mutex poisoned");
+        if slot.is_some() {
+            task.abort();
+            return Err(FinalisedStateError::Custom(
+                "schema migration task was already installed".into(),
+            ));
+        }
+        *slot = Some(task);
+        Ok(())
+    }
+
+    pub(super) fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
     }
 
     // ***** Capability router *****
@@ -385,6 +443,17 @@ impl<T: BlockchainSource> Router<T> {
         &self,
         cap: CapabilityRequest,
     ) -> Result<Arc<FinalisedSource<T>>, FinalisedStateError> {
+        if self.shutdown_requested() {
+            return Err(FinalisedStateError::Custom(
+                "finalised database shutdown has begun; routing is closed".into(),
+            ));
+        }
+        if self.primary.load().status() == StatusType::CriticalError {
+            return Err(FinalisedStateError::Custom(
+                "finalised database is in a critical error state; routing is closed".into(),
+            ));
+        }
+
         let bit = cap.as_capability().bits();
 
         if self.ephemeral_mask.load(Ordering::Acquire) & bit != 0 {
@@ -823,6 +892,9 @@ impl<T: BlockchainSource> DbCore for Router<T> {
         if primary_status == StatusType::CriticalError {
             return primary_status;
         }
+        if self.shutdown_requested() {
+            return StatusType::Closing;
+        }
 
         match self.backend(CapabilityRequest::ReadCore) {
             Ok(backend) => backend.status(),
@@ -836,6 +908,23 @@ impl<T: BlockchainSource> DbCore for Router<T> {
     /// capability routing, shuts down the primary backend, and then shuts down the removed ephemeral
     /// backend.
     async fn shutdown(&self) -> Result<(), FinalisedStateError> {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        self.shutdown_requested.store(true, Ordering::Release);
+
+        let schema_migration_task = self
+            .schema_migration_task
+            .lock()
+            .expect("schema migration task mutex poisoned")
+            .take();
+        let schema_migration_result = match schema_migration_task {
+            Some(task) => task.await.map_err(|error| {
+                FinalisedStateError::Custom(format!(
+                    "schema migration task failed during shutdown: {error}"
+                ))
+            }),
+            None => Ok(()),
+        };
+
         self.ephemeral_mask.store(0, Ordering::Release);
 
         let ephemeral = self.ephemeral.swap(None);
@@ -854,6 +943,7 @@ impl<T: BlockchainSource> DbCore for Router<T> {
 
         primary_shutdown_result?;
         ephemeral_shutdown_result?;
+        schema_migration_result?;
 
         Ok(())
     }
