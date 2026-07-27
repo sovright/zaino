@@ -8,6 +8,9 @@
 
 use std::{fmt, marker::PhantomData};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::time::Instant;
+
 use bytemuck::Pod;
 use rostl_primitives::traits::Cmov;
 
@@ -20,8 +23,12 @@ use super::AtomicWorkerBuildError;
 use super::{AtomicQueueCapacity, AtomicWorker, AtomicWorkerError};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::layout::FixedProbeLayout;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::records::{AddressDirectory, AddressKey};
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use crate::records::{PersistentAddressDirectory, PersistentAddressEventPage};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::timing_experiment::{Arm, PairedProbe};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use rand::Rng as _;
@@ -432,6 +439,124 @@ fn build_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
     AtomicWorker::spawn(executor, queue_capacity).map_err(RostlWorkerBuildError::Worker)
 }
 
+/// Times one insertion against a freshly built, equal-occupancy table.
+///
+/// # Why a fresh table per measurement
+///
+/// The miss arm *mutates*: inserting an absent key raises occupancy by one. If
+/// both arms shared a table, whichever ran second would face a different
+/// occupancy and the experiment would measure table growth rather than the
+/// hit/miss distinction. Rebuilding per measurement is therefore required for
+/// correctness, not tidiness. Only the single insertion is timed; the rebuild
+/// is not.
+///
+/// # Why the probe key is the same in both arms
+///
+/// Both arms insert the *same* key and hold occupancy equal; only the filler
+/// set differs. The hit arm pre-inserts the probe key, the miss arm substitutes
+/// one other filler in its place. That removes key identity as a confound, so
+/// the arms differ in exactly the property under test.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) struct DirectoryInsertProbe {
+    capacity: usize,
+    occupancy: usize,
+}
+
+/// Why a timed measurement could not be taken.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeError {
+    /// The requested shape cannot hold the fillers plus the probe key.
+    InvalidShape,
+    /// Building or filling the table failed.
+    Setup,
+    /// The timed insertion did not do what the arm required, so the
+    /// measurement does not describe the intended operation.
+    WrongOutcome,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl DirectoryInsertProbe {
+    /// The probe key, present for the hit arm and absent for the miss arm.
+    const PROBE_KEY: usize = 0;
+
+    /// Builds a probe over a table of `capacity` slots holding `occupancy`
+    /// records at the moment of measurement.
+    pub(crate) fn new(capacity: usize, occupancy: usize) -> Result<Self, ProbeError> {
+        // One spare filler index is needed so the miss arm can hold occupancy
+        // equal without pre-inserting the probe key, and admit_insert requires
+        // occupancy strictly below capacity.
+        if occupancy == 0 || occupancy + 1 >= capacity {
+            return Err(ProbeError::InvalidShape);
+        }
+        Ok(Self {
+            capacity,
+            occupancy,
+        })
+    }
+
+    fn filler(index: usize) -> PersistentAddressDirectory {
+        let byte = (index % 251) as u8 + 1;
+        PersistentAddressDirectory::from_business(&AddressDirectory::real(
+            index as u32,
+            AddressKey::new([byte; 32]),
+        ))
+    }
+
+    /// Builds a table holding exactly `occupancy` records, containing the probe
+    /// key only when `include_probe_key` is set.
+    fn prepared(
+        &self,
+        include_probe_key: bool,
+    ) -> Result<RostlTable<PersistentAddressDirectory>, ProbeError> {
+        let mut table = RostlTable::<PersistentAddressDirectory>::new(self.capacity)
+            .map_err(|_| ProbeError::Setup)?;
+        let mut inserted = 0usize;
+        let mut key = 0usize;
+        while inserted < self.occupancy {
+            if key == Self::PROBE_KEY && !include_probe_key {
+                key += 1;
+                continue;
+            }
+            table
+                .insert_record_unique(key, Self::filler(key))
+                .map_err(|_| ProbeError::Setup)?;
+            inserted += 1;
+            key += 1;
+        }
+        Ok(table)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl PairedProbe for DirectoryInsertProbe {
+    type Error = ProbeError;
+
+    fn measure(&mut self, arm: Arm) -> Result<u64, ProbeError> {
+        let hit = matches!(arm, Arm::Hit);
+        let mut table = self.prepared(hit)?;
+        let candidate = Self::filler(Self::PROBE_KEY);
+
+        let started = Instant::now();
+        let outcome = table.insert_record_unique(Self::PROBE_KEY, candidate);
+        let elapsed = started.elapsed();
+
+        // A measurement only describes the intended operation if the operation
+        // actually happened, so an unexpected outcome is discarded rather than
+        // silently contributing a timing.
+        let as_expected = match (hit, outcome) {
+            (true, Err(RostlStoreError::DuplicateKey)) => true,
+            (false, Ok(())) => true,
+            _ => false,
+        };
+        if !as_expected {
+            return Err(ProbeError::WrongOutcome);
+        }
+
+        u64::try_from(elapsed.as_nanos()).map_err(|_| ProbeError::WrongOutcome)
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn catch_upstream<R>(operation: impl FnOnce() -> R) -> Result<R, ()> {
     catch_unwind(AssertUnwindSafe(operation)).map_err(|_| ())
@@ -728,6 +853,48 @@ mod tests {
         let snapshot = worker.shutdown()?;
         assert_eq!(snapshot.completed, 2);
         assert_eq!(snapshot.failed, 0);
+        Ok(())
+    }
+
+    /// The experiment's core invariant: both arms hold occupancy equal, and
+    /// differ only in whether the probe key is present. If this drifts, the
+    /// experiment measures table growth instead of the hit/miss distinction.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn probe_arms_hold_occupancy_equal_and_differ_only_in_the_probe_key(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let probe = DirectoryInsertProbe::new(64, 8)?;
+        let mut with_key = probe.prepared(true)?;
+        let mut without_key = probe.prepared(false)?;
+
+        assert_eq!(with_key.occupied_record_count()?, 8);
+        assert_eq!(without_key.occupied_record_count()?, 8);
+        assert!(with_key
+            .read_record(DirectoryInsertProbe::PROBE_KEY)?
+            .is_some());
+        assert!(without_key
+            .read_record(DirectoryInsertProbe::PROBE_KEY)?
+            .is_none());
+        Ok(())
+    }
+
+    /// A measurement is only kept when the timed operation actually did what
+    /// the arm required.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn probe_measures_both_arms_and_rejects_an_impossible_shape() -> Result<(), ProbeError> {
+        let mut probe = DirectoryInsertProbe::new(64, 8)?;
+        assert!(probe.measure(Arm::Hit)? > 0);
+        assert!(probe.measure(Arm::Miss)? > 0);
+
+        assert_eq!(
+            DirectoryInsertProbe::new(8, 0).err(),
+            Some(ProbeError::InvalidShape)
+        );
+        assert_eq!(
+            DirectoryInsertProbe::new(8, 7).err(),
+            Some(ProbeError::InvalidShape)
+        );
         Ok(())
     }
 

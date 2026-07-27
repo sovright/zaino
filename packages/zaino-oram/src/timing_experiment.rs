@@ -184,6 +184,16 @@ fn measure_pair<P: PairedProbe>(probe: &mut P, miss_first: bool) -> Result<Pair,
     }
 }
 
+/// Whether `Cpus_allowed_list` names exactly one CPU.
+///
+/// Pinning is checked rather than assumed: a run that believes it is pinned but
+/// is not will migrate between cores mid-experiment, and the migration cost
+/// lands on whichever arm happens to be executing.
+pub fn single_cpu_allowed(cpus_allowed_list: &str) -> bool {
+    let list = cpus_allowed_list.trim();
+    !list.is_empty() && !list.contains(',') && !list.contains('-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +322,15 @@ mod tests {
         };
         assert_eq!(order_for(3), order_for(3));
         assert_ne!(order_for(3), order_for(4));
+    }
+
+    #[test]
+    fn only_a_single_pinned_cpu_is_accepted() {
+        assert!(single_cpu_allowed("3"));
+        assert!(single_cpu_allowed(" 11 "));
+        assert!(!single_cpu_allowed("0-15"));
+        assert!(!single_cpu_allowed("0,2"));
+        assert!(!single_cpu_allowed("2-3,7"));
+        assert!(!single_cpu_allowed(""));
     }
 }
