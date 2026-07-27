@@ -25,6 +25,308 @@ use crate::chain_index::{finalized_height_floor, ChainIndex};
 use std::time::Duration;
 use tokio::time::sleep;
 
+mod canonical_recent_chain {
+    use crate::{
+        chain_index::{
+            non_finalised_state::{
+                CanonicalRecentChainSnapshotError, ChainIndexSnapshot,
+                NonfinalizedBlockCacheSnapshot,
+            },
+            tests::vectors::{indexed_block_chain, load_test_vectors},
+            BlockIndex,
+        },
+        BlockHash, Height, IndexedBlock,
+    };
+    use std::{collections::HashMap, error::Error, io, sync::Arc};
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    fn fixture_chain() -> Result<[IndexedBlock; 4], Box<dyn Error>> {
+        let vectors = load_test_vectors()?;
+        let first_four = vectors
+            .blocks
+            .get(..4)
+            .ok_or_else(|| io::Error::other("test vectors must contain four blocks"))?;
+        let blocks = indexed_block_chain(first_four).collect::<Vec<_>>();
+        blocks.try_into().map_err(|blocks: Vec<IndexedBlock>| {
+            io::Error::other(format!(
+                "expected four indexed fixture blocks, found {}",
+                blocks.len()
+            ))
+            .into()
+        })
+    }
+
+    fn block_index(block: &IndexedBlock) -> BlockIndex {
+        BlockIndex {
+            height: block.height(),
+            hash: *block.hash(),
+        }
+    }
+
+    fn nfs_fixture(
+        blocks: &[IndexedBlock],
+    ) -> Result<NonfinalizedBlockCacheSnapshot, Box<dyn Error>> {
+        let tip = blocks
+            .last()
+            .ok_or_else(|| io::Error::other("NFS fixture requires at least one block"))?;
+        let mut blocks_by_hash = HashMap::new();
+        let mut heights_to_hashes = HashMap::new();
+        for block in blocks {
+            blocks_by_hash.insert(*block.hash(), block.clone());
+            heights_to_hashes.insert(block.height(), *block.hash());
+        }
+        Ok(NonfinalizedBlockCacheSnapshot {
+            blocks: blocks_by_hash,
+            heights_to_hashes,
+            best_tip: block_index(tip),
+        })
+    }
+
+    fn published_snapshot(nfs: NonfinalizedBlockCacheSnapshot) -> ChainIndexSnapshot {
+        ChainIndexSnapshot::NonFinalizedStateExists {
+            non_finalized_snapshot: Arc::new(nfs),
+        }
+    }
+
+    #[test]
+    fn returns_oldest_first_above_seam_and_ignores_side_blocks() -> TestResult {
+        let blocks = fixture_chain()?;
+        let [seam_block, first_recent, second_recent, tip_block] = &blocks;
+        let seam = block_index(seam_block);
+        let mut nfs = nfs_fixture(&blocks)?;
+
+        let side_hash = BlockHash([0xa5; 32]);
+        assert!(!nfs.blocks.contains_key(&side_hash));
+        let mut side_block = second_recent.clone();
+        side_block.context.index.hash = side_hash;
+        nfs.blocks.insert(side_hash, side_block);
+
+        let recent = published_snapshot(nfs).canonical_recent_chain(seam)?;
+        assert_eq!(recent.finalized(), seam);
+        assert_eq!(recent.tip(), block_index(tip_block));
+        assert_eq!(
+            recent
+                .blocks()
+                .iter()
+                .map(|block| *block.hash())
+                .collect::<Vec<_>>(),
+            vec![
+                *first_recent.hash(),
+                *second_recent.hash(),
+                *tip_block.hash()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_seam_at_tip_returns_an_empty_recent_segment() -> TestResult {
+        let blocks = fixture_chain()?;
+        let tip = block_index(&blocks[3]);
+        let recent = published_snapshot(nfs_fixture(&blocks)?).canonical_recent_chain(tip)?;
+
+        assert_eq!(recent.finalized(), tip);
+        assert_eq!(recent.tip(), tip);
+        assert!(recent.blocks().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn walks_from_maximum_height_minus_one_without_overflow() -> TestResult {
+        let blocks = fixture_chain()?;
+        let maximum_raw = zebra_chain::block::Height::MAX.0;
+        let seam_raw = maximum_raw
+            .checked_sub(1)
+            .ok_or_else(|| io::Error::other("maximum block height must have a predecessor"))?;
+        let seam_height = Height::try_from(seam_raw).map_err(io::Error::other)?;
+        let tip_height = Height::try_from(maximum_raw).map_err(io::Error::other)?;
+        let seam_hash = BlockHash([0xe1; 32]);
+        let tip_hash = BlockHash([0xe2; 32]);
+
+        let mut seam_block = blocks[0].clone();
+        seam_block.context.index = BlockIndex {
+            height: seam_height,
+            hash: seam_hash,
+        };
+        let mut tip_block = blocks[1].clone();
+        tip_block.context.index = BlockIndex {
+            height: tip_height,
+            hash: tip_hash,
+        };
+        tip_block.context.parent_hash = seam_hash;
+
+        let recent = published_snapshot(nfs_fixture(&[seam_block, tip_block])?)
+            .canonical_recent_chain(BlockIndex {
+                height: seam_height,
+                hash: seam_hash,
+            })?;
+        assert_eq!(recent.tip().height, tip_height);
+        assert_eq!(recent.blocks().len(), 1);
+        assert_eq!(recent.blocks()[0].height(), tip_height);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unpublished_state_and_finalized_seam_above_tip() -> TestResult {
+        let blocks = fixture_chain()?;
+        let tip = block_index(&blocks[3]);
+        let syncing = ChainIndexSnapshot::StillSyncingFinalizedState {
+            validator_finalized_height: tip.height,
+        };
+        assert!(matches!(
+            syncing.canonical_recent_chain(block_index(&blocks[0])),
+            Err(CanonicalRecentChainSnapshotError::StillSyncing)
+        ));
+
+        let above_tip_raw = u32::from(tip.height)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("fixture tip height must be incrementable"))?;
+        let above_tip_height = Height::try_from(above_tip_raw).map_err(io::Error::other)?;
+        let above_tip = BlockIndex {
+            height: above_tip_height,
+            hash: BlockHash([0xb6; 32]),
+        };
+        assert!(matches!(
+            published_snapshot(nfs_fixture(&blocks)?).canonical_recent_chain(above_tip),
+            Err(CanonicalRecentChainSnapshotError::FinalizedAboveTip {
+                finalized_height,
+                tip_height,
+            }) if finalized_height == above_tip_height && tip_height == tip.height
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn requires_exact_retained_finalized_checkpoint_payload() -> TestResult {
+        let blocks = fixture_chain()?;
+        let seam = block_index(&blocks[0]);
+
+        let mut missing_height = nfs_fixture(&blocks)?;
+        missing_height.heights_to_hashes.remove(&seam.height);
+        assert!(matches!(
+            published_snapshot(missing_height).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::FinalizedCheckpointMissing { height })
+                if height == seam.height
+        ));
+
+        let mut wrong_hash = nfs_fixture(&blocks)?;
+        wrong_hash
+            .heights_to_hashes
+            .insert(seam.height, *blocks[1].hash());
+        assert!(matches!(
+            published_snapshot(wrong_hash).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::FinalizedCheckpointHashMismatch { height })
+                if height == seam.height
+        ));
+
+        let mut missing_payload = nfs_fixture(&blocks)?;
+        missing_payload.blocks.remove(&seam.hash);
+        assert!(matches!(
+            published_snapshot(missing_payload).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::FinalizedCheckpointMissing { height })
+                if height == seam.height
+        ));
+
+        let mut wrong_payload_identity = nfs_fixture(&blocks)?;
+        wrong_payload_identity
+            .blocks
+            .insert(seam.hash, blocks[1].clone());
+        assert!(matches!(
+            published_snapshot(wrong_payload_identity).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::FinalizedCheckpointIdentityMismatch {
+                height
+            }) if height == seam.height
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_canonical_gaps_missing_payloads_and_wrong_payload_identity() -> TestResult {
+        let blocks = fixture_chain()?;
+        let seam = block_index(&blocks[0]);
+        let target = block_index(&blocks[2]);
+
+        let mut gap = nfs_fixture(&blocks)?;
+        gap.heights_to_hashes.remove(&blocks[1].height());
+        assert!(matches!(
+            published_snapshot(gap).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::NonContiguousHeight { height })
+                if height == blocks[1].height()
+        ));
+
+        let mut missing_payload = nfs_fixture(&blocks)?;
+        missing_payload.blocks.remove(&target.hash);
+        assert!(matches!(
+            published_snapshot(missing_payload).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::CanonicalBlockMissing { height })
+                if height == target.height
+        ));
+
+        let mut wrong_payload_identity = nfs_fixture(&blocks)?;
+        wrong_payload_identity
+            .blocks
+            .insert(target.hash, blocks[1].clone());
+        assert!(matches!(
+            published_snapshot(wrong_payload_identity).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::CanonicalBlockIdentityMismatch { height })
+                if height == target.height
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_broken_parent_links_and_best_tip_map_disagreement() -> TestResult {
+        let blocks = fixture_chain()?;
+        let seam = block_index(&blocks[0]);
+        let first_recent = block_index(&blocks[1]);
+        let target = block_index(&blocks[2]);
+
+        let mut broken_anchor_parent = nfs_fixture(&blocks)?;
+        let first_recent_block = broken_anchor_parent
+            .blocks
+            .get_mut(&first_recent.hash)
+            .ok_or_else(|| io::Error::other("first recent fixture block must exist"))?;
+        first_recent_block.context.parent_hash = BlockHash([0xb7; 32]);
+        assert!(matches!(
+            published_snapshot(broken_anchor_parent).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::ParentHashMismatch { height })
+                if height == first_recent.height
+        ));
+
+        let mut broken_parent = nfs_fixture(&blocks)?;
+        let target_block = broken_parent
+            .blocks
+            .get_mut(&target.hash)
+            .ok_or_else(|| io::Error::other("fixture target block must exist"))?;
+        target_block.context.parent_hash = BlockHash([0xc7; 32]);
+        assert!(matches!(
+            published_snapshot(broken_parent).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::ParentHashMismatch { height })
+                if height == target.height
+        ));
+
+        let mut wrong_tip_hash = nfs_fixture(&blocks)?;
+        wrong_tip_hash.best_tip.hash = BlockHash([0xd8; 32]);
+        let declared_tip_height = wrong_tip_hash.best_tip.height;
+        assert!(matches!(
+            published_snapshot(wrong_tip_hash).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::TipMismatch { height })
+                if height == declared_tip_height
+        ));
+
+        let mut canonical_height_above_tip = nfs_fixture(&blocks)?;
+        canonical_height_above_tip.best_tip = block_index(&blocks[2]);
+        let declared_tip_height = canonical_height_above_tip.best_tip.height;
+        assert!(matches!(
+            published_snapshot(canonical_height_above_tip).canonical_recent_chain(seam),
+            Err(CanonicalRecentChainSnapshotError::TipMismatch { height })
+                if height == declared_tip_height
+        ));
+        Ok(())
+    }
+}
+
 /// **B**: After the chain index has finished its first sync iteration,
 /// the lowest-height block in the NFS snapshot is the same block the
 /// finalized DB has at its tip. The two layers must overlap exactly at
