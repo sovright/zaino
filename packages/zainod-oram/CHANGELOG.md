@@ -2,14 +2,26 @@
 
 ## Unreleased
 
+- Add an explicit, bounded `corpus capture --fetch-concurrency` option that
+  keeps indexed-block reads in flight while reducing them strictly in height
+  order; the conservative default remains sequential.
+- Add a crate-private, mock-backed custom Tonic codec and body adapter that
+  retains a non-`Clone` pending response without an eager byte copy, performs
+  its fallible currentness check at the first outbound body poll, emits the
+  exact fixed-envelope DATA frame on success, and suppresses stale responses as
+  one uniform `Unavailable` trailer shape with no DATA. Dropping an unpolled
+  body releases the pending response without checking or borrowing its bytes.
+  This does not integrate the real process owner or prove socket-write,
+  transport-completion, peer-delivery, listener, or production privacy
+  properties.
 - Add a default-off `private-service` feature with an independent
   `zaino.private.v1.PrivateCompactTxStreamer/QueryPage` schema, committed
   generated Rust source, exact outer-envelope length validation through named
   wire methods, and a crate-private listener-free adapter tested against a mock
   runtime port. Its non-`Clone` result retains the port's pending response. The
   generated Tonic trait is not implemented; no concrete owner routing,
-  response-body/transport guard, currentness-at-write, listener, attestation, or
-  production privacy claim is added.
+  currentness at socket write, listener, attestation, or production privacy
+  claim is added.
 - Add listener-free `corpus capture` over one indexed non-finalized mainnet
   snapshot, with optional explicit height/hash selection and atomic,
   read-back-verified measurement artifacts.

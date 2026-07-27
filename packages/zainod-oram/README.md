@@ -28,20 +28,32 @@ Builds without `protoc` consume the same committed source, so ordinary and
 native-builder checks do not depend on an ambient compiler and never select a
 different generated contract.
 
-The same feature adds a crate-private synchronous, listener-free adapter over a
-crate-private mockable runtime port. It validates the protobuf boundary through
-named `try_from_wire` / `to_wire` methods, maps boundary and runtime-port
-failures to one redacted adapter error, and returns the encoded response only
-inside a non-`Clone` pending value that continues to own the port's pending
-response.
-The real process owner remains private and is not exposed, constructed, or
-routed by this package.
+The same feature adds a crate-private synchronous, listener-free adapter over
+the small `zaino-oram` `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and
+`PrivateQueryUnavailable` facade. It validates the protobuf boundary through
+named `try_from_wire` / `to_wire` methods, maps boundary and runtime failures to
+one redacted adapter error, and retains the non-`Clone` pending response without
+extracting detached response bytes.
 
-The generated Tonic service trait is deliberately not implemented in this
-slice. There is no listener, TLS, compression or message-limit policy,
-concurrent admission, response-body ownership, release-time currentness check,
-transport completion, peer delivery, attestation, or production privacy claim.
-The guarded body and actual owner wiring remain separate integration work.
+A crate-private custom Tonic codec and body adapter consumes that pending value
+only when the outbound body is first polled. That poll performs the pending
+value's fallible release-time currentness check before borrowing its fixed
+bytes. A successful check encodes one exact fixed-envelope protobuf DATA frame
+and releases the pending value after encoding. A stale or unavailable response
+emits no DATA and is collapsed to one static `Unavailable` trailer shape. If
+the body is dropped before it is polled, the pending value is released without
+a currentness check or response-byte borrow.
+
+The concrete `zaino-oram` runtime owner remains private, with no public
+constructor or factory, so this package currently exercises the shared facade
+with mock implementations only. The generated Tonic service trait is
+deliberately not implemented; it fixes the response type to the generated
+protobuf message and cannot carry this pending value. A generated route and
+listener, production protector/replay/material providers, durable replay,
+trusted clock and nonce ledger, key management, rollback protection, TLS/TDX,
+package/profile-specific message limits, real-owner integration, and
+transport-write or peer-delivery evidence remain open. Currentness at first
+body poll is not currentness at the later transport-write boundary.
 
 ## Release-bound deterministic-build receipt
 
@@ -281,6 +293,13 @@ earlier checkpoint; the RPC-order hash is verified against the indexed
 canonical block before the scan begins. The scanner then verifies genesis,
 height, parent-hash, and final checkpoint continuity while retaining no blocks
 in the runner.
+
+Block fetching is sequential by default. Operators may explicitly set
+`--fetch-concurrency` from 1 through 32 to keep a bounded number of indexed
+block reads in flight. Fetches may complete out of order, but the runner always
+feeds them to the canonical scanner in ascending height order, so this knob
+does not change the measurement or its digest. The bound limits transient
+full-block memory and validator work-queue pressure.
 
 `--output-dir` must name a new directory. The command builds the artifact in a
 temporary sibling directory and atomically renames it into place only after all
