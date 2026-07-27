@@ -205,9 +205,17 @@ where
             let occupied_records = self.occupied_records;
             // Admitted from public occupancy before the access path runs, so a
             // refusal never depends on whether the key is present.
-            admit_insert(occupied_records, capacity).inspect_err(|_| {
-                self.failed_closed = true;
-            })?;
+            match admit_insert(occupied_records, capacity) {
+                Ok(()) => {}
+                // A full table is a consistent state and a plain refusal, so it
+                // leaves the store usable. Only an impossible occupancy is
+                // corruption worth latching.
+                Err(RostlStoreError::TableFull) => return Err(RostlStoreError::TableFull),
+                Err(error) => {
+                    self.failed_closed = true;
+                    return Err(error);
+                }
+            }
             let result = catch_upstream(|| fixed_unique_insert(self, key, value, occupied_records));
             let commit = self.finish_upstream(result)?;
             let disposition = commit.classify().inspect_err(|_| {
@@ -672,6 +680,9 @@ mod tests {
             Err(RostlStoreError::TableFull)
         );
         assert_eq!(store.oram.evict_counter, before);
+
+        // A full table is a refusal, not corruption: the store must stay
+        // readable rather than latching failed-closed.
         assert_eq!(store.occupied_record_count()?, 8);
         assert_eq!(store.read_record(3)?, Some(directory_record(4, 3)));
         Ok(())
