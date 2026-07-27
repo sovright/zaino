@@ -14,6 +14,7 @@ on:
       - 'packages/zaino-oram/**'
       - 'packages/zaino-proto/**'
       - 'packages/zaino-state/**'
+      - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -27,6 +28,7 @@ on:
       - 'packages/zaino-oram/**'
       - 'packages/zaino-proto/**'
       - 'packages/zaino-state/**'
+      - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
 
 permissions:
@@ -73,4 +75,15 @@ jobs:
       - name: Run all-feature tests natively
         run: >-
           cargo nextest run -p zaino-oram --all-features --locked
+          --no-tests fail --status-level fail
+
+      - name: Run strict typed-qualification runner Clippy
+        run: >-
+          cargo clippy -p zainod-oram --all-features --all-targets --no-deps
+          --locked --
+          -D warnings -D clippy::unwrap_used
+
+      - name: Run typed-qualification runner tests natively
+        run: >-
+          cargo nextest run -p zainod-oram --all-features --locked
           --no-tests fail --status-level fail
