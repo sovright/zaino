@@ -3,17 +3,29 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fmt, num::NonZeroU32, path::PathBuf, process::ExitCode};
+use std::{
+    error::Error,
+    fmt,
+    future::Future,
+    num::{NonZeroU32, NonZeroUsize},
+    ops::RangeInclusive,
+    path::PathBuf,
+    process::ExitCode,
+};
+#[cfg(feature = "typed-qualification")]
+use std::{num::NonZeroU64, time::Duration};
 
 #[cfg(feature = "typed-qualification")]
 use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
+use futures::{stream, StreamExt};
 use zaino_common::Network;
 #[cfg(feature = "typed-qualification")]
 use zaino_oram::{
     run_typed_worker_full_map_saturation, run_typed_worker_qualification,
-    run_typed_worker_stress_qualification, TypedWorkerFullMapSaturationProfile,
-    TypedWorkerStressProfile,
+    run_typed_worker_stress_qualification, run_typed_worker_target_load,
+    TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport, TypedWorkerColdRebuildSession,
+    TypedWorkerFullMapSaturationProfile, TypedWorkerStressProfile, TypedWorkerTargetLoadProfile,
 };
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_state::{
@@ -25,9 +37,15 @@ use zainodlib::{
     config::{load_config, BackendType},
 };
 
+#[cfg(feature = "typed-qualification")]
+use crate::cold_rebuild_artifact::{publish_cold_rebuild, ColdRebuildSourceSnapshotV1};
 use crate::corpus_artifact::{
     load_capture, load_sizing, publish_capture, publish_sizing, BackendKind, CaptureProvenance,
     SelectionMode, SnapshotMode, ValidatedSizing,
+};
+#[cfg(feature = "typed-qualification")]
+use crate::execution_identity::{
+    create_release_receipt, verify_release_receipt, ReleaseReceiptInputs,
 };
 #[cfg(feature = "typed-qualification")]
 use crate::full_map_saturation_artifact::publish_full_map_saturation;
@@ -35,16 +53,30 @@ use crate::full_map_saturation_artifact::publish_full_map_saturation;
 use crate::qualification_artifact::publish_qualification;
 #[cfg(feature = "typed-qualification")]
 use crate::stress_qualification_artifact::publish_stress_qualification;
+#[cfg(feature = "typed-qualification")]
+use crate::target_load_artifact::publish_target_load;
 
+#[cfg(feature = "typed-qualification")]
+mod cold_rebuild_artifact;
 mod corpus_artifact;
 #[cfg(feature = "typed-qualification")]
+mod execution_identity;
+#[cfg(feature = "typed-qualification")]
 mod full_map_saturation_artifact;
+#[cfg(feature = "private-service")]
+mod private_proto;
+#[cfg(feature = "private-service")]
+mod private_service;
 #[cfg(feature = "typed-qualification")]
 mod qualification_artifact;
 #[cfg(feature = "typed-qualification")]
 mod stress_qualification_artifact;
+#[cfg(feature = "typed-qualification")]
+mod target_load_artifact;
 
 type RunnerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+const MAX_CAPTURE_FETCH_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -61,9 +93,72 @@ struct Cli {
 enum Command {
     /// Capture or inspect ORAM corpus evidence.
     Corpus(CorpusCommand),
+    /// Create or verify a self-reported local-integrity receipt without a listener.
+    #[cfg(feature = "typed-qualification")]
+    Release(ReleaseCommand),
     /// Exercise the fixed typed-worker correctness scenario without a listener.
     #[cfg(feature = "typed-qualification")]
     Qualification(QualificationCommand),
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct ReleaseCommand {
+    #[command(subcommand)]
+    command: ReleaseSubcommand,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Subcommand)]
+enum ReleaseSubcommand {
+    /// Record observed agreement between two fixed-procedure build artifacts.
+    CreateReceipt(ReleaseCreateReceiptArgs),
+    /// Check canonical receipt integrity and the running executable identity.
+    VerifyReceipt(ReleaseVerifyReceiptArgs),
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct ReleaseCreateReceiptArgs {
+    /// Exact full source revision reported for both build procedures.
+    #[arg(long)]
+    source_revision: String,
+
+    /// Git archive whose embedded commit and fixed inputs are checked locally.
+    #[arg(long, value_name = "FILE")]
+    source_archive: PathBuf,
+
+    /// Cargo.lock reported as consumed by both build procedures.
+    #[arg(long, value_name = "FILE")]
+    cargo_lock: PathBuf,
+
+    /// rust-toolchain.toml reported as consumed by both build procedures.
+    #[arg(long, value_name = "FILE")]
+    rust_toolchain: PathBuf,
+
+    /// Dockerfile.deterministic reported as consumed by both build procedures.
+    #[arg(long, value_name = "FILE")]
+    dockerfile: PathBuf,
+
+    /// Primary zainod-oram artifact, which must be this invoking executable.
+    #[arg(long, value_name = "FILE")]
+    binary: PathBuf,
+
+    /// Second no-cache build artifact that must have the same bytes.
+    #[arg(long, value_name = "FILE")]
+    reproducible_binary: PathBuf,
+
+    /// New path that will receive the canonical receipt JSON.
+    #[arg(long, value_name = "FILE")]
+    output: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct ReleaseVerifyReceiptArgs {
+    /// Canonical receipt to check against the running /proc/self/exe inode.
+    #[arg(long, value_name = "FILE")]
+    receipt: PathBuf,
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -80,6 +175,10 @@ enum QualificationSubcommand {
     Run(QualificationRunArgs),
     /// Run a fixed stress profile and publish aggregate evidence.
     Stress(QualificationStressArgs),
+    /// Run a sizing-bound builder target-load profile and publish aggregate evidence.
+    TargetLoad(QualificationTargetLoadArgs),
+    /// Rebuild a typed worker from a fixed canonical source snapshot.
+    ColdRebuild(QualificationColdRebuildArgs),
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -103,6 +202,58 @@ struct QualificationStressArgs {
 }
 
 #[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTargetLoadArgs {
+    /// Versioned fixed builder target-load profile to execute.
+    #[arg(long, value_enum)]
+    profile: TargetLoadProfileArg,
+
+    /// Complete three-file capture directory bound to the sizing input.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Complete three-file sizing directory to validate and consume.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+
+    /// New directory that will receive the complete verified evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationColdRebuildArgs {
+    /// Versioned source-bound cold-rebuild profile to execute.
+    #[arg(long, value_enum)]
+    profile: ColdRebuildProfileArg,
+
+    /// Mainnet Zainod TOML config used to open the canonical indexed source.
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+
+    /// Complete three-file capture directory bound to the sizing input.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Complete three-file sizing directory to validate and consume.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+
+    /// Declared allocation-through-readiness rebuild budget in whole seconds.
+    #[arg(long)]
+    declared_rebuild_budget_seconds: NonZeroU64,
+
+    /// New directory that will receive the complete verified evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+
+    /// Emit aggregate progress every this many public block heights.
+    #[arg(long)]
+    progress_interval: NonZeroU32,
+}
+
+#[cfg(feature = "typed-qualification")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StressQualificationProfileArg {
     /// Fixed smoke-level stress qualification profile.
@@ -111,6 +262,22 @@ enum StressQualificationProfileArg {
     /// Fixed full admitted-map correctness-saturation profile.
     #[value(name = "full-map-saturation-v1")]
     FullMapSaturationV1,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TargetLoadProfileArg {
+    /// Fixed single-caller profile for the generic Linux x86_64 builder.
+    #[value(name = "builder-foundation-v1")]
+    BuilderFoundationV1,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ColdRebuildProfileArg {
+    /// Fixed source-bound single-caller profile for the generic builder.
+    #[value(name = "source-bound-builder-v1")]
+    SourceBoundBuilderV1,
 }
 
 #[derive(Debug, Args)]
@@ -142,6 +309,14 @@ struct CorpusCaptureArgs {
     /// Emit aggregate progress every this many public block heights.
     #[arg(long, default_value = "10000")]
     progress_interval: NonZeroU32,
+
+    /// Maximum indexed-block fetches in flight; results are always reduced by height.
+    #[arg(
+        long,
+        default_value = "1",
+        value_parser = parse_capture_fetch_concurrency
+    )]
+    fetch_concurrency: NonZeroUsize,
 
     /// Public height to capture instead of the snapshot's serviceable tip.
     #[arg(long, requires = "target_hash")]
@@ -238,6 +413,8 @@ impl CorpusSizeArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    zaino_common::logging::init();
+
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -255,11 +432,42 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             CorpusSubcommand::ValidateSizing(args) => run_corpus_validate_sizing(args),
         },
         #[cfg(feature = "typed-qualification")]
+        Command::Release(command) => match command.command {
+            ReleaseSubcommand::CreateReceipt(args) => run_release_create_receipt(args),
+            ReleaseSubcommand::VerifyReceipt(args) => run_release_verify_receipt(args),
+        },
+        #[cfg(feature = "typed-qualification")]
         Command::Qualification(command) => match command.command {
             QualificationSubcommand::Run(args) => run_qualification(args),
             QualificationSubcommand::Stress(args) => run_stress_qualification(args),
+            QualificationSubcommand::TargetLoad(args) => run_target_load(args),
+            QualificationSubcommand::ColdRebuild(args) => run_cold_rebuild(args).await,
         },
     }
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_release_create_receipt(args: ReleaseCreateReceiptArgs) -> RunnerResult<()> {
+    let output = args.output.clone();
+    create_release_receipt(ReleaseReceiptInputs {
+        source_revision: args.source_revision,
+        source_archive: args.source_archive,
+        cargo_lock: args.cargo_lock,
+        rust_toolchain: args.rust_toolchain,
+        dockerfile: args.dockerfile,
+        binary: args.binary,
+        reproducible_binary: args.reproducible_binary,
+        output: args.output,
+    })?;
+    println!("release_receipt={}", output.display());
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_release_verify_receipt(args: ReleaseVerifyReceiptArgs) -> RunnerResult<()> {
+    verify_release_receipt(&args.receipt)?;
+    println!("release_receipt_verified={}", args.receipt.display());
+    Ok(())
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -299,6 +507,175 @@ fn run_stress_qualification(args: QualificationStressArgs) -> RunnerResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_target_load(args: QualificationTargetLoadArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    let profile = match args.profile {
+        TargetLoadProfileArg::BuilderFoundationV1 => {
+            TypedWorkerTargetLoadProfile::BuilderFoundationV1
+        }
+    };
+    let target_load = run_typed_worker_target_load(
+        profile,
+        sizing.qualification(),
+        sizing.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+    )?;
+    publish_target_load(
+        &args.output_dir,
+        &capture,
+        &sizing,
+        &target_load,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!("target_load_artifact={}", args.output_dir.display());
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+async fn run_cold_rebuild(args: QualificationColdRebuildArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    let config = load_config(&args.config)?;
+    if config.network != Network::Mainnet {
+        return Err(RunnerError::MainnetRequired {
+            configured: config.network,
+        }
+        .into());
+    }
+
+    let profile = match args.profile {
+        ColdRebuildProfileArg::SourceBoundBuilderV1 => {
+            TypedWorkerColdRebuildProfile::SourceBoundBuilderV1
+        }
+    };
+    let declared_rebuild_budget = Duration::from_secs(args.declared_rebuild_budget_seconds.get());
+    let source_backend = backend_kind(config.backend);
+    let service_config = NodeBackedIndexerServiceConfig::try_from(config)?;
+    let mut service = NodeBackedIndexerService::spawn(service_config).await?;
+    let rebuild_result = rebuild_fixed_snapshot(
+        &service,
+        profile,
+        &capture,
+        &sizing,
+        declared_rebuild_budget,
+        source_backend,
+        args.progress_interval,
+    )
+    .await;
+    service.close();
+    let (report, source_snapshot) = rebuild_result?;
+
+    publish_cold_rebuild(
+        &args.output_dir,
+        &capture,
+        &sizing,
+        &report,
+        declared_rebuild_budget,
+        &source_snapshot,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!("cold_rebuild_artifact={}", args.output_dir.display());
+    if report.declared_rebuild_budget_passed() {
+        Ok(())
+    } else {
+        Err(RunnerError::DeclaredRebuildBudgetMiss {
+            declared_seconds: args.declared_rebuild_budget_seconds.get(),
+        }
+        .into())
+    }
+}
+
+#[cfg(feature = "typed-qualification")]
+async fn rebuild_fixed_snapshot(
+    service: &NodeBackedIndexerService,
+    profile: TypedWorkerColdRebuildProfile,
+    capture: &crate::corpus_artifact::ValidatedCapture,
+    sizing: &ValidatedSizing,
+    declared_rebuild_budget: Duration,
+    source_backend: BackendKind,
+    progress_interval: NonZeroU32,
+) -> RunnerResult<(TypedWorkerColdRebuildReport, ColdRebuildSourceSnapshotV1)> {
+    let subscriber = service.get_subscriber().inner();
+    let snapshot = subscriber.indexer.snapshot_nonfinalized_state().await?;
+    classify_snapshot(&snapshot)?;
+
+    let checkpoint = capture.measurement().checkpoint();
+    let checkpoint_height = checkpoint.height();
+    let serviceable_height = u32::from(*snapshot.max_serviceable_height());
+    if checkpoint_height > serviceable_height {
+        return Err(RunnerError::CaptureCheckpointAboveServiceable {
+            checkpoint: checkpoint_height,
+            serviceable: serviceable_height,
+        }
+        .into());
+    }
+    let typed_checkpoint_height =
+        Height::try_from(checkpoint_height).map_err(|_| RunnerError::HeightOutOfRange {
+            height: checkpoint_height,
+        })?;
+    let actual_checkpoint_hash = subscriber
+        .indexer
+        .get_block_hash(&snapshot, typed_checkpoint_height)
+        .await?
+        .ok_or(RunnerError::MissingCanonicalBlock {
+            height: checkpoint_height,
+        })?;
+    if !actual_checkpoint_hash
+        .to_rpc_hex()
+        .eq_ignore_ascii_case(checkpoint.hash())
+    {
+        return Err(RunnerError::CaptureCheckpointHashMismatch {
+            height: checkpoint_height,
+        }
+        .into());
+    }
+    let source_snapshot = ColdRebuildSourceSnapshotV1::new_verified(
+        source_backend,
+        serviceable_height,
+        capture.measurement(),
+    )?;
+
+    // Worker allocation begins only after the source snapshot has proven the
+    // exact public capture checkpoint above.
+    let mut session = TypedWorkerColdRebuildSession::start(
+        profile,
+        capture.measurement(),
+        sizing.qualification(),
+        capture.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+        declared_rebuild_budget,
+    )?;
+    eprintln!(
+        "cold_rebuild_start=mainnet,target_height:{checkpoint_height},serviceable_height:{serviceable_height}"
+    );
+    for raw_height in 0..=checkpoint_height {
+        let height = Height::try_from(raw_height)
+            .map_err(|_| RunnerError::HeightOutOfRange { height: raw_height })?;
+        let block = subscriber
+            .indexer
+            .get_indexed_block_by_height(&snapshot, &height)
+            .await?
+            .ok_or(RunnerError::MissingCanonicalBlock { height: raw_height })?;
+        session.push(&block)?;
+        if raw_height % progress_interval.get() == 0 || raw_height == checkpoint_height {
+            eprintln!(
+                "cold_rebuild_progress=mainnet,current_height:{raw_height},target_height:{checkpoint_height}"
+            );
+        }
+    }
+    let report = session.finish()?;
+    report.validate_against(
+        capture.measurement(),
+        sizing.qualification(),
+        capture.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+        declared_rebuild_budget,
+    )?;
+    Ok((report, source_snapshot))
 }
 
 fn run_corpus_size(args: CorpusSizeArgs) -> RunnerResult<()> {
@@ -348,10 +725,7 @@ async fn run_corpus_capture(args: CorpusCaptureArgs) -> RunnerResult<()> {
         }
         .into());
     }
-    let backend = match config.backend {
-        BackendType::Direct => BackendKind::Direct,
-        BackendType::Rpc => BackendKind::Rpc,
-    };
+    let backend = backend_kind(config.backend);
 
     // Spawn the chain-data service directly. Unlike zainod's Indexer wrapper,
     // this path creates no gRPC, JSON-RPC, metrics, or other network listener.
@@ -360,6 +734,7 @@ async fn run_corpus_capture(args: CorpusCaptureArgs) -> RunnerResult<()> {
     let scan_result = scan_fixed_snapshot(
         &service,
         args.progress_interval,
+        args.fetch_concurrency,
         args.target_height,
         args.target_hash.as_deref(),
     )
@@ -379,9 +754,17 @@ async fn run_corpus_capture(args: CorpusCaptureArgs) -> RunnerResult<()> {
     Ok(())
 }
 
+const fn backend_kind(backend: BackendType) -> BackendKind {
+    match backend {
+        BackendType::Direct => BackendKind::Direct,
+        BackendType::Rpc => BackendKind::Rpc,
+    }
+}
+
 async fn scan_fixed_snapshot(
     service: &NodeBackedIndexerService,
     progress_interval: NonZeroU32,
+    fetch_concurrency: NonZeroUsize,
     target_height: Option<u32>,
     target_hash: Option<&str>,
 ) -> RunnerResult<CaptureScan> {
@@ -406,24 +789,39 @@ async fn scan_fixed_snapshot(
     let mut scanner = MainnetCorpusScanner::new();
 
     eprintln!(
-        "corpus_capture_start=mainnet,target_height:{fixed_tip},serviceable_height:{serviceable_height}"
+        "corpus_capture_start=mainnet,target_height:{fixed_tip},serviceable_height:{serviceable_height},fetch_concurrency:{}",
+        fetch_concurrency.get()
     );
-    for raw_height in 0..=fixed_tip {
-        let height = Height::try_from(raw_height)
-            .map_err(|_| RunnerError::HeightOutOfRange { height: raw_height })?;
-        let block = subscriber
-            .indexer
-            .get_indexed_block_by_height(&snapshot, &height)
-            .await?
-            .ok_or(RunnerError::MissingCanonicalBlock { height: raw_height })?;
-        scanner.push(&block)?;
+    let fetch_indexer = subscriber.indexer.clone();
+    let fetch_snapshot = snapshot.clone();
+    reduce_ordered_range(
+        0..=fixed_tip,
+        fetch_concurrency,
+        move |raw_height| {
+            let indexer = fetch_indexer.clone();
+            let snapshot = fetch_snapshot.clone();
+            async move {
+                let height = Height::try_from(raw_height)
+                    .map_err(|_| RunnerError::HeightOutOfRange { height: raw_height })?;
+                let block = indexer
+                    .get_indexed_block_by_height(&snapshot, &height)
+                    .await?
+                    .ok_or(RunnerError::MissingCanonicalBlock { height: raw_height })?;
+                Ok::<_, Box<dyn Error + Send + Sync>>(block)
+            }
+        },
+        |raw_height, block| {
+            scanner.push(&block)?;
 
-        if raw_height % progress_interval.get() == 0 || raw_height == fixed_tip {
-            eprintln!(
-                "corpus_capture_progress=mainnet,current_height:{raw_height},target_height:{fixed_tip}"
-            );
-        }
-    }
+            if raw_height % progress_interval.get() == 0 || raw_height == fixed_tip {
+                eprintln!(
+                    "corpus_capture_progress=mainnet,current_height:{raw_height},target_height:{fixed_tip}"
+                );
+            }
+            Ok(())
+        },
+    )
+    .await?;
 
     let measurement = scanner.finish()?;
     measurement.validate()?;
@@ -443,6 +841,47 @@ async fn scan_fixed_snapshot(
         serviceable_height,
         selection_mode,
     })
+}
+
+/// Fetches a bounded number of items concurrently while reducing them in range order.
+async fn reduce_ordered_range<T, E, Fetch, FetchFuture, Reduce>(
+    heights: RangeInclusive<u32>,
+    concurrency: NonZeroUsize,
+    fetch: Fetch,
+    mut reduce: Reduce,
+) -> Result<(), E>
+where
+    Fetch: Fn(u32) -> FetchFuture,
+    FetchFuture: Future<Output = Result<T, E>>,
+    Reduce: FnMut(u32, T) -> Result<(), E>,
+{
+    let fetched = stream::iter(heights)
+        .map(|height| {
+            let future = fetch(height);
+            async move { future.await.map(|item| (height, item)) }
+        })
+        .buffered(concurrency.get());
+    futures::pin_mut!(fetched);
+
+    while let Some(result) = fetched.next().await {
+        let (height, item) = result?;
+        reduce(height, item)?;
+    }
+    Ok(())
+}
+
+fn parse_capture_fetch_concurrency(value: &str) -> Result<NonZeroUsize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "fetch concurrency must be a positive integer".to_owned())?;
+    let concurrency = NonZeroUsize::new(parsed)
+        .ok_or_else(|| "fetch concurrency must be at least 1".to_owned())?;
+    if concurrency.get() > MAX_CAPTURE_FETCH_CONCURRENCY {
+        return Err(format!(
+            "fetch concurrency must not exceed {MAX_CAPTURE_FETCH_CONCURRENCY}"
+        ));
+    }
+    Ok(concurrency)
 }
 
 fn validate_checkpoint_hash(hash: &str) -> Result<(), RunnerError> {
@@ -492,13 +931,37 @@ struct CaptureScan {
 
 #[derive(Debug)]
 enum RunnerError {
-    MainnetRequired { configured: Network },
-    HeightOutOfRange { height: u32 },
-    MissingCanonicalBlock { height: u32 },
+    MainnetRequired {
+        configured: Network,
+    },
+    HeightOutOfRange {
+        height: u32,
+    },
+    MissingCanonicalBlock {
+        height: u32,
+    },
+    #[cfg(feature = "typed-qualification")]
+    CaptureCheckpointAboveServiceable {
+        checkpoint: u32,
+        serviceable: u32,
+    },
+    #[cfg(feature = "typed-qualification")]
+    CaptureCheckpointHashMismatch {
+        height: u32,
+    },
+    #[cfg(feature = "typed-qualification")]
+    DeclaredRebuildBudgetMiss {
+        declared_seconds: u64,
+    },
     IncompleteCheckpoint,
     InvalidCheckpointHash,
-    TargetAboveServiceable { target: u32, serviceable: u32 },
-    CheckpointHashMismatch { height: u32 },
+    TargetAboveServiceable {
+        target: u32,
+        serviceable: u32,
+    },
+    CheckpointHashMismatch {
+        height: u32,
+    },
     SnapshotStillSyncing,
     MeasuredCheckpointMismatch,
 }
@@ -519,6 +982,24 @@ impl fmt::Display for RunnerError {
             Self::MissingCanonicalBlock { height } => write!(
                 f,
                 "fixed canonical snapshot has no indexed block at public height {height}"
+            ),
+            #[cfg(feature = "typed-qualification")]
+            Self::CaptureCheckpointAboveServiceable {
+                checkpoint,
+                serviceable,
+            } => write!(
+                f,
+                "capture checkpoint height {checkpoint} exceeds fixed snapshot serviceable height {serviceable}"
+            ),
+            #[cfg(feature = "typed-qualification")]
+            Self::CaptureCheckpointHashMismatch { height } => write!(
+                f,
+                "fixed canonical snapshot does not match the capture checkpoint hash at height {height}"
+            ),
+            #[cfg(feature = "typed-qualification")]
+            Self::DeclaredRebuildBudgetMiss { declared_seconds } => write!(
+                f,
+                "fresh-worker rebuild exceeded the declared {declared_seconds}-second allocation-through-readiness budget; the valid negative artifact was published"
             ),
             Self::IncompleteCheckpoint => {
                 f.write_str("target height and target hash must be supplied together")
@@ -552,9 +1033,24 @@ impl Error for RunnerError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, collections::BTreeSet, ffi::OsString, fs, path::Path};
+    use blake2::{Blake2s256, Digest};
+    use std::{
+        collections::BTreeMap,
+        collections::BTreeSet,
+        ffi::OsString,
+        fs,
+        path::Path,
+        sync::{Arc, Mutex},
+        task::Poll,
+    };
 
     use crate::corpus_artifact::typed_test_measurement;
+
+    #[derive(Debug, PartialEq, Eq, serde::Serialize)]
+    struct OrderedFetchFixture {
+        height: u32,
+        payload: [u8; 4],
+    }
 
     fn valid_args() -> [&'static str; 7] {
         [
@@ -614,6 +1110,142 @@ mod tests {
         ]
     }
 
+    async fn collect_ordered_fetch_fixture(
+        concurrency: NonZeroUsize,
+    ) -> RunnerResult<(Vec<OrderedFetchFixture>, Vec<u32>)> {
+        const FINAL_HEIGHT: u32 = 7;
+
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        let fetch_completion_order = Arc::clone(&completion_order);
+        let mut reduced = Vec::new();
+        reduce_ordered_range(
+            0..=FINAL_HEIGHT,
+            concurrency,
+            move |height| {
+                let completion_order = Arc::clone(&fetch_completion_order);
+                async move {
+                    let mut remaining_polls = FINAL_HEIGHT - height;
+                    futures::future::poll_fn(move |context| {
+                        if remaining_polls == 0 {
+                            Poll::Ready(())
+                        } else {
+                            remaining_polls -= 1;
+                            context.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    completion_order
+                        .lock()
+                        .expect("fixture completion-order mutex poisoned")
+                        .push(height);
+                    Ok::<_, Box<dyn Error + Send + Sync>>(OrderedFetchFixture {
+                        height,
+                        payload: height.to_le_bytes(),
+                    })
+                }
+            },
+            |height, item| {
+                assert_eq!(item.height, height);
+                reduced.push(item);
+                Ok(())
+            },
+        )
+        .await?;
+
+        let completion_order = completion_order
+            .lock()
+            .expect("fixture completion-order mutex poisoned")
+            .clone();
+        Ok((reduced, completion_order))
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    fn valid_release_create_args() -> [&'static str; 19] {
+        [
+            "zainod-oram",
+            "release",
+            "create-receipt",
+            "--source-revision",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--source-archive",
+            "/tmp/source.tar",
+            "--cargo-lock",
+            "/tmp/Cargo.lock",
+            "--rust-toolchain",
+            "/tmp/rust-toolchain.toml",
+            "--dockerfile",
+            "/tmp/Dockerfile.deterministic",
+            "--binary",
+            "/tmp/build-a/zainod-oram",
+            "--reproducible-binary",
+            "/tmp/build-b/zainod-oram",
+            "--output",
+            "/tmp/release-receipt.json",
+        ]
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn release_cli_exposes_only_fixed_receipt_inputs() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_release_create_args())?;
+        let args = match cli.command {
+            Command::Release(command) => match command.command {
+                ReleaseSubcommand::CreateReceipt(args) => args,
+                ReleaseSubcommand::VerifyReceipt(_) => {
+                    panic!("create arguments parsed as receipt verification")
+                }
+            },
+            Command::Corpus(_) => panic!("release arguments parsed as corpus"),
+            #[cfg(feature = "typed-qualification")]
+            Command::Qualification(_) => panic!("release arguments parsed as qualification"),
+        };
+        assert_eq!(
+            args.source_revision,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(args.binary, PathBuf::from("/tmp/build-a/zainod-oram"));
+        assert_eq!(
+            args.reproducible_binary,
+            PathBuf::from("/tmp/build-b/zainod-oram")
+        );
+        assert_eq!(args.output, PathBuf::from("/tmp/release-receipt.json"));
+
+        for (rejected, value) in [
+            ("--target", "custom"),
+            ("--profile", "debug"),
+            ("--features", "custom"),
+            ("--rustflags", "custom"),
+            ("--source-date-epoch", "2"),
+        ] {
+            let mut command = valid_release_create_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+
+        let verify = Cli::try_parse_from([
+            "zainod-oram",
+            "release",
+            "verify-receipt",
+            "--receipt",
+            "/tmp/release-receipt.json",
+        ])?;
+        match verify.command {
+            Command::Release(command) => match command.command {
+                ReleaseSubcommand::VerifyReceipt(args) => {
+                    assert_eq!(args.receipt, PathBuf::from("/tmp/release-receipt.json"));
+                }
+                ReleaseSubcommand::CreateReceipt(_) => {
+                    panic!("verification arguments parsed as receipt creation")
+                }
+            },
+            Command::Corpus(_) => panic!("release arguments parsed as corpus"),
+            #[cfg(feature = "typed-qualification")]
+            Command::Qualification(_) => panic!("release arguments parsed as qualification"),
+        }
+        Ok(())
+    }
+
     fn snapshot_directory(directory: &Path) -> Result<BTreeMap<OsString, Vec<u8>>, std::io::Error> {
         fs::read_dir(directory)?
             .map(|entry| {
@@ -623,6 +1255,27 @@ mod tests {
                 Ok((name, bytes))
             })
             .collect()
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    fn publish_target_load_inputs(parent: &Path) -> RunnerResult<(PathBuf, PathBuf)> {
+        let capture_dir = parent.join("target-load-capture");
+        let sizing_dir = parent.join("target-load-sizing");
+        let measurement = typed_test_measurement()?;
+        let provenance = CaptureProvenance::new(
+            BackendKind::Rpc,
+            SnapshotMode::NonFinalizedState,
+            0,
+            SelectionMode::ServiceableTip,
+            "test-runner",
+            &measurement,
+        )?;
+        publish_capture(&capture_dir, &measurement, &provenance)?;
+        let capture = load_capture(&capture_dir)?;
+        let model = MainnetSizingModel::new(0, 0, 64, 48, 128, 96, 3, 4, 20_000, 1_000_000, 3_000)?;
+        let qualification = capture.measurement().apply_model(&model)?;
+        publish_sizing(&sizing_dir, &capture, &qualification, "test-runner")?;
+        Ok((capture_dir, sizing_dir))
     }
 
     #[cfg(feature = "typed-qualification")]
@@ -652,9 +1305,51 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_target_load_args() -> [&'static str; 11] {
+        [
+            "zainod-oram",
+            "qualification",
+            "target-load",
+            "--profile",
+            "builder-foundation-v1",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--output-dir",
+            "/tmp/oram-target-load",
+        ]
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    fn valid_cold_rebuild_args() -> [&'static str; 17] {
+        [
+            "zainod-oram",
+            "qualification",
+            "cold-rebuild",
+            "--profile",
+            "source-bound-builder-v1",
+            "--config",
+            "/tmp/zainod.toml",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--declared-rebuild-budget-seconds",
+            "3600",
+            "--output-dir",
+            "/tmp/oram-cold-rebuild",
+            "--progress-interval",
+            "5000",
+        ]
+    }
+
     fn parsed_corpus(cli: Cli) -> CorpusCommand {
         match cli.command {
             Command::Corpus(command) => command,
+            #[cfg(feature = "typed-qualification")]
+            Command::Release(_) => panic!("release arguments parsed as corpus"),
             #[cfg(feature = "typed-qualification")]
             Command::Qualification(_) => panic!("qualification arguments parsed as corpus"),
         }
@@ -668,8 +1363,15 @@ mod tests {
                 QualificationSubcommand::Run(_) => {
                     panic!("fixed qualification arguments parsed as stress")
                 }
+                QualificationSubcommand::TargetLoad(_) => {
+                    panic!("target-load arguments parsed as stress")
+                }
+                QualificationSubcommand::ColdRebuild(_) => {
+                    panic!("cold-rebuild arguments parsed as stress")
+                }
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
+            Command::Release(_) => panic!("stress arguments parsed as release"),
         }
     }
 
@@ -683,8 +1385,15 @@ mod tests {
                 QualificationSubcommand::Stress(_) => {
                     panic!("stress arguments parsed as fixed qualification")
                 }
+                QualificationSubcommand::TargetLoad(_) => {
+                    panic!("target-load arguments parsed as fixed qualification")
+                }
+                QualificationSubcommand::ColdRebuild(_) => {
+                    panic!("cold-rebuild arguments parsed as fixed qualification")
+                }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
+            Command::Release(_) => panic!("qualification arguments parsed as release"),
         };
         assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-qualification"));
 
@@ -762,6 +1471,145 @@ mod tests {
         unknown_profile[4] = "custom";
         assert!(Cli::try_parse_from(unknown_profile).is_err());
         Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn target_load_cli_requires_only_named_profile_and_source_bound_artifacts(
+    ) -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_target_load_args())?;
+        let args = match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::TargetLoad(args) => args,
+                QualificationSubcommand::Run(_)
+                | QualificationSubcommand::Stress(_)
+                | QualificationSubcommand::ColdRebuild(_) => {
+                    panic!("target-load arguments parsed as another qualification command")
+                }
+            },
+            Command::Corpus(_) => panic!("target-load arguments parsed as corpus"),
+            Command::Release(_) => panic!("target-load arguments parsed as release"),
+        };
+        assert_eq!(args.profile, TargetLoadProfileArg::BuilderFoundationV1);
+        assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-target-load"));
+
+        for (rejected, value) in [
+            ("--operations", "10"),
+            ("--concurrency", "2"),
+            ("--seed", "1"),
+            ("--directory-capacity", "64"),
+            ("--event-capacity", "128"),
+            ("--queue-capacity", "1"),
+            ("--config", "/tmp/zainod.toml"),
+        ] {
+            let mut command = valid_target_load_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn cold_rebuild_cli_requires_source_config_lineage_budget_output_and_progress(
+    ) -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_cold_rebuild_args())?;
+        let args = match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::ColdRebuild(args) => args,
+                QualificationSubcommand::Run(_)
+                | QualificationSubcommand::Stress(_)
+                | QualificationSubcommand::TargetLoad(_) => {
+                    panic!("cold-rebuild arguments parsed as another qualification command")
+                }
+            },
+            Command::Corpus(_) => panic!("cold-rebuild arguments parsed as corpus"),
+            Command::Release(_) => panic!("cold-rebuild arguments parsed as release"),
+        };
+        assert_eq!(args.profile, ColdRebuildProfileArg::SourceBoundBuilderV1);
+        assert_eq!(args.config, PathBuf::from("/tmp/zainod.toml"));
+        assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
+        assert_eq!(args.declared_rebuild_budget_seconds.get(), 3_600);
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-cold-rebuild"));
+        assert_eq!(args.progress_interval.get(), 5_000);
+
+        for required in [
+            "--profile",
+            "--config",
+            "--capture-dir",
+            "--sizing-dir",
+            "--declared-rebuild-budget-seconds",
+            "--output-dir",
+            "--progress-interval",
+        ] {
+            let mut missing = valid_cold_rebuild_args().to_vec();
+            let Some(index) = missing.iter().position(|value| *value == required) else {
+                panic!("valid cold-rebuild fixture must contain {required}");
+            };
+            missing.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(missing).is_err());
+        }
+
+        for zero_option in ["--declared-rebuild-budget-seconds", "--progress-interval"] {
+            let mut zero = valid_cold_rebuild_args();
+            let Some(index) = zero.iter().position(|value| *value == zero_option) else {
+                panic!("valid cold-rebuild fixture must contain {zero_option}");
+            };
+            zero[index + 1] = "0";
+            assert!(Cli::try_parse_from(zero).is_err());
+        }
+
+        let mut unknown_profile = valid_cold_rebuild_args();
+        unknown_profile[4] = "custom";
+        assert!(Cli::try_parse_from(unknown_profile).is_err());
+        Ok(())
+    }
+
+    #[cfg(not(feature = "typed-qualification"))]
+    #[test]
+    fn target_load_cli_is_absent_without_typed_qualification() {
+        assert!(Cli::try_parse_from([
+            "zainod-oram",
+            "qualification",
+            "target-load",
+            "--profile",
+            "builder-foundation-v1",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--output-dir",
+            "/tmp/oram-target-load",
+        ])
+        .is_err());
+    }
+
+    #[cfg(not(feature = "typed-qualification"))]
+    #[test]
+    fn cold_rebuild_cli_is_absent_without_typed_qualification() {
+        assert!(Cli::try_parse_from([
+            "zainod-oram",
+            "qualification",
+            "cold-rebuild",
+            "--profile",
+            "source-bound-builder-v1",
+            "--config",
+            "/tmp/zainod.toml",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--declared-rebuild-budget-seconds",
+            "3600",
+            "--output-dir",
+            "/tmp/oram-cold-rebuild",
+            "--progress-interval",
+            "5000",
+        ])
+        .is_err());
     }
 
     #[cfg(all(
@@ -890,6 +1738,72 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(
+        feature = "typed-qualification",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[tokio::test]
+    async fn target_load_dispatch_consumes_source_bound_sizing_and_publishes_three_files(
+    ) -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let (capture_dir, sizing_dir) = publish_target_load_inputs(parent.path())?;
+        let output_dir = parent.path().join("target-load");
+
+        run(Cli {
+            command: Command::Qualification(QualificationCommand {
+                command: QualificationSubcommand::TargetLoad(QualificationTargetLoadArgs {
+                    profile: TargetLoadProfileArg::BuilderFoundationV1,
+                    capture_dir,
+                    sizing_dir,
+                    output_dir: output_dir.clone(),
+                }),
+            }),
+        })
+        .await?;
+
+        let names = fs::read_dir(output_dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                OsString::from("provenance.json"),
+                OsString::from("target-load.json"),
+                OsString::from("target-load.txt"),
+            ])
+        );
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        not(all(target_os = "linux", target_arch = "x86_64"))
+    ))]
+    #[tokio::test]
+    async fn target_load_dispatch_fails_without_publication_on_unsupported_hosts(
+    ) -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let (capture_dir, sizing_dir) = publish_target_load_inputs(parent.path())?;
+        let output_dir = parent.path().join("target-load");
+
+        let result = run(Cli {
+            command: Command::Qualification(QualificationCommand {
+                command: QualificationSubcommand::TargetLoad(QualificationTargetLoadArgs {
+                    profile: TargetLoadProfileArg::BuilderFoundationV1,
+                    capture_dir,
+                    sizing_dir,
+                    output_dir: output_dir.clone(),
+                }),
+            }),
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(!output_dir.exists());
+        Ok(())
+    }
+
     #[test]
     fn corpus_capture_cli_has_no_sizing_parameters() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(valid_args())?;
@@ -904,8 +1818,54 @@ mod tests {
 
         assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-capture"));
         assert_eq!(args.progress_interval.get(), 10_000);
+        assert_eq!(args.fetch_concurrency.get(), 1);
         assert_eq!(args.target_height, None);
         assert_eq!(args.target_hash, None);
+
+        let mut pipelined = valid_args().to_vec();
+        pipelined.extend(["--fetch-concurrency", "8"]);
+        let args = match parsed_corpus(Cli::try_parse_from(pipelined)?).command {
+            CorpusSubcommand::Capture(args) => args,
+            CorpusSubcommand::Size(_) => panic!("capture arguments parsed as sizing arguments"),
+            CorpusSubcommand::ValidateSizing(_) => {
+                panic!("capture arguments parsed as sizing-validation arguments")
+            }
+        };
+        assert_eq!(args.fetch_concurrency.get(), 8);
+
+        for invalid in ["0", "33"] {
+            let mut command = valid_args().to_vec();
+            command.extend(["--fetch-concurrency", invalid]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordered_pipelining_preserves_fixture_bytes_and_digest() -> RunnerResult<()> {
+        let sequential_concurrency =
+            NonZeroUsize::new(1).expect("fixture sequential concurrency is nonzero");
+        let pipelined_concurrency =
+            NonZeroUsize::new(4).expect("fixture pipelined concurrency is nonzero");
+        let (sequential, sequential_completion_order) =
+            collect_ordered_fetch_fixture(sequential_concurrency).await?;
+        let (pipelined, pipelined_completion_order) =
+            collect_ordered_fetch_fixture(pipelined_concurrency).await?;
+
+        assert_eq!(sequential_completion_order, (0..=7).collect::<Vec<_>>());
+        assert_ne!(pipelined_completion_order, sequential_completion_order);
+        assert_eq!(
+            pipelined.iter().map(|item| item.height).collect::<Vec<_>>(),
+            (0..=7).collect::<Vec<_>>()
+        );
+
+        let sequential_bytes = serde_json::to_vec(&sequential)?;
+        let pipelined_bytes = serde_json::to_vec(&pipelined)?;
+        assert_eq!(pipelined_bytes, sequential_bytes);
+        assert_eq!(
+            Blake2s256::digest(&pipelined_bytes),
+            Blake2s256::digest(&sequential_bytes)
+        );
         Ok(())
     }
 
