@@ -294,6 +294,13 @@ canonical block before the scan begins. The scanner then verifies genesis,
 height, parent-hash, and final checkpoint continuity while retaining no blocks
 in the runner.
 
+Block fetching is sequential by default. Operators may explicitly set
+`--fetch-concurrency` from 1 through 32 to keep a bounded number of indexed
+block reads in flight. Fetches may complete out of order, but the runner always
+feeds them to the canonical scanner in ascending height order, so this knob
+does not change the measurement or its digest. The bound limits transient
+full-block memory and validator work-queue pressure.
+
 `--output-dir` must name a new directory. The command builds the artifact in a
 temporary sibling directory and atomically renames it into place only after all
 files validate, so it never merges with or overwrites an existing capture. The

@@ -3,7 +3,9 @@
 //! The lease below is an internal lifetime contract. Its in-process epoch and
 //! authority checks make fixture ownership and release ordering explicit, but
 //! do not establish durable replay, trusted time, nonce persistence, rollback
-//! resistance, key custody, or TDX evidence.
+//! resistance, key custody, or TDX evidence. In particular, the Unix-seconds
+//! value carried through a round is an observation supplied by the host or
+//! fixture, not an independently trusted time authority.
 
 use std::sync::{Arc, Mutex};
 
@@ -30,6 +32,11 @@ use super::UniformExternalFailure;
 const RUNTIME_SECURITY_PROTOCOL_VERSION: u16 = 1;
 
 /// Server-owned material acquired once before any continuation replay commit.
+///
+/// `now_unix_seconds` is part of the exact in-process reservation tuple. That
+/// binding prevents values from different fixture rounds being mixed, but does
+/// not establish that the observation is monotonic, fresh, or suitable for
+/// authorizing replay-claim retirement.
 pub(super) struct RoundMaterial {
     now_unix_seconds: u64,
     response_nonce: [u8; ENVELOPE_NONCE_BYTES],
@@ -102,8 +109,9 @@ pub(super) struct RoundMaterialUnavailable;
 /// Acquires clock and nonce values plus one opaque round reservation.
 ///
 /// Implementations must eventually be supplied by a production owner. The
-/// trait alone proves no time trust, nonce uniqueness, durability, or rollback
-/// resistance.
+/// time field remains an observed host/fixture input: the trait alone proves no
+/// time trust, nonce uniqueness, durability, or rollback resistance, and does
+/// not provide a replay-maintenance authority or cadence.
 pub(super) trait RoundMaterialSource {
     fn next_round_material(
         &mut self,

@@ -12,7 +12,10 @@ use std::{error::Error, fmt};
 use blake2::{Blake2s256, Digest};
 
 use super::{
-    replay_journal::{ReplayJournalComponentState, ReplayJournalComponentStateDigest},
+    replay_journal::{
+        ReplayJournalAdvanceReceipt, ReplayJournalComponentState,
+        ReplayJournalComponentStateDigest, ReplayJournalMaintenanceAdvanceReceipt,
+    },
     security_state_store::{
         SecurityStateIdentity, SecurityStateSnapshot, SecurityStateValueError, STATE_DIGEST_BYTES,
     },
@@ -87,17 +90,73 @@ where
     }
 }
 
-/// Constructs a successor after replay state advances under a live coordinator.
+/// Rejects an exhausted outer sequence before a replay commit can become durable.
+pub(super) fn preflight_successor(
+    expected_snapshot: &SecurityStateSnapshot,
+) -> Result<(), SecurityStateBindingError> {
+    expected_snapshot
+        .checked_successor_sequence()
+        .map(|_| ())
+        .map_err(SecurityStateBindingError::InvalidSnapshot)
+}
+
+/// Constructs a successor from one durably committed replay transaction.
 ///
-/// The caller must capture `previous_replay_digest` before advancing replay
-/// state and retain it in memory. This function verifies that the expected
-/// snapshot names that exact prior state and reads a changed digest from a
-/// ready concrete journal. Supplying the same authoritative journal instance
-/// and an allowed commit count remains the coordinator's responsibility; this
-/// seam never infers direction from reopened disk state.
-pub(super) fn successor_after_live_replay_advance<R>(
+/// The move-only receipt proves that the replay journal minted the transition
+/// after its durable boundary. This function accepts only the snapshot that
+/// names the receipt's immediate predecessor and never reads reopened disk
+/// state or infers a recovery direction.
+pub(super) fn successor_after_replay_commit<R>(
+    expected_snapshot: &SecurityStateSnapshot,
+    receipt: ReplayJournalAdvanceReceipt,
+    replay_journal: &R,
+) -> Result<SecurityStateSnapshot, SecurityStateBindingError>
+where
+    R: ReplayJournalComponentState + ?Sized,
+{
+    if !replay_journal.recognizes_receipt(&receipt) {
+        return Err(SecurityStateBindingError::ReplayJournalInstanceMismatch);
+    }
+
+    let (previous_replay_digest, committed_replay_digest) = receipt.into_digests();
+    successor_after_replay_transition(
+        expected_snapshot,
+        previous_replay_digest,
+        committed_replay_digest,
+        replay_journal,
+    )
+}
+
+/// Constructs a successor from one durably committed maintenance watermark.
+///
+/// The distinct move-only receipt cannot be substituted for request replay
+/// evidence. This function validates transition identity only; it does not
+/// establish trusted-time authority or authorize claim deletion.
+pub(super) fn successor_after_replay_maintenance<R>(
+    expected_snapshot: &SecurityStateSnapshot,
+    receipt: ReplayJournalMaintenanceAdvanceReceipt,
+    replay_journal: &R,
+) -> Result<SecurityStateSnapshot, SecurityStateBindingError>
+where
+    R: ReplayJournalComponentState + ?Sized,
+{
+    if !replay_journal.recognizes_maintenance_receipt(&receipt) {
+        return Err(SecurityStateBindingError::ReplayJournalInstanceMismatch);
+    }
+
+    let (previous_replay_digest, committed_replay_digest) = receipt.into_digests();
+    successor_after_replay_transition(
+        expected_snapshot,
+        previous_replay_digest,
+        committed_replay_digest,
+        replay_journal,
+    )
+}
+
+fn successor_after_replay_transition<R>(
     expected_snapshot: &SecurityStateSnapshot,
     previous_replay_digest: ReplayJournalComponentStateDigest,
+    committed_replay_digest: ReplayJournalComponentStateDigest,
     replay_journal: &R,
 ) -> Result<SecurityStateSnapshot, SecurityStateBindingError>
 where
@@ -109,12 +168,14 @@ where
         return Err(SecurityStateBindingError::ReplayComponentMismatch);
     }
 
-    let current_replay_digest = current_replay_digest(replay_journal)?;
-    if current_replay_digest == previous_replay_digest {
+    if committed_replay_digest == previous_replay_digest {
         return Err(SecurityStateBindingError::ReplayComponentDidNotAdvance);
     }
+    if current_replay_digest(replay_journal)? != committed_replay_digest {
+        return Err(SecurityStateBindingError::ReplayReceiptNotCurrent);
+    }
     let current_component =
-        SecurityComponentStateDigest::from_replay_journal(current_replay_digest);
+        SecurityComponentStateDigest::from_replay_journal(committed_replay_digest);
     expected_snapshot
         .successor_with_component_state_digest(current_component.into_bytes())
         .map_err(SecurityStateBindingError::InvalidSnapshot)
@@ -136,6 +197,8 @@ pub(super) enum SecurityStateBindingError {
     ReplayComponentMismatch,
     ReplayComponentDidNotAdvance,
     ReplayComponentUnavailable,
+    ReplayJournalInstanceMismatch,
+    ReplayReceiptNotCurrent,
     InvalidSnapshot(SecurityStateValueError),
 }
 
@@ -146,10 +209,16 @@ impl fmt::Display for SecurityStateBindingError {
                 f.write_str("replay component does not match the outer security snapshot")
             }
             Self::ReplayComponentDidNotAdvance => {
-                f.write_str("live replay component did not advance")
+                f.write_str("replay transition receipt did not advance the component")
             }
             Self::ReplayComponentUnavailable => {
                 f.write_str("replay component state is unavailable")
+            }
+            Self::ReplayJournalInstanceMismatch => {
+                f.write_str("replay transition receipt belongs to a different journal instance")
+            }
+            Self::ReplayReceiptNotCurrent => {
+                f.write_str("replay transition receipt no longer names the current journal state")
             }
             Self::InvalidSnapshot(_) => {
                 f.write_str("replay component produced an invalid security snapshot")
@@ -164,7 +233,9 @@ impl Error for SecurityStateBindingError {
             Self::InvalidSnapshot(error) => Some(error),
             Self::ReplayComponentMismatch
             | Self::ReplayComponentDidNotAdvance
-            | Self::ReplayComponentUnavailable => None,
+            | Self::ReplayComponentUnavailable
+            | Self::ReplayJournalInstanceMismatch
+            | Self::ReplayReceiptNotCurrent => None,
         }
     }
 }

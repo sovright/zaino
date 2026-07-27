@@ -145,6 +145,10 @@ impl SecurityStateIdentity {
         })
     }
 
+    pub(super) const fn profile_id(&self) -> &[u8; PROFILE_ID_BYTES] {
+        &self.profile_id
+    }
+
     /// Validates one same-namespace state update or complete owner rotation.
     fn validate_successor(&self, next: &Self) -> Result<(), SecurityStateSuccessorError> {
         if next.service_id != self.service_id {
@@ -191,10 +195,18 @@ impl SecurityStateIdentity {
 pub(super) fn test_security_state_identity(
     byte: u8,
 ) -> Result<SecurityStateIdentity, SecurityStateValueError> {
+    test_security_state_identity_with_profile_id(byte, [byte.wrapping_add(1); PROFILE_ID_BYTES])
+}
+
+#[cfg(test)]
+pub(super) fn test_security_state_identity_with_profile_id(
+    byte: u8,
+    profile_id: [u8; PROFILE_ID_BYTES],
+) -> Result<SecurityStateIdentity, SecurityStateValueError> {
     SecurityStateIdentity::new(
         [byte; SERVICE_ID_BYTES],
         SecurityStateEpochs::new(1, 2, 3, 4)?,
-        [byte.wrapping_add(1); PROFILE_ID_BYTES],
+        profile_id,
         [byte.wrapping_add(2); SESSION_BINDING_BYTES],
         [byte.wrapping_add(3); SECURITY_EPOCH_BINDING_BYTES],
     )
@@ -291,10 +303,7 @@ impl SecurityStateSnapshot {
         &self,
         component_state_digest: [u8; STATE_DIGEST_BYTES],
     ) -> Result<Self, SecurityStateValueError> {
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(SecurityStateValueError::SequenceOverflow)?;
+        let sequence = self.checked_successor_sequence()?;
         let commitment = SecurityStateCommitment::new(
             self.commitment.identity,
             self.commitment.serving_identity_digest,
@@ -318,6 +327,27 @@ impl SecurityStateSnapshot {
 
     const fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub(super) const fn checked_successor_sequence(&self) -> Result<u64, SecurityStateValueError> {
+        match self.sequence.checked_add(1) {
+            Some(sequence) => Ok(sequence),
+            None => Err(SecurityStateValueError::SequenceOverflow),
+        }
+    }
+
+    pub(super) const fn profile_id(&self) -> &[u8; PROFILE_ID_BYTES] {
+        self.commitment.identity.profile_id()
+    }
+
+    #[cfg(test)]
+    pub(super) const fn test_sequence(&self) -> u64 {
+        self.sequence()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_with_sequence(self, sequence: u64) -> Result<Self, SecurityStateValueError> {
+        Self::new(sequence, self.commitment)
     }
 
     pub(super) const fn component_state_digest(&self) -> [u8; STATE_DIGEST_BYTES] {
@@ -388,7 +418,7 @@ impl fmt::Display for SecurityStateValueError {
 impl std::error::Error for SecurityStateValueError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecurityStateSuccessorError {
+pub(super) enum SecurityStateSuccessorError {
     ServiceIdentityChanged,
     ProtocolVersionChanged,
     ProfileIdentityChanged,
@@ -420,7 +450,7 @@ impl fmt::Debug for SecurityStateDigest {
 
 /// Monotonic sequence and exact state digest named by an external authority.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct SecurityFreshness {
+pub(super) struct SecurityFreshness {
     sequence: u64,
     state_digest: SecurityStateDigest,
 }
@@ -443,7 +473,7 @@ impl fmt::Debug for SecurityFreshness {
 /// reject every successful transition except `None -> 1` or exact
 /// `n -> n + 1`. An `Err` is indeterminate: the witness may be unchanged or
 /// may already contain `next`, so the caller must fail closed and reconcile.
-trait SecurityFreshnessWitness {
+pub(super) trait SecurityFreshnessWitness {
     type Error;
 
     fn current(&mut self) -> Result<Option<SecurityFreshness>, Self::Error>;
@@ -592,7 +622,7 @@ impl std::error::Error for PersistentSecurityStateError {
 
 /// Local/witness reconciliation or commit failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecurityStateStoreError {
+pub(super) enum SecurityStateStoreError {
     LatchedIndeterminate,
     WitnessUnavailable,
     UnexpectedLocalStateWithoutWitness,
@@ -670,7 +700,7 @@ enum LocalStateLoadError {
 }
 
 /// Local snapshot store coupled to an externally authoritative witness.
-struct SecurityStateStore<W> {
+pub(super) struct SecurityStateStore<W> {
     recovery_directory: PathBuf,
     witness: W,
     health: SecurityStateStoreHealth,
@@ -690,7 +720,7 @@ struct DurableSecurityStateAdvance {
 }
 
 impl<W> SecurityStateStore<W> {
-    fn new(root: impl Into<PathBuf>, witness: W) -> Self {
+    pub(super) fn new(root: impl Into<PathBuf>, witness: W) -> Self {
         Self {
             recovery_directory: root.into(),
             witness,
@@ -772,7 +802,9 @@ where
     W: SecurityFreshnessWitness,
 {
     /// Returns only local state that exactly matches the external witness.
-    fn current(&mut self) -> Result<Option<SecurityStateSnapshot>, SecurityStateStoreError> {
+    pub(super) fn current(
+        &mut self,
+    ) -> Result<Option<SecurityStateSnapshot>, SecurityStateStoreError> {
         if self.health == SecurityStateStoreHealth::Indeterminate {
             return Err(SecurityStateStoreError::LatchedIndeterminate);
         }
@@ -784,7 +816,7 @@ where
     }
 
     /// Advances the exact state after committing it locally and before return.
-    fn compare_and_advance(
+    pub(super) fn compare_and_advance(
         &mut self,
         expected: Option<SecurityStateSnapshot>,
         next: SecurityStateSnapshot,
@@ -807,8 +839,8 @@ where
         let valid_sequence = match current {
             None => next.sequence() == 1,
             Some(state) => state
-                .sequence()
-                .checked_add(1)
+                .checked_successor_sequence()
+                .ok()
                 .is_some_and(|sequence| sequence == next.sequence()),
         };
         if !valid_sequence {

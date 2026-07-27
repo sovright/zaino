@@ -4,7 +4,9 @@
 //! epoch, round, reservation, and commit capabilities below only bind values
 //! inside deterministic fixtures and one live process. Their `Arc` identities
 //! prevent equal-value ABA and cross-round mixing in memory; they are not
-//! durable reservation, commit, freshness, or rollback evidence.
+//! durable reservation, commit, freshness, trusted-time, or rollback evidence.
+//! Profile v6 keeps its maintenance-watermark transition journal-local; these
+//! replay identities do not encode trusted maintenance authority.
 
 use std::{fmt, sync::Arc};
 
@@ -65,7 +67,9 @@ pub(super) struct RequestReplayKey {
 impl RequestReplayKey {
     /// Binds only the stable namespace and authenticated request nonce.
     ///
-    /// Request payload and query fields are deliberately absent.
+    /// Request payload and query fields are deliberately absent. There is also
+    /// no request expiry or retirement field, so continuation expiry cannot
+    /// justify deleting this lane's claim.
     pub(super) fn new(namespace: &ReplayNamespace, authenticated_nonce: [u8; NONCE_BYTES]) -> Self {
         let mut hasher = versioned_hasher(REQUEST_REPLAY_KEY_DOMAIN);
         Digest::update(&mut hasher, namespace.digest);
@@ -88,13 +92,18 @@ impl fmt::Debug for RequestReplayKey {
 }
 
 /// Opaque canonical identity for one continuation-token use.
+///
+/// The digest binds the exact token expiry. The post-authentication token
+/// module pairs this key with its profile-derived expiry-bucket ordinal before
+/// persistence can observe a continuation claim.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ContinuationReplayKey {
     digest: [u8; REPLAY_DIGEST_BYTES],
 }
 
 impl ContinuationReplayKey {
-    /// Commits every stable continuation claim field in canonical order.
+    /// Commits every stable continuation claim field, including the exact
+    /// expiry Unix second, in canonical order.
     pub(super) fn new(
         namespace: &ReplayNamespace,
         projection_epoch: u64,
@@ -126,21 +135,6 @@ impl ContinuationReplayKey {
 impl fmt::Debug for ContinuationReplayKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ContinuationReplayKey { ..REDACTED.. }")
-    }
-}
-
-/// Selects the continuation lane paired with every real request-nonce lane.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ContinuationReplayPlan {
-    /// Commit the profile-fixed durable cover operation.
-    Cover,
-    /// Claim a fresh continuation or commit cover when it is already claimed.
-    ClaimOrCover(ContinuationReplayKey),
-}
-
-impl fmt::Debug for ContinuationReplayPlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ContinuationReplayPlan([REDACTED])")
     }
 }
 
