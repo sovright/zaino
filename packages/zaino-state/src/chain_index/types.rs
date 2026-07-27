@@ -46,7 +46,8 @@ pub use db::{CommitmentTreeData, CommitmentTreeRoots, CommitmentTreeSizes};
 
 // Re-export business-layer primitives and containers
 pub use block_context::BlockContext;
-pub(super) use oram::{FinalizedOutpointSnapshot, FinalizedOutpointState};
+pub(super) use oram::FinalizedOutpointSnapshot;
+pub use oram::FinalizedOutpointState;
 pub use primitives::{
     BlockIndex, ChainWork, ChainWorkError, CompactDifficulty, CompactDifficultyError,
 };

@@ -71,6 +71,10 @@ pub mod mempool;
 /// stored separately as it may be reorged.
 pub mod non_finalised_state;
 mod projection;
+pub use projection::{
+    CanonicalTransparentProjectionBoundary, CanonicalTransparentProjectionInput,
+    CanonicalTransparentProjectionInputError,
+};
 /// BlockchainSource
 pub mod source;
 /// Common types used by the rest of this module

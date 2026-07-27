@@ -6,7 +6,7 @@ use super::{AddrScript, BlockIndex, Height, Outpoint};
 
 /// One outpoint's state at an exact finalized checkpoint.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(in crate::chain_index) enum FinalizedOutpointState {
+pub enum FinalizedOutpointState {
     /// The creating output did not exist at the checkpoint.
     NeverSeen,
     /// The output existed and had already been spent by the checkpoint.
