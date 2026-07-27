@@ -1,6 +1,22 @@
 # ORAM Phase 0/1 feasibility report with Phase 2 offline evidence
 
 - Date: 2026-07-15
+- Phase 0 technical stop-gate update (2026-07-23): private-server integration
+  and deployment remain closed at
+  `3a84280c3b727b434f26b424c4abad90f192d909`. The concise
+  [kill-gate report](oram-phase0-kill-gates-2026-07-23.md) records the live
+  mainnet-source sync, a compiled secret-dependent branch in the exact-source
+  deterministic release, the `rostl` redistribution concern, and the
+  fork-or-replace decision. Licensing is now tracked as pre-distribution due
+  diligence, not as a Phase 0 blocker or a restriction on technical-gate
+  remediation and backend-fork work.
+- Gate 1 capture update (2026-07-26): the reproducible full-Mainnet aggregate
+  capture and current-corpus logical sizing completed at combined source
+  `d35d158a9826c75a4ec1c31932c29b43cf4c7163`. The
+  [dated capture log](oram-phase0-mainnet-capture-log-2026-07-26.md) records
+  exact inputs, runtime counters, aggregates, digests, and limitations. Gate 1
+  remains open because growth, insertion/failure bounds, backend calibration,
+  and target-TDX RSS/no-swap headroom are unmeasured.
 - Evaluated fresh-worker rebuild code head:
   `feat/oram-source-bound-cold-rebuild` at
   `15f60d3014428e04e7a42779c9a8c2c7cc7a583d`, stacked on recovery evidence
@@ -73,16 +89,27 @@
   target-load, physical-obliviousness, TDX, or mainnet evidence.
 - Upstream baseline: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d)
 - Foundation commit: `bd601cf3028efc65a82484070f3d504af5107f4d`
-- Design authority: [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
+- Architecture and leakage authority:
+  [ADR-0007](../adr/0007-private-query-service-and-leakage-model.md)
+- Protection-primitive authority:
+  [ADR-0008](../adr/0008-private-query-xchacha-protection-primitive.md)
+- Runtime security-state ownership authority:
+  [ADR-0009](../adr/0009-private-query-runtime-security-state-owner.md)
 - Delivery plan: [ORAM-enabled Zaino plan](oram-enabled-zaino-plan.md)
 - Design seed: [TEE-backed Zaino/lightwalletd sketch](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3)
 
-## Decision
+## Current Phase 0 decision
 
 **Current decision: NO-GO for private-server integration, deployment, or any
 mainnet/host-oblivious privacy claim.**
 
-**Offline research may continue** in the non-published `zaino-oram` package.
+Technical Gate 1 remains incomplete on growth, backend calibration,
+insertion/failure bounds, and measured target-TDX RSS. Technical Gate 2 remains
+failed on the compiled secret-dependent branch.
+
+**Offline implementation and research that answers or remediates the technical
+Phase 0 gates may continue** in the non-published `zaino-oram` package.
+Licensing is tracked in parallel and adds no separate implementation freeze.
 The implemented work is useful evidence for API shape, fixed records, aggregate
 corpus accounting, logical schedules using a concrete runtime-owned
 `FrozenRecentSnapshot<N>` with an internally computed content commitment bound
@@ -120,9 +147,34 @@ equivalence, production encryption, durable ORAM state, a measured recovery-time
 TDX isolation, attestation, wire-shape equivalence, mainnet capacity, or
 target-load behavior.
 
-This is a gate decision, not a conclusion that ORAM is infeasible. Server work
-must remain closed until the Phase 0 blockers in this report have measured,
-reviewable results and the decision is revisited.
+The latest boundary refinement does not change that decision. Internally, a
+profile-bound non-`Clone` `ActiveSecurityLease` is now the sole runtime security
+owner and full raw security-bundle assembly is test-only. `zaino-oram` exposes
+only the lifetime-safe `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and
+`PrivateQueryUnavailable` facade consumed by `zainod-oram`, with no detached
+response bytes. The concrete owner remains private with no public constructor
+or factory. Production security providers, generated routing/listening,
+durability, trusted time/nonces, key management, rollback, TDX, and transport
+evidence remain blockers. Profile ID v6 binds the replay-policy dimensions,
+authenticated replay-entry-v2 semantics, and replay-current-v3 semantics.
+Entry v2 (`ZORJENT2`) remains unchanged; current v3 (`ZORJCUR3`) adds a `u64`
+maintenance watermark without changing any fixed record width. Zero is the
+sentinel for no classified bucket, while a nonzero value is the inclusive
+recorded highest fully expired continuation expiry bucket for future
+maintenance classification. The raw recorded value is not trusted-time, epoch,
+profile, currentness, expiry, or retirement authority. This adds no request
+expiry, garbage-collection execution, deletion, count reduction, compaction,
+reclamation, or bounded retention; capacity remains lifetime cumulative and
+the ten-phase schedule is unchanged.
+
+This is a technical gate decision, not a conclusion that ORAM is infeasible.
+Private-server integration, deployment, and host-oblivious privacy claims must
+remain closed until the technical Phase 0 blockers in this report have
+measured, reviewable results and the decision is revisited.
+
+The completed full-Mainnet capture clears the corpus-availability part of
+Gate 1, but does not change this decision. Its two offline models are logical
+necessary-condition checks, not measured ORAM or target-TDX capacity results.
 
 ## Evidence boundary
 
@@ -438,9 +490,10 @@ The following statements are **not** established by that evidence:
   capacity, or final workload;
 - the 72-byte record has not been benchmarked at mainnet capacity;
 - no production privacy profile or accepted profile constants exist;
-- no mainnet corpus report, target-TDX RSS or latency result, stash result,
-  target-load queue-contention result, assembly result, or physical trace result
-  exists. `BuilderFoundationV1` measures process-wide RSS plus process-lifetime
+- the full-Mainnet aggregate report now exists, but no target-TDX RSS or
+  latency result, stash result, target-load queue-contention result, passing
+  assembly result, or physical trace result exists. `BuilderFoundationV1`
+  measures process-wide RSS plus process-lifetime
   HWM, typed-worker call latency, mixed-phase completion rates, and lifecycle
   counters only on a generic builder;
   it exposes neither backend stash state nor physical accesses and is not
@@ -452,11 +505,27 @@ The following statements are **not** established by that evidence:
   non-cryptographic. Separate crate-internal XChaCha20-Poly1305 primitives now
   own separate zeroized request, response, and continuation role-key objects
   and pin canonical associated-data, fixed-vector, mutation, and cross-domain
-  behavior. A private opaque dependency composer exercises them end to end in
-  the listener-free runtime with deterministic material and counting replay
-  fixtures. They are not wired into a service/session owner, and key
-  establishment, provisioning, rotation, nonce generation/uniqueness, trusted
-  time, durable replay, attestation, and KMS/TDX ownership remain open;
+  behavior. Full raw security-bundle fixture assembly is now restricted to
+  `#[cfg(test)]`. Non-test runtime code instead retains one profile-bound,
+  non-`Clone` `ActiveSecurityLease` as the sole owner of protection, replay,
+  material, namespace, epoch, and release authority. Canonical versioned
+  request-nonce and continuation replay identities feed one atomic request plus
+  real-or-cover continuation transaction, whose non-`Clone` replay-commit
+  authority remains distinct from the exact round-material reservation
+  authority. Release validates both against the same round and active epoch,
+  and unavailable or retired state fails closed. This is not production
+  durable replay, a trusted clock, request-claim expiry, a nonce ledger, key
+  management, rollback resistance, TDX, listener, or transport evidence.
+  Profile ID v6 now binds the public replay-policy dimensions, authenticated
+  replay-entry-v2 semantics, and replay-current-v3 semantics. Unchanged entry
+  v2 persists each real continuation key and its nonzero, one-based ceiling
+  expiry-bucket ordinal as one typed claim. Current v3 persists the recorded
+  inclusive maintenance watermark, but neither value provides trusted-time or
+  maintenance authority. The ten-phase logical schedule remains unchanged.
+  [ADR 0009](../adr/0009-private-query-runtime-security-state-owner.md) fixes
+  the required joint owner, rollback, lifecycle, real/cover durability, and
+  response-release contract, but production provider and service evidence
+  remains open;
 - codec/runtime tests prove exact/canonical bytes, protection-interface
   plumbing, and equality of a source-level logical decode/token/replay/
   full-finalized-store/full-recent-snapshot/issuance/encode phase schedule. They
@@ -468,12 +537,66 @@ The following statements are **not** established by that evidence:
   from a generic source-reported digest, and its fault/corruption hooks are
   test-only. That deterministic commitment is neither externally authenticated
   nor a canonical/live Zaino snapshot root;
-- no private protobuf, gRPC adapter, live Zaino NFS acquisition or canonical
-  snapshot-publication seam, attestation provider, TLS identity, readiness
-  path, or private-service lifecycle exists;
-  `zainod-oram` contains listener-free corpus, fixed qualification,
-  target-load, and fresh-worker rebuild research runners, not a serving
-  lifecycle;
+- `zaino-oram` exports only the small lifetime-safe `FixedEnvelopeRuntime`,
+  `PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade. `zainod-oram`
+  consumes it in its independent private protobuf and lazy listener-free Tonic
+  body adapter; pending values lend guarded bytes without exporting detached
+  response bytes. The concrete runtime owner remains private with no public
+  constructor or factory. A production protector/replay/material-provider
+  bundle, generated route/listener, live owner integration, TLS/attestation
+  identity, readiness path, transport evidence, and private-service lifecycle
+  remain open;
+- the separate private outer security-state commit foundation does not
+  establish production rollback resistance. Its fixed-width snapshot binds the
+  stable security identity to opaque serving and component-state digests; local
+  replacement is synchronized before an injected exact sequence-and-digest
+  witness advances, and startup accepts only an exact match. Tests cover a
+  staged sequence-two orphan, a durable local sequence-two advance with a
+  sequence-one witness, rejected witness advancement, and advance-then-error
+  reconciliation. A separate crate-private replay component journal now
+  persists exact fixed-size, context-sealed request plus applied real-or-cover
+  continuation transactions with `current.bin` as its sole local commit marker
+  and exact prefix reconstruction. It never opens `head + 1`; retries replace
+  that non-authoritative candidate uniformly, committed entries remain
+  immutable, and one public transaction bound precedes secret-dependent claim
+  conditions. A module-private coordinator composes the replay journal with the
+  outer security-state snapshot. Explicit initial provisioning is distinct from
+  opening existing state, which requires an exact outer/current-replay match.
+  Query replay commits and greater maintenance-watermark advances mint distinct
+  move-only receipt types, each binding its opaque per-open journal identity and
+  pre/post digests. The coordinator accepts either only from the same live
+  journal and while its post-digest remains current, then advances the outer
+  local snapshot and injected witness. It does not infer direction or repair
+  either side, and a journal latched indeterminate cannot supply component
+  state. Any outer error after replay-current advances latches that coordinator
+  instance fail closed. A hard witness rejection leaves the durable local
+  snapshot ahead, so a fresh open fails with `WitnessLocalMismatch`; an
+  advance-then-error can fresh-open successfully when the witness did advance.
+  The journal still has only a deterministic test protector and no process lock
+  for its assumed single writer. Profile ID v6 binds the replay-policy
+  parameters, authenticated replay-entry-v2 semantics, and
+  replay-current-v3 semantics. Each persisted real continuation claim contains
+  its opaque replay key and a nonzero, one-based ceiling expiry-bucket ordinal
+  as one typed value in unchanged `ZORJENT2`. Fixed-width `ZORJCUR3` binds the
+  exact v6 profile ID and a `u64` maintenance watermark. Zero is the sentinel
+  for no classified bucket; a nonzero value is the inclusive recorded highest
+  fully expired continuation expiry bucket for future maintenance
+  classification. The raw recorded value is not authority. Lower proposals
+  reject, equal returns typed `NoAdvance` with no write, receipt, or outer
+  sequence advance, and greater durably advances only replay-current without
+  appending an entry or changing claim sets or counts. All fixed record widths
+  remain unchanged. Construction derives a lifetime-cumulative persisted
+  transaction bound from the profile. Profile v6 is fresh-provisioning-only and
+  neither migrates nor dual-accepts profile-v5/current-v2 or earlier state.
+  The mutation/coordinator surface remains module-private with no non-test
+  caller and no trusted-time/epoch/profile grant. Visibility widening or
+  runtime wiring must first consume a live epoch/profile/currentness-bound
+  move-only grant. There is no request expiry, committed-entry deletion, count
+  reduction, compaction, reclamation, bounded retention, or
+  garbage-collection execution. Replay-current, outer-snapshot, and witness
+  advancement are ordered but are not one atomic transaction. No production
+  witness, nonce/time component journal, production key/nonce owner, integrated
+  replay provider, or maintenance authority exists;
 - no durable ORAM backend, production freshness-witness/key owner, atomic
   coupling between public publication and ROSTL buckets/position maps/stash,
   published full-corpus rebuild result, controlled source-cache result, or
@@ -563,7 +686,8 @@ The following statements are **not** established by that evidence:
   finalization feed remains open;
 - static fixture parity is not live-backend shadow parity, finalised-database
   parity, reorg/seam coverage, a source-call trace, or mainnet evidence;
-- dependency licensing is not cleared for the intended distribution.
+- dependency licensing remains a pre-distribution due-diligence concern, not a
+  Phase 0 feasibility blocker.
 
 ## Gate scorecard
 
@@ -574,42 +698,43 @@ The following statements are **not** established by that evidence:
 | Recorded fork baseline | Pass | Branch merge-base is `c94ae247`; fork remote is `sovright/zaino` | Keep the baseline/current rebases recorded |
 | Threat model and architecture ADR | Pass for research | ADR-0007 is accepted for the research fork | Security and client teams must still accept final constants and claim |
 | Explicit leakage matrix | Draft in this report | Categories are enumerated below | Assign fixed budgets, owners, tests, and formal acceptance |
-| Aggregate corpus implementation | Partial | Identifier-free measurement, mainnet-only capture runner, fixed indexed snapshot, explicit checkpoint verification, semantic and digest read-back validation, atomic three-file publication, nonempty fixture, same-block spend, standard/nonstandard accounting | Execute the runner and produce a reproducible full-mainnet artifact |
-| Mainnet counts/distributions and growth | Missing | No mainnet output artifact exists | Measure distinct standard scripts, lifetime events, live/peak UTXOs, hot tails, script classes, record sizes, and selected growth horizon |
+| Aggregate corpus implementation | Pass for aggregate capture | The source-bound direct runner completed a full-Mainnet scan at checkpoint 3,425,046 and atomically published exactly three read-back-validated files. The measurement digest is `aba46f64da0113d9b0e93209ab4a8a98626d6d5bc7973444c8bf766a1922b127` | Preserve the artifact and reproduce independently when required |
+| Mainnet counts/distributions and growth | Partial | The artifact reports 9,193,009 distinct standard addresses, 351,872,272 lifetime standard-address events, 27,500,704 live standard UTXOs, 73,552 live nonstandard outputs, and a 3,360,022-event hot tail. No approved growth horizon or annual growth input exists | Approve and model a defensible growth horizon, including a potentially worsening hot-address tail |
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov`; generic native Linux CI constructs separate real 38/82-byte backend monomorphizations and exercises both | Measure the target-capacity profile on the selected CPU/TDX platform |
 | Fixed-probe table layout | Partial real integration | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, a complete bounded-history preflight, and a bounded worker with no raw storage bypass. A private offline owner validates exact projection/layout identity and admission limits before composing the coordinator and worker; generic native Linux CI runs 8/16-entry typed stores and the worker-owned exact executor | Add authenticated generation ownership and crash-safe commit/rebuild; select measured capacities/probe counts and trace the backend on target hardware |
-| Full-capacity logical sizing | Partial pass | Version-2 reports bind compiled 38/82-byte cells to shared directory/event allocation validation, charge both full table and position-map domains, keep modeled bytes fixed across occupancy/growth, and expose load/admission/hot-address/modeled-memory flags plus explicit negative evidence markers. Offline `corpus size` consumes a complete validated capture, recomputes every row, and atomically binds measurement/model/result digests. Read-only `corpus validate-sizing` can reopen the existing bundles and require the same source-bound recomputation without emitting another artifact | Calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and runtime working set on target hardware; select an accepted mainnet profile |
+| Full-capacity logical sizing | Partial pass | Strict current-corpus capacities are 16,777,216 directory and 536,870,912 event entries. The compiled-record logical allocation is 46,875,541,504 bytes and the hot tail forces 13,440,092 logical accesses per request. Validated 88/176 GiB models report logical fit with 30% reserved headroom, but also `insertion_bound = false`, `backend_calibrated = false`, `rss_measured = false`, and zero growth | Add approved growth and insertion/failure bounds; calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and working set; measure the accepted target-TDX profile |
 | Compiler pin | Pass for the current ORAM release procedure | Repository pins Rust 1.96.0; the receipt fixes the Linux-musl release profile, feature set, Rust flags, and source-date epoch | Independently pin and verify the complete builder image, LLVM behavior, and native-tool closure |
 | Release artifact identity/repeatability | Partial generic-builder pass | At exact head `a7172384`, two rootless-Podman no-cache builds matched and the published binary/receipt pair passed final verification; the receipt binds local source and build inputs plus binary identity | Repeat on an independent builder, add trusted CI and signed/attested provenance, and keep physical-trace, mainnet, target-CPU, and TDX gates separate |
 | CPU/target/TDX pin | Partial target-class gate | An Ubuntu 24.04 x86_64 CI lane with immutable action pins executes the real adapter; the hosted image, CPU generation, TDX instance, firmware/TCB, DOIT, and memory remain unset | Select CPU generations, exact target/release flags, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
-| Pinned ORAM dependency | Partial | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock` | Resolve API/failure/recovery concerns and decide upstream, fork, or replacement |
-| Dependency/license inventory | Blocked | Manifest declarations recorded below; `rostl` checkout has no root license text | Obtain authoritative license files/confirmation and complete automated transitive audit |
+| Pinned ORAM dependency | Upstream unchanged is technical NO-GO | `rostl` alpha9 at `8c3a12d2...` is in `Cargo.lock`; the selected path is affected by compiler-preservation, stash-recovery, and failure-bound gaps | Own those technical gaps in a Sovright fork or replace the backend; run license diligence in parallel |
+| Dependency/license inventory | Concern; not a Phase 0 gate | Manifest declarations recorded below; `rostl` checkout has no root license text | Obtain authoritative license files/confirmation and complete an automated transitive audit before redistribution |
 | Random full-map experiments | Partial builder foundation | Fixed `SmokeV1` covers a 64-step mixed workload, while separate `FullMapSaturationV1` workers exercise exact logical admission failures. Source-bound `BuilderFoundationV1` adds a deterministic shuffled 256-command hot/cold read/unique-append workload that fills both sizing-derived logical admission limits inside a fixed builder envelope and requires logical occupied-probe collisions. It is neither random/adversarial physical full-map load nor a long-run benchmark | Run mixed random reads/inserts and adversarial collisions at measured full-mainnet target capacity/load; keep that result schema separate from all deterministic profiles |
 | Memory/RSS gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` samples process-wide `VmRSS` before spawn, after spawn, after warmup, and after the measured phase, plus process-lifetime `VmHWM`, on Linux x86_64. The HWM includes driver/runtime memory predating the run. This is whole-process generic-builder evidence, not backend-only memory or intended-TDX headroom | Measure peak RSS, initialization pressure, page faults, and swapping on intended TDX hardware with at least 30% headroom |
 | Latency/stash/queue gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` records synchronous typed-worker call latency and mixed-phase wall-clock completion rates with a single caller and queue capacity one. Synthetic input preparation and verification are outside command latency but inside the phase wall; per-class rates are not isolated throughput. It also records clean-shutdown lifecycle/queue counters, while queue contention is unmeasured and stash/physical access is backend-unobservable | Record target-hardware latency distribution, sustained QPS, stash pressure, loaded queue depth, update contention, and failure behavior |
-| Assembly/compiler-preservation experiment | Missing | No release assembly or instruction trace | Resolve the concern tracked by [`rostl` issue #8](https://github.com/obliviouslabs/rostl/issues/8) for the pinned binary/toolchain |
+| Assembly/compiler-preservation experiment | Static release disassembly: FAIL | At exact evidence source `3a84280c`, both 38-byte and 82-byte insertion monomorphizations branch on the private hit/miss result before reconverging for the second ORAM access | Remediate the branch, rerun exact-source static review, then obtain dynamic instruction/memory/page/timing traces on a suitable host |
 | Failure probability | Missing | No long-run or analytical bound | Address [`rostl` issue #24](https://github.com/obliviouslabs/rostl/issues/24) and document node-year risk |
 | Typed capacity/stash/queue failure | Partial | Local validation is typed; the research worker has nonblocking bounded admission, a typed identifier-free `QueueFull`, no fallback, and terminal backend/panic latching. `SmokeV1` checks the per-address limit. Separate `FullMapSaturationV1` workers reach the directory and event admission bounds independently, fail closed on the next append, and latch terminal state. `BuilderFoundationV1` reaches both source-sized admission limits in one healthy run and requires a clean stopped snapshot, but its single caller does not load the queue and the backend exposes no stash telemetry | Replace panic-based upstream boundaries, type stash exhaustion, and prove capacity/stash/queue behavior under native target load |
-| Persistence/recovery/RTO | Partial public-manifest and fresh-worker runner foundation; production gate blocked | Fixed authenticated manifests, exact digest-bound external freshness transitions, deterministic crash-boundary tests, and fresh-worker genesis replay establish a fail-closed public publication/rebuild contract. A separate runner now binds a fixed source checkpoint, recomputes and exactly matches the capture during replay, measures allocation through validated readiness, records shutdown separately, and publishes valid budget misses. The candidate ROSTL adapter remains volatile; source cache is uncontrolled, and no production witness/key owner, composite ORAM-state commit, full-corpus result, controlled-cache result, or full-service RTO exists | Wire production key/freshness ownership and either implement authenticated atomic ORAM persistence or run a controlled target-hardware rebuild and publish an accepted full-service RTO |
+| Persistence/recovery/RTO | Partial public-rebuild, private outer-commit, replay-journal, and module-private coordinator foundations; production gate blocked | Fixed authenticated public manifests, exact digest-bound external freshness transitions, deterministic crash-boundary tests, and fresh-worker genesis replay establish a fail-closed public publication/rebuild contract. A separate private fixed-width snapshot commits stable security identity plus opaque serving/component digests locally before an injected exact witness. The local replay journal reconstructs the exact committed prefix from fixed-size context-sealed records. Profile v6 keeps entry v2 (`ZORJENT2`) unchanged and selects current v3 (`ZORJCUR3`); all record widths remain fixed. Entry v2 persists each real continuation's opaque replay key and nonzero ceiling expiry-bucket ordinal. Current v3 persists a `u64` watermark whose zero sentinel means no classified bucket and whose nonzero value records the inclusive highest fully expired continuation expiry bucket for future maintenance classification. The raw recorded value is not authority. Lower proposals reject; equal returns typed `NoAdvance` without a write, receipt, or outer sequence advance; greater durably advances replay-current without appending entries or changing claim sets/counts. Query replay and maintenance mint distinct move-only receipts before the module-private coordinator applies replay-current -> outer-local -> witness ordering. Hard witness rejection fresh-opens as `WitnessLocalMismatch`; witness advance-then-error can reconcile. Profile v6 requires fresh provisioning and neither migrates nor dual-accepts profile-v5/current-v2 or earlier state. The surface has no non-test caller or trusted-time/epoch/profile grant; runtime wiring or visibility widening first requires a live epoch/profile/currentness-bound move-only grant. There is no request expiry, deletion, count reduction, compaction, reclamation, bounded retention, or garbage-collection execution; capacity remains lifetime cumulative. It remains runtime-unwired, single-writer without a lock, and protected only by a test fixture. The three advancement steps are ordered but not one atomic transaction. No production witness/key/nonce owner, nonce/time journal, qualified integrated replay, composite ORAM-state commit, full-corpus result, controlled-cache result, or full-service RTO exists | Supply the production trusted-time and retirement authority plus a live epoch/profile/currentness-bound grant, complete replay/snapshot/witness ownership under the production freshness protocol, add nonce/time roots, and preserve the explicit no-deletion/no-reclamation boundary until a separately reviewed retention protocol exists; then either implement authenticated atomic ORAM persistence or run a controlled target-hardware rebuild and publish an accepted full-service RTO |
 | Go/no-go stakeholder acceptance | Missing | No accepted numeric profile or client contract | Security, operator, and client teams approve the exact leakage budget |
 
 Phase 0 does not pass. Mainnet capacity, hardware memory, physical behavior,
-recovery, and licensing are independent blockers; satisfying only one does not
-open the server gate.
+and recovery remain independent technical blockers; satisfying only one does
+not open the server gate. Licensing remains separate pre-distribution due
+diligence and does not block technical-gate remediation or backend-fork work.
 
 ### Phase 1 — deterministic contract
 
 | Deliverable or acceptance condition | State | Evidence or gap |
 |---|---|---|
 | Business and persistent records | Partial pass | Fixed UTXO and 72-byte event types exist with named conversions and adjacent tests; finalized create/spend states are enforced, and an in-memory offline checkpoint/projection model exists; persistent page/directory/checkpoint representations remain incomplete |
-| Fixed envelope codec | Partial pass | A crate-internal versioned codec binds direction, derived profile ID, fixed checkpoint, prepared query, opaque optional token, session binding, outcome/`has_more`, and canonical fixed result slots inside one exact envelope. Version/profile/session/direction are explicit protection context. Checked arithmetic rejects undersized shapes; a non-cryptographic deterministic fixture rejects one single-bit mutation at every byte offset, reseals malformed plaintext to exercise protected canonical rejection, and pins exact request/response digests. Separate XChaCha20-Poly1305 role-key objects pin request/response/token domains, canonical associated data, an independent cross-implementation vector, and mutation rejection; a private runtime test rejects a wrong request key before material/replay work and completes encrypted pagination, token-tamper, valid-claim, and replay paths with one modeled trace. Distinct effective key material is deferred to the owner/KDF slice. All pre-runtime decode failures map to one external failure class. There is no production key/session/nonce owner or protobuf framing |
-| Compiled profile table | Partial pass | Profile ID v3 binds query-store reads, zero query-store writes/allocations/source calls, the recent-snapshot scan budget, padded input slots, one replay lookup/write-back, one request/response application frame, fixed bytes, unary completion, response slots, cover rounds, runtime schedule version/count, continuation lifetime, timeout bucket, and a typed single-worker FIFO execution/queue/reject-at-capacity policy. Regression tests prove every selectable authoritative dimension changes the ID while the diagnostic label does not. Listener-free runtime fixtures bind a nonzero four-slot recent-snapshot budget; no production profile constants are guessed or accepted |
-| Continuation tokens | Partial pass for the logical model | The fixed token is opened and semantically validated before engine use; full checkpoint plus codec-session bytes are protector context, and continuation query binding v2 commits to the content computed internally from every slot plus in-memory generation, exact finalized identity, and recent tip height/hash. Cursors are bounded absolute ordinals in the combined finalized-plus-recent domain, expiry does not slide, and valid uses are atomically claimed through the injected guard. A continuation issued by one runtime lifecycle is rejected by another with different mock contents or a new generation with identical contents. Invalid/expired/mismatched/replayed tokens become one protected all-dummy outcome after the same modeled schedule when no higher-priority store or projection-readiness failure applies. Initial/invalid paths write back to a dedicated non-durable cover slot without mutating the real-token namespace, and every completed protected round after server-material acquisition issues one real-or-cover token. A crate-internal XChaCha20-Poly1305 primitive now pins canonical token context, but no production key/session/nonce owner, trusted clock, durable replay store, service integration, or instruction/memory/timing result exists |
+| Fixed envelope codec | Partial pass | A crate-internal versioned codec binds direction, derived profile ID, fixed checkpoint, prepared query, opaque optional token, session binding, outcome/`has_more`, and canonical fixed result slots inside one exact envelope. Version/profile/session/direction are explicit protection context. Checked arithmetic rejects undersized shapes; a non-cryptographic deterministic fixture rejects one single-bit mutation at every byte offset, reseals malformed plaintext to exercise protected canonical rejection, and pins exact request/response digests. Separate XChaCha20-Poly1305 role-key objects pin request/response/token domains, canonical associated data, an independent cross-implementation vector, and mutation rejection; a private runtime test rejects a wrong request key before material/replay work and completes encrypted pagination, token-tamper, valid-claim, and replay paths with one modeled trace. Distinct effective key material is deferred to the owner/KDF slice. All pre-runtime decode failures map to one external failure class. There is no production key/session/nonce owner; protobuf framing exists only in the adjacent listener-free facade consumer, with no generated route or listener |
+| Compiled profile table | Partial pass | Profile ID v6 binds query-store reads, zero query-store writes/allocations/source calls, the recent-snapshot scan budget, padded input slots, one replay lookup/write-back, one request/response application frame, fixed bytes, unary completion, response slots, cover rounds, runtime schedule version/count, continuation lifetime, timeout bucket, a typed single-worker FIFO execution/queue/reject-at-capacity policy, total committed replay-transaction capacity, the named public trusted-time expiry-bucket-width parameter, the named proactive fixed garbage-collection-interval parameter, authenticated replay-entry-v2 semantics, and replay-current-v3 semantics. V6 adds recorded classification state but no trusted-time/epoch/profile grant, request expiry, deletion, count reduction, compaction, reclamation, bounded retention, or garbage-collection execution. Regression tests prove every selectable authoritative dimension changes the ID while the diagnostic label does not. Listener-free runtime fixtures bind nonzero test-only values without guessing or accepting production profile constants; the ten-phase logical schedule is unchanged |
+| Continuation tokens | Partial pass for the logical model | The fixed token is opened and semantically validated before engine use; full checkpoint plus codec-session bytes are protector context, and continuation query binding v2 commits to the content computed internally from every slot plus in-memory generation, exact finalized identity, and recent tip height/hash. Cursors are bounded absolute ordinals in the combined finalized-plus-recent domain, expiry does not slide, and valid uses are atomically claimed through the injected guard. A continuation issued by one runtime lifecycle is rejected by another with different mock contents or a new generation with identical contents. Invalid/expired/mismatched/replayed tokens become one protected all-dummy outcome after the same modeled schedule when no higher-priority store or projection-readiness failure applies. Initial/invalid paths write back to a dedicated non-durable cover slot without mutating the real-token namespace, and every completed protected round after server-material acquisition issues one real-or-cover token. The newer fixture seam derives separate canonical versioned identities for the authenticated request nonce and continuation claim, then completes the request and real-or-cover continuation lanes atomically. A crate-private local journal now implements that seam with fixed context-sealed entry-v2 records and persists each real continuation's opaque replay key plus nonzero, one-based ceiling expiry-bucket ordinal as one typed claim; the ordinal is metadata, not runtime eligibility or deletion authority. The journal persists cover for both duplicate classes. Its module-private coordinator consumes one move-only replay-advance receipt only after the same live journal recognizes its per-open identity and confirms its post-digest is current, then orders the outer local snapshot and injected witness update; it is not wired to this runtime or to a production witness. A crate-internal XChaCha20-Poly1305 primitive pins canonical token context, but no production key/session/nonce owner, trusted clock, nonce ledger, integrated witness-backed replay, service integration, or instruction/memory/timing result exists |
 | Deterministic mock store | Pass for logical modeling | Bounded plaintext mock rejects duplicate/out-of-range/capacity errors |
 | Logical store trace | Partial pass for the offline model | Allocation-free recorder validates sequential query-store reads, a separately ordered recent-snapshot scan budget, zero query-store writes/allocations/source calls, one replay lookup/write-back, modeled application frames/bytes, completion, and the exact ordered ten-phase decode/token/replay/read/issue/encode schedule. The listener-free runtime executes the nonzero profile-bound ordinal scan through its concrete `FrozenRecentSnapshot<N>` and, only after completing the scan, rechecks exact checkpoint identity and recomputes both content and lineage commitments from the scanned slots and frozen metadata. It merges changes before pagination and rejects missing, extra, or reordered reads while keeping query-derived source calls at zero. Live NFS acquisition, physical, allocator, instruction, timing, and transport evidence remain open |
 | Failure completion schedule | Partial pass | Every test-injected finalized-store or recent-snapshot read fault still completes all configured logical reads. A read fault, checkpoint/content/lineage mismatch, malformed same-outpoint sequence, owner mismatch against a finalized output, or duplicate create produces a protected all-dummy `ProjectionNotReady` result and latches readiness only after the full modeled work. Fault and post-construction corruption hooks are `#[cfg(test)]` only and absent from the production API; physical failure behavior is not equivalent or measured |
 | Independent private proto | Partial pass | `zainod-oram/proto/private.proto` owns one independent `zaino.private.v1.PrivateCompactTxStreamer/QueryPage` method over a single `FixedEnvelope.bytes` field. Generated Rust is committed, verified when `protoc` is available, and refreshed only in explicit update mode. Exact non-empty decoded lengths are enforced by the listener-free adapter; attestation/public-info/admin schemas, generated-service integration, package/profile-specific message limits, and transport evidence remain open |
-| Private service adapter | Partial pass | A crate-private `zainod-oram` adapter uses named wire conversions, coarsens invalid-length and runtime-port errors, and retains only a mock port's non-`Clone` pending response without an eager byte copy. A custom listener-free Tonic codec/body performs the pending value's fallible currentness check at first outbound body poll. Tests pin the successful fixed-envelope DATA frame, prove a stale response emits no DATA and one uniform `Unavailable` trailer shape without borrowing response bytes, prove dropping an unpolled body releases without checking or borrowing, and prove detailed request/body errors lose metadata, details, and response extensions at the boundary. Separately, the internal `zaino-oram` finalized-runtime pending round now carries an exact-identity/opaque-boundary release witness and atomically authorizes its first byte borrow after a fresh observation; stale, unavailable, or owner-closed release fails closed, unpolled drop does not observe, and the witness retains no serving lease/store. Tests exercise the exact helper delegated to by the owner, not a successfully refreshed ready-owner lifecycle. `zainod-oram` still consumes only its mock port: the concrete process owner, its bytes, and release permit remain unexposed, and the package does not construct that owner or implement the generated Tonic trait. A lifetime-safe real-owner facade backed by non-test production providers, generated route/listener integration, concurrent policy, socket-write/peer-delivery currentness, transport completion/equivalence, TLS, compression, and package/profile-specific message-limit policy remain open |
+| Private service adapter | Partial pass | `zaino-oram` exports only the small lifetime-safe `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade, and the crate-private `zainod-oram` adapter consumes it through named wire conversions and one coarsened error. Its custom listener-free Tonic codec/body retains the non-`Clone` pending value and performs the fallible currentness check at first outbound body poll; no detached response bytes cross the facade. Tests pin the successful fixed-envelope DATA frame, prove a stale response emits no DATA and one uniform `Unavailable` trailer shape without borrowing response bytes, prove dropping an unpolled body releases without checking or borrowing, and prove detailed request/body errors lose metadata, details, and response extensions at the boundary. Internally, one profile-bound non-`Clone` `ActiveSecurityLease` is the sole runtime security owner; full raw bundle assembly is `#[cfg(test)]`, and release validates distinct material-reservation and replay-commit authorities against the active round and epoch. The concrete runtime owner remains private with no public constructor or factory, so `zainod-oram` currently exercises the facade with mocks and does not implement the generated Tonic trait. A production protector/replay/material-provider bundle, generated route/listener integration, concurrent policy, socket-write/peer-delivery currentness, transport completion/equivalence, TLS/TDX, compression, and package/profile-specific message-limit policy remain open |
 | Frame/byte/completion equivalence | Partial model | Every offline round models one fixed request and response application envelope, equal bytes, and unary completion; this is explicitly not protobuf, HTTP/2, TLS, packet-capture, or outer-status evidence |
 | NFS/source-call equivalence | Partial logical mock | The runtime owns a concrete `FrozenRecentSnapshot<N>` rather than a generic source, and the frozen type computes its content commitment internally from fixed slots and binds it to in-memory generation, exact finalized identity, and recent tip height/hash. Each round reads only public sequential ordinals, completes the nonzero profile-bound scan, rechecks exact checkpoint identity and recomputed content/lineage commitments, validates same-outpoint ownership/sequencing, and merges recent creates/spends before pagination. The lineage commitment is continuation-query-digest-bound across runtime lifecycles, and query-derived host/source calls remain modeled at zero. Under `corpus-zaino`, the private in-memory publication owner accepts a generation-free converted candidate only through its current ticket, checks exact finalized/tip metadata, and moves its slots into an owner-generated frozen snapshot; raw-slot activation is test-only. Begin-before-conversion ordering is not type-enforced, and no live refresh controller owns it. The owner still has no runtime caller and depends on a rolled projection epoch when recreated. This is not an authenticated canonical/live Zaino snapshot root; there is no live NFS acquisition, canonical ancestry validation, reorg-safe service publication, or integrated validator/LMDB/raw-transaction instrumentation |
 | Legacy golden/parity tests | Partial pass | A committed schema golden pins the upstream `CompactTxStreamer` service name, all 20 ordered RPC signatures, and normalized proto fingerprint; existing write/delete consumers retain nonstandard behavior; static ordinary-source versus offline-oracle UTXO parity is committed, while live direct/RPC and finalised-database parity remain open |
@@ -673,7 +798,7 @@ yet stakeholder-approved.
 | Client IP/network metadata | Permitted | Outside initial claim | No service exists | Not applicable yet |
 | Service/schema/profile ID | Permitted | Bound into attestation and publicly versioned | The inner codec carries a fixed test-only format version and a canonical 16-byte ID derived from the complete logical budget; there is no approved profile table, private schema, or attestation | Open |
 | Coarse network/chain epoch/height/hash/sync lag | Permitted | Public checkpoint and freshness policy | Corpus report plus offline oracle bind network, height/hash, schema, and key epoch with replay/rebuild decisions | Partial; authoritative live feed and serving policy absent |
-| Database capacity and projected growth | Permitted | Aggregate only, never identifier-bearing | Aggregate report types and redacted debug exist | Partial; no mainnet artifact |
+| Database capacity and projected growth | Permitted | Aggregate only, never identifier-bearing | Full-Mainnet aggregate report exists at checkpoint 3,425,046; growth horizon remains unapproved | Partial; measured current corpus, unmeasured growth |
 | Aggregate QPS/queue/health | Permitted within allowlist | No outcome/cardinality labels | An internal snapshot exists; no service metrics exporter or fixed-cadence aggregation/suppression policy exists | Open |
 | Logs, errors, traces, metric labels | Must exclude private values/outcomes | Allowlisted aggregate/public fields only | New sensitive types use redacted debug; no end-to-end log audit | Open |
 | CPU instructions/branches/timing | Must not distinguish secret cases above accepted threshold | Pinned release build, assembly review, classifier/trace gate | Not measured | Blocker |
@@ -719,20 +844,23 @@ behavior, target CPU features, or TDX isolation.
 | `zaino-state` | Local/version `0.3.1`, optional, no default features | Indexed-block corpus adapter | Workspace Apache-2.0 | Enabled only by `corpus-zaino` |
 | `bytemuck` | `1.25.1`, derive/min-const-generics | Exact `Pod` record proof | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
 | `bytemuck_derive` | `1.11.0` | Derive transitive | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
-| `rostl-oram` | `0.1.0-alpha9`, [`8c3a12d2...`](https://github.com/obliviouslabs/rostl/commit/8c3a12d2febf17b024f2e949428b3bc526d74172) | Volatile candidate Circuit ORAM | Workspace manifest: `MIT OR Apache-2.0`; no root `LICENSE`/`COPYING` file found in pinned checkout | Distribution blocker pending authoritative text/confirmation |
-| `rostl-primitives` | Same alpha/version/commit | `Cmov` trait and primitives | Same inherited manifest declaration; same missing root license text | Distribution blocker |
-| `rostl-sort` | Same alpha/version/commit, transitive | `rostl-oram` transitive | Same inherited manifest declaration; same missing root license text | Distribution blocker |
+| `rostl-oram` | `0.1.0-alpha9`, [`8c3a12d2...`](https://github.com/obliviouslabs/rostl/commit/8c3a12d2febf17b024f2e949428b3bc526d74172) | Volatile candidate Circuit ORAM and current optional dependency | Workspace manifest: `MIT OR Apache-2.0`; no root `LICENSE`/`COPYING` file found in pinned checkout | Pre-distribution diligence; not a Phase 0 blocker |
+| `rostl-primitives` | Same alpha/version/commit | Current optional `Cmov` dependency | Same inherited manifest declaration; same missing root license text | Pre-distribution diligence; not a Phase 0 blocker |
+| `rostl-sort` | Same alpha/version/commit, transitive | Current optional `rostl-oram` transitive dependency | Same inherited manifest declaration; same missing root license text | Pre-distribution diligence; not a Phase 0 blocker |
 | `assume` | `0.5.0`, transitive | `rostl` primitive support | Manifest: `MIT OR Apache-2.0` | Include in final automated audit |
 | `static_assertions` | `1.1.0`, transitive | `rostl` compile-time checks | Manifest: `MIT OR Apache-2.0` | Include in final automated audit |
 | `rand` family | Direct optional `rand 0.9.4` plus locked transitives | Uniform experimental remap-position sampling and upstream randomness | `rand` manifest: `MIT OR Apache-2.0` | Entropy source remains subject to TDX review; full transitive audit still required |
 | `rostl-datastructures` | Assessed at the same commit; not linked | Possible map layer | Same manifest family; macOS build is blocked by Linux-specific affinity code | Excluded from current dependency graph |
 | [`oblivious_node`](https://github.com/obliviouslabs/oblivious_node/commit/d00718dfdfd38dd50ec2e315e35ab54f25cd5067) | Reference only | Architecture/TDX precedent | Not a dependency and not cleared for redistribution here | Do not copy or ship |
-| TDX runtime and quote verifier | None selected | Attestation and TLS binding | No approved dependency inventory; the reference verifier boundary noted in the plan remains license-sensitive | Blocker before TDX integration |
+| [`tdx_easy_https` / `tdx_quote_verifier`](https://github.com/obliviouslabs/tdx_easy_https/blob/bd48faebeb21a385b8cd7e4451c107e5c60df02c/client/tdx_quote_verifier/Cargo.toml) | Reference only; not selected | Possible attestation-verifier precedent | The reference crate declares `AGPL-3.0-or-later`; it is absent from Zaino manifests, `Cargo.lock`, and all-feature Cargo trees | Separate license/integration review if considered; no current dependency-closure or Phase 0 blocker |
 
-The table is an engineering inventory, not legal advice. The final gate needs
-an automated license/SBOM review of the exact release closure plus authoritative
-license texts for git dependencies. A manifest string alone is insufficient for
-the intended redistribution decision.
+The table is an engineering inventory, not legal advice. Before redistribution,
+the exact release closure needs an automated license/SBOM review plus
+authoritative license texts for git dependencies. A manifest string alone is
+insufficient for that decision. This is pre-distribution due diligence, not a
+Phase 0 feasibility gate or reason to pause technical-gate remediation. The
+AGPL-declared verifier above is reference-only and is not part of the current
+dependency closure; adopting or copying it would trigger a separate review.
 
 ## Verification evidence
 
@@ -880,51 +1008,46 @@ is benchmark, mainnet, TDX, network, recovery, or side-channel evidence.
 
 ## Mainnet corpus and capacity blocker
 
-The scanner core now has useful safety properties: it requires a nonempty
-height-zero start, validates the network-bound canonical genesis hash and null
-genesis parent, checks contiguous heights and parent hashes, resolves spends
-from a genesis-forward live-output map, and returns an aggregate measurement
-bound to a public network/final height/hash checkpoint. Its returned measurement
-retains no address, transaction, or outpoint identifiers. Growth, table,
-backend-expansion, and memory assumptions are applied only after measurement and
-can be changed without rescanning.
+The full-Mainnet aggregate measurement is complete. The source-bound direct
+runner scanned genesis through explicit checkpoint 3,425,046 and atomically
+published exactly three read-back-validated files. The measurement retains no
+address, transaction, or outpoint identifiers. Its canonical compact-JSON
+BLAKE2s-256 digest is
+`aba46f64da0113d9b0e93209ab4a8a98626d6d5bc7973444c8bf766a1922b127`.
 
-It is not yet a mainnet measurement:
+The measured corpus contains 9,193,009 distinct standard addresses,
+351,872,272 lifetime standard-address events, 27,500,704 live standard UTXOs,
+and 73,552 live nonstandard outputs. The hottest two address histories contain
+3,360,022 and 3,360,020 events. Exact identities remain limited to standard
+P2PKH/P2SH scripts; nonstandard compact outputs are counted by class without
+inventing a false address identity.
 
-- the public `ChainIndex::get_indexed_block_by_height` point source and
-  `zainod-oram corpus capture` runner are implemented, including fixed-snapshot
-  checkpoint verification and atomic read-back-verified publication, but the
-  runner has not been executed against a full mainnet checkpoint and no output
-  artifact exists;
-- no mainnet checkpoint, counts, histogram, hot-address tail, or growth output
-  is checked in or otherwise attached to this branch;
-- exact identities are available only for standard P2PKH/P2SH scripts;
-  nonstandard compact outputs are counted by class without inventing a false
-  address identity;
-- the separate sizing model charges every compiled 38-byte directory and
-  82-byte event cell across the full configured table capacities plus both full
-  position-map domains; projected occupancy affects only explicit
-  load/admission/hot-address flags, never allocated bytes;
-- the position-map entry width and backend expansion remain uncalibrated
-  operator assumptions. The model does not calculate the pinned backend's
-  actual tree blocks, recursive map levels, stash, initialization temporaries,
-  allocator overhead, or runtime working set, and admission fit is not a bound
-  on fixed-probe insertion success or collision probability;
-- proportional growth currently multiplies address counts within existing
-  histogram buckets; it does not forecast a worsening hot-address tail;
-- no growth horizon or target TDX memory size has been approved.
+The smallest supported power-of-two capacities strictly greater than measured
+occupancy are 16,777,216 directory entries and 536,870,912 event entries. The
+current hot tail makes the logical fixed-work floor
+`4 + 4H = 13,440,092` accesses per request. Charging the compiled 38-byte
+directory and 82-byte event cells plus four-byte position-map entries gives
+46,875,541,504 logical bytes, approximately 43.66 GiB.
 
-Therefore `fits_modeled_memory` and `fits_modeled_constraints` are model results
-only. Neither may be used as the 30%-RSS go/no-go result. Those projections are
-not part of the captured measurement artifact; the offline `corpus size`
-command recomputes them from explicit assumptions into a separate artifact.
-No full-mainnet sizing artifact has been produced yet.
-The load-foundation slice adds a read-only `corpus validate-sizing` command that
-reopens and revalidates those existing capture and sizing inputs and requires
-the same source-bound recomputation. It emits no additional artifact, accepts no
-runtime or workload tuning, instantiates no ORAM backend, store, or worker, and
-supplies no load measurement, performance result, hardware result, or mainnet
-result.
+The separately validated 88 GiB and 176 GiB sizing bundles report
+current-corpus logical fit with 30% reserved headroom and bind qualification
+digests
+`ac8ff6f13e00e63c1c6a49e377f2b9908074be247cb7319404cdfe4abf051ea8`
+and
+`7c16856d25d363e9409a05408f6c6e4b6c668236e2851abcb1eb47763cd0b0f2`.
+They also explicitly report `insertion_bound = false`,
+`backend_calibrated = false`, and `rss_measured = false`, with zero growth
+horizon and annual growth.
+
+Therefore `fits_modeled_memory` and `fits_modeled_constraints` remain logical
+model results only. They are not the 30%-RSS go/no-go result. The model does
+not calculate the pinned backend's actual tree blocks, recursive map levels,
+stash, initialization temporaries, allocator overhead, or runtime working set;
+admission fit is not a bound on insertion success or collision probability.
+Approved growth must also consider a worsening hot-address tail rather than
+only proportionally scaling existing histogram buckets. The exact operational
+evidence is in the
+[dated capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
 
 ## RSS, benchmark, stash, and queue blockers
 
@@ -967,7 +1090,8 @@ persistence/recovery, a `10^9`-operation failure bound, signed or attested
 execution, backend physical-obliviousness, or mainnet readiness. Required
 evidence still includes:
 
-1. a full mainnet build at an explicit public checkpoint and growth horizon;
+1. an approved growth horizon applied to the completed explicit-checkpoint
+   Mainnet measurement;
 2. random full-map mixed reads/inserts, adversarial collision patterns, and
    realistic update/query interleaving;
 3. p50/p95/p99/p999 latency, throughput, queueing, and update contention;
@@ -988,18 +1112,25 @@ generic Ubuntu 24.04 x86_64; the bounded builder profile does not change that
 host qualification boundary. The private projection owner consumes that
 constructor, but has no runtime/service caller. The
 tables, synchronous executor, and outer worker boundary catch panics and latch
-coarse failed-closed state, but Rust's process-wide panic hook still runs and
-this is not recovery. Upstream open work includes Circuit ORAM stash recovery
-([#13](https://github.com/obliviouslabs/rostl/issues/13)) and map queue recovery
-([#32](https://github.com/obliviouslabs/rostl/issues/32)).
+  coarse failed-closed state, but Rust's process-wide panic hook still runs and
+  this is not recovery. Circuit ORAM stash recovery
+  ([#13](https://github.com/obliviouslabs/rostl/issues/13)) is directly relevant.
+  Map queue recovery
+  ([#32](https://github.com/obliviouslabs/rostl/issues/32)) applies only if
+  `rostl-datastructures` is adopted.
 
 ## Assembly and trace blocker
 
-An exact Linux x86_64-musl release artifact and its unsigned self-reported
-receipt now exist at head `a7172384`, but no release-binary assembly or
-physical trace experiment exists. Before a privacy claim, that exact artifact
-must be examined under the pinned compiler and target CPU policy for
-contrasting secret cases. At minimum, record and compare:
+Static disassembly of the exact evidence-source Linux x86_64-musl release at
+`3a84280c` fails this gate. In both record monomorphizations, the private
+hit/miss result directly controls a conditional jump before the paths
+reconverge for the second ORAM access. This is enough to reject the current
+binary; it is not a dynamic instruction, memory-address, page, allocation, or
+timing experiment.
+
+After the branch is remediated, examine the new exact artifact under the pinned
+compiler and target CPU policy for contrasting secret cases. At minimum, record
+and compare:
 
 - relevant instructions and secret-dependent branches;
 - memory addresses, page accesses/page faults, and allocations;
@@ -1035,6 +1166,23 @@ new projection epoch; missing, stale, corrupt, torn, or equivocating evidence
 stays unready. Tests cover portable fake workers and the Linux-x86_64 typed
 ROSTL path.
 
+The private side separately has a fixed outer security-state snapshot, a local
+replay journal, and a module-private coordinator between them. Explicit initial
+provisioning is distinct from opening existing state; an existing open accepts
+only an exact match with the current versioned, domain-separated replay digest.
+Each successful replay commit's sealed durable path mints one move-only receipt
+binding its opaque per-open journal identity and pre/post digests. The
+coordinator accepts it only from the same live journal and while its post-digest
+remains current, then advances the outer local snapshot and injected witness.
+It never infers which component is ahead or repairs either component. A journal
+latched indeterminate cannot supply component state, and any post-replay outer
+error latches the coordinator instance fail closed. A hard
+witness rejection causes a fresh open to fail with `WitnessLocalMismatch`;
+witness advance-then-error can fresh-open successfully when the witness
+advanced. No non-test runtime or security-owner caller constructs this
+coordinator. The replay commit, outer replacement, and witness advancement are
+ordered but are not one atomic transaction.
+
 This does not make the ORAM durable. No implementation or measurement currently
 provides:
 
@@ -1050,60 +1198,84 @@ provides:
 - recovery-directory hardening beyond the current trusted, exclusive-writer
   boundary and final-component file/directory checks.
 
+The private foundation now binds profile-v6 replay-policy parameters,
+authenticated replay-entry-v2 semantics, and replay-current-v3 semantics.
+Each persisted real continuation is one typed claim containing its opaque
+replay key and a nonzero, one-based ceiling expiry-bucket ordinal in unchanged
+entry v2 (`ZORJENT2`). Fixed-width current v3 (`ZORJCUR3`) binds the exact v6
+profile ID and a `u64` maintenance watermark. Zero is the sentinel for no
+classified bucket; a nonzero value is the inclusive recorded highest fully
+expired continuation expiry bucket for future maintenance classification. The
+raw recorded value is not trusted-time, epoch, profile, currentness, expiry, or
+retirement authority. Lower proposals reject, equal returns typed `NoAdvance`
+without a write, receipt, or outer sequence advance, and greater durably
+advances replay-current and mints the distinct maintenance receipt without
+appending an entry or changing claim sets/counts. Profile v6 requires fresh
+provisioning and neither migrates nor dual-accepts profile-v5/current-v2 or
+earlier state.
+
+The serialized replay-current -> outer-local -> witness recovery path remains
+module-private with no non-test caller and no trusted-time/epoch/profile grant.
+Any visibility widening or runtime wiring must first consume a live
+epoch/profile/currentness-bound move-only grant. Capacity remains lifetime
+cumulative: there is no request expiry, garbage-collection execution,
+committed-entry deletion or count reduction, compaction, reclamation, or
+bounded retention. Runtime/security-owner wiring, coordinated production
+witness advancement, production protector/nonce/time/key ownership, and
+rollback, TDX, mainnet, target-load, or access-oblivious qualification remain
+open. No production rollback resistance follows from the local binding.
+
 `catch_unwind` plus a public manifest is not a durable ORAM recovery protocol.
 Until one of the persistence options in the delivery plan is implemented and
 tested—or a measured cold rebuild meets the accepted RTO—the private endpoint
 must not exist, or must remain unready in a later offline prototype.
 
-## Work allowed under the NO-GO
+## Work under the technical NO-GO
 
-The following work remains in scope because it reduces uncertainty without
-exposing a private server:
+Work that answers or remediates a technical Phase 0 gate may continue under
+accurate experimental labeling. The priorities are:
 
-1. execute `zainod-oram corpus capture` at an explicit public mainnet checkpoint
-   and publish only its identifier-free, digest-bound artifact;
-2. produce and review the full-mainnet distribution and calibrated sizing
-   artifact;
-3. execute the fixed source-bound `BuilderFoundationV1` profile on the generic
-   Linux x86_64 builder, retain its three-file artifact, and harden the new
-   same-host release procedure with an independent rebuild, immutable builder
-   inputs, and signed or attested provenance without calling any intermediate
-   result a target-hardware or privacy qualification;
-4. select target CPU/TDX instances and measure random full-map performance,
-   stash/queue behavior, RSS, swapping, and rebuild time;
-5. extend the logical trace into release-binary source, allocator, physical
-   storage, instruction/memory/page, and real transport-frame instrumentation;
-6. implement production key/freshness-witness ownership and either obtain typed
-   durable upstream recovery behavior or qualify the authenticated
-   genesis-forward rebuild protocol against a declared target-hardware RTO;
-7. resolve git-dependency and TDX/verifier licensing with an exact SBOM;
-8. extend the completed logical token/runtime and injected mock scan/merge model
-   by supplying the production finalized-outpoint resolver, implementing a live
-   refresh controller that begins the update before conversion, wiring live
-   source/NFS acquisition into the existing owner-mediated candidate activation,
-   binding the owner-generated `FrozenRecentSnapshot` into atomic canonical
-   whole-serving epochs, and adding private schema, transport, allocator,
-   instruction/memory/page, timing, and outer-status evidence without opening a
-   production listener prematurely;
-   retain the legacy schema golden;
-9. obtain independent security review of the evidence and then revisit this
-   decision.
+1. apply approved growth and backend-calibration inputs to the completed
+   explicit-checkpoint Mainnet capture, define insertion/failure bounds, and
+   obtain target-TDX RSS/no-swap measurements with at least 30% headroom;
+2. remediate the exact-source secret-dependent branch, then rerun static
+   disassembly and dynamic instruction/memory/page/timing qualification;
+3. size and review a Sovright-owned fork or select a replacement,
+   explicitly owning recovery, failure bounds, and the ongoing compiler/backend
+   qualification matrix; and
+4. obtain written independent review of the technical gate results before
+   private-server integration, deployment, or a host-oblivious privacy claim.
+
+In parallel, obtain authoritative `rostl` license confirmation and canonical
+license and notice texts for the exact distribution closure. That work is
+release due diligence, not a Phase 0 kill question, and does not add to the
+technical slice freeze.
 
 ## Conditions to change the decision
 
-Changing from NO-GO requires all of the following, not a subset:
+Authorization to resume the frozen later research slices requires all of the
+following, not a subset:
 
-- a reproducible full-mainnet aggregate report at a public checkpoint;
-- approved growth and profile constants derived from that report;
-- measured target-TDX capacity with at least 30% RSS headroom and no swapping;
-- target-load latency/stash/queue/failure results with typed fail-closed
-  behavior;
-- reviewed assembly and physical trace evidence for the pinned release binary;
-- a credible authenticated persistence/recovery design and measured RTO;
-- resolved licenses for the exact distribution closure;
-- an accepted leakage matrix and client cover-round contract;
-- completion of the Phase 1 fixed-work/wire/source/legacy parity evidence; and
-- a written review that explicitly authorizes the next integration phase.
+- a reproducible full-mainnet aggregate report at a public checkpoint, approved
+  growth and backend-calibration inputs, and measured target-TDX capacity with
+  at least 30% RSS headroom and no swapping;
+- remediated secret-dependent release codegen followed by passing static and
+  dynamic physical-trace review;
+- an accepted fork or replacement decision that owns recovery, failure bounds,
+  and ongoing compiler/backend qualification; and
+- a written review that explicitly lifts the technical slice freeze.
+
+Authoritative license evidence and the exact-closure license/SBOM review remain
+required before redistribution. They are not conditions for technical-gate
+remediation, backend-fork work, or changing this technical feasibility
+decision.
+
+Private-server integration is a separate, stricter decision. It additionally
+requires target-load latency/stash/queue/failure results with typed fail-closed
+behavior, a credible authenticated persistence/recovery design and measured
+RTO, an accepted leakage matrix and client cover-round contract, completion of
+the fixed-work/wire/source/legacy parity evidence, and a written review that
+explicitly authorizes integration.
 
 Until then, the accurate description is: **experimental offline ORAM research
 for a possible Zaino private-query subsystem**.

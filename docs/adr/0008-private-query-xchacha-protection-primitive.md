@@ -72,24 +72,24 @@ itself require a wire-format change if the transcript remains interoperable.
 
 ## Deferred ownership decisions
 
-This ADR deliberately does not define or implement:
+The required joint ownership and fail-closed lifecycle for these concerns is
+now fixed by
+[ADR 0009](0009-private-query-runtime-security-state-owner.md). Concrete
+provider selections and implementations remain deferred. This ADR deliberately
+does not define or implement:
 
-- client/server key establishment or client interoperability;
-- whether session binding is per TLS connection, per attested workload, or
-  derived from a TLS exporter or another handshake transcript;
-- key derivation, provisioning, key-epoch binding, rotation, revocation, KMS,
-  sealing, restart, or multi-replica ownership;
-- entropy acquisition or uniqueness enforcement for request, response, or
-  continuation nonces;
-- a trusted clock, rollback-resistant time, durable replay state, replay
-  capacity/garbage collection, or crash-atomic replay claims;
-- attestation binding for the three protector keys and their effective
-  configuration; or
+- the concrete client/server handshake, exporter labels, or interoperability;
+- key derivation, provisioning, rotation, revocation, KMS, or sealing provider;
+- the rollback-resistant request, response, and continuation nonce allocator;
+- the trusted-time, durable replay, capacity, garbage-collection, and external
+  freshness providers;
+- attestation evidence for the owner and its effective configuration; or
 - a public opaque runtime factory, listener, transport, or service lifecycle.
 
-Those decisions must land before the private runtime is exposed outside its
-crate. Provider unavailability continues to fail closed under the contract
-established by the preceding fallible-protection slice.
+Those providers and API changes must satisfy ADR 0009 before the private
+runtime is exposed outside its crate. Provider unavailability continues to fail
+closed under the contract established by the preceding fallible-protection
+slice.
 
 ## Consequences
 

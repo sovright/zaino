@@ -16,11 +16,11 @@ use tonic::{
     Request, Response, Status,
 };
 use tonic_prost::{ProstDecoder, ProstEncoder};
+#[cfg(test)]
+use zaino_oram::PrivateQueryUnavailable;
+use zaino_oram::{FixedEnvelopeRuntime, PendingFixedEnvelope};
 
-use super::{
-    FixedEnvelopeRuntime, PendingFixedEnvelope, PendingQueryPage, PrivateServiceAdapter,
-    ValidatedFixedEnvelope,
-};
+use super::{PendingQueryPage, PrivateServiceAdapter, ValidatedFixedEnvelope};
 use crate::private_proto;
 
 const UNIFORM_GRPC_MESSAGE: &str = "private%20query%20unavailable";
@@ -286,8 +286,6 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use crate::private_service::RuntimeUnavailable;
-
     const ENVELOPE_BYTES: usize = 4;
 
     #[derive(Clone)]
@@ -317,10 +315,10 @@ mod tests {
     }
 
     impl PendingFixedEnvelope<ENVELOPE_BYTES> for MockPendingResponse {
-        fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], RuntimeUnavailable> {
+        fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], PrivateQueryUnavailable> {
             self.state.release_checks.fetch_add(1, Ordering::SeqCst);
             if !self.state.current.load(Ordering::SeqCst) {
-                return Err(RuntimeUnavailable);
+                return Err(PrivateQueryUnavailable);
             }
             self.state.released_borrows.fetch_add(1, Ordering::SeqCst);
             Ok(&self.response)
@@ -344,10 +342,10 @@ mod tests {
         fn query_page(
             &mut self,
             _request: [u8; ENVELOPE_BYTES],
-        ) -> Result<Self::PendingResponse, RuntimeUnavailable> {
+        ) -> Result<Self::PendingResponse, PrivateQueryUnavailable> {
             self.state.calls.fetch_add(1, Ordering::SeqCst);
             if self.state.busy.swap(true, Ordering::SeqCst) {
-                return Err(RuntimeUnavailable);
+                return Err(PrivateQueryUnavailable);
             }
             Ok(MockPendingResponse {
                 response: self.response,
