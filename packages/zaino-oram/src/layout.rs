@@ -19,8 +19,9 @@ use blake2::{
 };
 
 use crate::records::{
-    AddressDirectory, AddressEventPage, AddressKey, PersistentAddressDirectory,
-    PersistentAddressEventPage, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
+    finalized_live_utxo_at, AddressDirectory, AddressEventPage, AddressKey,
+    FinalizedEventHistoryError, PersistentAddressDirectory, PersistentAddressEventPage,
+    TransparentUtxo, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
 };
 
 mod atomic_store;
@@ -920,12 +921,19 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
 
     fn directory_plan(&self, address: StandardAddress) -> DirectoryProbePlan<DIRECTORY_PROBES> {
         let address_key = self.address_key(address);
+        self.directory_plan_for_key(&address_key)
+    }
+
+    fn directory_plan_for_key(
+        &self,
+        address_key: &AddressKey,
+    ) -> DirectoryProbePlan<DIRECTORY_PROBES> {
         let slots = self
             .probe_slots::<DIRECTORY_PROBES>(TableKind::Directory, address_key.as_bytes())
             .map(DirectorySlot);
         DirectoryProbePlan {
             profile_binding: self.profile_binding,
-            address_key,
+            address_key: *address_key,
             slots,
         }
     }
@@ -1601,6 +1609,20 @@ mod tests {
         assert_eq!(allocation.event(), layout.event.0.allocation());
         assert_eq!(allocation.max_events_per_address(), 8);
         assert_eq!(layout.max_events_per_address, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn key_addressed_directory_plan_matches_the_standard_address_plan(
+    ) -> Result<(), LayoutConfigError> {
+        let layout = layout()?;
+        let address = p2sh(0x2a);
+        let address_plan = layout.directory_plan(address);
+        let key_plan = layout.directory_plan_for_key(&address_plan.address_key);
+
+        assert_eq!(key_plan.profile_binding, address_plan.profile_binding);
+        assert_eq!(key_plan.address_key, address_plan.address_key);
+        assert_eq!(key_plan.slots, address_plan.slots);
         Ok(())
     }
 

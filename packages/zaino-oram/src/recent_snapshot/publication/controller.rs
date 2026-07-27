@@ -1,10 +1,11 @@
 //! Coherent Zaino capture, conversion, and recent-generation publication.
 //!
-//! This private build-stage controller deliberately does not provide the
-//! whole-serving-epoch lease. Its caller must serialize refresh against
-//! committed-finalized publication, and the serving layer must pair the
-//! published boundary with a response-release currentness check before any
-//! generation can answer queries.
+//! This private build-stage controller publishes one atomic serving epoch only
+//! after binding an owner-issued finalized store generation and identity, the
+//! owner-assigned recent generation, opaque source boundary, and release-time
+//! currentness capability. The process-lifetime runtime owner serializes
+//! refresh against query handling and retains the lease through runtime return;
+//! the eventual service must still retain a guard through transport completion.
 
 use std::{fmt, future::Future};
 
@@ -16,7 +17,9 @@ use zaino_state::chain_index::{
 use zaino_state::{BlockchainSource, NodeBackedChainIndexSubscriber, Outpoint};
 
 use super::{
-    RecentSnapshotPublicationError, RecentSnapshotPublicationOwner, RecentSnapshotUpdateTicket,
+    FinalizedServingStore, RecentSnapshotPublicationError, RecentSnapshotPublicationOwner,
+    RecentSnapshotUpdateTicket, ServingEpochBoundary, ServingEpochCurrentness, ServingEpochLease,
+    ServingEpochObservation, ServingEpochPublicationOwner, ServingEpochUnavailable,
 };
 use crate::{
     canonical_chain::{CanonicalNetwork, PublicChainCheckpoint},
@@ -32,20 +35,25 @@ use crate::{
 
 /// Builds and publishes recent snapshots from one live chain-index subscriber.
 ///
-/// This type is intentionally private until the service layer supplies the
-/// process-wide owner and serving-epoch integration. Within one instance it is
-/// the only path from a coherent Zaino capture to an owner-assigned generation.
-struct RecentSnapshotRefreshController<const N: usize> {
+/// This type is crate-visible only so the process-lifetime runtime owner can
+/// encapsulate it. Within one instance it is the only path from a coherent
+/// Zaino capture to an owner-assigned generation and its atomic serving-epoch
+/// publication.
+pub(crate) struct RecentSnapshotRefreshController<const N: usize, S, C> {
     owner: RecentSnapshotPublicationOwner<N>,
+    serving_epoch: ServingEpochPublicationOwner<N, CanonicalTransparentProjectionBoundary, S, C>,
     network: CanonicalNetwork,
     schema_version: u32,
     projection_epoch: u64,
     key_epoch: u64,
-    published_boundary: Option<CanonicalTransparentProjectionBoundary>,
 }
 
-impl<const N: usize> RecentSnapshotRefreshController<N> {
-    fn new(
+impl<const N: usize, S, C> RecentSnapshotRefreshController<N, S, C>
+where
+    S: FinalizedServingStore,
+    C: ServingEpochCurrentness<CanonicalTransparentProjectionBoundary>,
+{
+    pub(crate) fn new(
         network: CanonicalNetwork,
         schema_version: u32,
         projection_epoch: u64,
@@ -57,46 +65,23 @@ impl<const N: usize> RecentSnapshotRefreshController<N> {
 
         Ok(Self {
             owner: RecentSnapshotPublicationOwner::new(),
+            serving_epoch: ServingEpochPublicationOwner::new(),
             network,
             schema_version,
             projection_epoch,
             key_epoch,
-            published_boundary: None,
         })
-    }
-
-    /// Captures asynchronously, requires the caller-supplied committed
-    /// finalized-projection checkpoint, then completes the ticketed update
-    /// without an await point so cancellation cannot strand a generation.
-    ///
-    /// The caller must hold whatever exclusion protects that committed
-    /// checkpoint through this call. The final source recheck below rejects
-    /// drift already visible at build time; it is not an atomic serving lease.
-    async fn refresh<Source: BlockchainSource>(
-        &mut self,
-        subscriber: &NodeBackedChainIndexSubscriber<Source>,
-        committed_finalized: PublicChainCheckpoint,
-    ) -> Result<(), RecentSnapshotRefreshError> {
-        self.refresh_from_capture(
-            committed_finalized,
-            subscriber.capture_canonical_transparent_projection_input(),
-            |captured| {
-                subscriber
-                    .current_canonical_transparent_projection_boundary()
-                    .map(|current| captured.same_capture(&current))
-                    .map_err(|_| ())
-            },
-        )
-        .await
     }
 
     /// Owns the cancellation boundary so tests can hold capture pending
     /// without constructing a live database-backed subscriber.
-    async fn refresh_from_capture<Capture, Current>(
+    async fn refresh_from_capture<Capture, Current, Bind>(
         &mut self,
         committed_finalized: PublicChainCheckpoint,
+        finalized_store: S,
         capture: Capture,
         current: Current,
+        bind_currentness: Bind,
     ) -> Result<(), RecentSnapshotRefreshError>
     where
         Capture: Future<
@@ -106,10 +91,11 @@ impl<const N: usize> RecentSnapshotRefreshController<N> {
             >,
         >,
         Current: FnOnce(&CanonicalTransparentProjectionBoundary) -> Result<bool, ()>,
+        Bind: FnOnce(RecentSnapshotIdentity, &CanonicalTransparentProjectionBoundary) -> C,
     {
         // Invalidate before the only await point. If this future is cancelled
         // during capture, no prior generation remains eligible for service.
-        self.invalidate_before_capture();
+        self.invalidate_publication();
         let input = match capture.await {
             Ok(input) => input,
             Err(_) => return Err(RecentSnapshotRefreshError::CaptureUnavailable),
@@ -120,8 +106,8 @@ impl<const N: usize> RecentSnapshotRefreshController<N> {
         }
 
         let recent_tip = input.recent().tip();
-        let identity = RecentSnapshotIdentity::new(
-            recent_network_tag(self.network),
+        let identity = serving_identity(
+            self.network,
             committed_finalized.height(),
             committed_finalized.block_hash().bytes_in_display_order(),
             self.schema_version,
@@ -130,7 +116,7 @@ impl<const N: usize> RecentSnapshotRefreshController<N> {
         );
         let captured_boundary = input.boundary().clone();
 
-        let result = self.rebuild_candidate(
+        self.rebuild_candidate(
             identity,
             u32::from(recent_tip.height),
             recent_tip.hash.bytes_in_display_order(),
@@ -149,12 +135,27 @@ impl<const N: usize> RecentSnapshotRefreshController<N> {
                 // this observation.
                 current(&captured_boundary)
             },
-        );
+        )?;
 
-        if result.is_ok() {
-            self.published_boundary = Some(captured_boundary);
+        // Publication of the atomic epoch is deliberately the final step. A
+        // response can pin only after the recent generation, finalized
+        // identity, and opaque source revision are bound in one Arc.
+        let recent = self
+            .owner
+            .pin()
+            .ok_or(RecentSnapshotRefreshError::PublicationRejected)?;
+        let currentness = bind_currentness(identity, &captured_boundary);
+        if let Err(error) = self.serving_epoch.publish(
+            recent,
+            identity,
+            captured_boundary,
+            finalized_store,
+            currentness,
+        ) {
+            self.owner.clear_publication();
+            return Err(map_publication_error(error));
         }
-        result
+        Ok(())
     }
 
     /// Executes every post-capture step synchronously and consumes every ticket
@@ -171,7 +172,7 @@ impl<const N: usize> RecentSnapshotRefreshController<N> {
         Build: FnOnce() -> Result<ConvertedRecentSnapshot<N>, ()>,
         Current: FnOnce() -> Result<bool, ()>,
     {
-        self.published_boundary = None;
+        self.serving_epoch.clear();
         let ticket = self
             .owner
             .begin_update(identity, recent_tip_height, recent_tip_hash_display)
@@ -211,13 +212,151 @@ impl<const N: usize> RecentSnapshotRefreshController<N> {
             .map_err(map_publication_error)
     }
 
-    fn invalidate_before_capture(&mut self) {
+    /// Clears every controller-owned capability for the prior publication.
+    ///
+    /// The process-lifetime owner also calls this when runtime activation or
+    /// terminal lifecycle handling fails after a controller refresh.
+    pub(crate) fn invalidate_publication(&mut self) {
+        self.serving_epoch.clear();
         self.owner.clear_publication();
-        self.published_boundary = None;
+    }
+
+    /// Pins the exact atomic epoch published by the latest successful refresh.
+    pub(crate) fn pin_serving_epoch(
+        &self,
+    ) -> Option<ServingEpochLease<N, CanonicalTransparentProjectionBoundary, S, C>> {
+        self.serving_epoch.pin()
     }
 }
 
-impl<const N: usize> fmt::Debug for RecentSnapshotRefreshController<N> {
+impl<const N: usize, S, Source>
+    RecentSnapshotRefreshController<N, S, CanonicalServingEpochCurrentness<Source>>
+where
+    S: FinalizedServingStore,
+    Source: BlockchainSource,
+{
+    /// Captures asynchronously, requires one owner-issued finalized projection
+    /// generation, then completes the ticketed update without another await.
+    ///
+    /// The caller must hold whatever exclusion protects that generation and its
+    /// committed checkpoint through this call. The final source recheck rejects
+    /// drift visible during the build; the bound observer repeats the check when
+    /// runtime is ready to release a response.
+    pub(crate) async fn refresh(
+        &mut self,
+        subscriber: &NodeBackedChainIndexSubscriber<Source>,
+        committed_finalized: PublicChainCheckpoint,
+        finalized_store: S,
+    ) -> Result<(), RecentSnapshotRefreshError> {
+        let currentness_subscriber = subscriber.clone();
+        let network = self.network;
+        let schema_version = self.schema_version;
+        let projection_epoch = self.projection_epoch;
+        let key_epoch = self.key_epoch;
+        self.refresh_from_capture(
+            committed_finalized,
+            finalized_store,
+            subscriber.capture_canonical_transparent_projection_input(),
+            |captured| {
+                subscriber
+                    .current_canonical_transparent_projection_boundary()
+                    .map(|current| captured.same_capture(&current))
+                    .map_err(|_| ())
+            },
+            move |identity, boundary| {
+                CanonicalServingEpochCurrentness::new(
+                    currentness_subscriber,
+                    network,
+                    schema_version,
+                    projection_epoch,
+                    key_epoch,
+                    identity,
+                    boundary.clone(),
+                )
+            },
+        )
+        .await
+    }
+}
+
+/// Live source observer bound to one exact canonical projection capture.
+pub(crate) struct CanonicalServingEpochCurrentness<Source: BlockchainSource> {
+    subscriber: NodeBackedChainIndexSubscriber<Source>,
+    network: CanonicalNetwork,
+    schema_version: u32,
+    projection_epoch: u64,
+    key_epoch: u64,
+    bound_identity: RecentSnapshotIdentity,
+    bound_boundary: CanonicalTransparentProjectionBoundary,
+}
+
+impl<Source: BlockchainSource> CanonicalServingEpochCurrentness<Source> {
+    const fn new(
+        subscriber: NodeBackedChainIndexSubscriber<Source>,
+        network: CanonicalNetwork,
+        schema_version: u32,
+        projection_epoch: u64,
+        key_epoch: u64,
+        bound_identity: RecentSnapshotIdentity,
+        bound_boundary: CanonicalTransparentProjectionBoundary,
+    ) -> Self {
+        Self {
+            subscriber,
+            network,
+            schema_version,
+            projection_epoch,
+            key_epoch,
+            bound_identity,
+            bound_boundary,
+        }
+    }
+}
+
+impl<Source: BlockchainSource> ServingEpochCurrentness<CanonicalTransparentProjectionBoundary>
+    for CanonicalServingEpochCurrentness<Source>
+{
+    fn binding(
+        &self,
+    ) -> Option<(
+        RecentSnapshotIdentity,
+        &CanonicalTransparentProjectionBoundary,
+    )> {
+        Some((self.bound_identity, &self.bound_boundary))
+    }
+
+    fn observe(
+        &mut self,
+    ) -> Result<
+        ServingEpochObservation<CanonicalTransparentProjectionBoundary>,
+        ServingEpochUnavailable,
+    > {
+        let boundary = self
+            .subscriber
+            .current_canonical_transparent_projection_boundary()
+            .map_err(|_| ServingEpochUnavailable)?;
+        if !network_matches(self.network, boundary.network()) {
+            return Err(ServingEpochUnavailable);
+        }
+        let finalized = boundary.finalized();
+        let identity = serving_identity(
+            self.network,
+            u32::from(finalized.height),
+            finalized.hash.bytes_in_display_order(),
+            self.schema_version,
+            self.projection_epoch,
+            self.key_epoch,
+        );
+        Ok(ServingEpochObservation::new(identity, boundary))
+    }
+}
+
+impl ServingEpochBoundary for CanonicalTransparentProjectionBoundary {
+    fn same_capture(&self, other: &Self) -> bool {
+        CanonicalTransparentProjectionBoundary::same_capture(self, other)
+    }
+}
+
+impl<const N: usize, S, C> fmt::Debug for RecentSnapshotRefreshController<N, S, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("RecentSnapshotRefreshController { ..REDACTED.. }")
     }
@@ -305,17 +444,27 @@ fn network_matches(expected: CanonicalNetwork, captured: &ZebraNetwork) -> bool 
     }
 }
 
-const fn recent_network_tag(network: CanonicalNetwork) -> u8 {
-    match network {
-        CanonicalNetwork::Mainnet => 0,
-        CanonicalNetwork::Testnet => 1,
-        CanonicalNetwork::Regtest => 2,
-    }
+const fn serving_identity(
+    network: CanonicalNetwork,
+    finalized_height: u32,
+    finalized_hash_display: [u8; 32],
+    schema_version: u32,
+    projection_epoch: u64,
+    key_epoch: u64,
+) -> RecentSnapshotIdentity {
+    RecentSnapshotIdentity::from_finalized_projection(
+        network,
+        finalized_height,
+        finalized_hash_display,
+        schema_version,
+        projection_epoch,
+        key_epoch,
+    )
 }
 
 /// Coarsened controller failure without outpoint or checkpoint identifiers.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RecentSnapshotRefreshError {
+pub(crate) enum RecentSnapshotRefreshError {
     InvalidConfiguration,
     CaptureUnavailable,
     InputRejected,
@@ -366,7 +515,11 @@ const fn map_publication_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recent_snapshot::RecentSnapshotSlot;
+    use crate::{
+        recent_snapshot::RecentSnapshotSlot,
+        records::AddressKey,
+        store::{ObliviousStore, StoreSlot},
+    };
     use zaino_state::{AddrScript, BlockHash, Height, ScriptType};
 
     const FINALIZED_HASH: [u8; 32] = [0x11; 32];
@@ -374,6 +527,62 @@ mod tests {
     const TIP_HASH_A: [u8; 32] = [0x21; 32];
     const TIP_HASH_B: [u8; 32] = [0x22; 32];
     const SLOT_COUNT: usize = 2;
+
+    type TestController =
+        RecentSnapshotRefreshController<SLOT_COUNT, TestFinalizedStore, TestCurrentness>;
+    type LiveController = RecentSnapshotRefreshController<
+        SLOT_COUNT,
+        TestFinalizedStore,
+        CanonicalServingEpochCurrentness<zaino_state::ValidatorConnector>,
+    >;
+
+    struct TestFinalizedStore {
+        identity: RecentSnapshotIdentity,
+    }
+
+    impl ObliviousStore for TestFinalizedStore {
+        type Error = ();
+
+        fn slots_per_key(&self) -> usize {
+            4
+        }
+
+        fn read_slot(
+            &mut self,
+            _address_key: &AddressKey,
+            _slot: usize,
+        ) -> Result<StoreSlot, Self::Error> {
+            Ok(StoreSlot::dummy())
+        }
+    }
+
+    impl FinalizedServingStore for TestFinalizedStore {
+        fn serving_identity(&self) -> RecentSnapshotIdentity {
+            self.identity
+        }
+    }
+
+    struct TestCurrentness;
+
+    impl ServingEpochCurrentness<CanonicalTransparentProjectionBoundary> for TestCurrentness {
+        fn binding(
+            &self,
+        ) -> Option<(
+            RecentSnapshotIdentity,
+            &CanonicalTransparentProjectionBoundary,
+        )> {
+            None
+        }
+
+        fn observe(
+            &mut self,
+        ) -> Result<
+            ServingEpochObservation<CanonicalTransparentProjectionBoundary>,
+            ServingEpochUnavailable,
+        > {
+            Err(ServingEpochUnavailable)
+        }
+    }
 
     fn identity(height: u32, hash: [u8; 32]) -> RecentSnapshotIdentity {
         RecentSnapshotIdentity::new(0, height, hash, 1, 7, 9)
@@ -396,13 +605,18 @@ mod tests {
         )
     }
 
-    fn controller(
-    ) -> Result<RecentSnapshotRefreshController<SLOT_COUNT>, RecentSnapshotRefreshError> {
+    fn controller() -> Result<TestController, RecentSnapshotRefreshError> {
         RecentSnapshotRefreshController::new(CanonicalNetwork::Mainnet, 1, 7, 9)
     }
 
+    fn finalized_store() -> TestFinalizedStore {
+        TestFinalizedStore {
+            identity: identity(100, FINALIZED_HASH),
+        }
+    }
+
     fn rebuild(
-        controller: &mut RecentSnapshotRefreshController<SLOT_COUNT>,
+        controller: &mut TestController,
         finalized: RecentSnapshotIdentity,
     ) -> Result<(), RecentSnapshotRefreshError> {
         controller.rebuild_candidate(
@@ -414,9 +628,7 @@ mod tests {
         )
     }
 
-    fn active_generation(
-        controller: &RecentSnapshotRefreshController<SLOT_COUNT>,
-    ) -> Result<u64, RecentSnapshotRefreshError> {
+    fn active_generation(controller: &TestController) -> Result<u64, RecentSnapshotRefreshError> {
         controller
             .owner
             .pin()
@@ -427,20 +639,19 @@ mod tests {
     #[test]
     fn validates_lifecycle_configuration() {
         assert!(matches!(
-            RecentSnapshotRefreshController::<SLOT_COUNT>::new(CanonicalNetwork::Mainnet, 0, 7, 9,),
+            TestController::new(CanonicalNetwork::Mainnet, 0, 7, 9,),
             Err(RecentSnapshotRefreshError::InvalidConfiguration)
         ));
         assert!(matches!(
-            RecentSnapshotRefreshController::<SLOT_COUNT>::new(CanonicalNetwork::Mainnet, 1, 0, 9,),
+            TestController::new(CanonicalNetwork::Mainnet, 1, 0, 9,),
             Err(RecentSnapshotRefreshError::InvalidConfiguration)
         ));
     }
 
     #[test]
     fn live_entrypoint_typechecks() {
-        let _refresh = RecentSnapshotRefreshController::<SLOT_COUNT>::refresh::<
-            zaino_state::ValidatorConnector,
-        >;
+        let _refresh = LiveController::refresh;
+        let _pin = LiveController::pin_serving_epoch;
     }
 
     #[test]
@@ -455,7 +666,7 @@ mod tests {
             .owner
             .pin()
             .ok_or(RecentSnapshotRefreshError::PublicationRejected)?;
-        assert!(lease.is_current(&controller.owner));
+        assert!(lease.is_current());
         Ok(())
     }
 
@@ -469,6 +680,7 @@ mod tests {
             Err(RecentSnapshotRefreshError::BuildRejected)
         );
         assert!(controller.owner.pin().is_none());
+        assert!(controller.pin_serving_epoch().is_none());
         assert!(controller.owner.outstanding.is_none());
 
         rebuild(&mut controller, finalized)?;
@@ -523,8 +735,13 @@ mod tests {
                     CanonicalTransparentProjectionInputError,
                 >,
             >();
-            let refresh =
-                controller.refresh_from_capture(committed_finalized(), capture, |_| Ok(true));
+            let refresh = controller.refresh_from_capture(
+                committed_finalized(),
+                finalized_store(),
+                capture,
+                |_| Ok(true),
+                |_, _| TestCurrentness,
+            );
             tokio::pin!(refresh);
             tokio::select! {
                 biased;
@@ -534,6 +751,7 @@ mod tests {
         }
 
         assert!(controller.owner.pin().is_none());
+        assert!(controller.pin_serving_epoch().is_none());
         assert!(controller.owner.outstanding.is_none());
 
         rebuild(&mut controller, finalized)?;
@@ -599,9 +817,16 @@ mod tests {
 
     #[test]
     fn network_and_committed_checkpoint_mapping_is_exact_and_redacted() {
-        assert_eq!(recent_network_tag(CanonicalNetwork::Mainnet), 0);
-        assert_eq!(recent_network_tag(CanonicalNetwork::Testnet), 1);
-        assert_eq!(recent_network_tag(CanonicalNetwork::Regtest), 2);
+        for (network, expected_tag) in [
+            (CanonicalNetwork::Mainnet, 0),
+            (CanonicalNetwork::Testnet, 1),
+            (CanonicalNetwork::Regtest, 2),
+        ] {
+            assert_eq!(
+                serving_identity(network, 1, [0x01; 32], 1, 1, 1).network_tag(),
+                expected_tag
+            );
+        }
         let checkpoint = BlockIndex {
             height: Height::try_from(100_u32)
                 .expect("fixture height is inside the supported chain range"),

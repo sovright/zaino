@@ -198,26 +198,18 @@ impl<Source: BlockchainSource> NodeBackedChainIndexSubscriber<Source> {
     ///
     /// This synchronous check is deliberately unavailable unless the
     /// canonical chain-index and finalized-state components are both ready;
-    /// unrelated mempool readiness does not participate.
+    /// unrelated mempool readiness does not participate. Readiness and the
+    /// opaque NFS revision are observed twice so a sync iteration cannot race
+    /// the snapshot load and make a stale revision look current.
     pub fn current_canonical_transparent_projection_boundary(
         &self,
     ) -> Result<CanonicalTransparentProjectionBoundary, CanonicalTransparentProjectionInputError>
     {
-        if !projection_components_are_ready(self.status.load(), self.finalized_state.status()) {
-            return Err(CanonicalTransparentProjectionInputError::ChainIndexNotReady);
-        }
-
-        let revision = self.direct_non_finalized_snapshot()?;
-        let snapshot = ChainIndexSnapshot::NonFinalizedStateExists {
-            non_finalized_snapshot: Arc::clone(&revision),
-        };
-        let finalized = retained_checkpoint(&snapshot)?;
-        Ok(CanonicalTransparentProjectionBoundary::new(
+        current_projection_boundary_from_observers(
             self.network.clone(),
-            finalized,
-            revision.best_tip,
-            revision,
-        ))
+            || (self.status.load(), self.finalized_state.status()),
+            || self.direct_non_finalized_snapshot(),
+        )
     }
 
     fn direct_non_finalized_snapshot(
@@ -230,6 +222,53 @@ impl<Source: BlockchainSource> NodeBackedChainIndexSubscriber<Source> {
 
         Ok(non_finalized_state.get_snapshot())
     }
+}
+
+/// Performs the production double observation through injected read seams so
+/// deterministic tests exercise the same ordering as the live subscriber.
+fn current_projection_boundary_from_observers<ObserveStatus, ObserveRevision>(
+    network: ZebraNetwork,
+    mut observe_status: ObserveStatus,
+    mut observe_revision: ObserveRevision,
+) -> Result<CanonicalTransparentProjectionBoundary, CanonicalTransparentProjectionInputError>
+where
+    ObserveStatus: FnMut() -> (StatusType, StatusType),
+    ObserveRevision: FnMut() -> Result<
+        Arc<NonfinalizedBlockCacheSnapshot>,
+        CanonicalTransparentProjectionInputError,
+    >,
+{
+    let (chain_index_status, finalized_state_status) = observe_status();
+    if !projection_components_are_ready(chain_index_status, finalized_state_status) {
+        return Err(CanonicalTransparentProjectionInputError::ChainIndexNotReady);
+    }
+
+    let revision = observe_revision()?;
+    let snapshot = ChainIndexSnapshot::NonFinalizedStateExists {
+        non_finalized_snapshot: Arc::clone(&revision),
+    };
+    let finalized = retained_checkpoint(&snapshot)?;
+
+    // Observe readiness before reloading the revision. A successful read
+    // linearizes at this Ready observation: a transition already in flight
+    // fails readiness, one that completes before the reload changes the Arc,
+    // and one that begins afterward is later than the observation.
+    let (current_chain_index_status, current_finalized_state_status) = observe_status();
+    if !projection_components_are_ready(current_chain_index_status, current_finalized_state_status)
+    {
+        return Err(CanonicalTransparentProjectionInputError::ChainIndexNotReady);
+    }
+    let current_revision = observe_revision()?;
+    if !Arc::ptr_eq(&revision, &current_revision) {
+        return Err(CanonicalTransparentProjectionInputError::ChainIndexNotReady);
+    }
+
+    Ok(CanonicalTransparentProjectionBoundary::new(
+        network,
+        finalized,
+        revision.best_tip,
+        revision,
+    ))
 }
 
 /// Projection freshness depends on canonical chain components, not mempool readiness.
@@ -295,6 +334,28 @@ mod tests {
         })
     }
 
+    fn observed_boundary(
+        statuses: [(StatusType, StatusType); 2],
+        revisions: [Arc<NonfinalizedBlockCacheSnapshot>; 2],
+    ) -> Result<CanonicalTransparentProjectionBoundary, CanonicalTransparentProjectionInputError>
+    {
+        let mut statuses = statuses.into_iter();
+        let mut revisions = revisions.into_iter();
+        current_projection_boundary_from_observers(
+            ZebraNetwork::Mainnet,
+            || {
+                statuses
+                    .next()
+                    .unwrap_or((StatusType::Syncing, StatusType::Syncing))
+            },
+            || {
+                revisions
+                    .next()
+                    .ok_or(CanonicalTransparentProjectionInputError::NonFinalizedStateUnavailable)
+            },
+        )
+    }
+
     #[test]
     fn same_capture_rejects_equal_value_arc_replacement() {
         let finalized = BlockIndex {
@@ -347,5 +408,66 @@ mod tests {
             StatusType::Ready,
             StatusType::Syncing
         ));
+    }
+
+    #[test]
+    fn boundary_observation_rejects_ready_to_syncing_transition() {
+        let index = BlockIndex {
+            height: Height(100),
+            hash: BlockHash([0x33; 32]),
+        };
+        let captured_revision = revision(index);
+
+        assert!(matches!(
+            observed_boundary(
+                [
+                    (StatusType::Ready, StatusType::Ready),
+                    (StatusType::Syncing, StatusType::Ready),
+                ],
+                [Arc::clone(&captured_revision), captured_revision],
+            ),
+            Err(CanonicalTransparentProjectionInputError::ChainIndexNotReady)
+        ));
+    }
+
+    #[test]
+    fn boundary_observation_rejects_equal_value_revision_replacement() {
+        let index = BlockIndex {
+            height: Height(100),
+            hash: BlockHash([0x44; 32]),
+        };
+        let captured_revision = revision(index);
+        let equal_value_replacement = revision(index);
+
+        assert!(matches!(
+            observed_boundary(
+                [
+                    (StatusType::Ready, StatusType::Ready),
+                    (StatusType::Ready, StatusType::Ready),
+                ],
+                [captured_revision, equal_value_replacement],
+            ),
+            Err(CanonicalTransparentProjectionInputError::ChainIndexNotReady)
+        ));
+    }
+
+    #[test]
+    fn boundary_observation_accepts_one_unchanged_ready_revision() {
+        let index = BlockIndex {
+            height: Height(100),
+            hash: BlockHash([0x55; 32]),
+        };
+        let captured_revision = revision(index);
+        let boundary = observed_boundary(
+            [
+                (StatusType::Ready, StatusType::Ready),
+                (StatusType::Ready, StatusType::Ready),
+            ],
+            [Arc::clone(&captured_revision), captured_revision],
+        )
+        .expect("unchanged ready revision forms one coherent test boundary");
+
+        assert_eq!(boundary.finalized(), index);
+        assert_eq!(boundary.tip(), index);
     }
 }

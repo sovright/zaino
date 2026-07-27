@@ -4,9 +4,12 @@
 //! requires exclusive access, while pinned leases retain immutable snapshots.
 //! Beginning any update removes the active publication before validating or
 //! building its replacement, so a query can perform a final current-generation
-//! check immediately before releasing a response.
+//! check immediately before returning a response to its eventual transport.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use arc_swap::ArcSwapOption;
 
@@ -16,8 +19,14 @@ use super::{
     content_digest, lineage_binding_digest, RecentSnapshotIdentity, RecentSnapshotReadError,
     RecentSnapshotSlot,
 };
+use crate::{
+    records::AddressKey,
+    store::{ObliviousStore, StoreSlot},
+};
 #[cfg(feature = "corpus-zaino")]
 mod controller;
+#[cfg(feature = "corpus-zaino")]
+pub(crate) use controller::{CanonicalServingEpochCurrentness, RecentSnapshotRefreshController};
 
 /// Lineage that distinguishes every immutable recent snapshot generation.
 ///
@@ -135,6 +144,22 @@ pub(crate) struct FrozenRecentSnapshot<const N: usize> {
     read_calls: usize,
 }
 
+impl<const N: usize> Clone for FrozenRecentSnapshot<N> {
+    fn clone(&self) -> Self {
+        Self {
+            lineage: self.lineage,
+            slots: self.slots,
+            content_digest: self.content_digest,
+            binding_digest: self.binding_digest,
+            #[cfg(test)]
+            failing_ordinal: self.failing_ordinal,
+            #[cfg(test)]
+            // A clone is a fresh scan view of the same immutable generation.
+            read_calls: 0,
+        }
+    }
+}
+
 impl<const N: usize> FrozenRecentSnapshot<N> {
     fn new(lineage: RecentSnapshotLineage, slots: [RecentSnapshotSlot; N]) -> Self {
         let content_digest = content_digest(&slots);
@@ -248,7 +273,7 @@ impl<const N: usize> FrozenRecentSnapshot<N> {
 
 /// Models the active immutable recent snapshot and its single-writer lineage.
 struct RecentSnapshotPublicationOwner<const N: usize> {
-    active: ArcSwapOption<FrozenRecentSnapshot<N>>,
+    active: Arc<ArcSwapOption<FrozenRecentSnapshot<N>>>,
     finalized: Option<RecentSnapshotIdentity>,
     last_generation: u64,
     outstanding: Option<Arc<UpdateSeal>>,
@@ -261,7 +286,7 @@ impl<const N: usize> RecentSnapshotPublicationOwner<N> {
     /// otherwise an identical first publication would reproduce its binding.
     fn new() -> Self {
         Self {
-            active: ArcSwapOption::empty(),
+            active: Arc::new(ArcSwapOption::empty()),
             finalized: None,
             last_generation: 0,
             outstanding: None,
@@ -351,9 +376,10 @@ impl<const N: usize> RecentSnapshotPublicationOwner<N> {
     }
 
     fn pin(&self) -> Option<RecentSnapshotLease<N>> {
-        self.active
-            .load_full()
-            .map(|snapshot| RecentSnapshotLease { snapshot })
+        self.active.load_full().map(|snapshot| RecentSnapshotLease {
+            active: Arc::clone(&self.active),
+            snapshot,
+        })
     }
 
     fn clear_publication(&mut self) {
@@ -374,6 +400,12 @@ impl<const N: usize> RecentSnapshotPublicationOwner<N> {
     }
 }
 
+impl<const N: usize> Drop for RecentSnapshotPublicationOwner<N> {
+    fn drop(&mut self) {
+        self.active.store(None);
+    }
+}
+
 impl<const N: usize> fmt::Debug for RecentSnapshotPublicationOwner<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("RecentSnapshotPublicationOwner { ..REDACTED.. }")
@@ -382,6 +414,7 @@ impl<const N: usize> fmt::Debug for RecentSnapshotPublicationOwner<N> {
 
 /// A pinned immutable generation retained across publication transitions.
 struct RecentSnapshotLease<const N: usize> {
+    active: Arc<ArcSwapOption<FrozenRecentSnapshot<N>>>,
     snapshot: Arc<FrozenRecentSnapshot<N>>,
 }
 
@@ -391,9 +424,8 @@ impl<const N: usize> RecentSnapshotLease<N> {
     }
 
     /// Performs the final fail-closed generation check against the active Arc.
-    fn is_current(&self, owner: &RecentSnapshotPublicationOwner<N>) -> bool {
-        owner
-            .active
+    fn is_current(&self) -> bool {
+        self.active
             .load_full()
             .is_some_and(|active| Arc::ptr_eq(&self.snapshot, &active))
     }
@@ -403,6 +435,418 @@ impl<const N: usize> fmt::Debug for RecentSnapshotLease<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("RecentSnapshotLease { ..REDACTED.. }")
     }
+}
+
+/// Opaque capture identity used to bind and re-observe one serving epoch.
+///
+/// Implementations must compare capture identity rather than only public field
+/// equality so an equal-value ABA replacement is rejected.
+pub(crate) trait ServingEpochBoundary: Clone {
+    fn same_capture(&self, other: &Self) -> bool;
+}
+
+/// Query-independent currentness capability bound into one serving epoch.
+///
+/// Publication compares the capability's declared binding with the exact
+/// finalized identity and opaque capture boundary being published. Returning
+/// `None` fails publication closed rather than admitting an unbound observer.
+pub(crate) trait ServingEpochCurrentness<B> {
+    fn binding(&self) -> Option<(RecentSnapshotIdentity, &B)>;
+
+    fn observe(&mut self) -> Result<ServingEpochObservation<B>, ServingEpochUnavailable>;
+}
+
+/// Immutable finalized projection generation eligible for epoch publication.
+///
+/// Implementations are issued by the finalized projection owner and must keep
+/// the returned identity attached to the exact store generation they expose.
+pub(crate) trait FinalizedServingStore: ObliviousStore {
+    fn serving_identity(&self) -> RecentSnapshotIdentity;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServingEpochUnavailable;
+
+/// One response-release observation made after private query work completes.
+pub(crate) struct ServingEpochObservation<B> {
+    identity: RecentSnapshotIdentity,
+    boundary: B,
+    #[cfg(test)]
+    after_comparison: Option<Box<dyn Fn()>>,
+}
+
+impl<B> ServingEpochObservation<B> {
+    pub(crate) fn new(identity: RecentSnapshotIdentity, boundary: B) -> Self {
+        Self {
+            identity,
+            boundary,
+            #[cfg(test)]
+            after_comparison: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_comparison_for_tests(mut self, hook: impl Fn() + 'static) -> Self {
+        self.after_comparison = Some(Box::new(hook));
+        self
+    }
+}
+
+impl<B: ServingEpochBoundary> ServingEpochObservation<B> {
+    fn matches(&self, identity: RecentSnapshotIdentity, boundary: &B) -> bool {
+        let matches = identity == self.identity && boundary.same_capture(&self.boundary);
+        #[cfg(test)]
+        if let Some(hook) = self.after_comparison.as_ref() {
+            hook();
+        }
+        matches
+    }
+}
+
+impl<B> fmt::Debug for ServingEpochObservation<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServingEpochObservation { ..REDACTED.. }")
+    }
+}
+
+/// Minimal owned currentness capability retained until response release.
+///
+/// Unlike a serving-epoch lease, this witness does not retain the recent
+/// snapshot, finalized store, or active-publication binding.
+#[cfg(feature = "corpus-zaino")]
+pub(crate) struct ServingEpochReleaseWitness<B, C> {
+    expected_identity: RecentSnapshotIdentity,
+    expected_boundary: B,
+    currentness: Arc<Mutex<C>>,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<B, C> ServingEpochReleaseWitness<B, C>
+where
+    B: ServingEpochBoundary,
+    C: ServingEpochCurrentness<B>,
+{
+    pub(crate) fn observe_and_match(&self) -> Result<(), ServingEpochUnavailable> {
+        let observation = {
+            let mut currentness = self
+                .currentness
+                .lock()
+                .map_err(|_| ServingEpochUnavailable)?;
+            currentness.observe()?
+        };
+        if observation.matches(self.expected_identity, &self.expected_boundary) {
+            Ok(())
+        } else {
+            Err(ServingEpochUnavailable)
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<B, C> fmt::Debug for ServingEpochReleaseWitness<B, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServingEpochReleaseWitness { ..REDACTED.. }")
+    }
+}
+
+/// Single-writer publication of one atomic whole-serving-epoch binding.
+struct ServingEpochPublicationOwner<const N: usize, B, S, C> {
+    active: Arc<ArcSwapOption<ServingEpoch<N, B, S, C>>>,
+}
+
+impl<const N: usize, B, S, C> ServingEpochPublicationOwner<N, B, S, C> {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(ArcSwapOption::empty()),
+        }
+    }
+
+    /// Publishes last, after validating the exact recent/finalized binding.
+    fn publish(
+        &mut self,
+        recent: RecentSnapshotLease<N>,
+        identity: RecentSnapshotIdentity,
+        boundary: B,
+        finalized_store: S,
+        currentness: C,
+    ) -> Result<(), RecentSnapshotPublicationError>
+    where
+        B: ServingEpochBoundary,
+        S: FinalizedServingStore,
+        C: ServingEpochCurrentness<B>,
+    {
+        self.clear();
+        let Some((currentness_identity, currentness_boundary)) = currentness.binding() else {
+            return Err(RecentSnapshotPublicationError::InvalidUpdate);
+        };
+        if !recent.is_current()
+            || recent.snapshot().identity() != identity
+            || finalized_store.serving_identity() != identity
+            || currentness_identity != identity
+            || !boundary.same_capture(currentness_boundary)
+        {
+            return Err(RecentSnapshotPublicationError::InvalidUpdate);
+        }
+
+        let epoch = compose_serving_epoch(recent, identity, boundary, finalized_store, currentness);
+        if !epoch.recent.is_current() {
+            return Err(RecentSnapshotPublicationError::InvalidUpdate);
+        }
+        self.active.store(Some(epoch));
+        Ok(())
+    }
+
+    fn pin(&self) -> Option<ServingEpochLease<N, B, S, C>> {
+        self.active.load_full().map(|epoch| ServingEpochLease {
+            active: Arc::clone(&self.active),
+            epoch,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.active.store(None);
+    }
+}
+
+impl<const N: usize, B, S, C> Drop for ServingEpochPublicationOwner<N, B, S, C> {
+    fn drop(&mut self) {
+        self.active.store(None);
+    }
+}
+
+impl<const N: usize, B, S, C> fmt::Debug for ServingEpochPublicationOwner<N, B, S, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServingEpochPublicationOwner { ..REDACTED.. }")
+    }
+}
+
+struct ServingEpoch<const N: usize, B, S, C> {
+    recent: RecentSnapshotLease<N>,
+    /// Exact network/checkpoint/schema/key identity. `projection_epoch` must
+    /// roll whenever the finalized projection owner is rebuilt or replaced.
+    identity: RecentSnapshotIdentity,
+    boundary: B,
+    finalized_store: Arc<Mutex<S>>,
+    finalized_store_slots_per_key: usize,
+    currentness: Arc<Mutex<C>>,
+}
+
+fn compose_serving_epoch<const N: usize, B, S, C>(
+    recent: RecentSnapshotLease<N>,
+    identity: RecentSnapshotIdentity,
+    boundary: B,
+    finalized_store: S,
+    currentness: C,
+) -> Arc<ServingEpoch<N, B, S, C>>
+where
+    S: ObliviousStore,
+{
+    let finalized_store_slots_per_key = finalized_store.slots_per_key();
+    Arc::new(ServingEpoch {
+        recent,
+        identity,
+        boundary,
+        finalized_store: Arc::new(Mutex::new(finalized_store)),
+        finalized_store_slots_per_key,
+        currentness: Arc::new(Mutex::new(currentness)),
+    })
+}
+
+/// A pinned whole-serving-epoch binding retained for one private query.
+pub(crate) struct ServingEpochLease<const N: usize, B, S, C> {
+    active: Arc<ArcSwapOption<ServingEpoch<N, B, S, C>>>,
+    epoch: Arc<ServingEpoch<N, B, S, C>>,
+}
+
+impl<const N: usize, B, S, C> ServingEpochLease<N, B, S, C> {
+    pub(crate) fn snapshot(&self) -> &FrozenRecentSnapshot<N> {
+        self.epoch.recent.snapshot()
+    }
+
+    pub(crate) fn identity(&self) -> RecentSnapshotIdentity {
+        self.epoch.identity
+    }
+
+    pub(crate) fn finalized_store(&self) -> ServingEpochStore<S> {
+        ServingEpochStore {
+            inner: Arc::clone(&self.epoch.finalized_store),
+            slots_per_key: self.epoch.finalized_store_slots_per_key,
+        }
+    }
+
+    fn local_binding_is_current(&self) -> bool {
+        self.active
+            .load_full()
+            .is_some_and(|active| Arc::ptr_eq(&self.epoch, &active))
+            && self.epoch.recent.is_current()
+            && self.epoch.recent.snapshot().identity() == self.epoch.identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidator_for_tests(&self) -> ServingEpochInvalidator<N, B, S, C> {
+        ServingEpochInvalidator {
+            active: Arc::clone(&self.active),
+            recent_active: Arc::clone(&self.epoch.recent.active),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_currentness_for_tests<T>(
+        &self,
+        inspect: impl FnOnce(&mut C) -> T,
+    ) -> Option<T> {
+        self.epoch
+            .currentness
+            .lock()
+            .ok()
+            .map(|mut currentness| inspect(&mut currentness))
+    }
+}
+
+impl<const N: usize, B: ServingEpochBoundary, S, C> ServingEpochLease<N, B, S, C> {
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn release_witness(&self) -> ServingEpochReleaseWitness<B, C> {
+        ServingEpochReleaseWitness {
+            expected_identity: self.epoch.identity,
+            expected_boundary: self.epoch.boundary.clone(),
+            currentness: Arc::clone(&self.epoch.currentness),
+        }
+    }
+
+    /// Checks the atomic epoch and recent Arc both before and after comparing
+    /// the response-release observation. The second check rejects a refresh
+    /// that races the otherwise-current observation.
+    pub(crate) fn is_current(&self, observation: &ServingEpochObservation<B>) -> bool {
+        if !self.local_binding_is_current() {
+            return false;
+        }
+        let observation_matches = observation.matches(self.epoch.identity, &self.epoch.boundary);
+        observation_matches && self.local_binding_is_current()
+    }
+}
+
+impl<const N: usize, B, S, C> ServingEpochLease<N, B, S, C>
+where
+    C: ServingEpochCurrentness<B>,
+{
+    pub(crate) fn observe_current(
+        &self,
+    ) -> Result<ServingEpochObservation<B>, ServingEpochUnavailable> {
+        let mut currentness = self
+            .epoch
+            .currentness
+            .lock()
+            .map_err(|_| ServingEpochUnavailable)?;
+        currentness.observe()
+    }
+}
+
+impl<const N: usize, B, S, C> fmt::Debug for ServingEpochLease<N, B, S, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServingEpochLease { ..REDACTED.. }")
+    }
+}
+
+/// The finalized store generation owned by one serving-epoch lease.
+///
+/// The wrapper prevents runtime construction from injecting a store that was
+/// not published in the same atomic epoch as the recent snapshot and boundary.
+pub(crate) struct ServingEpochStore<S> {
+    inner: Arc<Mutex<S>>,
+    slots_per_key: usize,
+}
+
+impl<S> Clone for ServingEpochStore<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            slots_per_key: self.slots_per_key,
+        }
+    }
+}
+
+impl<S: ObliviousStore> ObliviousStore for ServingEpochStore<S> {
+    type Error = ServingEpochStoreUnavailable;
+
+    fn slots_per_key(&self) -> usize {
+        self.slots_per_key
+    }
+
+    fn read_slot(
+        &mut self,
+        address_key: &AddressKey,
+        slot: usize,
+    ) -> Result<StoreSlot, Self::Error> {
+        let mut store = self
+            .inner
+            .lock()
+            .map_err(|_| ServingEpochStoreUnavailable)?;
+        store
+            .read_slot(address_key, slot)
+            .map_err(|_| ServingEpochStoreUnavailable)
+    }
+}
+
+impl<S> fmt::Debug for ServingEpochStore<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServingEpochStore { ..REDACTED.. }")
+    }
+}
+
+impl<S> ServingEpochStore<S> {
+    #[cfg(test)]
+    pub(crate) fn inspect_for_tests<T>(&self, inspect: impl FnOnce(&S) -> T) -> Option<T> {
+        self.inner.lock().ok().map(|store| inspect(&store))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServingEpochStoreUnavailable;
+
+#[cfg(test)]
+pub(crate) struct ServingEpochInvalidator<const N: usize, B, S, C> {
+    active: Arc<ArcSwapOption<ServingEpoch<N, B, S, C>>>,
+    recent_active: Arc<ArcSwapOption<FrozenRecentSnapshot<N>>>,
+}
+
+#[cfg(test)]
+impl<const N: usize, B, S, C> ServingEpochInvalidator<N, B, S, C> {
+    pub(crate) fn clear_epoch(&self) {
+        self.active.store(None);
+    }
+
+    fn clear_recent(&self) {
+        self.recent_active.store(None);
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize, B, S, C> fmt::Debug for ServingEpochInvalidator<N, B, S, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServingEpochInvalidator { ..REDACTED.. }")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn serving_epoch_for_tests<const N: usize, B, S, C>(
+    snapshot: FrozenRecentSnapshot<N>,
+    boundary: B,
+    finalized_store: S,
+    currentness: C,
+) -> ServingEpochLease<N, B, S, C>
+where
+    S: ObliviousStore,
+{
+    let snapshot = Arc::new(snapshot);
+    let recent_active = Arc::new(ArcSwapOption::from(Some(Arc::clone(&snapshot))));
+    let recent = RecentSnapshotLease {
+        active: recent_active,
+        snapshot,
+    };
+    let identity = recent.snapshot().identity();
+    let epoch = compose_serving_epoch(recent, identity, boundary, finalized_store, currentness);
+    let active = Arc::new(ArcSwapOption::from(Some(Arc::clone(&epoch))));
+    ServingEpochLease { active, epoch }
 }
 
 /// Unforgeable capability for exactly one outstanding snapshot build.
@@ -483,6 +927,95 @@ mod tests {
     const SLOT_COUNT: usize = 2;
 
     type TestOwner = RecentSnapshotPublicationOwner<SLOT_COUNT>;
+    type TestServingOwner =
+        ServingEpochPublicationOwner<SLOT_COUNT, TestBoundary, TestFinalizedStore, TestCurrentness>;
+    type TestServingLease =
+        ServingEpochLease<SLOT_COUNT, TestBoundary, TestFinalizedStore, TestCurrentness>;
+    type ActivatedServingEpoch = (TestOwner, TestServingOwner, TestServingLease, TestBoundary);
+
+    struct TestFinalizedStore {
+        generation: u8,
+        identity: RecentSnapshotIdentity,
+    }
+
+    impl TestFinalizedStore {
+        const fn new(generation: u8, identity: RecentSnapshotIdentity) -> Self {
+            Self {
+                generation,
+                identity,
+            }
+        }
+    }
+
+    impl ObliviousStore for TestFinalizedStore {
+        type Error = ();
+
+        fn slots_per_key(&self) -> usize {
+            4
+        }
+
+        fn read_slot(
+            &mut self,
+            _address_key: &AddressKey,
+            _slot: usize,
+        ) -> Result<StoreSlot, Self::Error> {
+            Ok(StoreSlot::dummy())
+        }
+    }
+
+    impl FinalizedServingStore for TestFinalizedStore {
+        fn serving_identity(&self) -> RecentSnapshotIdentity {
+            self.identity
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestBoundary {
+        capture: u8,
+        revision: Arc<()>,
+    }
+
+    impl TestBoundary {
+        fn new() -> Self {
+            Self {
+                capture: 7,
+                revision: Arc::new(()),
+            }
+        }
+
+        fn replacement(&self) -> Self {
+            Self {
+                capture: self.capture,
+                revision: Arc::new(()),
+            }
+        }
+    }
+
+    impl ServingEpochBoundary for TestBoundary {
+        fn same_capture(&self, other: &Self) -> bool {
+            self.capture == other.capture && Arc::ptr_eq(&self.revision, &other.revision)
+        }
+    }
+
+    struct TestCurrentness {
+        identity: RecentSnapshotIdentity,
+        boundary: TestBoundary,
+    }
+
+    impl ServingEpochCurrentness<TestBoundary> for TestCurrentness {
+        fn binding(&self) -> Option<(RecentSnapshotIdentity, &TestBoundary)> {
+            Some((self.identity, &self.boundary))
+        }
+
+        fn observe(
+            &mut self,
+        ) -> Result<ServingEpochObservation<TestBoundary>, ServingEpochUnavailable> {
+            Ok(ServingEpochObservation::new(
+                self.identity,
+                self.boundary.clone(),
+            ))
+        }
+    }
 
     fn identity(height: u32, hash: [u8; 32]) -> RecentSnapshotIdentity {
         identity_at_epoch(height, hash, 7)
@@ -505,6 +1038,248 @@ mod tests {
         let ticket = owner.begin_update(identity(100, FINALIZED_HASH), 102, TIP_HASH_A)?;
         owner.activate(ticket, slots())?;
         Ok(owner)
+    }
+
+    fn activated_serving_epoch() -> Result<ActivatedServingEpoch, RecentSnapshotPublicationError> {
+        let owner = activated_owner()?;
+        let recent = owner
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+        let boundary = TestBoundary::new();
+        let finalized = identity(100, FINALIZED_HASH);
+        let mut serving = ServingEpochPublicationOwner::new();
+        serving.publish(
+            recent,
+            finalized,
+            boundary.clone(),
+            TestFinalizedStore::new(17, finalized),
+            TestCurrentness {
+                identity: finalized,
+                boundary: boundary.clone(),
+            },
+        )?;
+        let lease = serving
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+        Ok((owner, serving, lease, boundary))
+    }
+
+    fn assert_currentness_binding_rejected(
+        currentness_identity: RecentSnapshotIdentity,
+        published_boundary: TestBoundary,
+        currentness_boundary: TestBoundary,
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let owner = activated_owner()?;
+        let recent = owner
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+        let current_identity = identity(100, FINALIZED_HASH);
+        let mut serving = ServingEpochPublicationOwner::new();
+
+        assert_eq!(
+            serving.publish(
+                recent,
+                current_identity,
+                published_boundary,
+                TestFinalizedStore::new(17, current_identity),
+                TestCurrentness {
+                    identity: currentness_identity,
+                    boundary: currentness_boundary,
+                },
+            ),
+            Err(RecentSnapshotPublicationError::InvalidUpdate)
+        );
+        assert!(serving.pin().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serving_epoch_binds_exact_finalized_recent_and_boundary_identity(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let (_owner, _serving, lease, boundary) = activated_serving_epoch()?;
+        let exact = ServingEpochObservation::new(lease.identity(), boundary.clone());
+        assert!(lease.is_current(&exact));
+        let owner_observation = lease
+            .observe_current()
+            .map_err(|_| RecentSnapshotPublicationError::InvalidUpdate)?;
+        assert!(lease.is_current(&owner_observation));
+        assert_eq!(
+            lease
+                .finalized_store()
+                .inspect_for_tests(|store| store.generation),
+            Some(17)
+        );
+
+        let current = lease.identity();
+        let mismatched_finalized_or_projection_identities = [
+            RecentSnapshotIdentity::new(
+                current.network_tag() ^ 1,
+                current.finalized_height(),
+                *current.finalized_hash_display(),
+                current.schema_version(),
+                current.projection_epoch(),
+                current.key_epoch(),
+            ),
+            RecentSnapshotIdentity::new(
+                current.network_tag(),
+                current.finalized_height() + 1,
+                *current.finalized_hash_display(),
+                current.schema_version(),
+                current.projection_epoch(),
+                current.key_epoch(),
+            ),
+            RecentSnapshotIdentity::new(
+                current.network_tag(),
+                current.finalized_height(),
+                ADVANCED_FINALIZED_HASH,
+                current.schema_version(),
+                current.projection_epoch(),
+                current.key_epoch(),
+            ),
+            RecentSnapshotIdentity::new(
+                current.network_tag(),
+                current.finalized_height(),
+                *current.finalized_hash_display(),
+                current.schema_version() + 1,
+                current.projection_epoch(),
+                current.key_epoch(),
+            ),
+            RecentSnapshotIdentity::new(
+                current.network_tag(),
+                current.finalized_height(),
+                *current.finalized_hash_display(),
+                current.schema_version(),
+                current.projection_epoch() + 1,
+                current.key_epoch(),
+            ),
+            RecentSnapshotIdentity::new(
+                current.network_tag(),
+                current.finalized_height(),
+                *current.finalized_hash_display(),
+                current.schema_version(),
+                current.projection_epoch(),
+                current.key_epoch() + 1,
+            ),
+        ];
+        for mismatched in mismatched_finalized_or_projection_identities {
+            let observation = ServingEpochObservation::new(mismatched, boundary.clone());
+            assert!(!lease.is_current(&observation));
+        }
+
+        let equal_value_replacement =
+            ServingEpochObservation::new(lease.identity(), boundary.replacement());
+        assert!(!lease.is_current(&equal_value_replacement));
+        Ok(())
+    }
+
+    #[test]
+    fn serving_epoch_rejects_a_store_issued_for_another_identity(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let owner = activated_owner()?;
+        let recent = owner
+            .pin()
+            .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
+        let boundary = TestBoundary::new();
+        let current_identity = identity(100, FINALIZED_HASH);
+        let mut serving = ServingEpochPublicationOwner::new();
+
+        assert_eq!(
+            serving.publish(
+                recent,
+                current_identity,
+                boundary.clone(),
+                TestFinalizedStore::new(17, identity(101, ADVANCED_FINALIZED_HASH)),
+                TestCurrentness {
+                    identity: current_identity,
+                    boundary,
+                },
+            ),
+            Err(RecentSnapshotPublicationError::InvalidUpdate)
+        );
+        assert!(serving.pin().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn serving_epoch_rejects_mismatched_currentness_binding(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let boundary = TestBoundary::new();
+        assert_currentness_binding_rejected(
+            identity(101, ADVANCED_FINALIZED_HASH),
+            boundary.clone(),
+            boundary.clone(),
+        )?;
+        assert_currentness_binding_rejected(
+            identity(100, FINALIZED_HASH),
+            boundary.clone(),
+            boundary.replacement(),
+        )
+    }
+
+    #[test]
+    fn serving_epoch_second_check_rejects_refresh_after_observation(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let (_owner, _serving, lease, boundary) = activated_serving_epoch()?;
+        let invalidator = lease.invalidator_for_tests();
+        let observation = ServingEpochObservation::new(lease.identity(), boundary)
+            .with_after_comparison_for_tests(move || invalidator.clear_epoch());
+
+        assert!(!lease.is_current(&observation));
+        Ok(())
+    }
+
+    #[test]
+    fn serving_epoch_rejects_recent_invalidation_and_clears_atomically(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let (_owner, _serving, recent_invalidated, boundary) = activated_serving_epoch()?;
+        let observation =
+            ServingEpochObservation::new(recent_invalidated.identity(), boundary.clone());
+        recent_invalidated.invalidator_for_tests().clear_recent();
+        assert!(!recent_invalidated.is_current(&observation));
+
+        let (_owner, mut serving, epoch_invalidated, boundary) = activated_serving_epoch()?;
+        let observation = ServingEpochObservation::new(epoch_invalidated.identity(), boundary);
+        serving.clear();
+        assert!(!epoch_invalidated.is_current(&observation));
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_recent_owner_invalidates_recent_lease() -> Result<(), RecentSnapshotPublicationError>
+    {
+        let lease = {
+            let owner = activated_owner()?;
+            owner
+                .pin()
+                .ok_or(RecentSnapshotPublicationError::ActivationRejected)?
+        };
+
+        assert!(!lease.is_current());
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_serving_owner_invalidates_serving_lease(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let (_owner, serving, lease, boundary) = activated_serving_epoch()?;
+        let observation = ServingEpochObservation::new(lease.identity(), boundary);
+
+        drop(serving);
+
+        assert!(!lease.is_current(&observation));
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_recent_owner_invalidates_serving_lease(
+    ) -> Result<(), RecentSnapshotPublicationError> {
+        let (owner, _serving, lease, boundary) = activated_serving_epoch()?;
+        let observation = ServingEpochObservation::new(lease.identity(), boundary);
+
+        drop(owner);
+
+        assert!(!lease.is_current(&observation));
+        Ok(())
     }
 
     #[cfg(feature = "corpus-zaino")]
@@ -572,7 +1347,7 @@ mod tests {
             snapshot.binding_digest(),
             super::super::lineage_binding_digest(snapshot.lineage(), snapshot.content_digest())
         );
-        assert!(lease.is_current(&owner));
+        assert!(lease.is_current());
         Ok(())
     }
 
@@ -659,7 +1434,7 @@ mod tests {
                 .pin()
                 .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
             assert_eq!(lease.snapshot().lineage().generation(), 2);
-            assert!(lease.is_current(&owner));
+            assert!(lease.is_current());
         }
         Ok(())
     }
@@ -696,8 +1471,8 @@ mod tests {
             first.snapshot().binding_digest(),
             second.snapshot().binding_digest()
         );
-        assert!(!first.is_current(&owner));
-        assert!(second.is_current(&owner));
+        assert!(!first.is_current());
+        assert!(second.is_current());
         Ok(())
     }
 
@@ -737,8 +1512,8 @@ mod tests {
             first.snapshot().binding_digest(),
             second.snapshot().binding_digest()
         );
-        assert!(!first.is_current(&owner));
-        assert!(second.is_current(&owner));
+        assert!(!first.is_current());
+        assert!(second.is_current());
         Ok(())
     }
 
@@ -754,7 +1529,7 @@ mod tests {
             .pin()
             .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
         assert_eq!(first.snapshot().lineage().generation(), 1);
-        assert!(first.is_current(&owner));
+        assert!(first.is_current());
 
         let updated = owner.begin_update(identity(100, FINALIZED_HASH), 102, TIP_HASH_B)?;
         owner.activate(updated, slots())?;
@@ -762,8 +1537,8 @@ mod tests {
             .pin()
             .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
         assert_eq!(second.snapshot().lineage().generation(), 2);
-        assert!(second.is_current(&owner));
-        assert!(!first.is_current(&owner));
+        assert!(second.is_current());
+        assert!(!first.is_current());
         Ok(())
     }
 
@@ -778,7 +1553,7 @@ mod tests {
         let _ticket = owner.begin_update(identity(100, FINALIZED_HASH), 103, TIP_HASH_B)?;
 
         assert!(owner.pin().is_none());
-        assert!(!lease.is_current(&owner));
+        assert!(!lease.is_current());
         Ok(())
     }
 
@@ -845,7 +1620,7 @@ mod tests {
             .pin()
             .ok_or(RecentSnapshotPublicationError::ActivationRejected)?;
         assert_eq!(lease.snapshot().lineage().generation(), 2);
-        assert!(lease.is_current(&owner));
+        assert!(lease.is_current());
         Ok(())
     }
 
@@ -866,7 +1641,7 @@ mod tests {
             activation_owner.activate(stale_activation, slots()),
             Err(RecentSnapshotPublicationError::ActivationRejected)
         );
-        assert!(activated_lease.is_current(&activation_owner));
+        assert!(activated_lease.is_current());
 
         let mut failure_owner = TestOwner::new();
         let stale_failure =
@@ -882,7 +1657,7 @@ mod tests {
             failure_owner.fail_update(stale_failure),
             Err(RecentSnapshotPublicationError::ActivationRejected)
         );
-        assert!(failure_lease.is_current(&failure_owner));
+        assert!(failure_lease.is_current());
         Ok(())
     }
 
