@@ -154,6 +154,19 @@ impl SizingParameters {
             });
         }
 
+        self.estimate_aggregates(address_count, event_count, maximum_events_per_address)
+    }
+
+    /// Recomputes every deterministic estimate field from identifier-free
+    /// aggregate counts. This is also the validation seam for persisted sizing
+    /// rows; the histogram-based entry point above remains the source of those
+    /// counts during model application.
+    pub(super) fn estimate_aggregates(
+        &self,
+        address_count: u64,
+        event_count: u64,
+        maximum_events_per_address: u64,
+    ) -> Result<StorageEstimate, SizingError> {
         let allocated_directory_bytes = checked_mul(
             u64::from(self.layout.directory().capacity()),
             self.directory_record_bytes,
@@ -238,38 +251,6 @@ impl fmt::Debug for SizingParameters {
     }
 }
 
-impl fmt::Display for SizingParameters {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "sizing_parameters=directory_capacity:{},directory_admission_limit:{},directory_admission_bps:{},directory_record_bytes:{},event_capacity:{},event_admission_limit:{},event_admission_bps:{},event_record_bytes:{},max_events_per_address:{},position_map_entry_bytes:{},backend_expansion_bps:{},tdx_memory_bytes:{},required_headroom_bps:{}",
-            self.layout.directory().capacity(),
-            self.layout.directory().admission_limit(),
-            load_basis_points(
-                u64::from(self.layout.directory().admission_limit()),
-                self.layout.directory().capacity(),
-            ),
-            self.directory_record_bytes,
-            self.layout.event().capacity(),
-            self.layout.event().admission_limit(),
-            load_basis_points(
-                u64::from(self.layout.event().admission_limit()),
-                self.layout.event().capacity(),
-            ),
-            self.event_record_bytes,
-            self.layout.max_events_per_address(),
-            self.position_map_entry_bytes,
-            self.backend_expansion_bps,
-            self.tdx_memory_bytes,
-            self.required_headroom_bps,
-        )?;
-        writeln!(
-            f,
-            "sizing_evidence=insertion_bound:false,backend_calibrated:false,rss_measured:false,load_bps_rounding:floor,load_bps_capped:false"
-        )
-    }
-}
-
 /// Deterministic capacity results for one aggregate corpus histogram.
 ///
 /// The allocation byte counts are fixed by the selected profile. Corpus
@@ -298,7 +279,7 @@ pub(super) struct StorageEstimate {
 }
 
 impl StorageEstimate {
-    const fn address_count(&self) -> u64 {
+    pub(super) const fn address_count(&self) -> u64 {
         self.address_count
     }
 
@@ -889,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_while_display_records_the_public_model() -> Result<(), SizingError> {
+    fn debug_redacts_internal_sizing_values() -> Result<(), SizingError> {
         let parameters = parameters(3_000, 3_000)?;
         let estimate = parameters.estimate(1, &BTreeMap::from([(1, 1)]))?;
 
@@ -898,10 +879,6 @@ mod tests {
             "SizingParameters { ..REDACTED.. }"
         );
         assert_eq!(format!("{estimate:?}"), "StorageEstimate { ..REDACTED.. }");
-        assert_eq!(
-            parameters.to_string(),
-            "sizing_parameters=directory_capacity:8,directory_admission_limit:5,directory_admission_bps:6250,directory_record_bytes:38,event_capacity:16,event_admission_limit:12,event_admission_bps:7500,event_record_bytes:82,max_events_per_address:8,position_map_entry_bytes:2,backend_expansion_bps:12500,tdx_memory_bytes:3000,required_headroom_bps:3000\nsizing_evidence=insertion_bound:false,backend_calibrated:false,rss_measured:false,load_bps_rounding:floor,load_bps_capped:false\n"
-        );
         Ok(())
     }
 }

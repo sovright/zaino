@@ -1,6 +1,7 @@
 # Standalone dev-tooling crate: its own workspace (not a member of the root one)
-# so building a single tiny, std-only binary never drags in the production
-# dependency graph. One binary per `src/bin/*.rs`; shared logic in `src/lib.rs`.
+# so building a small workbench binary never drags in the production dependency
+# graph. `rustix` supplies atomic no-replace filesystem publication without
+# unsafe code. One binary per `src/bin/*.rs`; shared logic in `src/lib.rs`.
 [package]
 name = "workbench"
 version = "0.0.0"
@@ -13,3 +14,6 @@ publish = false
 # Crate-wide: forbid unsafe across the lib and every binary in one place.
 [lints.rust]
 unsafe_code = "forbid"
+
+[dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
