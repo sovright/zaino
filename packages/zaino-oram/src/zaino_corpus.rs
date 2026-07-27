@@ -324,6 +324,10 @@ impl MainnetCorpusMeasurement {
         &self.checkpoint
     }
 
+    pub(super) const fn output_count(&self) -> u64 {
+        self.aggregate.output_count()
+    }
+
     /// Revalidates every redundant aggregate field after deserialization.
     pub fn validate(&self) -> Result<(), MainnetCorpusError> {
         let expected_blocks = u64::from(self.checkpoint.height) + 1;
@@ -524,6 +528,12 @@ impl MainnetSizingQualification {
     /// Returns the explicit model applied to the captured measurement.
     pub const fn model(&self) -> &MainnetSizingModel {
         &self.model
+    }
+
+    pub(super) fn captured_corpus_fits_configured_limits(&self) -> bool {
+        self.projections
+            .first()
+            .is_some_and(|projection| projection.year == 0 && projection.fits_configured_limits)
     }
 
     /// Revalidates the model, compiled widths, projection arithmetic, and

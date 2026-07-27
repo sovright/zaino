@@ -5,6 +5,7 @@ pub(crate) mod mempool;
 mod mockchain_tests;
 mod non_finalised_state;
 mod poll;
+mod projection;
 mod proptest_blockgen;
 mod sync_loop;
 pub(crate) mod types;

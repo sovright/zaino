@@ -94,6 +94,7 @@ arc-swap = { workspace = true }
 reqwest.workspace = true
 bitflags = { workspace = true }
 derive_more = { workspace = true, features = ["from"] }
+fs2 = "0.4.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }

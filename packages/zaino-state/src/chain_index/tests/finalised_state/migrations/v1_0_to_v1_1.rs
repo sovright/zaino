@@ -8,6 +8,7 @@ use zaino_common::{DatabaseConfig, StorageConfig};
 use crate::chain_index::finalised_state::capability::{
     DbCore as _, DbRead as _, DbVersion, MigrationStatus,
 };
+use crate::chain_index::finalised_state::finalised_source::v1::canonical_schema_hash_for_test;
 use crate::chain_index::finalised_state::FinalisedState;
 use crate::chain_index::tests::init_tracing;
 use crate::chain_index::tests::vectors::{
@@ -70,7 +71,8 @@ async fn v1_0_to_v1_1_metadata_migration() {
     assert_eq!(metadata.migration_status, MigrationStatus::Empty);
     assert_eq!(
         metadata.schema_hash,
-        crate::chain_index::finalised_state::finalised_source::v1::DB_SCHEMA_V1_HASH
+        canonical_schema_hash_for_test(metadata.version)
+            .expect("v1.1.0 must have a canonical schema hash")
     );
 
     let db_height = zaino_db.db_height().await.unwrap().unwrap();
@@ -122,6 +124,11 @@ async fn v1_0_to_v1_1_mixed_blockheaderdata_formats() {
         }
     );
     assert_eq!(old_metadata.migration_status, MigrationStatus::Empty);
+    assert_eq!(
+        old_metadata.schema_hash,
+        canonical_schema_hash_for_test(old_metadata.version)
+            .expect("v1.0.0 must have a canonical schema hash")
+    );
 
     old_db.shutdown().await.unwrap();
     drop(old_db);

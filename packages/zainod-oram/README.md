@@ -3,6 +3,96 @@
 `zainod-oram` is a non-published application package for Zaino ORAM research.
 It is not part of the workspace's default members.
 
+## Listener-free private service boundary
+
+The default-off `private-service` feature compiles an independent
+`zaino.private.v1` protobuf contract owned by this package. Its only method is
+`PrivateCompactTxStreamer.QueryPage`; both directions carry one non-empty
+`FixedEnvelope.bytes` field whose decoded length must exactly match the selected
+compile-time profile:
+
+```console
+cargo check -p zainod-oram --features private-service
+```
+
+When `protoc` is available, the build script regenerates and formats a temporary
+copy, then fails if it differs from the committed Rust source. Refreshing after
+an intentional schema change requires the pinned toolchain's `rustfmt` and the
+explicit update mode:
+
+```console
+ZAINO_UPDATE_PRIVATE_PROTO=1 cargo check -p zainod-oram --features private-service
+```
+
+Builds without `protoc` consume the same committed source, so ordinary and
+native-builder checks do not depend on an ambient compiler and never select a
+different generated contract.
+
+The same feature adds a crate-private synchronous, listener-free adapter over
+the small `zaino-oram` `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and
+`PrivateQueryUnavailable` facade. It validates the protobuf boundary through
+named `try_from_wire` / `to_wire` methods, maps boundary and runtime failures to
+one redacted adapter error, and retains the non-`Clone` pending response without
+extracting detached response bytes.
+
+A crate-private custom Tonic codec and body adapter consumes that pending value
+only when the outbound body is first polled. That poll performs the pending
+value's fallible release-time currentness check before borrowing its fixed
+bytes. A successful check encodes one exact fixed-envelope protobuf DATA frame
+and releases the pending value after encoding. A stale or unavailable response
+emits no DATA and is collapsed to one static `Unavailable` trailer shape. If
+the body is dropped before it is polled, the pending value is released without
+a currentness check or response-byte borrow.
+
+The concrete `zaino-oram` runtime owner remains private, with no public
+constructor or factory, so this package currently exercises the shared facade
+with mock implementations only. The generated Tonic service trait is
+deliberately not implemented; it fixes the response type to the generated
+protobuf message and cannot carry this pending value. A generated route and
+listener, production protector/replay/material providers, durable replay,
+trusted clock and nonce ledger, key management, rollback protection, TLS/TDX,
+package/profile-specific message limits, real-owner integration, and
+transport-write or peer-delivery evidence remain open. Currentness at first
+body poll is not currentness at the later transport-write boundary.
+
+## Release-bound deterministic-build receipt
+
+From a completely clean checkout at an exact full source revision, the
+workbench can build and publish the fixed ORAM release product with Podman:
+
+```console
+CONTAINER_ENGINE=podman cargo run --locked --release --manifest-path tools/workbench/Cargo.toml --bin build-deterministic -- --product zainod-oram
+```
+
+The ORAM path accepts no forwarded container arguments. It archives the exact
+HEAD into a detached build context and performs two no-cache builds from that
+same source archive. Both builds use target `x86_64-unknown-linux-musl`, profile
+`release`, feature `typed-qualification`, and the fixed deterministic build
+flags. Their output files must have distinct inodes and identical bytes before
+the first binary creates a receipt and the second binary verifies it.
+
+Receipt creation checks that the archive's embedded source revision matches
+the requested revision and that its `Cargo.lock`, `rust-toolchain.toml`, and
+`Dockerfile.deterministic` bytes exactly match the separately hashed build
+inputs. The staged release is read back and verified before it is atomically
+published without replacing an existing destination. A successful run creates:
+
+- `build/oram-release/zainod-oram`
+- `build/oram-release/release-receipt.json`
+
+The published binary can reverify its canonical receipt and its own executable
+identity:
+
+```console
+./build/oram-release/zainod-oram release verify-receipt \
+  --receipt build/oram-release/release-receipt.json
+```
+
+The receipt is self-reported procedure, local-integrity, and binary-identity
+evidence only. It is unsigned and provides no execution attestation,
+source-derivation attestation, physical-access trace, TDX result, mainnet
+result, or claim that the two same-source builds were independently executed.
+
 ## Typed-worker correctness qualification
 
 The default-off `typed-qualification` feature exposes one fixed, listener-free
@@ -95,6 +185,97 @@ source/lockfile/toolchain/binary-bound or execution-attested and supplies no
 node-year failure bound or mainnet-gate result. Unsupported hosts fail before
 creating the output directory.
 
+## Typed-worker admitted-map saturation qualification
+
+The `typed-qualification` feature also exposes a separate deterministic
+admitted-map boundary profile:
+
+```console
+cargo run -p zainod-oram --features typed-qualification -- \
+  qualification stress --profile full-map-saturation-v1 \
+  --output-dir <NEW_DIR>
+```
+
+`FullMapSaturationV1` uses two independent workers so one terminal fault cannot
+mask the other case. The directory-boundary case admits six addresses with one
+event each into the fixed 8-slot/6-admitted directory and 16-slot/12-admitted
+event tables, verifies histories, replay behavior, absent reads, and
+cross-address rejection, then requires a seventh-address append to return
+`FailedClosed` and latch terminal state. The event-boundary case admits three
+events for each of four addresses, verifies the same invariants at 12 admitted
+events while directory admission remains below its bound, then requires a
+thirteenth unique event on an existing address to fail closed and latch.
+
+Publication uses the same bounded, no-follow, synchronized sibling-staging and
+atomic no-replace path, but writes a distinct `full-map-saturation.json`,
+`full-map-saturation.txt`, and `provenance.json` bundle. The report schema is
+`zaino-oram-full-map-saturation-v1`; provenance uses
+`zaino-oram-full-map-saturation-provenance-v1` and binds the compact typed
+wrapper digest. The aggregate report records exact logical occupancy, admission
+bounds, physical-capacity reserve, deterministic schedule and final-state digests,
+one-hot pre-fault boundary conditions, and identifier-free worker snapshots.
+
+This profile proves deterministic correctness at both logical admitted-map
+boundaries. It deliberately leaves physical capacity unreached and is not a
+random or adversarial target-load experiment, benchmark, latency/RSS/stash or
+queue-load measurement, billion-operation soak, persistence/recovery test,
+physical-trace experiment, target CPU/TDX or attestation result, mainnet sizing
+result, or mainnet gate.
+The bundle is unsigned and self-reported; it binds no source revision, lockfile,
+toolchain, release binary, or execution attestation.
+
+## Source-bound fresh-worker rebuild qualification
+
+The `typed-qualification` feature exposes a listener-free mainnet rebuild
+foundation for a fresh volatile typed worker:
+
+```console
+cargo run -p zainod-oram --features typed-qualification -- \
+  qualification cold-rebuild \
+  --profile source-bound-builder-v1 \
+  --config <MAINNET_ZAINOD_TOML> \
+  --capture-dir <CAPTURE_DIR> \
+  --sizing-dir <SIZING_DIR> \
+  --declared-rebuild-budget-seconds <SECONDS> \
+  --output-dir <NEW_DIR> \
+  --progress-interval <BLOCKS>
+```
+
+The runner revalidates the complete capture and sizing lineage, opens one fixed
+non-finalized mainnet snapshot, and verifies the capture checkpoint height and
+hash against that source before allocating the worker. It then streams the same
+genesis-forward `IndexedBlock` sequence into both a fresh corpus scanner and the
+fresh typed projection owner. Readiness is accepted only if the recomputed
+measurement exactly equals the loaded capture, the worker reaches the exact
+checkpoint, the semantic publication is available, and the worker shuts down
+cleanly. A source, scanner, worker, memory-sampling, or validation failure drops
+the identifier-bearing scanner state, shuts down the candidate worker, and
+publishes no output.
+
+The declared budget has a deliberately narrow boundary: it starts immediately
+before worker allocation and ends after source-measurement equality and typed
+worker readiness are validated. Source-service startup, snapshot selection and
+checkpoint preverification happen before this timer. Shutdown and total
+lifecycle time are recorded separately and cannot change the budget result.
+When the validated rebuild misses the budget, the command first publishes the
+valid negative artifact and then exits unsuccessfully.
+
+The new output directory contains `cold-rebuild.json`, `cold-rebuild.txt`, and
+`provenance.json`. The typed JSON binds the capture and sizing digests, declared
+budget, fresh-worker report, and source snapshot evidence: backend kind, fixed
+snapshot mode, serviceable height, preverified checkpoint, and the explicit
+`uncontrolled` source-cache mode. Provenance binds the compact typed wrapper to
+the runner version and Linux x86_64 target labels. Staged files are bounded,
+read back, semantically revalidated against both input directories, and
+atomically published without replacing an existing output.
+
+This is fresh-worker replay evidence on the executing host, not a full-service
+recovery-time objective or a controlled cold-cache benchmark. It does not
+establish durable ORAM state, authenticated state restoration, production key
+or freshness ownership, target hardware or TDX behavior, physical access-trace
+obliviousness, attestation, signed provenance, full-mainnet feasibility, or
+mainnet readiness.
+
 ## Corpus capture
 
 `corpus capture` produces an identifier-free measurement of the transparent
@@ -112,6 +293,13 @@ earlier checkpoint; the RPC-order hash is verified against the indexed
 canonical block before the scan begins. The scanner then verifies genesis,
 height, parent-hash, and final checkpoint continuity while retaining no blocks
 in the runner.
+
+Block fetching is sequential by default. Operators may explicitly set
+`--fetch-concurrency` from 1 through 32 to keep a bounded number of indexed
+block reads in flight. Fetches may complete out of order, but the runner always
+feeds them to the canonical scanner in ascending height order, so this knob
+does not change the measurement or its digest. The bound limits transient
+full-block memory and validator work-queue pressure.
 
 `--output-dir` must name a new directory. The command builds the artifact in a
 temporary sibling directory and atomically renames it into place only after all
