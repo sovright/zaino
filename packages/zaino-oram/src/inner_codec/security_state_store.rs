@@ -145,6 +145,10 @@ impl SecurityStateIdentity {
         })
     }
 
+    pub(super) const fn profile_id(&self) -> &[u8; PROFILE_ID_BYTES] {
+        &self.profile_id
+    }
+
     /// Validates one same-namespace state update or complete owner rotation.
     fn validate_successor(&self, next: &Self) -> Result<(), SecurityStateSuccessorError> {
         if next.service_id != self.service_id {
@@ -191,10 +195,18 @@ impl SecurityStateIdentity {
 pub(super) fn test_security_state_identity(
     byte: u8,
 ) -> Result<SecurityStateIdentity, SecurityStateValueError> {
+    test_security_state_identity_with_profile_id(byte, [byte.wrapping_add(1); PROFILE_ID_BYTES])
+}
+
+#[cfg(test)]
+pub(super) fn test_security_state_identity_with_profile_id(
+    byte: u8,
+    profile_id: [u8; PROFILE_ID_BYTES],
+) -> Result<SecurityStateIdentity, SecurityStateValueError> {
     SecurityStateIdentity::new(
         [byte; SERVICE_ID_BYTES],
         SecurityStateEpochs::new(1, 2, 3, 4)?,
-        [byte.wrapping_add(1); PROFILE_ID_BYTES],
+        profile_id,
         [byte.wrapping_add(2); SESSION_BINDING_BYTES],
         [byte.wrapping_add(3); SECURITY_EPOCH_BINDING_BYTES],
     )
@@ -291,10 +303,7 @@ impl SecurityStateSnapshot {
         &self,
         component_state_digest: [u8; STATE_DIGEST_BYTES],
     ) -> Result<Self, SecurityStateValueError> {
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(SecurityStateValueError::SequenceOverflow)?;
+        let sequence = self.checked_successor_sequence()?;
         let commitment = SecurityStateCommitment::new(
             self.commitment.identity,
             self.commitment.serving_identity_digest,
@@ -320,9 +329,25 @@ impl SecurityStateSnapshot {
         self.sequence
     }
 
+    pub(super) const fn checked_successor_sequence(&self) -> Result<u64, SecurityStateValueError> {
+        match self.sequence.checked_add(1) {
+            Some(sequence) => Ok(sequence),
+            None => Err(SecurityStateValueError::SequenceOverflow),
+        }
+    }
+
+    pub(super) const fn profile_id(&self) -> &[u8; PROFILE_ID_BYTES] {
+        self.commitment.identity.profile_id()
+    }
+
     #[cfg(test)]
     pub(super) const fn test_sequence(&self) -> u64 {
         self.sequence()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_with_sequence(self, sequence: u64) -> Result<Self, SecurityStateValueError> {
+        Self::new(sequence, self.commitment)
     }
 
     pub(super) const fn component_state_digest(&self) -> [u8; STATE_DIGEST_BYTES] {
@@ -814,8 +839,8 @@ where
         let valid_sequence = match current {
             None => next.sequence() == 1,
             Some(state) => state
-                .sequence()
-                .checked_add(1)
+                .checked_successor_sequence()
+                .ok()
                 .is_some_and(|sequence| sequence == next.sequence()),
         };
         if !valid_sequence {
