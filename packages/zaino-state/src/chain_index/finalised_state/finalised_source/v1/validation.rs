@@ -736,34 +736,17 @@ impl DbV1 {
             match txn.get(self.metadata, b"metadata") {
                 // ***** Existing DB *****
                 Ok(raw_bytes) => {
-                    let stored: StoredEntryFixed<DbMetadata> =
-                        StoredEntryFixed::from_bytes(raw_bytes).map_err(|e| {
-                            FinalisedStateError::Custom(format!("corrupt metadata CBOR: {e}"))
-                        })?;
-                    if !stored.verify(b"metadata") {
-                        return Err(FinalisedStateError::Custom(
-                            "metadata checksum mismatch – DB corruption suspected".into(),
-                        ));
-                    }
+                    let meta = Self::validate_stored_schema_metadata(raw_bytes)?;
 
-                    let meta = stored.item;
-
-                    // Error if major version differs
-                    if meta.version.major != DB_VERSION_V1.major {
-                        return Err(FinalisedStateError::Custom(format!(
-                            "unsupported schema major version {} (expected {})",
-                            meta.version.major, DB_VERSION_V1.major
-                        )));
-                    }
-
-                    // Warn if schema hash mismatches
-                    // NOTE: There could be a schema mismatch at launch during minor migrations,
-                    //       so we do not return an error here. Maybe we can improve this?
+                    // Historical versions can legitimately carry a different schema hash and are
+                    // admitted for migration. The exact current version was already checked above
+                    // and fails closed on a mismatch.
                     if meta.schema_hash != DB_SCHEMA_V1_HASH {
                         warn!(
+                            version = %meta.version,
                             expected = ?&DB_SCHEMA_V1_HASH[..4],
                             found = ?&meta.schema_hash[..4],
-                            "schema hash mismatch: db_schema_v1.txt likely changed without version bump"
+                            "historical schema hash differs from current schema; migration required"
                         );
                     }
                 }
@@ -794,5 +777,77 @@ impl DbV1 {
             txn.commit()?;
             Ok(())
         })
+    }
+
+    /// Decodes and admits one persisted V1 metadata singleton.
+    ///
+    /// Kept separate from the transaction so the read-only startup preflight and the normal opener
+    /// apply exactly the same checksum and exact-version rules.
+    pub(super) fn validate_stored_schema_metadata(
+        raw_bytes: &[u8],
+    ) -> Result<DbMetadata, FinalisedStateError> {
+        let stored: StoredEntryFixed<DbMetadata> = StoredEntryFixed::from_bytes(raw_bytes)
+            .map_err(|error| {
+                FinalisedStateError::Custom(format!("corrupt metadata CBOR: {error}"))
+            })?;
+        if !stored.verify(b"metadata") {
+            return Err(FinalisedStateError::Custom(
+                "metadata checksum mismatch – DB corruption suspected".into(),
+            ));
+        }
+
+        let meta = stored.item;
+        if meta.version.major != DB_VERSION_V1.major {
+            return Err(FinalisedStateError::Custom(format!(
+                "unsupported schema major version {} (expected {})",
+                meta.version.major, DB_VERSION_V1.major
+            )));
+        }
+
+        if meta.version > DB_VERSION_V1 {
+            return Err(FinalisedStateError::Custom(format!(
+                "database schema version {} is newer than compiled version {}",
+                meta.version, DB_VERSION_V1
+            )));
+        }
+
+        if meta.version.capability().is_empty() {
+            return Err(FinalisedStateError::Custom(format!(
+                "unsupported database schema version {}",
+                meta.version
+            )));
+        }
+
+        if !schema_hash_is_supported(meta.version, meta.schema_hash) {
+            if meta.version == DB_VERSION_V1 {
+                return Err(FinalisedStateError::Custom(format!(
+                    "database schema hash mismatch for current version {}",
+                    meta.version
+                )));
+            }
+
+            return Err(FinalisedStateError::Custom(format!(
+                "database schema hash mismatch for supported version {}",
+                meta.version
+            )));
+        }
+
+        if meta.version == DB_VERSION_V1 && meta.migration_status != MigrationStatus::Empty {
+            return Err(FinalisedStateError::Custom(format!(
+                "current database schema version {} has non-empty migration status {}",
+                meta.version, meta.migration_status
+            )));
+        }
+
+        #[cfg(feature = "transparent_address_history_experimental")]
+        if meta.version < DB_VERSION_V1 {
+            return Err(FinalisedStateError::Custom(
+                "historical database migration is unsupported when transparent address history is \
+                 enabled; reopen without the experimental feature to migrate first"
+                    .into(),
+            ));
+        }
+
+        Ok(meta)
     }
 }

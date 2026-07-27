@@ -49,7 +49,10 @@ use zaino_proto::proto::utils::PoolTypeFilter;
 use crate::{
     chain_index::{
         finalised_state::capability::CapabilityRequest,
-        types::{db::metadata::FinalisedTxOutSetInfoAccumulator, TransactionHash},
+        types::{
+            db::metadata::FinalisedTxOutSetInfoAccumulator, BlockIndex, FinalizedOutpointSnapshot,
+            TransactionHash,
+        },
     },
     error::FinalisedStateError,
     BlockHash, BlockHeaderData, BlockchainSource, CommitmentTreeData, CompactBlockStream, Height,
@@ -62,7 +65,7 @@ use crate::{chain_index::types::AddrEventBytes, AddrScript};
 
 use super::{
     capability::{
-        BlockCoreExt, BlockShieldedExt, BlockTransparentExt, CompactBlockExt, DbMetadata,
+        BlockCoreExt, BlockShieldedExt, BlockTransparentExt, CompactBlockExt, DbCore, DbMetadata,
         IndexedBlockExt, TransparentHistExt,
     },
     finalised_source::FinalisedSource,
@@ -488,6 +491,38 @@ impl<T: BlockchainSource> DbReader<T> {
         self.db(CapabilityRequest::TransparentHistExt)?
             .get_outpoint_spenders(outpoints)
             .await
+    }
+
+    /// Materializes outpoint state from one ready backend at an exact finalized checkpoint.
+    ///
+    /// The capability route is pinned for the duration of the read and revalidated before return,
+    /// so a migration or backend replacement cannot silently combine different sources.
+    pub(in crate::chain_index) async fn materialize_finalized_outpoints(
+        &self,
+        checkpoint: BlockIndex,
+        expected_new_outpoints: Vec<Outpoint>,
+        required_outpoints: Vec<Outpoint>,
+    ) -> Result<FinalizedOutpointSnapshot, FinalisedStateError> {
+        let backend = self.db(CapabilityRequest::TransparentHistExt)?;
+        if backend.status() != StatusType::Ready {
+            return Err(FinalisedStateError::DataUnavailable(
+                "finalized outpoint backend is not ready".into(),
+            ));
+        }
+
+        let snapshot = backend
+            .materialize_finalized_outpoints(checkpoint, expected_new_outpoints, required_outpoints)
+            .await?;
+
+        let current_backend = self.db(CapabilityRequest::TransparentHistExt)?;
+        if !Arc::ptr_eq(&backend, &current_backend) || current_backend.status() != StatusType::Ready
+        {
+            return Err(FinalisedStateError::DataUnavailable(
+                "finalized outpoint backend changed during materialization".into(),
+            ));
+        }
+
+        Ok(snapshot)
     }
 
     /// Returns the finalised-state txout-set accumulator.

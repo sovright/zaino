@@ -7,24 +7,27 @@ use zaino_common::network::ActivationHeights;
 use zaino_common::{DatabaseConfig, StorageConfig};
 use zaino_proto::proto::utils::{compact_block_with_pool_types, PoolTypeFilter};
 
+#[cfg(not(feature = "transparent_address_history_experimental"))]
 use crate::chain_index::finalised_state::finalised_source::FinalisedSource;
 use crate::chain_index::finalised_state::reader::DbReader;
 use crate::chain_index::finalised_state::FinalisedState;
 use crate::chain_index::source::mockchain_source::MockchainSource;
 use crate::chain_index::tests::init_tracing;
+#[cfg(not(feature = "transparent_address_history_experimental"))]
+use crate::chain_index::tests::vectors::copy_dir_recursive;
 use crate::chain_index::tests::vectors::{
-    build_mockchain_source, copy_dir_recursive, index_test_vector_blocks, indexed_block_chain,
-    load_test_vectors, TestVectorBlockData, TestVectorData,
+    build_mockchain_source, index_test_vector_blocks, indexed_block_chain, load_test_vectors,
+    TestVectorBlockData, TestVectorData,
 };
 
 use crate::chain_index::types::TransactionHash;
 
+#[cfg(not(feature = "transparent_address_history_experimental"))]
 use crate::chain_index::finalised_state::entry::StoredEntryVar;
 use crate::error::FinalisedStateError;
-use crate::{
-    BlockHeaderData, BlockMetadata, BlockWithMetadata, ChainIndexConfig, Height, IndexedBlock,
-    ZainoVersionedSerde as _,
-};
+#[cfg(not(feature = "transparent_address_history_experimental"))]
+use crate::{BlockHeaderData, ZainoVersionedSerde as _};
+use crate::{BlockMetadata, BlockWithMetadata, ChainIndexConfig, Height, IndexedBlock};
 
 use crate::{AddrScript, Outpoint};
 
@@ -248,6 +251,7 @@ async fn save_db_to_file_and_reload() {
     .unwrap();
 }
 
+#[cfg(not(feature = "transparent_address_history_experimental"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn load_db_backend_from_file() {
     init_tracing();
