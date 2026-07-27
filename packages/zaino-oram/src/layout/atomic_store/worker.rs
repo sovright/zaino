@@ -3,8 +3,10 @@
 //! The worker consumes the complete executor, so no raw table handle, slot,
 //! read, or insert operation crosses the command boundary. It remains a
 //! volatile, module-private research model. Its feature-gated child can build
-//! the exact typed `rostl` executor on Linux x86_64 for offline evidence, but
-//! no projection, query-engine, or service owner calls that constructor.
+//! the exact typed `rostl` executor on Linux x86_64 for the crate-internal
+//! offline projection owner, but no query engine or service owns it. Restart
+//! creates a fresh worker and rebuilds from public blocks; no worker snapshot,
+//! stash, position map, or table content is restored.
 //! Append reply tickets fail the worker closed when dropped unconsumed, while
 //! merely retaining a ticket never stalls later work or shutdown. Deliberately
 //! leaking a ticket with `mem::forget` is outside this trusted module-private
@@ -22,6 +24,8 @@ use std::{
 };
 
 use super::*;
+#[cfg(feature = "corpus-zaino")]
+use crate::projection::ProjectionEventSink;
 
 #[cfg(feature = "rostl-experimental")]
 mod rostl;
@@ -32,13 +36,13 @@ const MAX_WORKER_QUEUE_CAPACITY: usize = 4_096;
 const WORKER_THREAD_NAME: &str = "zaino-oram-atomic";
 
 #[derive(Clone, Copy)]
-struct AtomicQueueCapacity(NonZeroUsize);
+pub(crate) struct AtomicQueueCapacity(NonZeroUsize);
 
 impl AtomicQueueCapacity {
-    fn try_new(value: usize) -> Result<Self, AtomicWorkerError> {
+    pub(crate) fn try_new(value: usize) -> Result<Self, AtomicQueueCapacityError> {
         match NonZeroUsize::new(value) {
             Some(value) if value.get() <= MAX_WORKER_QUEUE_CAPACITY => Ok(Self(value)),
-            Some(_) | None => Err(AtomicWorkerError::InvalidQueueCapacity),
+            Some(_) | None => Err(AtomicQueueCapacityError::Invalid),
         }
     }
 
@@ -48,7 +52,7 @@ impl AtomicQueueCapacity {
 }
 
 /// Owns the worker thread and the only command handle into its executor.
-struct AtomicWorker {
+pub(crate) struct AtomicWorker {
     handle: AtomicWorkerHandle,
     join: Option<JoinHandle<WorkerExit>>,
 }
@@ -88,6 +92,82 @@ impl AtomicWorker {
 
     fn snapshot(&self) -> AtomicWorkerSnapshot {
         self.handle.snapshot()
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_read_history(
+        &self,
+        address: StandardAddress,
+    ) -> Result<Vec<Option<UtxoEvent>>, ()> {
+        self.qualification_read_history_typed(address)
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_read_history_typed(
+        &self,
+        address: StandardAddress,
+    ) -> Result<Vec<Option<UtxoEvent>>, AtomicQualificationCommandError> {
+        self.handle
+            .try_read_history(address)
+            .map_err(AtomicQualificationCommandError::from_worker)?
+            .wait()
+            .map(|history| history.slots)
+            .map_err(AtomicQualificationCommandError::from_worker)
+    }
+
+    /// Reads one creation-order dense live slot through the complete fixed profile.
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn serving_read_slot(
+        &self,
+        address_key: &AddressKey,
+        slot: usize,
+        maximum_finalized_height: u32,
+    ) -> Result<Option<TransparentUtxo>, ()> {
+        self.handle
+            .try_read_live_slot(address_key, slot, maximum_finalized_height)
+            .map_err(|_| ())?
+            .wait()
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_append(
+        &self,
+        address: StandardAddress,
+        event: UtxoEvent,
+    ) -> Result<AtomicQualificationAppendResult, ()> {
+        self.qualification_append_typed(address, event)
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_append_typed(
+        &self,
+        address: StandardAddress,
+        event: UtxoEvent,
+    ) -> Result<AtomicQualificationAppendResult, AtomicQualificationCommandError> {
+        self.handle
+            .try_append(address, event)
+            .map_err(AtomicQualificationCommandError::from_worker)?
+            .wait()
+            .map(|result| AtomicQualificationAppendResult {
+                disposition: match result.disposition {
+                    AppendDisposition::Inserted => AtomicQualificationAppendDisposition::Inserted,
+                    AppendDisposition::ExactReplay => {
+                        AtomicQualificationAppendDisposition::ExactReplay
+                    }
+                },
+                history: result.history.slots,
+            })
+            .map_err(AtomicQualificationCommandError::from_worker)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_shutdown(self) -> Result<AtomicQualificationSnapshot, ()> {
+        self.shutdown()
+            .map(AtomicQualificationSnapshot::from_snapshot)
+            .map_err(|_| ())
     }
 
     fn shutdown(mut self) -> Result<AtomicWorkerSnapshot, AtomicWorkerError> {
@@ -145,6 +225,69 @@ impl AtomicWorker {
     }
 }
 
+#[cfg(feature = "corpus-zaino")]
+pub(crate) fn spawn_typed_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
+    layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
+    queue_capacity: AtomicQueueCapacity,
+) -> Result<AtomicWorker, AtomicWorkerBuildError> {
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    {
+        rostl::spawn_rostl_worker(layout, queue_capacity)
+    }
+
+    #[cfg(not(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    {
+        let _ = (layout, queue_capacity);
+        Err(AtomicWorkerBuildError::TypedBackendUnavailable)
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+pub(crate) fn shutdown_atomic_worker(worker: AtomicWorker) -> Result<(), ()> {
+    worker.shutdown().map(|_| ()).map_err(|_| ())
+}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
+pub(super) fn spawn_atomic_worker_for_tests<
+    D,
+    E,
+    const DIRECTORY_PROBES: usize,
+    const EVENT_PROBES: usize,
+>(
+    executor: ExclusiveTwoTableExecutor<D, E, DIRECTORY_PROBES, EVENT_PROBES>,
+    queue_capacity: AtomicQueueCapacity,
+) -> Result<AtomicWorker, AtomicWorkerBuildError>
+where
+    D: UniqueTable<PersistentAddressDirectory> + Send + 'static,
+    E: UniqueTable<PersistentAddressEventPage> + Send + 'static,
+{
+    AtomicWorker::spawn(executor, queue_capacity)
+        .map_err(|_| AtomicWorkerBuildError::ConstructionFailed)
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl ProjectionEventSink for AtomicWorker {
+    type Error = AtomicProjectionSinkError;
+
+    fn append_and_wait(&mut self, event: UtxoEvent) -> Result<(), Self::Error> {
+        let address = StandardAddress::from_event(&event).map_err(|_| AtomicProjectionSinkError)?;
+        self.handle
+            .try_append(address, event)
+            .map_err(|_| AtomicProjectionSinkError)?
+            .wait()
+            .map(|_| ())
+            .map_err(|_| AtomicProjectionSinkError)
+    }
+}
+
 impl Drop for AtomicWorker {
     fn drop(&mut self) {
         if self.join.is_none() {
@@ -169,6 +312,27 @@ struct AtomicWorkerHandle {
 }
 
 impl AtomicWorkerHandle {
+    fn try_read_live_slot(
+        &self,
+        address_key: &AddressKey,
+        logical_slot: usize,
+        maximum_finalized_height: u32,
+    ) -> Result<AtomicWorkerReply<Option<TransparentUtxo>>, AtomicWorkerError> {
+        let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
+        self.admit(WorkerCommand::ReadLiveSlot {
+            address_key: *address_key,
+            logical_slot,
+            maximum_finalized_height,
+            reply,
+        })?;
+        Ok(AtomicWorkerReply {
+            response,
+            shared: Arc::clone(&self.shared),
+            consumed: false,
+            terminal_on_abandonment: false,
+        })
+    }
+
     fn try_read_history(
         &self,
         address: StandardAddress,
@@ -187,7 +351,7 @@ impl AtomicWorkerHandle {
         &self,
         address: StandardAddress,
         event: UtxoEvent,
-    ) -> Result<AtomicWorkerReply<FixedEventHistory>, AtomicWorkerError> {
+    ) -> Result<AtomicWorkerReply<AppendResult>, AtomicWorkerError> {
         let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
         self.admit(WorkerCommand::Append {
             address,
@@ -326,6 +490,59 @@ struct AtomicWorkerSnapshot {
     fault: Option<WorkerFault>,
 }
 
+/// Aggregate append disposition retained only for the qualification facade.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicQualificationAppendDisposition {
+    Inserted,
+    ExactReplay,
+}
+
+/// Identifier-free append outcome retained only for the qualification facade.
+#[cfg(feature = "corpus-zaino")]
+pub(crate) struct AtomicQualificationAppendResult {
+    pub(crate) disposition: AtomicQualificationAppendDisposition,
+    pub(crate) history: Vec<Option<UtxoEvent>>,
+}
+
+/// Aggregate stopped-worker state exposed only to the qualification facade.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomicQualificationSnapshot {
+    pub(crate) queue_capacity: usize,
+    pub(crate) queued: usize,
+    pub(crate) in_flight: usize,
+    pub(crate) queue_high_water: usize,
+    pub(crate) accepted: u64,
+    pub(crate) completed: u64,
+    pub(crate) failed: u64,
+    pub(crate) full_rejected: u64,
+    pub(crate) not_running_rejected: u64,
+    pub(crate) reply_delivery_failed: u64,
+    pub(crate) stopped: bool,
+    pub(crate) faulted: bool,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl AtomicQualificationSnapshot {
+    const fn from_snapshot(snapshot: AtomicWorkerSnapshot) -> Self {
+        Self {
+            queue_capacity: snapshot.queue_capacity,
+            queued: snapshot.queued,
+            in_flight: snapshot.in_flight,
+            queue_high_water: snapshot.queue_high_water,
+            accepted: snapshot.accepted,
+            completed: snapshot.completed,
+            failed: snapshot.failed,
+            full_rejected: snapshot.full_rejected,
+            not_running_rejected: snapshot.not_running_rejected,
+            reply_delivery_failed: snapshot.reply_delivery_failed,
+            stopped: matches!(snapshot.lifecycle, WorkerLifecycle::Stopped),
+            faulted: snapshot.fault.is_some(),
+        }
+    }
+}
+
 impl AtomicWorkerSnapshot {
     const fn from_state(state: &WorkerState) -> Self {
         Self {
@@ -419,6 +636,12 @@ fn lock_state(shared: &WorkerShared) -> MutexGuard<'_, WorkerState> {
 }
 
 enum WorkerCommand {
+    ReadLiveSlot {
+        address_key: AddressKey,
+        logical_slot: usize,
+        maximum_finalized_height: u32,
+        reply: SyncSender<Result<Option<TransparentUtxo>, AtomicWorkerError>>,
+    },
     ReadHistory {
         address: StandardAddress,
         reply: SyncSender<Result<FixedEventHistory, AtomicWorkerError>>,
@@ -426,7 +649,7 @@ enum WorkerCommand {
     Append {
         address: StandardAddress,
         event: UtxoEvent,
-        reply: SyncSender<Result<FixedEventHistory, AtomicWorkerError>>,
+        reply: SyncSender<Result<AppendResult, AtomicWorkerError>>,
     },
     Shutdown {
         reply: SyncSender<()>,
@@ -487,6 +710,18 @@ where
             }
         };
         match command {
+            WorkerCommand::ReadLiveSlot {
+                address_key,
+                logical_slot,
+                maximum_finalized_height,
+                reply,
+            } => {
+                mark_dequeued(shared);
+                let result = execute_command(executor, shared, |executor| {
+                    executor.read_live_slot(&address_key, logical_slot, maximum_finalized_height)
+                });
+                send_reply(reply, result);
+            }
             WorkerCommand::ReadHistory { address, reply } => {
                 mark_dequeued(shared);
                 let result =
@@ -499,9 +734,8 @@ where
                 reply,
             } => {
                 mark_dequeued(shared);
-                let result = execute_command(executor, shared, |executor| {
-                    executor.append(address, event).map(|result| result.history)
-                });
+                let result =
+                    execute_command(executor, shared, |executor| executor.append(address, event));
                 send_reply(reply, result);
             }
             WorkerCommand::Shutdown { reply } => {
@@ -621,6 +855,10 @@ fn increment_reply_delivery_failed(shared: &WorkerShared) {
 fn drain_failed_commands(receiver: &Receiver<WorkerCommand>, shared: &WorkerShared) {
     loop {
         match receiver.try_recv() {
+            Ok(WorkerCommand::ReadLiveSlot { reply, .. }) => {
+                resolve_queued_failure(shared);
+                send_reply(reply, Err(AtomicWorkerError::FailedClosed));
+            }
             Ok(WorkerCommand::ReadHistory { reply, .. }) => {
                 resolve_queued_failure(shared);
                 send_reply(reply, Err(AtomicWorkerError::FailedClosed));
@@ -660,10 +898,102 @@ enum WorkerExit {
     Panicked,
 }
 
+/// Identifier-free queue-bound validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicQueueCapacityError {
+    Invalid,
+}
+
+impl fmt::Display for AtomicQueueCapacityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid => write!(
+                f,
+                "atomic worker queue capacity must be in 1..={MAX_WORKER_QUEUE_CAPACITY}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AtomicQueueCapacityError {}
+
+/// Coarse typed-worker construction failure for the offline owner.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicWorkerBuildError {
+    #[cfg(not(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    TypedBackendUnavailable,
+    ConstructionFailed,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl fmt::Display for AtomicWorkerBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(not(all(
+                feature = "rostl-experimental",
+                target_os = "linux",
+                target_arch = "x86_64"
+            )))]
+            Self::TypedBackendUnavailable => {
+                f.write_str("typed atomic worker backend is unavailable")
+            }
+            Self::ConstructionFailed => f.write_str("typed atomic worker construction failed"),
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::error::Error for AtomicWorkerBuildError {}
+
+/// Coarse identifier-free outcome from one typed qualification command.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicQualificationCommandError {
+    QueueFull,
+    NotRunning,
+    CommandRejected,
+    FailedClosed,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl AtomicQualificationCommandError {
+    fn from_worker(error: AtomicWorkerError) -> Self {
+        match error {
+            AtomicWorkerError::QueueFull => Self::QueueFull,
+            AtomicWorkerError::NotRunning => Self::NotRunning,
+            AtomicWorkerError::CommandRejected => Self::CommandRejected,
+            AtomicWorkerError::ThreadSpawn(_)
+            | AtomicWorkerError::WorkerDisconnected
+            | AtomicWorkerError::AcceptedOutcomeIndeterminate
+            | AtomicWorkerError::FailedClosed
+            | AtomicWorkerError::WorkerPanicked => Self::FailedClosed,
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl fmt::Display for AtomicQualificationCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueFull => f.write_str("typed qualification worker queue is full"),
+            Self::NotRunning => f.write_str("typed qualification worker is not running"),
+            Self::CommandRejected => f.write_str("typed qualification command was rejected"),
+            Self::FailedClosed => f.write_str("typed qualification worker is failed closed"),
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::error::Error for AtomicQualificationCommandError {}
+
 /// Identifier-free failure from worker startup, admission, execution, or join.
 #[derive(Debug)]
 enum AtomicWorkerError {
-    InvalidQueueCapacity,
     ThreadSpawn(io::Error),
     QueueFull,
     NotRunning,
@@ -676,13 +1006,24 @@ enum AtomicWorkerError {
     WorkerPanicked,
 }
 
+/// Identifier-free projection-to-worker boundary failure.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomicProjectionSinkError;
+
+#[cfg(feature = "corpus-zaino")]
+impl fmt::Display for AtomicProjectionSinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("projection event mutation failed")
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl std::error::Error for AtomicProjectionSinkError {}
+
 impl fmt::Display for AtomicWorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidQueueCapacity => write!(
-                f,
-                "atomic worker queue capacity must be in 1..={MAX_WORKER_QUEUE_CAPACITY}"
-            ),
             Self::ThreadSpawn(_) => f.write_str("atomic worker could not start"),
             Self::QueueFull => f.write_str("atomic worker queue is full"),
             Self::NotRunning => f.write_str("atomic worker is not accepting work"),
@@ -701,8 +1042,7 @@ impl std::error::Error for AtomicWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ThreadSpawn(error) => Some(error),
-            Self::InvalidQueueCapacity
-            | Self::QueueFull
+            Self::QueueFull
             | Self::NotRunning
             | Self::WorkerDisconnected
             | Self::AcceptedOutcomeIndeterminate
@@ -932,6 +1272,14 @@ mod tests {
         directory_control: Option<ReadControl>,
         event_write_control: Option<WriteControl>,
     ) -> TestResult<(TestExecutor, ObservationLog)> {
+        executor_with_max_events(directory_control, event_write_control, MAX_EVENTS)
+    }
+
+    fn executor_with_max_events(
+        directory_control: Option<ReadControl>,
+        event_write_control: Option<WriteControl>,
+        max_events_per_address: u64,
+    ) -> TestResult<(TestExecutor, ObservationLog)> {
         let observation = Arc::new(Mutex::new(Vec::new()));
         let directory = TestTable::new(
             TableKind::Directory,
@@ -951,10 +1299,21 @@ mod tests {
             LayoutIdentity::new(LayoutNetwork::Mainnet, 1, 7, 11, [0x5a; 32])?,
             DirectoryTableConfiguration::new(8, 6)?,
             EventTableConfiguration::new(16, 12)?,
-            MAX_EVENTS,
+            max_events_per_address,
         )?;
         Ok((
             ExclusiveTwoTableExecutor::new(layout, directory, events)?,
+            observation,
+        ))
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn worker_with_max_events(
+        max_events_per_address: u64,
+    ) -> TestResult<(AtomicWorker, ObservationLog)> {
+        let (executor, observation) = executor_with_max_events(None, None, max_events_per_address)?;
+        Ok((
+            AtomicWorker::spawn(executor, queue_capacity(1))?,
             observation,
         ))
     }
@@ -1002,6 +1361,150 @@ mod tests {
             UtxoScriptClass::PayToPublicKeyHash,
             address.hash,
         )
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn serving_slot_uses_one_complete_worker_command_and_unit_errors() -> TestResult<()> {
+        let (worker, observation) = worker_with_max_events(MAX_EVENTS)?;
+        let owner = address(0x28);
+        let created = event(owner, 0x48);
+        worker.qualification_append_typed(owner, created)?;
+        let address_key = derive_standard_address_key(LayoutNetwork::Mainnet, 1, owner);
+        lock_test(&observation).clear();
+
+        let selected = worker
+            .serving_read_slot(&address_key, 0, 172)
+            .map_err(|()| "valid serving read failed")?
+            .ok_or("created output must be live")?;
+        assert_eq!(selected.txid(), &[0x48; TXID_BYTES]);
+        assert_eq!(
+            lock_test(&observation)
+                .iter()
+                .filter(|call| call.operation == OperationKind::Read)
+                .count(),
+            DIRECTORY_PROBES
+                + usize::try_from(MAX_EVENTS).expect("test maximum fits usize") * EVENT_PROBES
+        );
+        assert_eq!(
+            worker.serving_read_slot(
+                &address_key,
+                usize::try_from(MAX_EVENTS).expect("test maximum fits usize"),
+                172,
+            ),
+            Err(())
+        );
+        assert!(worker
+            .serving_read_slot(&address_key, 0, 172)
+            .map_err(|()| "worker did not recover from invalid public slot")?
+            .is_some());
+        worker.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn projection_sink_waits_for_the_worker_mutation() -> TestResult<()> {
+        let (mut worker, observation) = worker(1, None)?;
+        let owner = StandardAddress::new(StandardScriptKind::PayToScriptHash, [0x2a; 20]);
+        let projected = UtxoEvent::created(
+            [0x4a; TXID_BYTES],
+            14,
+            15,
+            16,
+            UtxoScriptClass::PayToScriptHash,
+            owner.hash,
+        );
+
+        ProjectionEventSink::append_and_wait(&mut worker, projected)?;
+
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.accepted, 1);
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.in_flight, 0);
+        assert_eq!(
+            lock_test(&observation)
+                .iter()
+                .filter(|call| call.operation == OperationKind::Write)
+                .count(),
+            2
+        );
+        let history = worker.handle().try_read_history(owner)?.wait()?;
+        assert_eq!(history.events()[0], Some(projected));
+        worker.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn projection_sink_consumes_terminal_mutation_failure() -> TestResult<()> {
+        let control = WriteControl {
+            call: 1,
+            outcome: WriteOutcome::MutateThenFail,
+        };
+        let (mut worker, observation) = worker_with_event_write(control)?;
+        let owner = address(0x2b);
+
+        assert_eq!(
+            ProjectionEventSink::append_and_wait(&mut worker, event(owner, 0x4b)),
+            Err(AtomicProjectionSinkError)
+        );
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.fault, Some(WorkerFault::Terminal));
+        assert_eq!(snapshot.reply_delivery_failed, 0);
+        let calls_after_failure = lock_test(&observation).len();
+        assert!(matches!(
+            worker.handle().try_read_history(owner),
+            Err(AtomicWorkerError::FailedClosed)
+        ));
+        assert_eq!(lock_test(&observation).len(), calls_after_failure);
+        worker.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn projection_sink_rejects_nonstandard_events_before_admission() -> TestResult<()> {
+        let (mut worker, observation) = worker(1, None)?;
+        let event = UtxoEvent::created(
+            [0x6b; TXID_BYTES],
+            11,
+            12,
+            13,
+            UtxoScriptClass::NonStandard,
+            [0x7c; 20],
+        );
+
+        assert_eq!(
+            ProjectionEventSink::append_and_wait(&mut worker, event),
+            Err(AtomicProjectionSinkError)
+        );
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.accepted, 0);
+        assert_eq!(snapshot.completed, 0);
+        assert_eq!(snapshot.failed, 0);
+        assert!(lock_test(&observation).is_empty());
+        worker.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn projection_sink_errors_and_debug_output_are_identifier_free() -> TestResult<()> {
+        let (worker, _) = worker(1, None)?;
+
+        assert_eq!(
+            AtomicProjectionSinkError.to_string(),
+            "projection event mutation failed"
+        );
+        assert_eq!(
+            format!("{AtomicProjectionSinkError:?}"),
+            "AtomicProjectionSinkError"
+        );
+        assert_eq!(format!("{worker:?}"), "AtomicWorker { ..REDACTED.. }");
+        worker.shutdown()?;
+        Ok(())
     }
 
     fn wait_for(
@@ -1176,6 +1679,76 @@ mod tests {
         assert_eq!(snapshot.completed, 1);
         assert_eq!(snapshot.failed, 1);
         assert_accounting(snapshot);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn typed_qualification_rejection_keeps_worker_usable() -> TestResult<()> {
+        let (worker, _) = worker(1, None)?;
+        let requested = address(0x53);
+        let actual_owner = address(0x54);
+
+        assert!(matches!(
+            worker.qualification_append_typed(requested, event(actual_owner, 0x73)),
+            Err(AtomicQualificationCommandError::CommandRejected)
+        ));
+        let history = worker.qualification_read_history_typed(requested)?;
+        assert_eq!(history.len(), usize::try_from(MAX_EVENTS)?);
+        assert!(history.iter().all(Option::is_none));
+
+        let snapshot = worker.shutdown()?;
+        assert_eq!(snapshot.lifecycle, WorkerLifecycle::Stopped);
+        assert_eq!(snapshot.fault, None);
+        assert_eq!(snapshot.accepted, 2);
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(snapshot.not_running_rejected, 0);
+        assert_accounting(snapshot);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn typed_qualification_capacity_failure_stays_failed_closed_without_more_io() -> TestResult<()>
+    {
+        let (worker, observation) = worker_with_max_events(1)?;
+        let owner = address(0x55);
+
+        let first = worker.qualification_append_typed(owner, event(owner, 0x75))?;
+        assert_eq!(
+            first.disposition,
+            AtomicQualificationAppendDisposition::Inserted
+        );
+        assert!(matches!(
+            worker.qualification_append_typed(owner, event(owner, 0x76)),
+            Err(AtomicQualificationCommandError::FailedClosed)
+        ));
+        let executor_calls_after_failure = lock_test(&observation).len();
+
+        assert!(matches!(
+            worker.qualification_read_history_typed(owner),
+            Err(AtomicQualificationCommandError::FailedClosed)
+        ));
+        assert!(matches!(
+            worker.qualification_append_typed(owner, event(owner, 0x77)),
+            Err(AtomicQualificationCommandError::FailedClosed)
+        ));
+        assert_eq!(lock_test(&observation).len(), executor_calls_after_failure);
+
+        let snapshot = worker
+            .qualification_shutdown()
+            .expect("faulted qualification worker must shut down cleanly");
+        assert!(snapshot.stopped);
+        assert!(snapshot.faulted);
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.in_flight, 0);
+        assert_eq!(snapshot.accepted, 2);
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(snapshot.not_running_rejected, 2);
+        assert_eq!(snapshot.full_rejected, 0);
+        assert_eq!(snapshot.reply_delivery_failed, 0);
         Ok(())
     }
 
@@ -1510,11 +2083,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert!(matches!(
             AtomicQueueCapacity::try_new(0),
-            Err(AtomicWorkerError::InvalidQueueCapacity)
+            Err(AtomicQueueCapacityError::Invalid)
         ));
         assert!(matches!(
             AtomicQueueCapacity::try_new(MAX_WORKER_QUEUE_CAPACITY + 1),
-            Err(AtomicWorkerError::InvalidQueueCapacity)
+            Err(AtomicQueueCapacityError::Invalid)
         ));
 
         let (worker, _) = worker(1, None)?;
