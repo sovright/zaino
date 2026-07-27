@@ -18,8 +18,8 @@ log, not a change to the normative
 
 ## Current slice
 
-Implementation and local verification are in progress for a deterministic
-insertion-budget analyzer. The intended qualification:
+This slice implemented and locally verified a deterministic insertion-budget
+analyzer. The qualification:
 
 1. verifies the existing capture and sizing inputs;
 2. replays the exact current corpus through the production standard-address
@@ -35,10 +35,13 @@ distribution. This first slice deliberately does not search doubled or
 quadrupled capacities or eight- and sixteen-probe alternatives; a current-layout
 miss will determine the scope of that follow-up instead.
 
-No remote qualification artifact or Gate 1 result has been published for this
-slice yet. Until the remote replay completes and its artifact passes semantic
-and digest read-back validation, this is implementation work rather than
-evidence.
+The source-bound mainnet replay subsequently completed at executed source
+`a4c5599260a0e2dd3ba15526117bec06743e6227`. It atomically published a valid
+three-file artifact, passed semantic and digest read-back validation, and
+returned the documented unsuccessful status for a typed NO-GO. The
+[dated evidence log](oram-gate1-mainnet-insertion-bound-log-2026-07-27.md)
+records the exact result and links the
+[preserved bundle](../evidence/oram/gate1/insertion-mainnet-a4c55992-h3425046-p4-s8-b0/).
 
 ## Claim boundary
 
@@ -58,9 +61,14 @@ recorded deterministic schedules, the current-capacity four-probe layout, and th
 selected diagnostic failure budget. Gate 1 remains **IN PROGRESS** until its
 remaining growth, backend, and target-hardware evidence is available.
 
-## Next evidence step
+## Completed evidence and next step
 
-Finish local review and verification, run the analyzer against the retained
-full-Mainnet capture source, publish and validate the resulting artifact, and
-then update the kill-gate report with the measured result and its exact claim
-boundary.
+The completed run is a deterministic sampled NO-GO only for the current
+1x-capacity, four-probe layout under eight fixed schedules and a zero-basis-point
+sampled failure budget. It does not establish a probabilistic or worst-case
+bound, and it does not close Gate 1.
+
+The next evidence step is to test a remediated insertion design or explicit
+alternative profiles, then complete the still-open growth, backend-calibration,
+failure-bound, and target-TDX RSS/headroom work recorded in the
+[kill-gate report](oram-phase0-kill-gates-2026-07-23.md).

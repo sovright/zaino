@@ -1,0 +1,5 @@
+{
+  "schema": "zaino-oram-source-bound-insertion-budget-provenance-v1",
+  "runner_version": "0.1.0",
+  "insertion_bound_blake2s256": "2577a0e26d0ab024b269fa793f561e5bd068d968fa68d3399ce9d0aa343bf4c9"
+}
