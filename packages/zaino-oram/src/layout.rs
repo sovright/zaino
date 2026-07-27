@@ -44,6 +44,8 @@ const PROFILE_BINDING_DOMAIN: &[u8] = b"zaino-oram-layout-binding-v1";
 const MINIMUM_TABLE_CAPACITY: u64 = 2;
 const MAXIMUM_TABLE_CAPACITY: u64 = 1_u64 << 31;
 const MAXIMUM_PROBE_COUNT: usize = 64;
+#[cfg(feature = "corpus-zaino")]
+const MAXIMUM_RUNTIME_PROBE_COUNT: usize = 16;
 
 /// Network domain included in canonical address keys and probe plans.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64,7 +66,7 @@ impl LayoutNetwork {
 }
 
 /// Standard transparent address identity before canonical key derivation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct StandardAddress {
     kind: StandardScriptKind,
     hash: [u8; 20],
@@ -92,7 +94,7 @@ impl fmt::Debug for StandardAddress {
 }
 
 /// Supported standard transparent locking-script class.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum StandardScriptKind {
     PayToPublicKeyHash,
     PayToScriptHash,
@@ -419,6 +421,7 @@ pub(super) enum LayoutConfigError {
     ZeroProbeSeed,
     ZeroProbeCount { table: TableKind },
     ProbeCountAboveResearchLimit { table: TableKind },
+    RuntimeProbeCountAboveQualificationLimit { table: TableKind },
     CapacityBelowMinimum { table: TableKind },
     CapacityOutsideSlotDomain { table: TableKind },
     CapacityNotPowerOfTwo { table: TableKind },
@@ -443,6 +446,10 @@ impl fmt::Display for LayoutConfigError {
             Self::ProbeCountAboveResearchLimit { table } => write!(
                 f,
                 "{table:?} table probe count exceeds the research safety bound"
+            ),
+            Self::RuntimeProbeCountAboveQualificationLimit { table } => write!(
+                f,
+                "{table:?} table runtime probe count exceeds the qualification limit"
             ),
             Self::CapacityBelowMinimum { table } => {
                 write!(f, "{table:?} table capacity is below the backend minimum")
@@ -494,9 +501,10 @@ fn validate_max_events_per_address(
 
 /// Identifier-free failure to prepare a logical probe plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayoutPlanError {
+pub(super) enum LayoutPlanError {
     EventOrdinalOutOfRange,
     DirectoryProfileMismatch,
+    DirectoryIndexOutsideProbeSet,
     ProbePlanProfileMismatch,
     BackendIndexOutsideHostDomain,
 }
@@ -509,6 +517,9 @@ impl fmt::Display for LayoutPlanError {
             }
             Self::DirectoryProfileMismatch => {
                 f.write_str("directory witness belongs to a different layout profile")
+            }
+            Self::DirectoryIndexOutsideProbeSet => {
+                f.write_str("directory index is outside the keyed probe set")
             }
             Self::ProbePlanProfileMismatch => {
                 f.write_str("probe plan belongs to a different layout profile")
@@ -848,6 +859,152 @@ struct ScanWork {
 struct ScanOutcome<T> {
     result: Result<T, LayoutCorruption>,
     work: ScanWork,
+}
+
+/// Fixed-capacity backend indices for one runtime qualification probe.
+#[cfg(feature = "corpus-zaino")]
+pub(super) struct RuntimeProbeIndices {
+    indices: [usize; MAXIMUM_RUNTIME_PROBE_COUNT],
+    len: usize,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl RuntimeProbeIndices {
+    pub(super) fn as_slice(&self) -> &[usize] {
+        &self.indices[..self.len]
+    }
+}
+
+/// Directory probes retaining the authority to bind one selected probe slot.
+#[cfg(feature = "corpus-zaino")]
+pub(super) struct RuntimeDirectoryProbeIndices(RuntimeProbeIndices);
+
+#[cfg(feature = "corpus-zaino")]
+impl RuntimeDirectoryProbeIndices {
+    pub(super) fn as_slice(&self) -> &[usize] {
+        self.0.as_slice()
+    }
+
+    pub(super) fn bind(
+        &self,
+        directory_index: usize,
+    ) -> Result<RuntimeBoundDirectorySlot, LayoutPlanError> {
+        if !self.as_slice().contains(&directory_index) {
+            return Err(LayoutPlanError::DirectoryIndexOutsideProbeSet);
+        }
+        let slot = u32::try_from(directory_index)
+            .map_err(|_| LayoutPlanError::BackendIndexOutsideHostDomain)?;
+        Ok(RuntimeBoundDirectorySlot(slot))
+    }
+}
+
+/// Directory slot whose membership in an address probe set was checked once.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct RuntimeBoundDirectorySlot(u32);
+
+/// Runtime-shaped keyed planner used only by corpus qualification analysis.
+#[cfg(feature = "corpus-zaino")]
+pub(super) struct RuntimeProbeLayout {
+    identity: LayoutIdentity,
+    directory: TableShape,
+    event: TableShape,
+    max_events_per_address: u32,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl RuntimeProbeLayout {
+    pub(super) fn new(
+        identity: LayoutIdentity,
+        allocation: FixedLayoutAllocation,
+        directory_probe_count: usize,
+        event_probe_count: usize,
+    ) -> Result<Self, LayoutConfigError> {
+        validate_runtime_probe_count(TableKind::Directory, directory_probe_count)?;
+        validate_runtime_probe_count(TableKind::Event, event_probe_count)?;
+        let directory_allocation = allocation.directory();
+        let event_allocation = allocation.event();
+        Ok(Self {
+            identity,
+            directory: TableShape::new(
+                TableKind::Directory,
+                u64::from(directory_allocation.capacity()),
+                u64::from(directory_allocation.admission_limit()),
+                directory_probe_count,
+            )?,
+            event: TableShape::new(
+                TableKind::Event,
+                u64::from(event_allocation.capacity()),
+                u64::from(event_allocation.admission_limit()),
+                event_probe_count,
+            )?,
+            max_events_per_address: allocation.max_events_per_address(),
+        })
+    }
+
+    pub(super) fn directory_probe_indices(
+        &self,
+        address: StandardAddress,
+    ) -> Result<RuntimeDirectoryProbeIndices, LayoutPlanError> {
+        let address_key = derive_standard_address_key(
+            self.identity.network,
+            self.identity.schema_version,
+            address,
+        );
+        self.probe_indices(TableKind::Directory, address_key.as_bytes())
+            .map(RuntimeDirectoryProbeIndices)
+    }
+
+    pub(super) fn event_probe_indices(
+        &self,
+        directory: RuntimeBoundDirectorySlot,
+        ordinal: u64,
+    ) -> Result<RuntimeProbeIndices, LayoutPlanError> {
+        let ordinal =
+            u32::try_from(ordinal).map_err(|_| LayoutPlanError::EventOrdinalOutOfRange)?;
+        if ordinal >= self.max_events_per_address {
+            return Err(LayoutPlanError::EventOrdinalOutOfRange);
+        }
+        let mut logical_identity = [0; 8];
+        logical_identity[..4].copy_from_slice(&directory.0.to_le_bytes());
+        logical_identity[4..].copy_from_slice(&ordinal.to_le_bytes());
+        self.probe_indices(TableKind::Event, &logical_identity)
+    }
+
+    fn probe_indices(
+        &self,
+        table: TableKind,
+        logical_identity: &[u8],
+    ) -> Result<RuntimeProbeIndices, LayoutPlanError> {
+        let configuration = table_shape(self.directory, self.event, table);
+        let mut sequence = probe_sequence(
+            &self.identity,
+            self.directory,
+            self.event,
+            self.max_events_per_address,
+            table,
+            logical_identity,
+        );
+        let len = usize::try_from(configuration.probe_count)
+            .map_err(|_| LayoutPlanError::BackendIndexOutsideHostDomain)?;
+        let mut indices = [0; MAXIMUM_RUNTIME_PROBE_COUNT];
+        for destination in indices.iter_mut().take(len) {
+            *destination = usize::try_from(sequence.next_slot())
+                .map_err(|_| LayoutPlanError::BackendIndexOutsideHostDomain)?;
+        }
+        Ok(RuntimeProbeIndices { indices, len })
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+fn validate_runtime_probe_count(
+    table: TableKind,
+    probe_count: usize,
+) -> Result<(), LayoutConfigError> {
+    if probe_count > MAXIMUM_RUNTIME_PROBE_COUNT {
+        return Err(LayoutConfigError::RuntimeProbeCountAboveQualificationLimit { table });
+    }
+    Ok(())
 }
 
 /// Pure keyed planner for a two-table immutable layout generation.
@@ -1461,71 +1618,35 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
         table: TableKind,
         logical_identity: &[u8],
     ) -> [u32; PROBES] {
-        let configuration = self.table(table);
-        let digest = self.probe_digest(table, logical_identity);
-        let start =
-            u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) & configuration.mask();
-        let step = (u32::from_le_bytes([digest[4], digest[5], digest[6], digest[7]])
-            & configuration.mask())
-            | 1;
-        let mut next = start;
-        std::array::from_fn(|_| {
-            let current = next;
-            next = next.wrapping_add(step) & configuration.mask();
-            current
-        })
+        let mut sequence = probe_sequence(
+            &self.identity,
+            self.directory.0,
+            self.event.0,
+            self.max_events_per_address,
+            table,
+            logical_identity,
+        );
+        std::array::from_fn(|_| sequence.next_slot())
     }
 
     fn probe_digest(&self, table: TableKind, logical_identity: &[u8]) -> [u8; 32] {
-        let mut mac = self.probe_mac();
-        Mac::update(&mut mac, PROBE_DOMAIN);
-        self.update_profile_mac(&mut mac);
-        Mac::update(&mut mac, &[table.tag()]);
-        Mac::update(&mut mac, logical_identity);
-        let digest = Mac::finalize(mac).into_bytes();
-        let mut bytes = [0; 32];
-        bytes.copy_from_slice(&digest);
-        bytes
+        probe_digest(
+            &self.identity,
+            self.directory.0,
+            self.event.0,
+            self.max_events_per_address,
+            table,
+            logical_identity,
+        )
     }
 
     fn profile_binding(&self) -> [u8; 32] {
-        let mut mac = self.probe_mac();
-        Mac::update(&mut mac, PROFILE_BINDING_DOMAIN);
-        self.update_profile_mac(&mut mac);
-        let digest = Mac::finalize(mac).into_bytes();
-        let mut bytes = [0; 32];
-        bytes.copy_from_slice(&digest);
-        bytes
-    }
-
-    fn update_profile_mac(&self, mac: &mut Blake2sMac256) {
-        Mac::update(mac, &[LAYOUT_FORMAT_VERSION]);
-        Mac::update(mac, &[self.identity.network.tag()]);
-        Mac::update(mac, &self.identity.schema_version.to_le_bytes());
-        Mac::update(mac, &self.identity.key_epoch.get().to_le_bytes());
-        Mac::update(mac, &self.identity.generation.get().to_le_bytes());
-        self.update_table_mac(mac, TableKind::Directory, self.directory.0);
-        self.update_table_mac(mac, TableKind::Event, self.event.0);
-        Mac::update(mac, &self.max_events_per_address.to_le_bytes());
-    }
-
-    fn probe_mac(&self) -> Blake2sMac256 {
-        let key = Key::<Blake2sMac256>::from(self.identity.seed.0);
-        <Blake2sMac256 as KeyInit>::new(&key)
-    }
-
-    fn update_table_mac(&self, mac: &mut Blake2sMac256, kind: TableKind, table: TableShape) {
-        Mac::update(mac, &[kind.tag()]);
-        Mac::update(mac, &table.capacity.to_le_bytes());
-        Mac::update(mac, &table.admission_limit.to_le_bytes());
-        Mac::update(mac, &table.probe_count.to_le_bytes());
-    }
-
-    const fn table(&self, table: TableKind) -> TableShape {
-        match table {
-            TableKind::Directory => self.directory.0,
-            TableKind::Event => self.event.0,
-        }
+        profile_binding(
+            &self.identity,
+            self.directory.0,
+            self.event.0,
+            self.max_events_per_address,
+        )
     }
 
     fn synthetic_address_key(&self) -> AddressKey {
@@ -1533,6 +1654,119 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
             StandardScriptKind::PayToPublicKeyHash,
             [0; 20],
         ))
+    }
+}
+
+struct ProbeSequence {
+    next: u32,
+    step: u32,
+    mask: u32,
+}
+
+impl ProbeSequence {
+    fn next_slot(&mut self) -> u32 {
+        let current = self.next;
+        self.next = self.next.wrapping_add(self.step) & self.mask;
+        current
+    }
+}
+
+fn probe_sequence(
+    identity: &LayoutIdentity,
+    directory: TableShape,
+    event: TableShape,
+    max_events_per_address: u32,
+    table: TableKind,
+    logical_identity: &[u8],
+) -> ProbeSequence {
+    let configuration = table_shape(directory, event, table);
+    let digest = probe_digest(
+        identity,
+        directory,
+        event,
+        max_events_per_address,
+        table,
+        logical_identity,
+    );
+    let start =
+        u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) & configuration.mask();
+    let step = (u32::from_le_bytes([digest[4], digest[5], digest[6], digest[7]])
+        & configuration.mask())
+        | 1;
+    ProbeSequence {
+        next: start,
+        step,
+        mask: configuration.mask(),
+    }
+}
+
+fn probe_digest(
+    identity: &LayoutIdentity,
+    directory: TableShape,
+    event: TableShape,
+    max_events_per_address: u32,
+    table: TableKind,
+    logical_identity: &[u8],
+) -> [u8; 32] {
+    let mut mac = probe_mac(identity);
+    Mac::update(&mut mac, PROBE_DOMAIN);
+    update_profile_mac(&mut mac, identity, directory, event, max_events_per_address);
+    Mac::update(&mut mac, &[table.tag()]);
+    Mac::update(&mut mac, logical_identity);
+    let digest = Mac::finalize(mac).into_bytes();
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+fn profile_binding(
+    identity: &LayoutIdentity,
+    directory: TableShape,
+    event: TableShape,
+    max_events_per_address: u32,
+) -> [u8; 32] {
+    let mut mac = probe_mac(identity);
+    Mac::update(&mut mac, PROFILE_BINDING_DOMAIN);
+    update_profile_mac(&mut mac, identity, directory, event, max_events_per_address);
+    let digest = Mac::finalize(mac).into_bytes();
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+fn update_profile_mac(
+    mac: &mut Blake2sMac256,
+    identity: &LayoutIdentity,
+    directory: TableShape,
+    event: TableShape,
+    max_events_per_address: u32,
+) {
+    Mac::update(mac, &[LAYOUT_FORMAT_VERSION]);
+    Mac::update(mac, &[identity.network.tag()]);
+    Mac::update(mac, &identity.schema_version.to_le_bytes());
+    Mac::update(mac, &identity.key_epoch.get().to_le_bytes());
+    Mac::update(mac, &identity.generation.get().to_le_bytes());
+    update_table_mac(mac, TableKind::Directory, directory);
+    update_table_mac(mac, TableKind::Event, event);
+    Mac::update(mac, &max_events_per_address.to_le_bytes());
+}
+
+fn probe_mac(identity: &LayoutIdentity) -> Blake2sMac256 {
+    let key = Key::<Blake2sMac256>::from(identity.seed.0);
+    <Blake2sMac256 as KeyInit>::new(&key)
+}
+
+fn update_table_mac(mac: &mut Blake2sMac256, kind: TableKind, table: TableShape) {
+    Mac::update(mac, &[kind.tag()]);
+    Mac::update(mac, &table.capacity.to_le_bytes());
+    Mac::update(mac, &table.admission_limit.to_le_bytes());
+    Mac::update(mac, &table.probe_count.to_le_bytes());
+}
+
+const fn table_shape(directory: TableShape, event: TableShape, table: TableKind) -> TableShape {
+    match table {
+        TableKind::Directory => directory,
+        TableKind::Event => event,
     }
 }
 
@@ -1609,6 +1843,94 @@ mod tests {
         assert_eq!(allocation.event(), layout.event.0.allocation());
         assert_eq!(allocation.max_events_per_address(), 8);
         assert_eq!(layout.max_events_per_address, 8);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn assert_runtime_probe_parity<const PROBES: usize>() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixed = FixedProbeLayout::<PROBES, PROBES>::new(
+            LayoutIdentity::new(LayoutNetwork::Mainnet, 1, 7, 11, [0x5a; 32])?,
+            DirectoryTableConfiguration::<PROBES>::new(32, 28)?,
+            EventTableConfiguration::<PROBES>::new(64, 56)?,
+            8,
+        )?;
+        let runtime = RuntimeProbeLayout::new(
+            LayoutIdentity::new(LayoutNetwork::Mainnet, 1, 7, 11, [0x5a; 32])?,
+            FixedLayoutAllocation::new(32, 28, 64, 56, 8)?,
+            PROBES,
+            PROBES,
+        )?;
+
+        for address in [p2pkh(0x11), p2sh(0x22), p2pkh(0xff)] {
+            let expected_directory = fixed
+                .qualification_directory_probe_indices(address)
+                .expect("valid fixed qualification directory plan");
+            let actual_directory = runtime.directory_probe_indices(address)?;
+            assert_eq!(actual_directory.as_slice(), expected_directory.as_slice());
+
+            for directory_index in expected_directory {
+                let bound_directory = actual_directory.bind(directory_index)?;
+                for ordinal in [0, 3, 7] {
+                    let expected_event = fixed
+                        .qualification_event_probe_indices(address, directory_index, ordinal)
+                        .expect("valid fixed qualification event plan");
+                    let actual_event = runtime.event_probe_indices(bound_directory, ordinal)?;
+                    assert_eq!(actual_event.as_slice(), expected_event.as_slice());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn runtime_probes_match_fixed_qualification_helpers_at_supported_counts(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_runtime_probe_parity::<4>()?;
+        assert_runtime_probe_parity::<8>()?;
+        assert_runtime_probe_parity::<16>()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn runtime_directory_binding_rejects_non_probe_slots() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let runtime = RuntimeProbeLayout::new(
+            LayoutIdentity::new(LayoutNetwork::Mainnet, 1, 7, 11, [0x5a; 32])?,
+            FixedLayoutAllocation::new(32, 28, 64, 56, 8)?,
+            4,
+            4,
+        )?;
+        let probes = runtime.directory_probe_indices(p2pkh(0x42))?;
+
+        assert!(matches!(
+            probes.bind(usize::MAX),
+            Err(LayoutPlanError::DirectoryIndexOutsideProbeSet)
+        ));
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn runtime_probe_count_is_bounded_by_fixed_representation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let result = RuntimeProbeLayout::new(
+            LayoutIdentity::new(LayoutNetwork::Mainnet, 1, 7, 11, [0x5a; 32])?,
+            FixedLayoutAllocation::new(32, 28, 64, 56, 8)?,
+            MAXIMUM_RUNTIME_PROBE_COUNT + 1,
+            4,
+        );
+
+        assert!(matches!(
+            result,
+            Err(
+                LayoutConfigError::RuntimeProbeCountAboveQualificationLimit {
+                    table: TableKind::Directory
+                }
+            )
+        ));
         Ok(())
     }
 
