@@ -129,9 +129,9 @@
 //! The current logic recognises two layouts:
 //!
 //! - **Legacy v0 layout:** network directories `live/`, `test/`, `local/` containing LMDB
-//!   `data.mdb` + `lock.mdb`. This layout is still *detected* so that `spawn` can return a clear
-//!   error — v0 is no longer supported, so an on-disk v0 database is rejected rather than opened or
-//!   migrated. The operator must remove the directory and resync a v1 database.
+//!   `data.mdb` (`lock.mdb` is disposable). This layout is still *detected* so that `spawn` can
+//!   return a clear error — v0 is no longer supported, so an on-disk v0 database is rejected rather
+//!   than opened or migrated. The operator must remove the directory and resync a v1 database.
 //! - **Versioned v1+ layout:** network directories `mainnet/`, `testnet/`, `regtest/` containing
 //!   version subdirectories enumerated by `finalised_source::VERSION_DIRS` (e.g. `v1/`).
 //!
@@ -223,9 +223,10 @@ pub(crate) mod router;
 
 use capability::*;
 use finalised_source::{FinalisedSource, VERSION_DIRS};
+use futures::FutureExt as _;
 use migrations::MigrationManager;
 use reader::*;
-use router::Router;
+use router::{EphemeralReference, Router};
 use tracing::{info, instrument};
 use zebra_chain::parameters::NetworkKind;
 
@@ -240,8 +241,322 @@ use crate::{
     BlockHash, BlockMetadata, BlockWithMetadata, ChainWork, Height, IndexedBlock, StatusType,
 };
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    fs::{self, File, OpenOptions},
+    io,
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 use tokio::time::{interval, MissedTickBehavior};
+
+#[cfg(test)]
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
+    sync::{Mutex, OnceLock},
+};
+#[cfg(test)]
+use tokio::sync::Notify;
+
+const SCHEMA_ADMISSION_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const SCHEMA_ADMISSION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+fn schema_admission_lock_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| fs2::lock_contended_error().raw_os_error() == Some(code))
+}
+
+#[cfg(test)]
+#[test]
+fn fs2_contention_error_is_recognized() {
+    assert!(schema_admission_lock_contended(&fs2::lock_contended_error()));
+    assert!(!schema_admission_lock_contended(&io::Error::other(
+        "unrelated lock error"
+    )));
+}
+
+/// Cross-process ownership of one persistent finalised-state namespace.
+///
+/// The sidecar is operational coordination state, not part of the versioned LMDB schema. One
+/// process retains the exclusive lease for the full lifetime of its router. This is intentionally
+/// stricter than a schema-only lock: every normal Zaino instance can write chain data, so admitting
+/// multiple processes as nominal "readers" would still permit application-level concurrent writers.
+///
+/// The first release using this protocol must be deployed with the old process stopped, because
+/// binaries predating this lease do not participate in it.
+#[derive(Debug)]
+struct SchemaAdmissionGuard {
+    _file: File,
+}
+
+impl SchemaAdmissionGuard {
+    async fn acquire(config: &ChainIndexConfig) -> Result<Self, FinalisedStateError> {
+        let lock_path = Self::lock_path(config);
+        tokio::task::spawn_blocking(move || Self::acquire_blocking(&lock_path))
+            .await
+            .map_err(|error| {
+                FinalisedStateError::Custom(format!(
+                    "schema-admission lock task failed before startup: {error}"
+                ))
+            })?
+    }
+
+    fn lock_path(config: &ChainIndexConfig) -> PathBuf {
+        let namespace = match config.network.kind() {
+            NetworkKind::Mainnet => "mainnet",
+            NetworkKind::Testnet => "testnet",
+            NetworkKind::Regtest => "regtest",
+        };
+        config
+            .storage
+            .database
+            .path
+            .join(format!(".zaino-finalised-{namespace}.lock"))
+    }
+
+    fn acquire_blocking(lock_path: &Path) -> Result<Self, FinalisedStateError> {
+        if let Some(database_root) = lock_path.parent() {
+            fs::create_dir_all(database_root)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(Self { _file: file }),
+            Err(error) if schema_admission_lock_contended(&error) => {
+                #[cfg(test)]
+                notify_schema_admission_contended(lock_path);
+                info!(
+                    path = %lock_path.display(),
+                    timeout_seconds = SCHEMA_ADMISSION_LOCK_TIMEOUT.as_secs(),
+                    "waiting for finalised-schema admission ownership"
+                );
+            }
+            Err(error) => return Err(FinalisedStateError::IoError(error)),
+        }
+
+        let deadline = Instant::now() + SCHEMA_ADMISSION_LOCK_TIMEOUT;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(FinalisedStateError::IoError(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting {}s for schema-admission lock at {}; another Zaino process may still own the database",
+                        SCHEMA_ADMISSION_LOCK_TIMEOUT.as_secs(),
+                        lock_path.display()
+                    ),
+                )));
+            }
+
+            thread::sleep(SCHEMA_ADMISSION_LOCK_RETRY_INTERVAL.min(deadline - now));
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(error) if schema_admission_lock_contended(&error) => {}
+                Err(error) => return Err(FinalisedStateError::IoError(error)),
+            }
+        }
+    }
+}
+
+/// Keeps full ephemeral routing active until a schema migration has reached a safe terminal state.
+///
+/// If the migration future errors, panics, or is cancelled, `Drop` marks the persistent primary
+/// critical before releasing the full-mode ephemeral reference. Router lookups then remain closed
+/// even though ordinary routing masks are restored by the reference's own `Drop` implementation.
+struct SchemaMigrationRuntimeGuard<T>
+where
+    T: BlockchainSource + Send + Sync + 'static,
+{
+    router: Arc<Router<T>>,
+    _ephemeral_reference: EphemeralReference<T>,
+    completed: bool,
+}
+
+impl<T> SchemaMigrationRuntimeGuard<T>
+where
+    T: BlockchainSource + Send + Sync + 'static,
+{
+    fn new(router: Arc<Router<T>>, ephemeral_reference: EphemeralReference<T>) -> Self {
+        Self {
+            router,
+            _ephemeral_reference: ephemeral_reference,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl<T> Drop for SchemaMigrationRuntimeGuard<T>
+where
+    T: BlockchainSource + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        if !self.completed {
+            self.router.store_primary_status(StatusType::CriticalError);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn verify_schema_admission_released(
+    config: &ChainIndexConfig,
+) -> Result<(), FinalisedStateError> {
+    let guard = SchemaAdmissionGuard::acquire(config).await?;
+    drop(guard);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn verify_schema_admission_held(
+    config: &ChainIndexConfig,
+) -> Result<(), FinalisedStateError> {
+    let lock_path = SchemaAdmissionGuard::lock_path(config);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Err(error) if schema_admission_lock_contended(&error) => Ok(()),
+        Ok(()) => {
+            fs2::FileExt::unlock(&file)?;
+            Err(FinalisedStateError::Custom(format!(
+                "schema-admission lease at {} was unexpectedly free",
+                lock_path.display()
+            )))
+        }
+        Err(error) => Err(FinalisedStateError::IoError(error)),
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SchemaMigrationTestHookState {
+    migration_entered: Notify,
+    admission_contended: Notify,
+    release_migration: Notify,
+    panic_after_release: AtomicBool,
+}
+
+#[cfg(test)]
+static SCHEMA_MIGRATION_TEST_HOOKS: OnceLock<
+    Mutex<HashMap<PathBuf, Arc<SchemaMigrationTestHookState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn schema_migration_test_hooks(
+) -> &'static Mutex<HashMap<PathBuf, Arc<SchemaMigrationTestHookState>>> {
+    SCHEMA_MIGRATION_TEST_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SchemaMigrationPause {
+    database_root: PathBuf,
+    state: Arc<SchemaMigrationTestHookState>,
+}
+
+#[cfg(test)]
+impl SchemaMigrationPause {
+    pub(crate) async fn wait_until_migration_entered(&self) {
+        self.state.migration_entered.notified().await;
+    }
+
+    pub(crate) async fn wait_until_admission_contended(&self) {
+        self.state.admission_contended.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release_migration.notify_one();
+    }
+
+    pub(crate) fn panic_on_release(&self) {
+        self.state
+            .panic_after_release
+            .store(true, AtomicOrdering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for SchemaMigrationPause {
+    fn drop(&mut self) {
+        self.state.release_migration.notify_one();
+        let mut hooks = schema_migration_test_hooks()
+            .lock()
+            .expect("schema migration test-hook registry mutex poisoned");
+        if hooks
+            .get(&self.database_root)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            hooks.remove(&self.database_root);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pause_schema_migration(config: &ChainIndexConfig) -> SchemaMigrationPause {
+    let database_root = config.storage.database.path.clone();
+    let state = Arc::new(SchemaMigrationTestHookState {
+        migration_entered: Notify::new(),
+        admission_contended: Notify::new(),
+        release_migration: Notify::new(),
+        panic_after_release: AtomicBool::new(false),
+    });
+    schema_migration_test_hooks()
+        .lock()
+        .expect("schema migration test-hook registry mutex poisoned")
+        .insert(database_root.clone(), Arc::clone(&state));
+    SchemaMigrationPause {
+        database_root,
+        state,
+    }
+}
+
+#[cfg(test)]
+fn notify_schema_admission_contended(lock_path: &Path) {
+    let Some(database_root) = lock_path.parent() else {
+        return;
+    };
+    let state = schema_migration_test_hooks()
+        .lock()
+        .expect("schema migration test-hook registry mutex poisoned")
+        .get(database_root)
+        .cloned();
+    if let Some(state) = state {
+        state.admission_contended.notify_one();
+    }
+}
+
+#[cfg(test)]
+async fn pause_before_schema_migration(config: &ChainIndexConfig) {
+    let state = schema_migration_test_hooks()
+        .lock()
+        .expect("schema migration test-hook registry mutex poisoned")
+        .get(&config.storage.database.path)
+        .cloned();
+    if let Some(state) = state {
+        state.migration_entered.notify_one();
+        state.release_migration.notified().await;
+        assert!(
+            !state.panic_after_release.load(AtomicOrdering::Acquire),
+            "injected schema migration panic"
+        );
+    }
+}
 
 /// The activation heights of the three shielded pools whose data
 /// [`build_indexed_block_from_source`] assembles, resolved once per run.
@@ -455,6 +770,21 @@ pub(crate) struct FinalisedState<T: BlockchainSource> {
 impl<T: BlockchainSource> FinalisedState<T> {
     // ***** DB control *****
 
+    fn ensure_persistent_mutation_allowed(&self) -> Result<(), FinalisedStateError> {
+        if self.db.shutdown_requested() {
+            return Err(FinalisedStateError::Custom(
+                "finalised database shutdown has begun; refusing to mutate persistent state".into(),
+            ));
+        }
+        if self.status() == StatusType::CriticalError {
+            return Err(FinalisedStateError::Custom(
+                "finalised database is in a critical error state; refusing to mutate persistent state"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Spawns a `FinalisedState` instance.
     ///
     /// This method:
@@ -497,6 +827,7 @@ impl<T: BlockchainSource> FinalisedState<T> {
                 cfg,
             });
         } else {
+            let schema_admission_guard = SchemaAdmissionGuard::acquire(&cfg).await?;
             let version_opt = Self::try_find_current_db_version(&cfg).await;
 
             let target_version = match cfg.db_version {
@@ -519,7 +850,13 @@ impl<T: BlockchainSource> FinalisedState<T> {
                                 cfg.storage.database.path.display()
                             )));
                         }
-                        1 => FinalisedSource::spawn_v1(&cfg).await?,
+                        1 => {
+                            FinalisedSource::spawn_v1_under_schema_admission(
+                                &cfg,
+                                &schema_admission_guard,
+                            )
+                            .await?
+                        }
                         _ => {
                             return Err(FinalisedStateError::Custom(format!(
                                 "unsupported database version: DbV{version}"
@@ -530,7 +867,13 @@ impl<T: BlockchainSource> FinalisedState<T> {
                 None => {
                     info!(version = %target_version, "Creating new FinalisedState");
                     match target_version.major() {
-                        1 => FinalisedSource::spawn_v1(&cfg).await?,
+                        1 => {
+                            FinalisedSource::spawn_v1_under_schema_admission(
+                                &cfg,
+                                &schema_admission_guard,
+                            )
+                            .await?
+                        }
                         _ => {
                             return Err(FinalisedStateError::Custom(format!(
                                 "unsupported database version: DbV{target_version}"
@@ -541,50 +884,79 @@ impl<T: BlockchainSource> FinalisedState<T> {
             };
             let current_version = backend.get_metadata().await?.version();
 
-            let router = Arc::new(Router::new(Arc::new(backend)));
+            let router = Arc::new(Router::new_with_schema_admission(
+                Arc::new(backend),
+                schema_admission_guard,
+            ));
 
-            if version_opt.is_some() && current_version < target_version {
+            if current_version < target_version {
                 info!(
                     from_version = %current_version,
                     to_version = %target_version,
                     "Starting FinalisedState migration in background"
                 );
 
+                // Install full ephemeral routing before returning from startup. This closes normal
+                // routed writes immediately, rather than leaving a window before the migration task
+                // first polls and installs its own per-step reference.
+                let db_height = router.primary_backend().db_height().await?;
+                let ephemeral_reference = router
+                    .init_or_take_ephemeral(
+                        source.clone(),
+                        cfg.network.clone(),
+                        EphemeralMode::Full,
+                        db_height,
+                    )
+                    .await?;
+                let migration_runtime_guard =
+                    SchemaMigrationRuntimeGuard::new(Arc::clone(&router), ephemeral_reference);
+
                 let migration_router = Arc::clone(&router);
                 let migration_cfg = cfg.clone();
                 let migration_source = source.clone();
 
-                // Register the migration in the foreground, before spawning, so `wait_until_synced`
-                // blocks until the background migration completes (or fails). The guard is moved into
-                // the task and drops when it finishes, on either path.
+                // Register the operation in the foreground so `wait_until_synced` observes it from
+                // before startup returns. Router shutdown owns and awaits the task handle, ensuring
+                // no migration can keep mutating LMDB after backend shutdown begins.
                 let op_guard = router.begin_background_op();
-
-                tokio::spawn(async move {
+                let migration_task = tokio::spawn(async move {
                     let _op_guard = op_guard;
+                    let runtime_guard = migration_runtime_guard;
+                    let migration_outcome = AssertUnwindSafe(async {
+                        #[cfg(test)]
+                        pause_before_schema_migration(&migration_cfg).await;
 
-                    let mut migration_manager = MigrationManager {
-                        router: migration_router.clone(),
-                        cfg: migration_cfg,
-                        current_version,
-                        target_version,
-                        source: migration_source,
-                    };
+                        let mut migration_manager = MigrationManager {
+                            router: Arc::clone(&migration_router),
+                            cfg: migration_cfg,
+                            current_version,
+                            target_version,
+                            source: migration_source,
+                        };
+                        migration_manager.migrate().await
+                    })
+                    .catch_unwind()
+                    .await;
 
-                    match migration_manager.migrate().await {
-                        Ok(()) => {
-                            // Start the background validator only now that every migration has
-                            // finished: its initial scan reads tables a migration populates (e.g.
-                            // `commitment_tree_data_1_3_0`), so starting it earlier would race the
-                            // migration and fail on a not-yet-written row.
-                            migration_router.primary_backend().start_validator();
+                    match migration_outcome {
+                        Ok(Ok(())) => {
+                            // Start the validator only after every migration has finished. Its
+                            // initial scan reads tables populated by migrations, and shutdown must
+                            // not race by starting a validator it is already tearing down.
+                            if !migration_router.shutdown_requested() {
+                                migration_router.primary_backend().start_validator();
+                            }
+                            runtime_guard.complete();
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             tracing::error!("FinalisedState migration failed: {error}");
-
-                            migration_router.store_primary_status(StatusType::CriticalError);
+                        }
+                        Err(_) => {
+                            tracing::error!("FinalisedState migration task panicked");
                         }
                     }
                 });
+                router.install_schema_migration_task(migration_task)?;
             } else {
                 // No migration to run, so the on-disk tables the validator scans are already at the
                 // current schema: start it immediately.
@@ -683,7 +1055,7 @@ impl<T: BlockchainSource> FinalisedState<T> {
     ///
     /// - **Legacy v0 layout**
     ///   - Network directories: `live/`, `test/`, `local/`
-    ///   - Presence check: both `data.mdb` and `lock.mdb` exist
+    ///   - Presence check: `data.mdb` exists (`lock.mdb` is disposable coordination state)
     ///   - Reported version: `Some(0)`. v0 is no longer supported, so `spawn` rejects this with a
     ///     clear error rather than opening or migrating it; detection exists only to produce that
     ///     error.
@@ -691,7 +1063,7 @@ impl<T: BlockchainSource> FinalisedState<T> {
     /// - **Versioned v1+ layout**
     ///   - Network directories: `mainnet/`, `testnet/`, `regtest/`
     ///   - Version subdirectories: enumerated by `finalised_source::VERSION_DIRS` (e.g. `"v1"`)
-    ///   - Presence check: both `data.mdb` and `lock.mdb` exist within a version directory
+    ///   - Presence check: `data.mdb` exists within a version directory
     ///   - Reported version: `Some(i + 1)` where `i` is the index in `VERSION_DIRS`
     ///
     /// Returns:
@@ -704,7 +1076,7 @@ impl<T: BlockchainSource> FinalisedState<T> {
             NetworkKind::Regtest => "local",
         };
         let legacy_path = cfg.storage.database.path.join(legacy_dir);
-        if legacy_path.join("data.mdb").exists() && legacy_path.join("lock.mdb").exists() {
+        if legacy_path.join("data.mdb").exists() {
             return Some(0);
         }
 
@@ -718,8 +1090,7 @@ impl<T: BlockchainSource> FinalisedState<T> {
             for (i, version_dir) in VERSION_DIRS.iter().enumerate() {
                 let db_path = net_path.join(version_dir);
                 let data_file = db_path.join("data.mdb");
-                let lock_file = db_path.join("lock.mdb");
-                if data_file.exists() && lock_file.exists() {
+                if data_file.exists() {
                     let version = (i + 1) as u32;
                     return Some(version);
                 }
@@ -779,6 +1150,8 @@ impl<T: BlockchainSource> FinalisedState<T> {
         if self.db.primary_is_ephemeral() {
             return Ok(());
         }
+
+        self.ensure_persistent_mutation_allowed()?;
 
         if self.db.has_full_ephemeral_reference() {
             return Ok(());
@@ -932,6 +1305,7 @@ impl<T: BlockchainSource> FinalisedState<T> {
     /// For reorg handling, callers should delete tip blocks using [`FinalisedState::delete_block_at_height`]
     /// or [`FinalisedState::delete_block`] before re-appending.
     pub(crate) async fn write_block(&self, b: IndexedBlock) -> Result<(), FinalisedStateError> {
+        self.ensure_persistent_mutation_allowed()?;
         self.db.write_block(b).await
     }
 
@@ -948,6 +1322,7 @@ impl<T: BlockchainSource> FinalisedState<T> {
         &self,
         h: Height,
     ) -> Result<(), FinalisedStateError> {
+        self.ensure_persistent_mutation_allowed()?;
         self.db.delete_block_at_height(h).await
     }
 
@@ -959,6 +1334,7 @@ impl<T: BlockchainSource> FinalisedState<T> {
     /// Prefer [`FinalisedState::delete_block_at_height`] when possible; use this method when the backend
     /// requires full block contents to correctly reverse all indices.
     pub(crate) async fn delete_block(&self, b: &IndexedBlock) -> Result<(), FinalisedStateError> {
+        self.ensure_persistent_mutation_allowed()?;
         self.db.delete_block(b).await
     }
 
@@ -1019,6 +1395,11 @@ impl<T: BlockchainSource> FinalisedState<T> {
         &self.db
     }
 
+    /// Returns whether coordinated router shutdown has begun.
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        self.db.shutdown_requested()
+    }
+
     /// Opens an existing test database and migrates it to `target_version`.
     ///
     /// This helper is intended to be called after a historical fixture database has already been
@@ -1026,7 +1407,8 @@ impl<T: BlockchainSource> FinalisedState<T> {
     /// database if none exists. A missing database is treated as a test setup error.
     ///
     /// The method:
-    /// - rejects target versions newer than the current compiled [`DB_VERSION_V1`],
+    /// - rejects target versions that are unsupported or newer than the current compiled
+    ///   [`DB_VERSION_V1`],
     /// - discovers the existing on-disk major database version,
     /// - opens the matching backend implementation,
     /// - reads the precise metadata version stored on disk,
@@ -1041,24 +1423,26 @@ impl<T: BlockchainSource> FinalisedState<T> {
         source: T,
         target_version: DbVersion,
     ) -> Result<Self, FinalisedStateError> {
-        if target_version.major() > DB_VERSION_V1.major() {
-            return Err(FinalisedStateError::Custom(format!(
-                "unsupported database version: {target_version}"
-            )));
-        }
-        if target_version.major() == DB_VERSION_V1.major() && target_version > DB_VERSION_V1 {
+        if target_version > DB_VERSION_V1 || target_version.capability().is_empty() {
             return Err(FinalisedStateError::Custom(format!(
                 "unsupported database version: {target_version}"
             )));
         }
 
+        let schema_admission_guard = SchemaAdmissionGuard::acquire(&cfg).await?;
         let version_opt = Self::try_find_current_db_version(&cfg).await;
 
         let backend = match version_opt {
             Some(version) => {
                 info!(version, "Opening FinalisedState from file");
                 match version {
-                    1 => FinalisedSource::spawn_v1(&cfg).await?,
+                    1 => {
+                        FinalisedSource::spawn_v1_under_schema_admission(
+                            &cfg,
+                            &schema_admission_guard,
+                        )
+                        .await?
+                    }
                     _ => {
                         return Err(FinalisedStateError::Custom(format!(
                             "unsupported database version: DbV{version}"
@@ -1075,7 +1459,10 @@ impl<T: BlockchainSource> FinalisedState<T> {
         };
         let current_version = backend.get_metadata().await?.version();
 
-        let router = Arc::new(Router::new(Arc::new(backend)));
+        let router = Arc::new(Router::new_with_schema_admission(
+            Arc::new(backend),
+            schema_admission_guard,
+        ));
 
         if current_version < target_version {
             info!(

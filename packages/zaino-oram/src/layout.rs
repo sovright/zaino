@@ -8,7 +8,8 @@
 //! backend interfaces under one synchronous owner and terminal-latches an
 //! uncertain generation. Neither layer authenticates record contents, persists
 //! the secret seed, proves crash atomicity, or establishes physical
-//! obliviousness.
+//! obliviousness. A higher-layer authenticated public projection manifest does
+//! not change those properties or make either table resumable after restart.
 
 use std::{fmt, num::NonZeroU64};
 
@@ -18,19 +19,23 @@ use blake2::{
 };
 
 use crate::records::{
-    AddressDirectory, AddressEventPage, AddressKey, PersistentAddressDirectory,
-    PersistentAddressEventPage, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
+    finalized_live_utxo_at, AddressDirectory, AddressEventPage, AddressKey,
+    FinalizedEventHistoryError, PersistentAddressDirectory, PersistentAddressEventPage,
+    TransparentUtxo, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
 };
 
 mod atomic_store;
 
 #[cfg(feature = "corpus-zaino")]
 pub(super) use atomic_store::{
-    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQueueCapacity,
-    AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
+    AtomicQualificationAppendResult, AtomicQualificationCommandError, AtomicQualificationSnapshot,
+    AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
 #[cfg(all(test, feature = "corpus-zaino"))]
-pub(super) use atomic_store::{spawn_atomic_worker_for_tests, BackendFailure, UniqueTable};
+pub(super) use atomic_store::{
+    spawn_atomic_worker_for_tests, BackendFailure, QualificationMemoryTable, UniqueTable,
+};
 
 const LAYOUT_FORMAT_VERSION: u8 = 1;
 const ADDRESS_KEY_DOMAIN: &[u8] = b"zaino-oram-address-key-v1";
@@ -60,13 +65,13 @@ impl LayoutNetwork {
 
 /// Standard transparent address identity before canonical key derivation.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct StandardAddress {
+pub(super) struct StandardAddress {
     kind: StandardScriptKind,
     hash: [u8; 20],
 }
 
 impl StandardAddress {
-    const fn new(kind: StandardScriptKind, hash: [u8; 20]) -> Self {
+    pub(super) const fn new(kind: StandardScriptKind, hash: [u8; 20]) -> Self {
         Self { kind, hash }
     }
 
@@ -88,7 +93,7 @@ impl fmt::Debug for StandardAddress {
 
 /// Supported standard transparent locking-script class.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum StandardScriptKind {
+pub(super) enum StandardScriptKind {
     PayToPublicKeyHash,
     PayToScriptHash,
 }
@@ -100,6 +105,25 @@ impl StandardScriptKind {
             Self::PayToScriptHash => 2,
         }
     }
+}
+
+/// Derives the canonical layout key for one standard transparent address.
+pub(super) fn derive_standard_address_key(
+    network: LayoutNetwork,
+    schema_version: u32,
+    address: StandardAddress,
+) -> AddressKey {
+    let mut hasher = Blake2s256::new();
+    Digest::update(&mut hasher, ADDRESS_KEY_DOMAIN);
+    Digest::update(&mut hasher, [LAYOUT_FORMAT_VERSION]);
+    Digest::update(&mut hasher, [network.tag()]);
+    Digest::update(&mut hasher, schema_version.to_le_bytes());
+    Digest::update(&mut hasher, [address.kind.tag()]);
+    Digest::update(&mut hasher, address.hash);
+    let digest = Digest::finalize(hasher);
+    let mut bytes = [0; ADDRESS_KEY_BYTES];
+    bytes.copy_from_slice(&digest);
+    AddressKey::new(bytes)
 }
 
 /// Secret probe seed injected by a future lifecycle owner.
@@ -892,27 +916,24 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
     }
 
     fn address_key(&self, address: StandardAddress) -> AddressKey {
-        let mut hasher = Blake2s256::new();
-        Digest::update(&mut hasher, ADDRESS_KEY_DOMAIN);
-        Digest::update(&mut hasher, [LAYOUT_FORMAT_VERSION]);
-        Digest::update(&mut hasher, [self.identity.network.tag()]);
-        Digest::update(&mut hasher, self.identity.schema_version.to_le_bytes());
-        Digest::update(&mut hasher, [address.kind.tag()]);
-        Digest::update(&mut hasher, address.hash);
-        let digest = Digest::finalize(hasher);
-        let mut bytes = [0; ADDRESS_KEY_BYTES];
-        bytes.copy_from_slice(&digest);
-        AddressKey::new(bytes)
+        derive_standard_address_key(self.identity.network, self.identity.schema_version, address)
     }
 
     fn directory_plan(&self, address: StandardAddress) -> DirectoryProbePlan<DIRECTORY_PROBES> {
         let address_key = self.address_key(address);
+        self.directory_plan_for_key(&address_key)
+    }
+
+    fn directory_plan_for_key(
+        &self,
+        address_key: &AddressKey,
+    ) -> DirectoryProbePlan<DIRECTORY_PROBES> {
         let slots = self
             .probe_slots::<DIRECTORY_PROBES>(TableKind::Directory, address_key.as_bytes())
             .map(DirectorySlot);
         DirectoryProbePlan {
             profile_binding: self.profile_binding,
-            address_key,
+            address_key: *address_key,
             slots,
         }
     }
@@ -929,6 +950,36 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
             *destination = slot.backend_index()?;
         }
         Ok(indices)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) fn qualification_directory_probe_indices(
+        &self,
+        address: StandardAddress,
+    ) -> Result<[usize; DIRECTORY_PROBES], ()> {
+        self.directory_backend_indices(&self.directory_plan(address))
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) fn qualification_event_probe_indices(
+        &self,
+        address: StandardAddress,
+        directory_index: usize,
+        ordinal: u64,
+    ) -> Result<[usize; EVENT_PROBES], ()> {
+        let directory_slot = DirectorySlot(u32::try_from(directory_index).map_err(|_| ())?);
+        let directory_plan = self.directory_plan(address);
+        if !directory_plan.slots.contains(&directory_slot) {
+            return Err(());
+        }
+        let directory = BoundDirectory {
+            profile_binding: directory_plan.profile_binding,
+            slot: directory_slot,
+            address_key: directory_plan.address_key,
+        };
+        let event_plan = self.event_plan(&directory, ordinal).map_err(|_| ())?;
+        self.event_backend_indices(&event_plan).map_err(|_| ())
     }
 
     fn event_plan(
@@ -1558,6 +1609,20 @@ mod tests {
         assert_eq!(allocation.event(), layout.event.0.allocation());
         assert_eq!(allocation.max_events_per_address(), 8);
         assert_eq!(layout.max_events_per_address, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn key_addressed_directory_plan_matches_the_standard_address_plan(
+    ) -> Result<(), LayoutConfigError> {
+        let layout = layout()?;
+        let address = p2sh(0x2a);
+        let address_plan = layout.directory_plan(address);
+        let key_plan = layout.directory_plan_for_key(&address_plan.address_key);
+
+        assert_eq!(key_plan.profile_binding, address_plan.profile_binding);
+        assert_eq!(key_plan.address_key, address_plan.address_key);
+        assert_eq!(key_plan.slots, address_plan.slots);
         Ok(())
     }
 
