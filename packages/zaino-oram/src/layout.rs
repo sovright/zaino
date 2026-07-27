@@ -19,8 +19,9 @@ use blake2::{
 };
 
 use crate::records::{
-    AddressDirectory, AddressEventPage, AddressKey, PersistentAddressDirectory,
-    PersistentAddressEventPage, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
+    finalized_live_utxo_at, AddressDirectory, AddressEventPage, AddressKey,
+    FinalizedEventHistoryError, PersistentAddressDirectory, PersistentAddressEventPage,
+    TransparentUtxo, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
 };
 
 mod atomic_store;
@@ -104,6 +105,25 @@ impl StandardScriptKind {
             Self::PayToScriptHash => 2,
         }
     }
+}
+
+/// Derives the canonical layout key for one standard transparent address.
+pub(super) fn derive_standard_address_key(
+    network: LayoutNetwork,
+    schema_version: u32,
+    address: StandardAddress,
+) -> AddressKey {
+    let mut hasher = Blake2s256::new();
+    Digest::update(&mut hasher, ADDRESS_KEY_DOMAIN);
+    Digest::update(&mut hasher, [LAYOUT_FORMAT_VERSION]);
+    Digest::update(&mut hasher, [network.tag()]);
+    Digest::update(&mut hasher, schema_version.to_le_bytes());
+    Digest::update(&mut hasher, [address.kind.tag()]);
+    Digest::update(&mut hasher, address.hash);
+    let digest = Digest::finalize(hasher);
+    let mut bytes = [0; ADDRESS_KEY_BYTES];
+    bytes.copy_from_slice(&digest);
+    AddressKey::new(bytes)
 }
 
 /// Secret probe seed injected by a future lifecycle owner.
@@ -896,27 +916,24 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
     }
 
     fn address_key(&self, address: StandardAddress) -> AddressKey {
-        let mut hasher = Blake2s256::new();
-        Digest::update(&mut hasher, ADDRESS_KEY_DOMAIN);
-        Digest::update(&mut hasher, [LAYOUT_FORMAT_VERSION]);
-        Digest::update(&mut hasher, [self.identity.network.tag()]);
-        Digest::update(&mut hasher, self.identity.schema_version.to_le_bytes());
-        Digest::update(&mut hasher, [address.kind.tag()]);
-        Digest::update(&mut hasher, address.hash);
-        let digest = Digest::finalize(hasher);
-        let mut bytes = [0; ADDRESS_KEY_BYTES];
-        bytes.copy_from_slice(&digest);
-        AddressKey::new(bytes)
+        derive_standard_address_key(self.identity.network, self.identity.schema_version, address)
     }
 
     fn directory_plan(&self, address: StandardAddress) -> DirectoryProbePlan<DIRECTORY_PROBES> {
         let address_key = self.address_key(address);
+        self.directory_plan_for_key(&address_key)
+    }
+
+    fn directory_plan_for_key(
+        &self,
+        address_key: &AddressKey,
+    ) -> DirectoryProbePlan<DIRECTORY_PROBES> {
         let slots = self
             .probe_slots::<DIRECTORY_PROBES>(TableKind::Directory, address_key.as_bytes())
             .map(DirectorySlot);
         DirectoryProbePlan {
             profile_binding: self.profile_binding,
-            address_key,
+            address_key: *address_key,
             slots,
         }
     }
@@ -1592,6 +1609,20 @@ mod tests {
         assert_eq!(allocation.event(), layout.event.0.allocation());
         assert_eq!(allocation.max_events_per_address(), 8);
         assert_eq!(layout.max_events_per_address, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn key_addressed_directory_plan_matches_the_standard_address_plan(
+    ) -> Result<(), LayoutConfigError> {
+        let layout = layout()?;
+        let address = p2sh(0x2a);
+        let address_plan = layout.directory_plan(address);
+        let key_plan = layout.directory_plan_for_key(&address_plan.address_key);
+
+        assert_eq!(key_plan.profile_binding, address_plan.profile_binding);
+        assert_eq!(key_plan.address_key, address_plan.address_key);
+        assert_eq!(key_plan.slots, address_plan.slots);
         Ok(())
     }
 

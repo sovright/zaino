@@ -1,6 +1,11 @@
 //! Crate-internal owner for one offline projection candidate and its atomic worker.
 
 mod cold_rebuild;
+mod serving_store;
+
+pub(crate) use serving_store::FinalizedProjectionServingStore;
+#[cfg(test)]
+pub(crate) use tests::finalized_serving_store_for_runtime_tests;
 
 pub use cold_rebuild::{
     TypedWorkerColdRebuildError, TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport,
@@ -302,6 +307,7 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use super::serving_store::FinalizedProjectionServingStoreBuildError;
     use super::*;
     use crate::{
         checkpoint::{
@@ -309,11 +315,15 @@ mod tests {
             ProjectionManifestStore, ProjectionRestartPlan, PublishedProjectionManifest,
         },
         layout::{
-            spawn_atomic_worker_for_tests, BackendFailure, DirectoryTableConfiguration,
-            EventTableConfiguration, LayoutIdentity, UniqueTable,
+            derive_standard_address_key, spawn_atomic_worker_for_tests, BackendFailure,
+            DirectoryTableConfiguration, EventTableConfiguration, LayoutIdentity, StandardAddress,
+            StandardScriptKind, UniqueTable,
         },
         projection::ProjectionCapacities,
-        records::{PersistentAddressDirectory, PersistentAddressEventPage},
+        recent_snapshot::{FinalizedServingStore, RecentSnapshotIdentity},
+        records::{
+            AddressKey, PersistentAddressDirectory, PersistentAddressEventPage, ADDRESS_KEY_BYTES,
+        },
         zaino_fixtures::{projection_chain, FixtureResult},
     };
 
@@ -393,6 +403,7 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct TableStats {
+        reads: usize,
         writes: usize,
         drops: usize,
     }
@@ -440,6 +451,9 @@ mod tests {
             if index >= self.capacity {
                 return Err(BackendFailure);
             }
+            let mut stats = self.observation.0.lock().map_err(|_| BackendFailure)?;
+            stats.reads = stats.reads.checked_add(1).ok_or(BackendFailure)?;
+            drop(stats);
             Ok(self.cells.get(&index).copied())
         }
 
@@ -613,6 +627,14 @@ mod tests {
         ))
     }
 
+    pub(crate) fn finalized_serving_store_for_runtime_tests(
+    ) -> FixtureResult<FinalizedProjectionServingStore> {
+        let blocks = projection_chain()?;
+        let (owner, _, _) = fake_owner(None)?;
+        let (owner, _) = finish_owner(owner, &blocks)?;
+        Ok(owner.into_serving_store()?)
+    }
+
     fn fake_worker(
         projection: ProjectionConfig,
         fail_on_event_write: Option<usize>,
@@ -648,9 +670,26 @@ mod tests {
     }
 
     fn run_owner_to_ready<P>(
-        mut owner: OfflineProjectionOwner<P>,
+        owner: OfflineProjectionOwner<P>,
         blocks: &[IndexedBlock],
     ) -> FixtureResult<PublicChainCheckpoint>
+    where
+        P: ProjectionCheckpointPublisher,
+    {
+        let (owner, target) = finish_owner(owner, blocks)?;
+        assert!(matches!(
+            owner.shutdown(),
+            ProjectionOwnerShutdownOutcome::Stopped {
+                readiness: ProjectionOwnerReadiness::Ready { checkpoint },
+            } if checkpoint == target
+        ));
+        Ok(target)
+    }
+
+    fn finish_owner<P>(
+        mut owner: OfflineProjectionOwner<P>,
+        blocks: &[IndexedBlock],
+    ) -> FixtureResult<(OfflineProjectionOwner<P>, PublicChainCheckpoint)>
     where
         P: ProjectionCheckpointPublisher,
     {
@@ -660,13 +699,7 @@ mod tests {
         }
         let target = target.ok_or("fixture chain must be nonempty")?;
         assert_eq!(owner.finish(target)?, target);
-        assert!(matches!(
-            owner.shutdown(),
-            ProjectionOwnerShutdownOutcome::Stopped {
-                readiness: ProjectionOwnerReadiness::Ready { checkpoint },
-            } if checkpoint == target
-        ));
-        Ok(target)
+        Ok((owner, target))
     }
 
     #[test]
@@ -771,6 +804,214 @@ mod tests {
     }
 
     #[test]
+    fn ready_owner_issues_exact_identity_bound_serving_store() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let projection = compatible_projection_config()?;
+        let (mut owner, directory, events) = fake_owner(None)?;
+        let mut target = None;
+        for block in &blocks {
+            target = Some(owner.apply_finalized(block)?);
+        }
+        let target = target.ok_or("fixture chain must be nonempty")?;
+        owner.finish(target)?;
+
+        let store = owner.into_serving_store()?;
+        assert_eq!(store.committed_checkpoint(), target);
+        assert_eq!(
+            store.serving_identity(),
+            RecentSnapshotIdentity::from_finalized_projection(
+                projection.network(),
+                target.height(),
+                target.block_hash().bytes_in_display_order(),
+                projection.schema_version(),
+                projection.projection_epoch(),
+                projection.key_epoch(),
+            )
+        );
+        assert_eq!(
+            crate::store::ObliviousStore::slots_per_key(&store),
+            usize::try_from(MAX_EVENTS_PER_ADDRESS)?
+        );
+        assert_eq!(
+            format!("{store:?}"),
+            "FinalizedProjectionServingStore { ..REDACTED.. }"
+        );
+
+        drop(store);
+        assert_eq!(directory.stats()?.drops, 1);
+        assert_eq!(events.stats()?.drops, 1);
+        Ok(())
+    }
+
+    fn fixture_address_key(kind: StandardScriptKind, hash: [u8; 20]) -> AddressKey {
+        derive_standard_address_key(
+            LayoutNetwork::Regtest,
+            SCHEMA_VERSION,
+            StandardAddress::new(kind, hash),
+        )
+    }
+
+    fn assert_one_complete_read(
+        before_directory: TableStats,
+        after_directory: TableStats,
+        before_events: TableStats,
+        after_events: TableStats,
+    ) {
+        let max_events = usize::try_from(MAX_EVENTS_PER_ADDRESS)
+            .expect("test max-events profile fits the host usize");
+        assert_eq!(
+            after_directory.reads - before_directory.reads,
+            DIRECTORY_PROBES
+        );
+        assert_eq!(
+            after_events.reads - before_events.reads,
+            EVENT_PROBES * max_events
+        );
+    }
+
+    #[test]
+    fn serving_store_reads_dense_live_slots_with_one_complete_command_each() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (mut owner, directory, events) = fake_owner(None)?;
+        let mut target = None;
+        for block in &blocks {
+            target = Some(owner.apply_finalized(block)?);
+        }
+        let target = target.ok_or("fixture chain must be nonempty")?;
+        owner.finish(target)?;
+        let mut store = owner.into_serving_store()?;
+
+        let address_a = fixture_address_key(StandardScriptKind::PayToPublicKeyHash, [0xa1; 20]);
+        let mut first_script = [0; 25];
+        first_script[..3].copy_from_slice(&[0x76, 0xa9, 0x14]);
+        first_script[3..23].copy_from_slice(&[0xa1; 20]);
+        first_script[23..].copy_from_slice(&[0x88, 0xac]);
+        let expected_first =
+            crate::records::TransparentUtxo::new([0x11; 32], 1, 60, 0, &first_script)?;
+        let expected_second =
+            crate::records::TransparentUtxo::new([0x33; 32], 0, 30, 1, &first_script)?;
+
+        let before_directory = directory.stats()?;
+        let before_events = events.stats()?;
+        let first = crate::store::ObliviousStore::read_slot(&mut store, &address_a, 0)?;
+        assert!(first.is_occupied());
+        assert_eq!(first.record(), &expected_first);
+        assert_one_complete_read(
+            before_directory,
+            directory.stats()?,
+            before_events,
+            events.stats()?,
+        );
+
+        let before_directory = directory.stats()?;
+        let before_events = events.stats()?;
+        let second = crate::store::ObliviousStore::read_slot(&mut store, &address_a, 1)?;
+        assert!(second.is_occupied());
+        assert_eq!(second.record(), &expected_second);
+        assert_one_complete_read(
+            before_directory,
+            directory.stats()?,
+            before_events,
+            events.stats()?,
+        );
+
+        let before_directory = directory.stats()?;
+        let before_events = events.stats()?;
+        let padding = crate::store::ObliviousStore::read_slot(&mut store, &address_a, 2)?;
+        assert!(!padding.is_occupied());
+        assert_one_complete_read(
+            before_directory,
+            directory.stats()?,
+            before_events,
+            events.stats()?,
+        );
+
+        let spent_address = fixture_address_key(StandardScriptKind::PayToScriptHash, [0xb2; 20]);
+        let before_directory = directory.stats()?;
+        let before_events = events.stats()?;
+        let spent = crate::store::ObliviousStore::read_slot(&mut store, &spent_address, 0)?;
+        assert!(!spent.is_occupied());
+        assert_one_complete_read(
+            before_directory,
+            directory.stats()?,
+            before_events,
+            events.stats()?,
+        );
+
+        let missing = AddressKey::new([0xff; ADDRESS_KEY_BYTES]);
+        let before_directory = directory.stats()?;
+        let before_events = events.stats()?;
+        let miss = crate::store::ObliviousStore::read_slot(&mut store, &missing, 0)?;
+        assert!(!miss.is_occupied());
+        assert_one_complete_read(
+            before_directory,
+            directory.stats()?,
+            before_events,
+            events.stats()?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_ready_owner_cannot_issue_a_serving_store() -> FixtureResult<()> {
+        let (building, building_directory, building_events) = fake_owner(None)?;
+        assert!(matches!(
+            building.into_serving_store(),
+            Err(FinalizedProjectionServingStoreBuildError)
+        ));
+        assert_eq!(building_directory.stats()?.drops, 1);
+        assert_eq!(building_events.stats()?.drops, 1);
+
+        let blocks = projection_chain()?;
+        let (mut failed, failed_directory, failed_events) = fake_owner(Some(6))?;
+        failed.apply_finalized(&blocks[0])?;
+        assert_eq!(
+            failed.apply_finalized(&blocks[1]),
+            Err(ProjectionOwnerCommandError::FailedClosed)
+        );
+        assert!(matches!(
+            failed.into_serving_store(),
+            Err(FinalizedProjectionServingStoreBuildError)
+        ));
+        assert_eq!(failed_directory.stats()?.drops, 1);
+        assert_eq!(failed_events.stats()?.drops, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_owner_rolls_the_serving_identity_projection_epoch() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let first_config = compatible_projection_config_with_epoch(PROJECTION_EPOCH)?;
+        let (first_worker, _, _) = fake_worker(first_config, None)?;
+        let mut first_owner = OfflineProjectionOwner::from_worker(first_config, first_worker);
+        let mut first_target = None;
+        for block in &blocks {
+            first_target = Some(first_owner.apply_finalized(block)?);
+        }
+        let first_target = first_target.ok_or("fixture chain must be nonempty")?;
+        first_owner.finish(first_target)?;
+        let first_store = first_owner.into_serving_store()?;
+
+        let second_config = compatible_projection_config_with_epoch(PROJECTION_EPOCH + 1)?;
+        let (second_worker, _, _) = fake_worker(second_config, None)?;
+        let mut second_owner = OfflineProjectionOwner::from_worker(second_config, second_worker);
+        let mut second_target = None;
+        for block in &blocks {
+            second_target = Some(second_owner.apply_finalized(block)?);
+        }
+        let second_target = second_target.ok_or("fixture chain must be nonempty")?;
+        second_owner.finish(second_target)?;
+        let second_store = second_owner.into_serving_store()?;
+
+        assert_eq!(first_target, second_target);
+        assert_ne!(
+            first_store.serving_identity(),
+            second_store.serving_identity()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn partial_backend_mutation_latches_failure_and_forbids_retry() -> FixtureResult<()> {
         let blocks = projection_chain()?;
         let (mut owner, directory, events) = fake_owner(Some(6))?;
@@ -869,7 +1110,7 @@ mod tests {
         target_arch = "x86_64"
     ))]
     #[test]
-    fn linux_rostl_owner_builds_finishes_and_shuts_down() -> FixtureResult<()> {
+    fn linux_rostl_owner_builds_finishes_and_serves_a_dense_slot() -> FixtureResult<()> {
         let blocks = projection_chain()?;
         let mut owner =
             OfflineProjectionOwner::new(compatible_projection_config()?, compatible_layout()?, 1)?;
@@ -879,12 +1120,12 @@ mod tests {
         }
         let target = target.ok_or("fixture chain must be nonempty")?;
         assert_eq!(owner.finish(target)?, target);
-        assert_eq!(
-            owner.shutdown(),
-            ProjectionOwnerShutdownOutcome::Stopped {
-                readiness: ProjectionOwnerReadiness::Ready { checkpoint: target },
-            }
-        );
+        let mut store = owner.into_serving_store()?;
+        let address = fixture_address_key(StandardScriptKind::PayToPublicKeyHash, [0xa1; 20]);
+        let slot = crate::store::ObliviousStore::read_slot(&mut store, &address, 0)?;
+        assert!(slot.is_occupied());
+        assert_eq!(slot.record().txid(), &[0x11; 32]);
+        assert_eq!(slot.record().output_index(), 1);
         Ok(())
     }
 
