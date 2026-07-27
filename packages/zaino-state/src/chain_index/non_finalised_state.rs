@@ -98,6 +98,21 @@ pub struct CanonicalRecentChainSnapshot {
 }
 
 impl CanonicalRecentChainSnapshot {
+    /// Constructs a canonical recent-chain fixture without repeating cache validation.
+    #[cfg(feature = "test_dependencies")]
+    #[doc(hidden)]
+    pub fn from_parts_for_tests(
+        finalized: BlockIndex,
+        tip: BlockIndex,
+        blocks: Vec<IndexedBlock>,
+    ) -> Self {
+        Self {
+            finalized,
+            tip,
+            blocks: blocks.into(),
+        }
+    }
+
     /// Returns the finalized checkpoint that immediately precedes the recent blocks.
     pub fn finalized(&self) -> BlockIndex {
         self.finalized
