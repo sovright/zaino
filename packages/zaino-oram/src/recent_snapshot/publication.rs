@@ -492,9 +492,60 @@ impl<B> ServingEpochObservation<B> {
     }
 }
 
+impl<B: ServingEpochBoundary> ServingEpochObservation<B> {
+    fn matches(&self, identity: RecentSnapshotIdentity, boundary: &B) -> bool {
+        let matches = identity == self.identity && boundary.same_capture(&self.boundary);
+        #[cfg(test)]
+        if let Some(hook) = self.after_comparison.as_ref() {
+            hook();
+        }
+        matches
+    }
+}
+
 impl<B> fmt::Debug for ServingEpochObservation<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ServingEpochObservation { ..REDACTED.. }")
+    }
+}
+
+/// Minimal owned currentness capability retained until response release.
+///
+/// Unlike a serving-epoch lease, this witness does not retain the recent
+/// snapshot, finalized store, or active-publication binding.
+#[cfg(feature = "corpus-zaino")]
+pub(crate) struct ServingEpochReleaseWitness<B, C> {
+    expected_identity: RecentSnapshotIdentity,
+    expected_boundary: B,
+    currentness: Arc<Mutex<C>>,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<B, C> ServingEpochReleaseWitness<B, C>
+where
+    B: ServingEpochBoundary,
+    C: ServingEpochCurrentness<B>,
+{
+    pub(crate) fn observe_and_match(&self) -> Result<(), ServingEpochUnavailable> {
+        let observation = {
+            let mut currentness = self
+                .currentness
+                .lock()
+                .map_err(|_| ServingEpochUnavailable)?;
+            currentness.observe()?
+        };
+        if observation.matches(self.expected_identity, &self.expected_boundary) {
+            Ok(())
+        } else {
+            Err(ServingEpochUnavailable)
+        }
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<B, C> fmt::Debug for ServingEpochReleaseWitness<B, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServingEpochReleaseWitness { ..REDACTED.. }")
     }
 }
 
@@ -653,6 +704,15 @@ impl<const N: usize, B, S, C> ServingEpochLease<N, B, S, C> {
 }
 
 impl<const N: usize, B: ServingEpochBoundary, S, C> ServingEpochLease<N, B, S, C> {
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn release_witness(&self) -> ServingEpochReleaseWitness<B, C> {
+        ServingEpochReleaseWitness {
+            expected_identity: self.epoch.identity,
+            expected_boundary: self.epoch.boundary.clone(),
+            currentness: Arc::clone(&self.epoch.currentness),
+        }
+    }
+
     /// Checks the atomic epoch and recent Arc both before and after comparing
     /// the response-release observation. The second check rejects a refresh
     /// that races the otherwise-current observation.
@@ -660,12 +720,7 @@ impl<const N: usize, B: ServingEpochBoundary, S, C> ServingEpochLease<N, B, S, C
         if !self.local_binding_is_current() {
             return false;
         }
-        let observation_matches = self.epoch.identity == observation.identity
-            && self.epoch.boundary.same_capture(&observation.boundary);
-        #[cfg(test)]
-        if let Some(hook) = observation.after_comparison.as_ref() {
-            hook();
-        }
+        let observation_matches = observation.matches(self.epoch.identity, &self.epoch.boundary);
         observation_matches && self.local_binding_is_current()
     }
 }
