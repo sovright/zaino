@@ -70,6 +70,11 @@ pub mod mempool;
 /// State within [`OPERATIONAL_NFS_DEPTH`] blocks of the best-known chain tip;
 /// stored separately as it may be reorged.
 pub mod non_finalised_state;
+mod projection;
+pub use projection::{
+    CanonicalTransparentProjectionBoundary, CanonicalTransparentProjectionInput,
+    CanonicalTransparentProjectionInputError,
+};
 /// BlockchainSource
 pub mod source;
 /// Common types used by the rest of this module
@@ -77,6 +82,13 @@ pub mod types;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(feature = "test_dependencies", not(test)))]
+#[path = "chain_index/tests/vectors.rs"]
+pub(crate) mod shadow_vectors;
+
+#[cfg(all(feature = "test_dependencies", test))]
+pub(crate) use tests::vectors as shadow_vectors;
 
 /// Distance (in blocks) between the best-known chain tip and the highest block that
 /// zaino treats as part of the finalised DB — the finalised / non-finalised seam.

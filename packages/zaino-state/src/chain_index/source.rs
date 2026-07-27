@@ -34,7 +34,7 @@ use zebra_rpc::{
 };
 use zebra_state::{HashOrHeight, ReadRequest, ReadResponse, ReadStateService};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test_dependencies"))]
 pub(crate) mod mockchain_source;
 
 pub mod validator_connector;

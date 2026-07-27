@@ -12,6 +12,7 @@ publish = false
 [features]
 default = []
 corpus-zaino = ["dep:zaino-state"]
+shadow-parity = ["corpus-zaino"]
 rostl-experimental = [
     "dep:bytemuck",
     "dep:rand",
@@ -20,8 +21,19 @@ rostl-experimental = [
 ]
 
 [dependencies]
+arc-swap.workspace = true
+blake2 = { workspace = true }
 bytemuck = { version = "1.25.1", features = ["derive", "min_const_generics"], optional = true }
+chacha20poly1305 = { version = "0.10.1", default-features = false }
 rand = { version = "0.9.4", optional = true }
 rostl-oram = { git = "https://github.com/obliviouslabs/rostl", rev = "8c3a12d2febf17b024f2e949428b3bc526d74172", version = "0.1.0-alpha9", optional = true }
 rostl-primitives = { git = "https://github.com/obliviouslabs/rostl", rev = "8c3a12d2febf17b024f2e949428b3bc526d74172", version = "0.1.0-alpha9", optional = true }
+serde = { workspace = true, features = ["derive"] }
+tempfile.workspace = true
 zaino-state = { version = "0.3.1", path = "../zaino-state", default-features = false, optional = true }
+zeroize = "1.9.0"
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+zaino-state = { version = "0.3.1", path = "../zaino-state", default-features = false, features = ["test_dependencies"] }
