@@ -72,7 +72,10 @@ use crate::{
             },
             finalised_source::ephemeral::EphemeralFinalisedState,
         },
-        types::{db::metadata::FinalisedTxOutSetInfoAccumulator, TransactionHash},
+        types::{
+            db::metadata::FinalisedTxOutSetInfoAccumulator, BlockIndex, FinalizedOutpointSnapshot,
+            TransactionHash,
+        },
     },
     config::ChainIndexConfig,
     error::FinalisedStateError,
@@ -97,7 +100,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::capability::Capability;
+use super::{capability::Capability, SchemaAdmissionGuard};
 
 /// Lifecycle scaffolding shared by every `DbVx` finalised-state backend.
 ///
@@ -245,12 +248,29 @@ pub(crate) enum FinalisedSource<T: BlockchainSource> {
 // ***** Core database functionality *****
 
 impl<T: BlockchainSource> FinalisedSource<T> {
-    /// Spawn a v1 database backend.
+    /// Spawn a v1 database backend for direct storage-fixture inspection.
     ///
     /// This constructs and initializes the current schema implementation and returns it wrapped in
-    /// [`FinalisedSource::V1`].
+    /// [`FinalisedSource::V1`]. Production persistent state must go through [`FinalisedState`], whose
+    /// router retains the process-lifetime schema lease; this direct helper is limited to isolated
+    /// test directories.
+    #[cfg(test)]
     pub(crate) async fn spawn_v1(cfg: &ChainIndexConfig) -> Result<Self, FinalisedStateError> {
-        Ok(Self::V1(Box::new(DbV1::spawn(cfg).await?)))
+        let schema_admission_guard = SchemaAdmissionGuard::acquire(cfg).await?;
+        Self::spawn_v1_under_schema_admission(cfg, &schema_admission_guard).await
+    }
+
+    /// Spawn a v1 backend while the caller retains schema-admission ownership.
+    ///
+    /// The parent orchestrator uses this form so the same guard can remain live through any
+    /// migration selected after the backend metadata is read.
+    pub(super) async fn spawn_v1_under_schema_admission(
+        cfg: &ChainIndexConfig,
+        schema_admission_guard: &SchemaAdmissionGuard,
+    ) -> Result<Self, FinalisedStateError> {
+        Ok(Self::V1(Box::new(
+            DbV1::spawn(cfg, schema_admission_guard).await?,
+        )))
     }
 
     /// Spawns a "ephemeral" finalised state.
@@ -335,6 +355,23 @@ impl<T: BlockchainSource> FinalisedSource<T> {
             Self::V1(db) => Ok(db.as_ref()),
             Self::Ephemeral(_) => Err(FinalisedStateError::FeatureUnavailable(feature)),
         }
+    }
+
+    /// Materializes outpoint state at an exact finalized checkpoint.
+    ///
+    /// `expected_new_outpoints` are proven by the caller's canonical recent snapshot to be created
+    /// after the checkpoint; their pre-checkpoint absence becomes `NeverSeen`, while an indexed
+    /// collision is returned verbatim. Every `required_outpoint` is asserted to have existed at
+    /// the checkpoint, so an absent creator or output is an integrity error.
+    pub(super) async fn materialize_finalized_outpoints(
+        &self,
+        checkpoint: BlockIndex,
+        expected_new_outpoints: Vec<Outpoint>,
+        required_outpoints: Vec<Outpoint>,
+    ) -> Result<FinalizedOutpointSnapshot, FinalisedStateError> {
+        self.require_v1("finalized outpoint materialization")?
+            .materialize_outpoint_snapshot(checkpoint, expected_new_outpoints, required_outpoints)
+            .await
     }
 
     /// Return an arc clone of the underlying LMDB environment, used during some DB migrations.

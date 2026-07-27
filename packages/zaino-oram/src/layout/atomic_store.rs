@@ -8,6 +8,8 @@
 //! without another executor command interleaving. A new-address append still
 //! performs two sequential writes; it is not an all-or-nothing transaction,
 //! and a second-write failure leaves an unusable partial candidate.
+//! Higher-layer checkpoint publication records rebuild provenance only; this
+//! executor remains volatile and cannot resume either table after a crash.
 //!
 //! Catching a backend panic does not suppress the process-wide panic hook.
 //! Real backend integration therefore remains blocked on a panic-free or
@@ -25,8 +27,8 @@ mod worker;
 #[cfg(feature = "corpus-zaino")]
 pub(crate) use worker::{
     shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
-    AtomicQualificationAppendResult, AtomicQualificationSnapshot, AtomicQueueCapacity,
-    AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+    AtomicQualificationAppendResult, AtomicQualificationCommandError, AtomicQualificationSnapshot,
+    AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
 
 /// A sparse fixed-capacity table whose insert never overwrites an existing key.
@@ -104,7 +106,7 @@ impl fmt::Debug for AppendResult {
 
 struct AtomicPlan<const DIRECTORY_PROBES: usize> {
     profile_binding: [u8; 32],
-    address: StandardAddress,
+    address_key: AddressKey,
     directory: DirectoryProbePlan<DIRECTORY_PROBES>,
     append: Option<UtxoEvent>,
 }
@@ -185,8 +187,56 @@ where
         &mut self,
         address: StandardAddress,
     ) -> Result<FixedEventHistory, AtomicStoreError> {
-        let plan = self.plan(address, None);
+        let address_key = self.layout.address_key(address);
+        self.read_history_by_key(&address_key)
+    }
+
+    fn read_history_by_key(
+        &mut self,
+        address_key: &AddressKey,
+    ) -> Result<FixedEventHistory, AtomicStoreError> {
+        let plan = self.plan_for_key(address_key, None);
         self.execute(plan).map(|result| result.history)
+    }
+
+    fn read_live_slot(
+        &mut self,
+        address_key: &AddressKey,
+        logical_slot: usize,
+        maximum_finalized_height: u32,
+    ) -> Result<Option<TransparentUtxo>, AtomicStoreError> {
+        self.ensure_ready()?;
+        let slots_per_key = usize::try_from(self.layout.max_events_per_address)
+            .map_err(|_| AtomicStoreError::ResultAllocationFailed)?;
+        if logical_slot >= slots_per_key {
+            return Err(AtomicStoreError::InvalidLogicalSlot);
+        }
+
+        let history = self.read_history_by_key(address_key)?;
+        let mut invalid_owner = false;
+        for entry in history.events() {
+            invalid_owner |= !self.event_owner_is_valid(entry, address_key);
+        }
+        if invalid_owner {
+            return Err(self.discard(AtomicStoreError::InvalidEventHistory));
+        }
+        match finalized_live_utxo_at(history.events(), logical_slot, maximum_finalized_height) {
+            Ok(utxo) => Ok(utxo),
+            Err(FinalizedEventHistoryError::AllocationFailed) => {
+                Err(self.discard(AtomicStoreError::ResultAllocationFailed))
+            }
+            Err(FinalizedEventHistoryError::Invalid) => {
+                Err(self.discard(AtomicStoreError::InvalidEventHistory))
+            }
+        }
+    }
+
+    fn event_owner_is_valid(&self, entry: &Option<UtxoEvent>, address_key: &AddressKey) -> bool {
+        match entry {
+            Some(event) => StandardAddress::from_event(event)
+                .is_ok_and(|owner| self.layout.address_key(owner) == *address_key),
+            None => true,
+        }
     }
 
     fn append(
@@ -203,10 +253,19 @@ where
         address: StandardAddress,
         append: Option<UtxoEvent>,
     ) -> AtomicPlan<DIRECTORY_PROBES> {
+        let address_key = self.layout.address_key(address);
+        self.plan_for_key(&address_key, append)
+    }
+
+    fn plan_for_key(
+        &self,
+        address_key: &AddressKey,
+        append: Option<UtxoEvent>,
+    ) -> AtomicPlan<DIRECTORY_PROBES> {
         AtomicPlan {
             profile_binding: self.layout.profile_binding,
-            address,
-            directory: self.layout.directory_plan(address),
+            address_key: *address_key,
+            directory: self.layout.directory_plan_for_key(address_key),
             append,
         }
     }
@@ -216,11 +275,12 @@ where
         plan: AtomicPlan<DIRECTORY_PROBES>,
     ) -> Result<AppendResult, AtomicStoreError> {
         self.ensure_ready()?;
-        if plan
-            .append
-            .is_some_and(|event| StandardAddress::from_event(&event) != Ok(plan.address))
-        {
-            return Err(AtomicStoreError::Conflict);
+        if let Some(event) = plan.append {
+            let owner =
+                StandardAddress::from_event(&event).map_err(|_| AtomicStoreError::Conflict)?;
+            if self.layout.address_key(owner) != plan.address_key {
+                return Err(AtomicStoreError::Conflict);
+            }
         }
         match catch_unwind(AssertUnwindSafe(|| self.execute_inner(plan))) {
             Ok(result) => result,
@@ -455,7 +515,7 @@ where
         if !fixed_bytes_equal(&plan.profile_binding, &self.layout.profile_binding) {
             return Err(AtomicStoreError::PlanProfileMismatch);
         }
-        let expected = self.layout.directory_plan(plan.address);
+        let expected = self.layout.directory_plan_for_key(&plan.address_key);
         if expected.address_key != plan.directory.address_key
             || expected.slots != plan.directory.slots
         {
@@ -632,6 +692,8 @@ enum AtomicStoreError {
     BackendCapacityMismatch { table: TableKind },
     PlanProfileMismatch,
     InvalidPlan,
+    InvalidLogicalSlot,
+    InvalidEventHistory,
     ResultAllocationFailed,
     AdmissionLimitReached { table: TableKind },
     ProbeSetFull { table: TableKind },
@@ -655,6 +717,8 @@ impl fmt::Display for AtomicStoreError {
             }
             Self::PlanProfileMismatch => f.write_str("atomic plan belongs to another profile"),
             Self::InvalidPlan => f.write_str("atomic plan is invalid"),
+            Self::InvalidLogicalSlot => f.write_str("logical slot is outside the fixed profile"),
+            Self::InvalidEventHistory => f.write_str("finalized event history is invalid"),
             Self::ResultAllocationFailed => f.write_str("fixed history allocation failed"),
             Self::AdmissionLimitReached { table } => {
                 write!(f, "{table:?} admission limit is reached")
@@ -681,6 +745,47 @@ impl fmt::Display for AtomicStoreError {
 }
 
 impl std::error::Error for AtomicStoreError {}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
+pub(crate) struct QualificationMemoryTable<T> {
+    slots: Vec<Option<T>>,
+    occupied: u64,
+}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
+impl<T> QualificationMemoryTable<T> {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            slots: std::iter::repeat_with(|| None).take(capacity).collect(),
+            occupied: 0,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "corpus-zaino"))]
+impl<T: Copy> UniqueTable<T> for QualificationMemoryTable<T> {
+    fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn read(&mut self, index: usize) -> Result<Option<T>, BackendFailure> {
+        self.slots.get(index).copied().ok_or(BackendFailure)
+    }
+
+    fn occupied_records(&mut self) -> Result<u64, BackendFailure> {
+        Ok(self.occupied)
+    }
+
+    fn insert_unique(&mut self, index: usize, value: T) -> Result<(), BackendFailure> {
+        let slot = self.slots.get_mut(index).ok_or(BackendFailure)?;
+        if slot.is_some() {
+            return Err(BackendFailure);
+        }
+        *slot = Some(value);
+        self.occupied = self.occupied.checked_add(1).ok_or(BackendFailure)?;
+        Ok(())
+    }
+}
 
 #[cfg(all(test, feature = "corpus-zaino"))]
 pub(crate) fn spawn_atomic_worker_for_tests<
@@ -883,9 +988,90 @@ mod tests {
         )
     }
 
+    fn spent_event(address: StandardAddress, byte: u8, spending_height: u32) -> UtxoEvent {
+        UtxoEvent::spent(
+            [byte; TXID_BYTES],
+            u32::from(byte),
+            10_000 + u64::from(byte),
+            spending_height,
+            match address.kind {
+                StandardScriptKind::PayToPublicKeyHash => UtxoScriptClass::PayToPublicKeyHash,
+                StandardScriptKind::PayToScriptHash => UtxoScriptClass::PayToScriptHash,
+            },
+            address.hash,
+        )
+    }
+
     fn fixed_read_count() -> usize {
         DIRECTORY_PROBES
             + usize::try_from(MAX_EVENTS).expect("test maximum fits usize") * EVENT_PROBES
+    }
+
+    #[test]
+    fn key_addressed_live_slots_use_full_reads_and_dense_creation_order(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut executor = executor(6, 12)?;
+        let owner = address(0x19);
+        let first = event(owner, 0x21);
+        let second = event(owner, 0x22);
+        executor.append(owner, first)?;
+        executor.append(owner, second)?;
+        executor.append(owner, spent_event(owner, 0x21, 200))?;
+        let address_key = executor.layout.address_key(owner);
+        executor.directory.trace.borrow_mut().clear();
+        executor.directory.reads.clear();
+        executor.events.reads.clear();
+
+        let selected = executor
+            .read_live_slot(&address_key, 0, 200)?
+            .ok_or("second creation must remain live")?;
+        assert_eq!(selected.txid(), &[0x22; TXID_BYTES]);
+        assert_eq!(selected.output_index(), u32::from(0x22_u8));
+        assert_eq!(selected.value_zat(), 10_000 + u64::from(0x22_u8));
+        assert_eq!(selected.height(), 100 + u32::from(0x22_u8));
+        assert_eq!(executor.directory.trace.borrow().len(), fixed_read_count());
+
+        assert_eq!(executor.read_live_slot(&address_key, 1, 200)?, None);
+        assert_eq!(
+            executor.directory.trace.borrow().len(),
+            fixed_read_count() * 2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_live_slot_is_rejected_before_io_without_discarding(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut executor = executor(6, 12)?;
+        let address_key = executor.layout.address_key(address(0x1a));
+
+        assert_eq!(
+            executor.read_live_slot(&address_key, usize::try_from(MAX_EVENTS)?, u32::MAX),
+            Err(AtomicStoreError::InvalidLogicalSlot)
+        );
+        assert!(executor.directory.trace.borrow().is_empty());
+        assert_eq!(executor.state, ExecutorState::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_history_completes_fixed_reads_then_discards(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut executor = executor(6, 12)?;
+        let owner = address(0x1b);
+        executor.append(owner, spent_event(owner, 0x41, 300))?;
+        let address_key = executor.layout.address_key(owner);
+        executor.directory.trace.borrow_mut().clear();
+        executor.directory.reads.clear();
+        executor.events.reads.clear();
+
+        assert_eq!(
+            executor.read_live_slot(&address_key, 0, 300),
+            Err(AtomicStoreError::InvalidEventHistory)
+        );
+        assert_eq!(executor.directory.trace.borrow().len(), fixed_read_count());
+        assert_eq!(executor.state, ExecutorState::Discarded);
+        Ok(())
     }
 
     fn reads_from_records<T: Copy, const PROBES: usize>(
@@ -1414,10 +1600,11 @@ mod tests {
         let mut executor = executor(6, 12)?;
         let foreign = layout(6, 12, 12)?;
         let owner = address(0xa1);
+        let address_key = foreign.address_key(owner);
         let plan = AtomicPlan {
             profile_binding: foreign.profile_binding,
-            address: owner,
-            directory: foreign.directory_plan(owner),
+            address_key,
+            directory: foreign.directory_plan_for_key(&address_key),
             append: None,
         };
 
@@ -1456,6 +1643,8 @@ mod tests {
             },
             AtomicStoreError::PlanProfileMismatch,
             AtomicStoreError::InvalidPlan,
+            AtomicStoreError::InvalidLogicalSlot,
+            AtomicStoreError::InvalidEventHistory,
             AtomicStoreError::ResultAllocationFailed,
             AtomicStoreError::AdmissionLimitReached {
                 table: TableKind::Event,
