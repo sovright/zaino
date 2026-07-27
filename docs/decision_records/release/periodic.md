@@ -7,9 +7,9 @@ for release, in the order it landed. We do not cherry-pick from `dev` to cut
 releases -- the release is always a **prefix** of `dev`'s history.
 
 There are 6 publishable crates (`zainod`, `zaino-serve`, `zaino-state`,
-`zaino-fetch`, `zaino-proto`, `zaino-common`) and 3 internal-only
-(`e2e`, `integration`, `zaino-testutils`). Each public crate is versioned and
-released independently.
+`zaino-fetch`, `zaino-proto`, `zaino-common`) and 4 internal-only
+(`e2e`, `clientless`, `zaino-testutils`, `zaino-oram`). Each public crate is
+versioned and released independently.
 
 ### Relationship to ADR 003
 
@@ -536,8 +536,8 @@ From [ADR 003 §5, "Public interfaces governed by this ADR"](https://github.com/
 
 **Authoritative crate list (this repo)**: [Context](#context) enumerates the
 **6 crates.io-published packages** — `zainod`, `zaino-serve`, `zaino-state`,
-`zaino-fetch`, `zaino-proto`, `zaino-common` — and **3 internal-only
-packages** — `e2e`, `integration`, and `zaino-testutils`.
+`zaino-fetch`, `zaino-proto`, `zaino-common` — and **4 internal-only
+packages** — `e2e`, `clientless`, `zaino-testutils`, and `zaino-oram`.
 
 `zainodlib` exists as a library target inside the `zainod` package
 (`packages/zainod/Cargo.toml`: `[[bin]] name = "zainod"` alongside
@@ -556,7 +556,7 @@ repository/workspace and is now published independently to crates.io; its
 release policy is governed there, not here. ADR 003's listing of it as an
 excluded crate in this repo is therefore moot — it is out of scope entirely
 for this ADR. The excluded (internal-only, not-crates.io-published) crate
-list governed by this ADR is the two packages named above.
+list governed by this ADR is the four packages named above.
 
 The per-crate subsections below reproduce the public-interface and
 public-item lists from ADR 003 verbatim. Subsection headers use the Rust
@@ -642,7 +642,8 @@ corresponding package names (`Cargo.toml`) use the hyphenated form.
 
 > - `zaino-testutils`
 > - `e2e`
-> - `integration`
+> - `clientless`
+> - `zaino-oram`
 >
 > These may change freely without affecting SemVer, except where they force changes to governed public crates.
 
@@ -664,4 +665,3 @@ are resolved in the body of this document:
 - **Container image publication** — follows ADR 003 §6 step 7 verbatim: images MUST be tagged with the release version (`vMAJOR.MINOR.PATCH`) and SHOULD also be tagged with the Git commit SHA.
 
 Source: [ADR 003 §6, "Release strategy"](https://github.com/zingolabs/zingo-adrs/blob/dev/ADR%20003-Zaino%20Branching%2C%20Versioning%2C%20Documentation%2C%20Public%20Interfaces%2C%20and%20Release%20Strategy.md#6-release-strategy).
-

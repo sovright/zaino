@@ -72,20 +72,25 @@ pub use chain_index::source::{BlockchainSource, State, ValidatorConnector};
 pub use chain_index::encoding::*;
 pub use chain_index::mempool::Mempool;
 pub use chain_index::non_finalised_state::{
-    ChainIndexSnapshot, InitError, NodeConnectionError, NonFinalizedState, SyncError, UpdateError,
+    CanonicalRecentChainSnapshot, CanonicalRecentChainSnapshotError, ChainIndexSnapshot, InitError,
+    NodeConnectionError, NonFinalizedState, SyncError, UpdateError,
 };
 // NOTE: Should these be pub at all?
 pub use chain_index::types::{
-    AddrHistRecord, AddrScript, BlockContext, BlockData, BlockHash, BlockHeaderData, BlockMetadata,
-    BlockWithMetadata, ChainWork, ChainWorkError, CommitmentTreeData, CommitmentTreeRoots,
-    CommitmentTreeSizes, CompactDifficulty, CompactDifficultyError, CompactOrchardAction,
-    CompactSaplingOutput, CompactSaplingSpend, CompactTxData, Height, IndexedBlock,
-    OrchardCompactTx, OrchardTxList, Outpoint, SaplingCompactTx, SaplingTxList, ScriptType,
-    ShardIndex, ShardRoot, TransactionHash, TransparentCompactTx, TransparentTxList, TreeRootData,
-    TxInCompact, TxLocation, TxOutCompact, TxidList,
+    extract_transparent_events, AddrHistRecord, AddrScript, BlockContext, BlockData, BlockHash,
+    BlockHeaderData, BlockMetadata, BlockWithMetadata, ChainWork, ChainWorkError,
+    CommitmentTreeData, CommitmentTreeRoots, CommitmentTreeSizes, CompactDifficulty,
+    CompactDifficultyError, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend,
+    CompactTxData, Height, IndexedBlock, OrchardCompactTx, OrchardTxList, Outpoint,
+    SaplingCompactTx, SaplingTxList, ScriptType, ShardIndex, ShardRoot, TransactionHash,
+    TransparentBlockEvent, TransparentCompactTx, TransparentEventError, TransparentTxList,
+    TreeRootData, TxInCompact, TxLocation, TxOutCompact, TxidList,
 };
 
 pub use chain_index::mempool::{MempoolKey, MempoolValue};
+
+#[cfg(feature = "test_dependencies")]
+mod shadow_parity;
 
 #[cfg(feature = "test_dependencies")]
 /// allow public access to additional APIs, for testing
@@ -95,6 +100,10 @@ pub mod test_dependencies {
         pub use crate::chain_index::*;
     }
 
+    pub use crate::shadow_parity::{
+        load_ordinary_utxo_shadow_fixture, OrdinaryTransparentUtxo, OrdinaryUtxoShadowCase,
+        OrdinaryUtxoShadowError, OrdinaryUtxoShadowFixture,
+    };
     pub use crate::ChainIndexConfig;
 }
 

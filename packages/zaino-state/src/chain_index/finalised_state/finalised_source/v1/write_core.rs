@@ -55,6 +55,19 @@ struct BlockPoolLists {
     ironwood: Vec<Option<OrchardCompactTx>>,
 }
 
+#[cfg(feature = "transparent_address_history_experimental")]
+type AddressHistoryInputRecords =
+    HashMap<AddrScript, Vec<(AddrHistRecord, (AddrScript, AddrHistRecord))>>;
+
+#[cfg(feature = "transparent_address_history_experimental")]
+type AddressHistoryOutputRecords = HashMap<AddrScript, Vec<AddrHistRecord>>;
+
+#[cfg(feature = "transparent_address_history_experimental")]
+struct BlockAddressHistories {
+    inputs: AddressHistoryInputRecords,
+    outputs: AddressHistoryOutputRecords,
+}
+
 /// Builds the per-transaction pool lists for one block: each pool records
 /// `Some(compact data)` for a transaction with data in that pool, `None` otherwise,
 /// keeping every list index-aligned with the block's txids.
@@ -401,7 +414,7 @@ impl DbWrite for DbV1 {
             for height_int in start_height..=height.0 {
                 let block = build_indexed_block_from_source(
                     source,
-                    network,
+                    zebra_network.clone(),
                     sapling_activation_height,
                     nu5_activation_height,
                     nu6_3_activation_height,
@@ -441,6 +454,174 @@ impl DbWrite for DbV1 {
 impl DbV1 {
     //! *** DB write / delete methods ***
     //! **These should only ever be used in a single DB control task.**
+
+    #[cfg(feature = "transparent_address_history_experimental")]
+    fn invalid_address_history_event(
+        block: &IndexedBlock,
+        reason: impl Into<String>,
+    ) -> FinalisedStateError {
+        FinalisedStateError::InvalidBlock {
+            height: block.height().0,
+            hash: *block.hash(),
+            reason: reason.into(),
+        }
+    }
+
+    #[cfg(feature = "transparent_address_history_experimental")]
+    fn transaction_at_event_location(
+        block: &IndexedBlock,
+        location: TxLocation,
+    ) -> Result<&CompactTxData, FinalisedStateError> {
+        if location.block_height() != block.height().0 {
+            return Err(Self::invalid_address_history_event(
+                block,
+                "Invalid block data: transparent event height does not match block.",
+            ));
+        }
+
+        block
+            .transactions()
+            .get(usize::from(location.tx_index()))
+            .ok_or_else(|| {
+                Self::invalid_address_history_event(
+                    block,
+                    "Invalid block data: transparent event transaction does not exist.",
+                )
+            })
+    }
+
+    /// Builds address-history records from the shared transparent event seam.
+    ///
+    /// This remains separate from the LMDB mutation phase so output records are
+    /// still written before input records mark their previous outputs spent.
+    #[cfg(feature = "transparent_address_history_experimental")]
+    fn build_block_address_histories_blocking(
+        &self,
+        block: &IndexedBlock,
+    ) -> Result<BlockAddressHistories, FinalisedStateError> {
+        let events =
+            crate::chain_index::types::extract_transparent_events(block).map_err(|error| {
+                Self::invalid_address_history_event(
+                    block,
+                    format!("Invalid block data: transparent event extraction failed: {error}"),
+                )
+            })?;
+        let mut inputs = HashMap::new();
+        let mut outputs = HashMap::new();
+
+        for event in events {
+            match event {
+                crate::chain_index::types::TransparentBlockEvent::Created {
+                    location,
+                    output_index,
+                    ..
+                } => {
+                    let transaction = Self::transaction_at_event_location(block, location)?;
+                    let output = transaction
+                        .transparent()
+                        .outputs()
+                        .get(usize::from(output_index))
+                        .ok_or_else(|| {
+                            Self::invalid_address_history_event(
+                                block,
+                                "Invalid block data: transparent event output does not exist.",
+                            )
+                        })?;
+
+                    // Use the compact output itself rather than the event's optional standard
+                    // address. The legacy address-history table also indexes non-standard outputs
+                    // by their truncated compact script payload, and that behavior must remain
+                    // unchanged while ORAM consumers deliberately receive `address: None`.
+                    Self::build_transaction_output_histories(
+                        &mut outputs,
+                        location,
+                        std::iter::once((usize::from(output_index), output)),
+                    );
+                }
+                crate::chain_index::types::TransparentBlockEvent::Spent {
+                    location,
+                    input_index,
+                    previous,
+                } => {
+                    let transaction = Self::transaction_at_event_location(block, location)?;
+                    let input = transaction
+                        .transparent()
+                        .inputs()
+                        .get(usize::from(input_index))
+                        .ok_or_else(|| {
+                            Self::invalid_address_history_event(
+                                block,
+                                "Invalid block data: transparent event input does not exist.",
+                            )
+                        })?;
+                    let previous_txid = TransactionHash(*previous.prev_txid());
+
+                    if let Some((previous_tx_index, previous_transaction)) = block
+                        .transactions()
+                        .iter()
+                        .enumerate()
+                        .find(|(_, transaction)| transaction.txid() == &previous_txid)
+                    {
+                        let Some(previous_output) = previous_transaction
+                            .transparent()
+                            .outputs()
+                            .get(previous.prev_index() as usize)
+                        else {
+                            // Preserve the legacy invalid-block path: the txout-set accumulator
+                            // performs the authoritative same-block outpoint validation.
+                            continue;
+                        };
+                        let previous_tx_index = u16::try_from(previous_tx_index).map_err(|_| {
+                            Self::invalid_address_history_event(
+                                block,
+                                "Invalid block data: previous transaction index does not fit into u16.",
+                            )
+                        })?;
+                        Self::build_input_history(
+                            &mut inputs,
+                            location,
+                            input_index,
+                            input,
+                            previous_output,
+                            TxLocation::new(block.height().0, previous_tx_index),
+                        );
+                    } else {
+                        let previous_output =
+                            self.get_previous_output_blocking(previous).map_err(|_| {
+                                Self::invalid_address_history_event(
+                                    block,
+                                    "Invalid block data: invalid transparent input.",
+                                )
+                            })?;
+                        let previous_output_location = self
+                            .find_txid_index_blocking(&previous_txid)
+                            .map_err(|_| {
+                                Self::invalid_address_history_event(
+                                    block,
+                                    "Invalid block data: invalid transparent input.",
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                Self::invalid_address_history_event(
+                                    block,
+                                    "Invalid block data: invalid transparent input.",
+                                )
+                            })?;
+                        Self::build_input_history(
+                            &mut inputs,
+                            location,
+                            input_index,
+                            input,
+                            &previous_output,
+                            previous_output_location,
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(BlockAddressHistories { inputs, outputs })
+    }
 
     /// Writes a given (finalised) [`IndexedBlock`] to FinalisedState.
     ///
@@ -588,32 +769,20 @@ impl DbV1 {
         let pool_lists = extract_block_pool_lists(&block)?;
 
         #[cfg(feature = "transparent_address_history_experimental")]
-        let txid_set: HashSet<TransactionHash> = pool_lists
-            .transactions
-            .iter()
-            .map(|(hash, _)| *hash)
-            .collect();
+        let BlockAddressHistories {
+            inputs: addrhist_inputs_map,
+            outputs: addrhist_outputs_map,
+        } = tokio::task::block_in_place(|| self.build_block_address_histories_blocking(&block))?;
 
         let mut spent_map: HashMap<Outpoint, TxLocation> = HashMap::new();
 
-        #[cfg(feature = "transparent_address_history_experimental")]
-        #[allow(clippy::type_complexity)]
-        let mut addrhist_inputs_map: HashMap<
-            AddrScript,
-            Vec<(AddrHistRecord, (AddrScript, AddrHistRecord))>,
-        > = HashMap::new();
-
-        #[cfg(feature = "transparent_address_history_experimental")]
-        let mut addrhist_outputs_map: HashMap<AddrScript, Vec<AddrHistRecord>> = HashMap::new();
-
-        #[allow(clippy::unused_enumerate_index)]
-        for (_tx_index, tx) in block.transactions().iter().enumerate() {
+        for (tx_index, tx) in block.transactions().iter().enumerate() {
             // Transaction location
             let tx_index =
-                u16::try_from(_tx_index).map_err(|_| FinalisedStateError::InvalidBlock {
+                u16::try_from(tx_index).map_err(|_| FinalisedStateError::InvalidBlock {
                     height: block_height.0,
                     hash: block_hash,
-                    reason: format!("transaction index {_tx_index} does not fit into u16"),
+                    reason: format!("transaction index {tx_index} does not fit into u16"),
                 })?;
 
             let tx_location = TxLocation::new(block_height.into(), tx_index);
@@ -628,83 +797,6 @@ impl DbV1 {
                             "duplicate transparent spend for outpoint {prev_outpoint:?}"
                         ),
                     });
-                }
-            }
-
-            #[cfg(feature = "transparent_address_history_experimental")]
-            {
-                // Transparent Outputs: Build Address History
-                DbV1::build_transaction_output_histories(
-                    &mut addrhist_outputs_map,
-                    tx_location,
-                    tx.transparent().outputs().iter().enumerate(),
-                );
-
-                // Transparent Inputs: Build Address History
-                for (input_index, input) in tx.transparent().inputs().iter().enumerate() {
-                    if input.is_null_prevout() {
-                        continue;
-                    }
-                    let prev_outpoint = Outpoint::new(*input.prevout_txid(), input.prevout_index());
-
-                    // Check if output is in *this* block, else fetch from DB.
-                    let prev_tx_hash = TransactionHash(*prev_outpoint.prev_txid());
-                    if txid_set.contains(&prev_tx_hash) {
-                        // Locate the paired (txid, transparent_data) within this block.
-                        if let Some((tx_index, (_, Some(prev_transparent)))) = pool_lists
-                            .transactions
-                            .iter()
-                            .enumerate()
-                            .find(|(_, (h, _))| h == &prev_tx_hash)
-                        {
-                            // Fetch output from transaction
-                            if let Some(prev_output) = prev_transparent
-                                .outputs()
-                                .get(prev_outpoint.prev_index() as usize)
-                            {
-                                let prev_output_tx_location =
-                                    TxLocation::new(block_height.0, tx_index as u16);
-                                DbV1::build_input_history(
-                                    &mut addrhist_inputs_map,
-                                    tx_location,
-                                    input_index as u16,
-                                    input,
-                                    prev_output,
-                                    prev_output_tx_location,
-                                );
-                            }
-                        }
-                    } else if let Ok((prev_output, prev_output_tx_location)) =
-                        tokio::task::block_in_place(|| {
-                            let prev_output = self.get_previous_output_blocking(prev_outpoint)?;
-                            let prev_output_tx_location = self
-                                .find_txid_index_blocking(&TransactionHash::from(
-                                    *prev_outpoint.prev_txid(),
-                                ))?
-                                .ok_or_else(|| {
-                                    FinalisedStateError::Custom("Previous txid not found".into())
-                                })?;
-                            Ok::<(_, _), FinalisedStateError>((
-                                prev_output,
-                                prev_output_tx_location,
-                            ))
-                        })
-                    {
-                        DbV1::build_input_history(
-                            &mut addrhist_inputs_map,
-                            tx_location,
-                            input_index as u16,
-                            input,
-                            &prev_output,
-                            prev_output_tx_location,
-                        );
-                    } else {
-                        return Err(FinalisedStateError::InvalidBlock {
-                            height: block.height().0,
-                            hash: *block.hash(),
-                            reason: "Invalid block data: invalid transparent input.".to_string(),
-                        });
-                    }
                 }
             }
         }
@@ -1476,14 +1568,10 @@ impl DbV1 {
         let mut spent_map: HashMap<Outpoint, TxLocation> = HashMap::new();
 
         #[cfg(feature = "transparent_address_history_experimental")]
-        #[allow(clippy::type_complexity)]
-        let mut addrhist_inputs_map: HashMap<
-            AddrScript,
-            Vec<(AddrHistRecord, (AddrScript, AddrHistRecord))>,
-        > = HashMap::new();
-
-        #[cfg(feature = "transparent_address_history_experimental")]
-        let mut addrhist_outputs_map: HashMap<AddrScript, Vec<AddrHistRecord>> = HashMap::new();
+        let BlockAddressHistories {
+            inputs: addrhist_inputs_map,
+            outputs: addrhist_outputs_map,
+        } = tokio::task::block_in_place(|| self.build_block_address_histories_blocking(block))?;
 
         #[allow(clippy::unused_enumerate_index)]
         for (_tx_index, tx) in block.transactions().iter().enumerate() {
@@ -1514,93 +1602,6 @@ impl DbV1 {
                             "duplicate transparent spend for outpoint {prev_outpoint:?}"
                         ),
                     });
-                }
-            }
-
-            #[cfg(feature = "transparent_address_history_experimental")]
-            {
-                // Transparent Outputs: Build Address History
-                DbV1::build_transaction_output_histories(
-                    &mut addrhist_outputs_map,
-                    tx_location,
-                    tx.transparent().outputs().iter().enumerate(),
-                );
-
-                // Transparent Inputs: Build Address History
-                for (input_index, input) in tx.transparent().inputs().iter().enumerate() {
-                    if input.is_null_prevout() {
-                        continue;
-                    }
-
-                    let prev_outpoint = Outpoint::new(*input.prevout_txid(), input.prevout_index());
-
-                    //Check if output is in *this* block, else fetch from DB.
-                    let prev_tx_hash = TransactionHash(*prev_outpoint.prev_txid());
-                    if txid_set.contains(&prev_tx_hash) {
-                        // Locate the paired (txid, transparent_data) within this block.
-                        if let Some((tx_index, (_, Some(prev_transparent)))) = pool_lists
-                            .transactions
-                            .iter()
-                            .enumerate()
-                            .find(|(_, (h, _))| h == &prev_tx_hash)
-                        {
-                            // Fetch output from transaction
-                            if let Some(prev_output) = prev_transparent
-                                .outputs()
-                                .get(prev_outpoint.prev_index() as usize)
-                            {
-                                let prev_output_tx_location =
-                                    TxLocation::new(block_height.0, tx_index as u16);
-                                DbV1::build_input_history(
-                                    &mut addrhist_inputs_map,
-                                    tx_location,
-                                    input_index as u16,
-                                    input,
-                                    prev_output,
-                                    prev_output_tx_location,
-                                );
-                            }
-                        }
-                    } else if let Ok((prev_output, prev_output_tx_location)) =
-                        tokio::task::block_in_place(|| {
-                            let prev_output = self.get_previous_output_blocking(prev_outpoint)?;
-
-                            let prev_output_tx_location = self
-                                .find_txid_index_blocking(&TransactionHash::from(
-                                    *prev_outpoint.prev_txid(),
-                                ))
-                                .map_err(|e| FinalisedStateError::InvalidBlock {
-                                    height: block.height().0,
-                                    hash: *block.hash(),
-                                    reason: e.to_string(),
-                                })?
-                                .ok_or_else(|| FinalisedStateError::InvalidBlock {
-                                    height: block.height().0,
-                                    hash: *block.hash(),
-                                    reason: "Invalid block data: invalid txid data.".to_string(),
-                                })?;
-
-                            Ok::<(_, _), FinalisedStateError>((
-                                prev_output,
-                                prev_output_tx_location,
-                            ))
-                        })
-                    {
-                        DbV1::build_input_history(
-                            &mut addrhist_inputs_map,
-                            tx_location,
-                            input_index as u16,
-                            input,
-                            &prev_output,
-                            prev_output_tx_location,
-                        );
-                    } else {
-                        return Err(FinalisedStateError::InvalidBlock {
-                            height: block.height().0,
-                            hash: *block.hash(),
-                            reason: "Invalid block data: invalid transparent input.".to_string(),
-                        });
-                    }
                 }
             }
         }

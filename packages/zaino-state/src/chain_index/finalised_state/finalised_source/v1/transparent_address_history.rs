@@ -1033,3 +1033,33 @@ impl DbV1 {
         Ok(None)
     }
 }
+
+#[cfg(all(test, feature = "transparent_address_history_experimental"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_history_preserves_nonstandard_compact_key() {
+        let compact_payload = [0x5a; 20];
+        let output = TxOutCompact::new(42, compact_payload, crate::ScriptType::NonStandard as u8)
+            .expect("known non-standard script class constructs a compact output");
+        let location = TxLocation::new(7, 3);
+        let mut histories = HashMap::new();
+
+        DbV1::build_transaction_output_histories(
+            &mut histories,
+            location,
+            std::iter::once((5, &output)),
+        );
+
+        let legacy_key = AddrScript::new(compact_payload, crate::ScriptType::NonStandard as u8);
+        let records = histories
+            .get(&legacy_key)
+            .expect("non-standard output keeps its legacy compact address-history key");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tx_location(), location);
+        assert_eq!(records[0].out_index(), 5);
+        assert_eq!(records[0].value(), 42);
+        assert_eq!(records[0].flags(), AddrHistRecord::FLAG_MINED);
+    }
+}

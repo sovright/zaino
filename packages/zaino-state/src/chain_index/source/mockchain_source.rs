@@ -190,6 +190,7 @@ impl MockchainSource {
     /// the loaded chain's tip — every loaded block is immediately served.
     /// All inputs must be the same length, and ordered by ascending
     /// height starting from 0.
+    #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(crate) fn new(
         blocks: Vec<Arc<Block>>,
@@ -255,12 +256,14 @@ impl MockchainSource {
 
     /// Whether [`BlockchainSource::shutdown`] has run on this source (or any
     /// clone of it).
+    #[cfg(test)]
     pub(crate) fn shutdown_called(&self) -> bool {
         self.shutdown_called.load(Ordering::SeqCst)
     }
 
     /// When set to true, `get_best_block_height` and `get_best_block_hash`
     /// return `BlockchainSourceError::Unrecoverable`.
+    #[cfg(test)]
     pub(crate) fn set_failing(&self, fail: bool) {
         self.force_requests_against_source_to_fail
             .store(fail, Ordering::SeqCst);
@@ -270,6 +273,7 @@ impl MockchainSource {
     /// `max_chain_height`. Returns `true` iff the height changed; on a
     /// no-op advance (already at the cap) returns `false` so callers
     /// can decide whether to fire the change-notify.
+    #[cfg(test)]
     fn advance_active_height(&self, blocks: u32) -> bool {
         // len() returns one-indexed length, height is zero-indexed.
         let max_height = self.max_chain_height();
@@ -285,6 +289,7 @@ impl MockchainSource {
             .is_ok()
     }
 
+    #[cfg(test)]
     pub(crate) fn mine_blocks(&self, blocks: u32) {
         if self.advance_active_height(blocks) {
             self.blocks_received_broadcaster.send_replace(());
@@ -297,6 +302,7 @@ impl MockchainSource {
     /// chain-index *behind* the mempool in tests, since the mempool's
     /// serve loop polls `get_best_block_hash` directly and always
     /// notices, notify or not.
+    #[cfg(test)]
     pub(crate) fn mine_blocks_silent(&self, blocks: u32) {
         self.advance_active_height(blocks);
     }
@@ -311,6 +317,7 @@ impl MockchainSource {
     /// The closure runs synchronously inside `get_block`; do non-blocking
     /// work only (e.g. [`Self::mine_blocks`]). The hook is cleared after
     /// firing; replacing an armed hook is a silent overwrite.
+    #[cfg(test)]
     pub(crate) fn arm_one_shot_get_block_hook(&self, f: Box<dyn FnOnce() + Send + Sync>) {
         *self
             .get_block_hook
@@ -342,11 +349,7 @@ impl MockchainSource {
         let active_chain_height = self.active_height() as usize;
         let height_index = self.hashes.iter().position(|h| h.0 == hash.0);
 
-        if height_index.is_some() && height_index.unwrap() <= active_chain_height {
-            height_index
-        } else {
-            None
-        }
+        height_index.filter(|height| *height <= active_chain_height)
     }
 
     fn active_chain_height_as_usize(&self) -> usize {

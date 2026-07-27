@@ -2,11 +2,13 @@
 [workspace]
 members = [
     "packages/zaino-common",
+    "packages/zaino-oram",
     "packages/zainod",
     "packages/zaino-serve",
     "packages/zaino-state",
     "packages/zaino-fetch",
     "packages/zaino-proto",
+    "packages/zainod-oram",
     # Live-test suite (docs/adr/0002, docs/adr/0003, docs/adr/0004).
     # zaino-testutils first: the e2e/clientless partitions depend on it.
     "live-tests/zaino-testutils",
@@ -48,7 +50,7 @@ zcash_transparent = "0.9.0-pre.0"
 zcash_client_backend = "0.24.0-pre.0"
 
 # Zebra
-zebra-chain = "11.0"
+zebra-chain = "11.1"
 zebra-state = "10.0"
 zebra-rpc = "11.0"
 
@@ -159,3 +161,7 @@ opt-level = 3
 debug = true
 
 [patch.crates-io]
+# Source-bound backport of ZcashFoundation/zebra#10841 with a stricter
+# post-catch-up canonical (height, hash) replay guard. Remove this patch after
+# that guard is available in a compatible published Zebra dependency cohort.
+zebra-rpc = { git = "https://github.com/sovright/zebra.git", rev = "68ba61488a3c4386e6a3bd0370583f4ead153770" }
