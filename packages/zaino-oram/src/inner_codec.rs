@@ -2,8 +2,9 @@
 //!
 //! The codec pins canonical big-endian fields inside one compile-time fixed
 //! envelope and injects a whole-envelope protection interface. It supplies no
-//! production protector, nonce owner, runtime adapter, or fixed-work trace;
-//! those remain separate review gates.
+//! production protector or nonce owner. Its private listener-free runtime child
+//! composes the codec with the logical engine and fixed phase recorder; no
+//! network, production AEAD, or physical fixed-work claim is made.
 //!
 //! Deviation from the named `to_wire` / `try_from_wire` convention: this
 //! format has no intermediate proto or wire structs. Codec-local helpers write
@@ -14,15 +15,28 @@
 
 use std::{fmt, marker::PhantomData};
 
+use blake2::{Blake2s256, Digest};
+
 use crate::{
-    continuation_token::{ContinuationToken, CONTINUATION_TOKEN_BYTES},
+    continuation_token::{
+        ContinuationProtectionContext, ContinuationToken, CONTINUATION_CONTEXT_BYTES,
+        CONTINUATION_TOKEN_BYTES,
+    },
     envelope::FixedEnvelope,
     profile::{all_zero, CompiledQueryShape, PROFILE_ID_BYTES},
+    protection::{AuthenticationDecision, ProtectionUnavailable},
     records::{
         AddressKey, QueryOutcome, TransparentUtxo, UtxoQuery, UtxoResultPage, ADDRESS_KEY_BYTES,
         TRANSPARENT_SCRIPT_CAPACITY, TXID_BYTES,
     },
 };
+
+mod replay_journal;
+mod runtime;
+mod security_owner;
+mod security_state_binding;
+mod security_state_store;
+mod xchacha20;
 
 const FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
@@ -57,6 +71,8 @@ const RESPONSE_SLOTS_START: usize = RESPONSE_OUTCOME_START + 1;
 const REQUEST_FLAG_CONTINUATION: u8 = 1 << 0;
 const RESPONSE_FLAG_HAS_MORE: u8 = 1 << 0;
 const QUERY_FLAG_DOMAIN_VALID: u8 = 1 << 0;
+const QUERY_DIGEST_DOMAIN: &[u8] = b"zaino-oram/utxo-query/v1";
+const UTXO_QUERY_METHOD_TAG: u8 = 1;
 
 type EnvelopePartsMut<'a> = (
     &'a mut [u8; ENVELOPE_NONCE_BYTES],
@@ -105,6 +121,7 @@ struct PrivateQueryCheckpoint {
     /// Canonical 32-byte block hash in RPC/display byte order.
     block_hash_display: [u8; BLOCK_HASH_BYTES],
     schema_version: u32,
+    /// Volatile projection lifecycle; rolls on every restart/rebuild.
     projection_epoch: u64,
     key_epoch: u64,
 }
@@ -203,26 +220,46 @@ impl<const RESPONSE_SLOTS: usize> fmt::Debug for PrivateQueryResponse<RESPONSE_S
 
 /// Protection injected around the complete fixed envelope body.
 ///
-/// No production implementation is supplied. A later runtime must own nonce
-/// generation and provide reviewed AEAD protection. It must bind the complete
-/// [`EnvelopeProtectionContext`] as associated data or through domain-separated
-/// key derivation before releasing plaintext. The codec never treats the
-/// deterministic test implementation as cryptographic evidence.
+/// A crate-internal XChaCha20-Poly1305 primitive is available, but no service
+/// yet owns its keys, session establishment, or nonce lifecycle. Any selected
+/// implementation must bind the complete [`EnvelopeProtectionContext`] as
+/// associated data or through domain-separated key derivation before releasing
+/// plaintext. The codec never treats the deterministic test implementation as
+/// cryptographic evidence.
 trait EnvelopeProtector {
+    /// Protects `body`, or reports that no protected output can be produced.
     fn seal(
         &self,
         context: &EnvelopeProtectionContext,
         nonce: &[u8; ENVELOPE_NONCE_BYTES],
         body: &mut [u8],
-    ) -> [u8; ENVELOPE_AUTHENTICATION_BYTES];
+    ) -> Result<[u8; ENVELOPE_AUTHENTICATION_BYTES], ProtectionUnavailable>;
 
+    /// Authenticates `body` without exposing plaintext on rejection or error.
     fn open(
         &self,
         context: &EnvelopeProtectionContext,
         nonce: &[u8; ENVELOPE_NONCE_BYTES],
         body: &mut [u8],
         authentication: &[u8; ENVELOPE_AUTHENTICATION_BYTES],
-    ) -> bool;
+    ) -> Result<AuthenticationDecision, ProtectionUnavailable>;
+}
+
+fn xchacha20_envelope_protector(
+    request_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+    response_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+) -> impl EnvelopeProtector {
+    xchacha20::envelope_protector(request_key, response_key)
+}
+
+fn require_authentication(
+    decision: Result<AuthenticationDecision, ProtectionUnavailable>,
+) -> Result<(), InnerCodecError> {
+    match decision {
+        Ok(AuthenticationDecision::Accepted) => Ok(()),
+        Ok(AuthenticationDecision::Rejected) => Err(InnerCodecError::AuthenticationFailed),
+        Err(ProtectionUnavailable) => Err(InnerCodecError::ProtectionUnavailable),
+    }
 }
 
 /// Public context that must be cryptographically bound outside the protected
@@ -290,6 +327,19 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
         }
     }
 
+    fn continuation_protection_context(
+        &self,
+        checkpoint: &PrivateQueryCheckpoint,
+    ) -> Result<ContinuationProtectionContext, InnerCodecError> {
+        if CHECKPOINT_BYTES + SESSION_BINDING_BYTES != CONTINUATION_CONTEXT_BYTES {
+            return Err(InnerCodecError::LayoutInvariant);
+        }
+        let mut bytes = [0; CONTINUATION_CONTEXT_BYTES];
+        encode_checkpoint(&mut bytes, 0, checkpoint)?;
+        write_array(&mut bytes, CHECKPOINT_BYTES, &self.session_binding)?;
+        Ok(ContinuationProtectionContext::new(bytes))
+    }
+
     fn encode_request<P>(
         &self,
         request: &PrivateQueryRequest,
@@ -313,11 +363,13 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
         )?;
         write_array(body, REQUEST_SESSION_BINDING_START, &self.session_binding)?;
         ensure_zero(body, REQUEST_BODY_BYTES)?;
-        *authentication = protector.seal(
-            &self.protection_context(EnvelopeDirection::Request),
-            outer_nonce,
-            body,
-        );
+        *authentication = protector
+            .seal(
+                &self.protection_context(EnvelopeDirection::Request),
+                outer_nonce,
+                body,
+            )
+            .map_err(|_| InnerCodecError::ProtectionUnavailable)?;
         Ok(FixedEnvelope::from_array(bytes))
     }
 
@@ -329,16 +381,27 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
     where
         P: EnvelopeProtector,
     {
+        self.decode_request_with_nonce(envelope, protector)
+            .map(|(request, _nonce)| request)
+    }
+
+    fn decode_request_with_nonce<P>(
+        &self,
+        envelope: &FixedEnvelope<ENVELOPE_BYTES>,
+        protector: &P,
+    ) -> Result<(PrivateQueryRequest, [u8; ENVELOPE_NONCE_BYTES]), InnerCodecError>
+    where
+        P: EnvelopeProtector,
+    {
         let mut bytes = *envelope.as_bytes();
         let (nonce, body, authentication) = split_envelope_mut(&mut bytes)?;
-        if !protector.open(
+        require_authentication(protector.open(
             &self.protection_context(EnvelopeDirection::Request),
             nonce,
             body,
             authentication,
-        ) {
-            return Err(InnerCodecError::AuthenticationFailed);
-        }
+        ))?;
+        let authenticated_nonce = *nonce;
         let checkpoint = self.decode_header(body, EnvelopeDirection::Request)?;
         let query = decode_query(body, REQUEST_QUERY_START)?;
         let continuation = decode_optional_token(
@@ -349,7 +412,23 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
         )?;
         validate_binding(body, REQUEST_SESSION_BINDING_START, &self.session_binding)?;
         ensure_zero(body, REQUEST_BODY_BYTES)?;
-        Ok(PrivateQueryRequest::new(checkpoint, query, continuation))
+        Ok((
+            PrivateQueryRequest::new(checkpoint, query, continuation),
+            authenticated_nonce,
+        ))
+    }
+
+    fn query_digest(&self, query: &UtxoQuery) -> [u8; 32] {
+        let mut hasher = Blake2s256::new();
+        Digest::update(&mut hasher, QUERY_DIGEST_DOMAIN);
+        Digest::update(&mut hasher, [UTXO_QUERY_METHOD_TAG]);
+        Digest::update(&mut hasher, query.address_key().as_bytes());
+        Digest::update(&mut hasher, query.minimum_height().to_be_bytes());
+        Digest::update(&mut hasher, [u8::from(query.domain_valid())]);
+        let digest = Digest::finalize(hasher);
+        let mut query_digest = [0; 32];
+        query_digest.copy_from_slice(&digest);
+        query_digest
     }
 
     fn encode_response<P>(
@@ -386,11 +465,13 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
         )?;
         write_array(body, layout.session_binding, &self.session_binding)?;
         ensure_zero(body, layout.body_end)?;
-        *authentication = protector.seal(
-            &self.protection_context(EnvelopeDirection::Response),
-            outer_nonce,
-            body,
-        );
+        *authentication = protector
+            .seal(
+                &self.protection_context(EnvelopeDirection::Response),
+                outer_nonce,
+                body,
+            )
+            .map_err(|_| InnerCodecError::ProtectionUnavailable)?;
         Ok(FixedEnvelope::from_array(bytes))
     }
 
@@ -405,14 +486,12 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
         let layout = response_layout(RESPONSE_SLOTS)?;
         let mut bytes = *envelope.as_bytes();
         let (nonce, body, authentication) = split_envelope_mut(&mut bytes)?;
-        if !protector.open(
+        require_authentication(protector.open(
             &self.protection_context(EnvelopeDirection::Response),
             nonce,
             body,
             authentication,
-        ) {
-            return Err(InnerCodecError::AuthenticationFailed);
-        }
+        ))?;
         let checkpoint = self.decode_header(body, EnvelopeDirection::Response)?;
         let outcome = outcome_from_tag(read_byte(body, RESPONSE_OUTCOME_START)?)?;
         let page = decode_result_page(body, RESPONSE_SLOTS_START, outcome)?;
@@ -746,7 +825,8 @@ fn validate_response_shape<const N: usize>(
         }
         QueryOutcome::InvalidDomain
         | QueryOutcome::StoreFailure
-        | QueryOutcome::ProjectionNotReady => {
+        | QueryOutcome::ProjectionNotReady
+        | QueryOutcome::InvalidContinuation => {
             if has_more || continuation.is_some() || !page.is_all_dummy() {
                 return Err(InnerCodecError::InvalidResponseShape);
             }
@@ -776,6 +856,7 @@ const fn outcome_tag(outcome: QueryOutcome) -> u8 {
         QueryOutcome::InvalidDomain => 2,
         QueryOutcome::StoreFailure => 3,
         QueryOutcome::ProjectionNotReady => 4,
+        QueryOutcome::InvalidContinuation => 5,
     }
 }
 
@@ -786,6 +867,7 @@ const fn outcome_from_tag(tag: u8) -> Result<QueryOutcome, InnerCodecError> {
         2 => Ok(QueryOutcome::InvalidDomain),
         3 => Ok(QueryOutcome::StoreFailure),
         4 => Ok(QueryOutcome::ProjectionNotReady),
+        5 => Ok(QueryOutcome::InvalidContinuation),
         _ => Err(InnerCodecError::UnknownOutcome),
     }
 }
@@ -854,8 +936,8 @@ fn offset(start: usize, width: usize) -> Result<usize, InnerCodecError> {
 
 /// A protected inner envelope failed shape or canonical validation.
 ///
-/// These detailed variants are module-internal diagnostics only. A future
-/// runtime adapter must map every variant through
+/// These detailed variants are module-internal diagnostics only. The private
+/// runtime adapter maps every variant through
 /// [`InnerCodecError::into_uniform_external_failure`] before recording
 /// outcome-labelled telemetry or producing a caller-visible failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -865,6 +947,7 @@ enum InnerCodecError {
     LayoutOverflow,
     LayoutInvariant,
     AuthenticationFailed,
+    ProtectionUnavailable,
     VersionMismatch,
     DirectionMismatch,
     ProfileMismatch,
@@ -899,6 +982,8 @@ impl fmt::Display for UniformExternalFailure {
     }
 }
 
+impl std::error::Error for UniformExternalFailure {}
+
 impl fmt::Display for InnerCodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -914,6 +999,9 @@ impl fmt::Display for InnerCodecError {
             Self::LayoutInvariant => f.write_str("private envelope layout is inconsistent"),
             Self::AuthenticationFailed => {
                 f.write_str("private envelope authentication failed")
+            }
+            Self::ProtectionUnavailable => {
+                f.write_str("private envelope protection is unavailable")
             }
             Self::VersionMismatch => f.write_str("private envelope version does not match"),
             Self::DirectionMismatch => f.write_str("private envelope direction does not match"),
@@ -954,7 +1042,10 @@ mod tests {
     use blake2::{Blake2s256, Digest};
 
     use super::*;
-    use crate::{profile::PrivacyProfile, records::UtxoResultPage};
+    use crate::{
+        profile::{test_profile_without_recent_snapshot, PrivacyProfile},
+        records::UtxoResultPage,
+    };
 
     const RESPONSE_SLOTS: usize = 2;
     const ENVELOPE_BYTES: usize = 512;
@@ -1018,8 +1109,8 @@ mod tests {
             context: &EnvelopeProtectionContext,
             nonce: &[u8; ENVELOPE_NONCE_BYTES],
             body: &mut [u8],
-        ) -> [u8; ENVELOPE_AUTHENTICATION_BYTES] {
-            self.authentication(context, nonce, body)
+        ) -> Result<[u8; ENVELOPE_AUTHENTICATION_BYTES], ProtectionUnavailable> {
+            Ok(self.authentication(context, nonce, body))
         }
 
         fn open(
@@ -1028,20 +1119,48 @@ mod tests {
             nonce: &[u8; ENVELOPE_NONCE_BYTES],
             body: &mut [u8],
             authentication: &[u8; ENVELOPE_AUTHENTICATION_BYTES],
-        ) -> bool {
+        ) -> Result<AuthenticationDecision, ProtectionUnavailable> {
             let expected = self.authentication(context, nonce, body);
-            expected
+            let accepted = expected
                 .iter()
                 .zip(authentication)
                 .fold(0_u8, |difference, (left, right)| {
                     difference | (left ^ right)
                 })
-                == 0
+                == 0;
+            Ok(if accepted {
+                AuthenticationDecision::Accepted
+            } else {
+                AuthenticationDecision::Rejected
+            })
+        }
+    }
+
+    struct UnavailableTestProtector;
+
+    impl EnvelopeProtector for UnavailableTestProtector {
+        fn seal(
+            &self,
+            _context: &EnvelopeProtectionContext,
+            _nonce: &[u8; ENVELOPE_NONCE_BYTES],
+            _body: &mut [u8],
+        ) -> Result<[u8; ENVELOPE_AUTHENTICATION_BYTES], ProtectionUnavailable> {
+            Err(ProtectionUnavailable)
+        }
+
+        fn open(
+            &self,
+            _context: &EnvelopeProtectionContext,
+            _nonce: &[u8; ENVELOPE_NONCE_BYTES],
+            _body: &mut [u8],
+            _authentication: &[u8; ENVELOPE_AUTHENTICATION_BYTES],
+        ) -> Result<AuthenticationDecision, ProtectionUnavailable> {
+            Err(ProtectionUnavailable)
         }
     }
 
     fn profile<const SLOTS: usize, const BYTES: usize>() -> PrivacyProfile {
-        PrivacyProfile::new("codec-test-v1", 4, SLOTS, BYTES, 2)
+        test_profile_without_recent_snapshot("codec-test-v1", 4, SLOTS, BYTES, 2, 60)
             .expect("test profile inputs are nonzero")
     }
 
@@ -1059,12 +1178,13 @@ mod tests {
         cover_rounds: usize,
         session_binding: [u8; SESSION_BINDING_BYTES],
     ) -> TestCodec {
-        let profile = PrivacyProfile::new(
+        let profile = test_profile_without_recent_snapshot(
             "codec-test-v1",
             store_reads,
             RESPONSE_SLOTS,
             ENVELOPE_BYTES,
             cover_rounds,
+            60,
         )
         .expect("alternate test profile inputs are nonzero");
         let shape = CompiledQueryShape::new(profile)
@@ -1144,7 +1264,9 @@ mod tests {
         let mut bytes = *envelope.as_bytes();
         let (nonce, body, authentication) = split_envelope_mut(&mut bytes)?;
         mutate(body);
-        *authentication = protector().seal(&codec().protection_context(direction), nonce, body);
+        *authentication = protector()
+            .seal(&codec().protection_context(direction), nonce, body)
+            .map_err(|_| InnerCodecError::ProtectionUnavailable)?;
         Ok(FixedEnvelope::from_array(bytes))
     }
 
@@ -1158,9 +1280,47 @@ mod tests {
         assert_eq!(
             digest(&envelope),
             [
-                208, 66, 216, 138, 209, 3, 242, 181, 104, 174, 248, 16, 139, 214, 158, 242, 103,
-                86, 161, 69, 49, 89, 243, 50, 96, 75, 234, 195, 226, 173, 130, 94,
+                243, 46, 130, 99, 165, 69, 13, 41, 40, 29, 36, 43, 205, 154, 18, 53, 68, 47, 238,
+                84, 46, 168, 177, 140, 156, 222, 9, 94, 193, 53, 204, 33,
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_protection_returns_no_output_and_preserves_input() -> Result<(), InnerCodecError>
+    {
+        let codec = codec();
+        let unavailable = UnavailableTestProtector;
+        assert!(matches!(
+            codec.encode_request(&request(), REQUEST_NONCE, &unavailable),
+            Err(InnerCodecError::ProtectionUnavailable)
+        ));
+        assert!(matches!(
+            codec.encode_response(&response(), RESPONSE_NONCE, &unavailable),
+            Err(InnerCodecError::ProtectionUnavailable)
+        ));
+
+        let request_envelope = codec.encode_request(&request(), REQUEST_NONCE, &protector())?;
+        let request_bytes = *request_envelope.as_bytes();
+        assert!(matches!(
+            codec.decode_request(&request_envelope, &unavailable),
+            Err(InnerCodecError::ProtectionUnavailable)
+        ));
+        assert_eq!(request_envelope.as_bytes(), &request_bytes);
+
+        let response_envelope = codec.encode_response(&response(), RESPONSE_NONCE, &protector())?;
+        let response_bytes = *response_envelope.as_bytes();
+        assert!(matches!(
+            codec.decode_response(&response_envelope, &unavailable),
+            Err(InnerCodecError::ProtectionUnavailable)
+        ));
+        assert_eq!(response_envelope.as_bytes(), &response_bytes);
+        assert_eq!(
+            InnerCodecError::ProtectionUnavailable
+                .into_uniform_external_failure()
+                .to_string(),
+            "private query failed"
         );
         Ok(())
     }
@@ -1247,8 +1407,8 @@ mod tests {
         assert_eq!(
             digest(&envelope),
             [
-                143, 184, 230, 133, 55, 157, 71, 88, 139, 92, 45, 65, 154, 195, 141, 191, 248, 14,
-                27, 78, 133, 199, 139, 132, 183, 35, 181, 9, 182, 14, 85, 77,
+                140, 143, 245, 55, 145, 47, 35, 181, 122, 31, 132, 46, 182, 64, 252, 110, 207, 29,
+                112, 253, 15, 193, 124, 118, 31, 85, 167, 49, 138, 55, 37, 107,
             ]
         );
         Ok(())
@@ -1518,10 +1678,11 @@ mod tests {
             outcome_response(QueryOutcome::InvalidDomain)?,
             outcome_response(QueryOutcome::StoreFailure)?,
             outcome_response(QueryOutcome::ProjectionNotReady)?,
+            outcome_response(QueryOutcome::InvalidContinuation)?,
         ];
 
         for (index, response) in cases.iter().enumerate() {
-            let nonce_byte = u8::try_from(index + 1).expect("seven test cases fit u8");
+            let nonce_byte = u8::try_from(index + 1).expect("eight test cases fit u8");
             let envelope = codec.encode_response(
                 response,
                 [nonce_byte; ENVELOPE_NONCE_BYTES],

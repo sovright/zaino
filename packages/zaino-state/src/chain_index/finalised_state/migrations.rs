@@ -152,7 +152,7 @@ use crate::{
         finalised_state::{
             capability::DbMetadata,
             entry::{StoredEntryFixed, StoredEntryVar},
-            finalised_source::v1::SYNC_CHECKPOINT_INTERVAL,
+            finalised_source::v1::{canonical_schema_hash, SYNC_CHECKPOINT_INTERVAL},
             router::EphemeralMode,
         },
         source::BlockchainSource,
@@ -169,6 +169,14 @@ use crate::SendFut;
 
 use std::sync::Arc;
 use tracing::info;
+
+fn canonical_migration_schema_hash(version: DbVersion) -> Result<[u8; 32], FinalisedStateError> {
+    canonical_schema_hash(version).ok_or_else(|| {
+        FinalisedStateError::Custom(format!(
+            "no canonical schema hash is registered for migration target version {version}"
+        ))
+    })
+}
 
 /// Broad categorisation of migration severity.
 ///
@@ -262,14 +270,17 @@ pub trait Migration<T: BlockchainSource> {
                 "starting metadata-only migration"
             );
 
-            let mut metadata: DbMetadata = router.get_metadata().await?;
+            // Full ephemeral mode deliberately closes normal routed access while a migration owns
+            // the persistent database. Migration code is maintenance code, so it must bypass the
+            // service router explicitly and mutate the admitted primary backend.
+            let primary = router.primary_backend();
+            let mut metadata: DbMetadata = primary.get_metadata().await?;
 
             metadata.version = Self::TO_VERSION;
-            metadata.schema_hash =
-                crate::chain_index::finalised_state::finalised_source::v1::DB_SCHEMA_V1_HASH;
+            metadata.schema_hash = canonical_migration_schema_hash(Self::TO_VERSION)?;
             metadata.migration_status = MigrationStatus::Empty;
 
-            router.update_metadata(metadata).await?;
+            primary.update_metadata(metadata).await?;
 
             info!(
                 from = %Self::CURRENT_VERSION,
@@ -952,8 +963,7 @@ impl<T: BlockchainSource> Migration<T> for Migration1_1_0To1_2_0 {
 
         let mut metadata: DbMetadata = backend.get_metadata().await?;
         metadata.version = <Self as Migration<T>>::TO_VERSION;
-        metadata.schema_hash =
-            crate::chain_index::finalised_state::finalised_source::v1::DB_SCHEMA_V1_HASH;
+        metadata.schema_hash = canonical_migration_schema_hash(<Self as Migration<T>>::TO_VERSION)?;
         metadata.migration_status = MigrationStatus::Empty;
         backend.update_metadata(metadata).await?;
         env.sync(true)?;
@@ -1290,8 +1300,7 @@ impl<T: BlockchainSource> Migration<T> for Migration1_2_1To1_3_0 {
         env.sync(true)?;
         let mut metadata: DbMetadata = backend.get_metadata().await?;
         metadata.version = <Self as Migration<T>>::TO_VERSION;
-        metadata.schema_hash =
-            crate::chain_index::finalised_state::finalised_source::v1::DB_SCHEMA_V1_HASH;
+        metadata.schema_hash = canonical_migration_schema_hash(<Self as Migration<T>>::TO_VERSION)?;
         metadata.migration_status = MigrationStatus::Empty;
         backend.update_metadata(metadata).await?;
         env.sync(true)?;
