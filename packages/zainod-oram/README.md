@@ -93,6 +93,63 @@ evidence only. It is unsigned and provides no execution attestation,
 source-derivation attestation, physical-access trace, TDX result, mainnet
 result, or claim that the two same-source builds were independently executed.
 
+## Gate 2 paired insertion timing
+
+The `typed-qualification` feature also builds a separate synchronous binary for
+the dynamic half of the insertion-path experiment. Run it on Linux x86_64 under
+`taskset`; it refuses to start unless `/proc/self/status` confirms exactly one
+allowed CPU, Linux scheduler statistics are enabled, and the declared load
+policy admits the initial host state:
+
+```console
+cargo build -p zainod-oram --features typed-qualification \
+  --bin zainod-oram-timing --release
+taskset -c 3 target/release/zainod-oram-timing \
+  --directory-capacity <POWER_OF_TWO> \
+  --directory-occupancy <RECORDS_BELOW_CAPACITY> \
+  --event-capacity <POWER_OF_TWO> \
+  --event-occupancy <RECORDS_BELOW_CAPACITY> \
+  --mean-bound-nanos <PREDECLARED_NANOSECONDS> \
+  --cdf-distance-bound <PREDECLARED_0_TO_1_BOUND> \
+  --max-load-average-1m <LOAD> \
+  --max-competing-processes <COUNT> \
+  --max-runqueue-wait-ratio <PREDECLARED_0_TO_1_RATIO> \
+  --seed <SEED> \
+  --output <NEW_JSON_FILE>
+```
+
+Set `kernel.sched_schedstats=1` before the run if the host has disabled that
+accounting. The driver reads the control before, between, and after the two
+record-kind experiments and fails closed if it is unavailable or disabled.
+
+One invocation measures both fixed-record monomorphizations. Each uses 50
+discarded warm-up pairs followed by exactly 500 measured pairs against fresh,
+equal-occupancy tables, with an exactly balanced seed-shuffled AB/BA order.
+The single atomically renamed, no-replace JSON file records both raw timing
+vectors, plans, predeclared bounds, classifier AUC, the nominal family-wise 95%
+paired-mean bootstrap intervals and permutation diagnostic, empirical CDF
+distance, and its distribution-free joint family-wise 95% upper confidence
+limits. The statistical gate evaluates the pooled sample, both AB/BA order
+strata, and both first/second measurement positions, preventing order or
+cache-period effects from cancelling into a pass. The file also records CPU
+and quiescence observations before, between, and after the two experiments.
+Scheduler counters bracket every timed insertion. Run-queue wait is divided by
+the narrower measured wall-clock interval, so scheduler work at either procfs
+bracket can only make admission more conservative; both aggregate and
+worst-measurement ratios must meet the declared bound.
+CPU-affinity drift, disabled scheduler accounting, or excess run-queue waiting
+makes `declared_criteria_satisfied` false after preserving the negative result.
+The initial load policy is not reused as a post-run gate because the CPU-bound
+driver contributes to Linux's one-minute load average.
+
+The CDF gate detects threshold-visible distribution shapes that mean and AUC
+can miss, but it is not evidence against arbitrary nonlinear classifiers,
+memory/page traces, PMU traces, allocator behavior, or other host side
+channels. Bounds and host thresholds are caller-selected, so
+`declared_criteria_satisfied` means exactly that and is not by itself a Gate 2
+qualification. The output is self-reported and is not signed, source-bound, or
+execution-attested.
+
 ## Typed-worker correctness qualification
 
 The default-off `typed-qualification` feature exposes one fixed, listener-free

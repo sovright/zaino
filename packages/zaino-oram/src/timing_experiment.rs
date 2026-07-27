@@ -1,11 +1,10 @@
 //! Scheduling and preconditions for the paired access-path timing experiment.
 //!
-//! This is the portable half of the driver. It decides *what* to measure and in
-//! *what order*, and it decides whether the machine is fit to measure on at
-//! all. It never measures anything itself: the caller supplies a [`PairedProbe`]
-//! that performs one timed insertion against a fresh, equal-occupancy worker.
-//! That split keeps the scheduling rules testable on any host, and confines the
-//! platform-specific work to a thin implementation of one trait method.
+//! This is the portable scheduler. It decides *what* to measure and in *what
+//! order*. It never measures the host environment itself: the synchronous
+//! platform driver must enforce CPU affinity and quiescence immediately before
+//! and after calling [`run`]. The caller supplies a [`PairedProbe`] that performs
+//! one timed insertion against a fresh, equal-occupancy table.
 //!
 //! # Why quiescence is a precondition, not a caveat
 //!
@@ -16,37 +15,37 @@
 //! dominant noise term for this workload — precisely the term pinning does not
 //! isolate.
 //!
-//! That matters in a specific and dangerous direction. Concurrent load inflates
-//! variance, a wider distribution widens the bootstrap interval, and a wide
-//! interval is *easier* to fit inside an equivalence bound. A noisy machine
-//! therefore biases this experiment toward falsely reporting "indistinguishable".
-//! So [`QuiescencePolicy`] is checked before a run and its observation is
-//! recorded with the result, rather than the run proceeding and the noise being
-//! mentioned afterwards.
+//! Concurrent load inflates variance and widens confidence intervals, making an
+//! equivalence result harder to obtain. More importantly, uncontrolled load can
+//! create, erase, or reorder timing effects, so a noisy run is not conservative
+//! evidence in either direction. The platform driver therefore checks an
+//! initial [`Quiescence`] snapshot and records contention throughout the run.
 
-use crate::timing_equivalence::{Pair, Rng, Seed, MINIMUM_PAIRS};
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use crate::timing_equivalence::{ArmMeasurement, Pair, PairOrder, Rng, Seed, MINIMUM_PAIRS};
+use serde::Serialize;
 
 /// Which side of the pair is being measured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Arm {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arm {
     /// The key is already present.
     Hit,
     /// The key is absent.
     Miss,
 }
 
-/// One timed insertion against a fresh, equal-occupancy worker.
+/// One timed insertion against a fresh, equal-occupancy table.
 ///
 /// Implementations must rebuild state between calls so that occupancy is
 /// identical for both arms; otherwise the experiment measures table growth
 /// rather than the hit/miss distinction.
-pub trait PairedProbe {
+pub(crate) trait PairedProbe {
     /// Why a measurement could not be taken.
     type Error;
 
-    /// Performs one insertion on `arm` and returns its duration in nanoseconds.
-    fn measure(&mut self, arm: Arm) -> Result<u64, Self::Error>;
+    /// Performs one insertion on `arm`.
+    fn measure(&mut self, arm: Arm) -> Result<ArmMeasurement, Self::Error>;
 }
 
 /// Why an experiment plan was refused.
@@ -59,10 +58,29 @@ pub enum PlanError {
     },
     /// A run with no warm-up measures cold caches, not steady state.
     NoWarmup,
+    /// The warm-up and measured pair counts cannot be added safely.
+    IterationCountOverflow,
 }
 
+impl fmt::Display for PlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Underpowered { requested } => write!(
+                formatter,
+                "timing plan requested {requested} pairs; at least {MINIMUM_PAIRS} are required"
+            ),
+            Self::NoWarmup => formatter.write_str("timing plan requires at least one warm-up pair"),
+            Self::IterationCountOverflow => {
+                formatter.write_str("timing plan pair count overflows usize")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlanError {}
+
 /// A validated experiment plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ExperimentPlan {
     pairs: usize,
     warmup_pairs: usize,
@@ -78,6 +96,9 @@ impl ExperimentPlan {
         if warmup_pairs == 0 {
             return Err(PlanError::NoWarmup);
         }
+        warmup_pairs
+            .checked_add(pairs)
+            .ok_or(PlanError::IterationCountOverflow)?;
         Ok(Self {
             pairs,
             warmup_pairs,
@@ -97,14 +118,14 @@ impl ExperimentPlan {
 }
 
 /// An observation of how busy the machine was.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Quiescence {
     load_average_1m: f64,
     competing_processes: usize,
 }
 
 impl Quiescence {
-    /// Records a machine-state observation taken immediately before a run.
+    /// Records one machine-state observation.
     pub const fn new(load_average_1m: f64, competing_processes: usize) -> Self {
         Self {
             load_average_1m,
@@ -114,7 +135,7 @@ impl Quiescence {
 }
 
 /// The machine conditions a run requires.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct QuiescencePolicy {
     max_load_average_1m: f64,
     max_competing_processes: usize,
@@ -131,56 +152,68 @@ impl QuiescencePolicy {
 
     /// Whether the observed machine state is fit to measure on.
     pub fn admits(&self, observed: &Quiescence) -> bool {
-        observed.load_average_1m <= self.max_load_average_1m
+        self.max_load_average_1m.is_finite()
+            && self.max_load_average_1m >= 0.0
+            && observed.load_average_1m.is_finite()
+            && observed.load_average_1m >= 0.0
+            && observed.load_average_1m <= self.max_load_average_1m
             && observed.competing_processes <= self.max_competing_processes
     }
-}
-
-/// Why a run was refused or abandoned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunError<E> {
-    /// The machine was too busy for the measurement to mean anything.
-    NotQuiescent,
-    /// The probe could not take a measurement.
-    Probe(E),
 }
 
 /// Runs the plan, returning one [`Pair`] per measured iteration.
 ///
 /// Warm-up pairs are measured and discarded. Within each pair the two arms are
-/// measured in a seed-determined order, so any monotonic drift over the run
-/// falls on both arms equally rather than accumulating against one of them.
-pub fn run<P: PairedProbe>(
+/// measured in a seed-determined, exactly balanced order (within one pair for an
+/// odd count), so monotonic drift falls on both arms in expectation rather than
+/// systematically accumulating against one of them.
+pub(crate) fn run<P: PairedProbe>(
     plan: &ExperimentPlan,
-    policy: &QuiescencePolicy,
-    observed: &Quiescence,
     probe: &mut P,
-) -> Result<Vec<Pair>, RunError<P::Error>> {
-    if !policy.admits(observed) {
-        return Err(RunError::NotQuiescent);
-    }
-
+) -> Result<Vec<Pair>, P::Error> {
     let mut rng = Rng::new(plan.seed.value() ^ 0xa1b2_c3d4_e5f6_0789);
+    let warmup_orders = balanced_orders(plan.warmup_pairs, &mut rng);
+    measure_orders(probe, &warmup_orders, |_| {})?;
+
+    let measured_orders = balanced_orders(plan.pairs, &mut rng);
     let mut pairs = Vec::with_capacity(plan.pairs);
-    for index in 0..(plan.warmup_pairs + plan.pairs) {
-        let miss_first = rng.next_u64() & 1 == 0;
-        let pair = measure_pair(probe, miss_first).map_err(RunError::Probe)?;
-        if index >= plan.warmup_pairs {
-            pairs.push(pair);
-        }
-    }
+    measure_orders(probe, &measured_orders, |pair| pairs.push(pair))?;
     Ok(pairs)
+}
+
+fn measure_orders<P, F>(
+    probe: &mut P,
+    miss_first_orders: &[bool],
+    mut retain: F,
+) -> Result<(), P::Error>
+where
+    P: PairedProbe,
+    F: FnMut(Pair),
+{
+    for &miss_first in miss_first_orders {
+        retain(measure_pair(probe, miss_first)?);
+    }
+    Ok(())
+}
+
+fn balanced_orders(count: usize, rng: &mut Rng) -> Vec<bool> {
+    let mut orders: Vec<bool> = (0..count).map(|index| index.is_multiple_of(2)).collect();
+    for index in (1..orders.len()).rev() {
+        let other = rng.below(index + 1);
+        orders.swap(index, other);
+    }
+    orders
 }
 
 fn measure_pair<P: PairedProbe>(probe: &mut P, miss_first: bool) -> Result<Pair, P::Error> {
     if miss_first {
         let miss = probe.measure(Arm::Miss)?;
         let hit = probe.measure(Arm::Hit)?;
-        Ok(Pair::new(hit, miss))
+        Ok(Pair::from_measurements(hit, miss, PairOrder::MissFirst))
     } else {
         let hit = probe.measure(Arm::Hit)?;
         let miss = probe.measure(Arm::Miss)?;
-        Ok(Pair::new(hit, miss))
+        Ok(Pair::from_measurements(hit, miss, PairOrder::HitFirst))
     }
 }
 
@@ -189,9 +222,13 @@ fn measure_pair<P: PairedProbe>(probe: &mut P, miss_first: bool) -> Result<Pair,
 /// Pinning is checked rather than assumed: a run that believes it is pinned but
 /// is not will migrate between cores mid-experiment, and the migration cost
 /// lands on whichever arm happens to be executing.
-pub fn single_cpu_allowed(cpus_allowed_list: &str) -> bool {
-    let list = cpus_allowed_list.trim();
-    !list.is_empty() && !list.contains(',') && !list.contains('-')
+fn single_cpu_allowed(cpus_allowed_list: &str) -> bool {
+    single_allowed_cpu(cpus_allowed_list).is_some()
+}
+
+/// Returns the sole CPU named by `Cpus_allowed_list`, if there is exactly one.
+pub fn single_allowed_cpu(cpus_allowed_list: &str) -> Option<u32> {
+    cpus_allowed_list.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -207,18 +244,15 @@ mod tests {
     impl PairedProbe for FakeProbe {
         type Error = ();
 
-        fn measure(&mut self, arm: Arm) -> Result<u64, ()> {
+        fn measure(&mut self, arm: Arm) -> Result<ArmMeasurement, ()> {
             self.order.push(arm);
             self.calls += 1;
-            Ok(match arm {
+            let nanos = match arm {
                 Arm::Hit => 1_000,
                 Arm::Miss => 1_000,
-            })
+            };
+            Ok(ArmMeasurement::duration_only(nanos))
         }
-    }
-
-    fn quiet() -> (QuiescencePolicy, Quiescence) {
-        (QuiescencePolicy::new(0.5, 0), Quiescence::new(0.1, 0))
     }
 
     #[test]
@@ -240,36 +274,33 @@ mod tests {
         );
     }
 
-    /// A busy machine biases this experiment toward a false "equivalent", so the
-    /// run must refuse rather than proceed and caveat.
     #[test]
-    fn a_busy_machine_refuses_to_produce_measurements() {
-        let plan = ExperimentPlan::new(MINIMUM_PAIRS, 4, Seed::new(1)).expect("valid plan");
+    fn a_plan_with_an_overflowing_iteration_count_is_refused() {
+        assert_eq!(
+            ExperimentPlan::new(usize::MAX, 1, Seed::new(1)),
+            Err(PlanError::IterationCountOverflow)
+        );
+    }
+
+    /// A noisy environment is inadmissible evidence in either direction.
+    #[test]
+    fn a_busy_machine_is_rejected_by_policy() {
         let policy = QuiescencePolicy::new(0.5, 0);
-        let mut probe = FakeProbe::default();
 
         let loaded = Quiescence::new(3.7, 0);
-        assert_eq!(
-            run(&plan, &policy, &loaded, &mut probe),
-            Err(RunError::NotQuiescent)
-        );
+        assert!(!policy.admits(&loaded));
 
         let competing = Quiescence::new(0.1, 2);
-        assert_eq!(
-            run(&plan, &policy, &competing, &mut probe),
-            Err(RunError::NotQuiescent)
-        );
-
-        // Nothing was measured, so no partial result can be published.
-        assert_eq!(probe.calls, 0);
+        assert!(!policy.admits(&competing));
+        assert!(policy.admits(&Quiescence::new(0.1, 0)));
+        assert!(!QuiescencePolicy::new(f64::NAN, 0).admits(&Quiescence::new(0.1, 0)));
     }
 
     #[test]
     fn warmup_pairs_are_measured_and_discarded() {
         let plan = ExperimentPlan::new(MINIMUM_PAIRS, 7, Seed::new(9)).expect("valid plan");
-        let (policy, observed) = quiet();
         let mut probe = FakeProbe::default();
-        let pairs = run(&plan, &policy, &observed, &mut probe).expect("quiet machine");
+        let pairs = run(&plan, &mut probe).expect("probe succeeds");
 
         assert_eq!(pairs.len(), MINIMUM_PAIRS);
         // Every pair, warm-up included, costs two measurements.
@@ -279,9 +310,8 @@ mod tests {
     #[test]
     fn each_pair_measures_both_arms_exactly_once() {
         let plan = ExperimentPlan::new(MINIMUM_PAIRS, 1, Seed::new(5)).expect("valid plan");
-        let (policy, observed) = quiet();
         let mut probe = FakeProbe::default();
-        run(&plan, &policy, &observed, &mut probe).expect("quiet machine");
+        run(&plan, &mut probe).expect("probe succeeds");
 
         for window in probe.order.chunks(2) {
             assert_eq!(window.len(), 2);
@@ -294,30 +324,28 @@ mod tests {
     #[test]
     fn arm_ordering_is_randomised_and_balanced() {
         let plan = ExperimentPlan::new(2_000, 1, Seed::new(11)).expect("valid plan");
-        let (policy, observed) = quiet();
         let mut probe = FakeProbe::default();
-        run(&plan, &policy, &observed, &mut probe).expect("quiet machine");
+        run(&plan, &mut probe).expect("probe succeeds");
 
-        let hit_first = probe
-            .order
+        let measured_order = &probe.order[plan.warmup_pairs() * 2..];
+        let hit_first = measured_order
             .chunks(2)
             .filter(|window| window[0] == Arm::Hit)
             .count();
-        let total = probe.order.len() / 2;
-        let share = hit_first as f64 / total as f64;
+        let total = measured_order.len() / 2;
+        let miss_first = total - hit_first;
         assert!(
-            (0.45..=0.55).contains(&share),
-            "ordering was lopsided: {share}"
+            hit_first.abs_diff(miss_first) <= 1,
+            "ordering was not exactly balanced: hit-first={hit_first}, miss-first={miss_first}"
         );
     }
 
     #[test]
     fn ordering_is_reproducible_from_the_recorded_seed() {
-        let (policy, observed) = quiet();
         let order_for = |seed: u64| {
             let plan = ExperimentPlan::new(MINIMUM_PAIRS, 1, Seed::new(seed)).expect("valid plan");
             let mut probe = FakeProbe::default();
-            run(&plan, &policy, &observed, &mut probe).expect("quiet machine");
+            run(&plan, &mut probe).expect("probe succeeds");
             probe.order
         };
         assert_eq!(order_for(3), order_for(3));
@@ -332,5 +360,7 @@ mod tests {
         assert!(!single_cpu_allowed("0,2"));
         assert!(!single_cpu_allowed("2-3,7"));
         assert!(!single_cpu_allowed(""));
+        assert!(!single_cpu_allowed("cpu3"));
+        assert_eq!(single_allowed_cpu(" 11 "), Some(11));
     }
 }

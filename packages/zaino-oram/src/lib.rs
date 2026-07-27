@@ -44,6 +44,7 @@ mod protection;
 mod qualification;
 mod recent_snapshot;
 mod records;
+mod rostl_timing;
 mod runtime_security;
 mod sizing;
 mod store;
@@ -75,6 +76,10 @@ pub use projection_owner::{
 pub use qualification::{
     run_typed_worker_qualification, TypedWorkerQualificationError, TypedWorkerQualificationReport,
 };
+pub use rostl_timing::{
+    run_rostl_insert_timing, validate_rostl_timing_shape, RostlTimingError, RostlTimingRecordKind,
+    RostlTimingRun, RostlTimingSchedulerSummary,
+};
 #[cfg(feature = "corpus-zaino")]
 pub use stress_qualification::{
     run_typed_worker_stress_qualification, TypedWorkerStressProfile,
@@ -86,12 +91,11 @@ pub use target_load::{
     TypedWorkerTargetLoadReport,
 };
 pub use timing_equivalence::{
-    evaluate as evaluate_timing_equivalence, EquivalenceBound, EquivalenceReport, Pair,
-    Seed as TimingSeed, MINIMUM_PAIRS,
+    evaluate as evaluate_timing_equivalence, BoundError as TimingBoundError, EquivalenceBounds,
+    EquivalenceReport, Pair, PairOrder, Seed as TimingSeed, MINIMUM_PAIRS,
 };
 pub use timing_experiment::{
-    run as run_timing_experiment, Arm, ExperimentPlan, PairedProbe, PlanError, Quiescence,
-    QuiescencePolicy, RunError,
+    single_allowed_cpu, ExperimentPlan, PlanError, Quiescence, QuiescencePolicy,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use zaino_corpus::{

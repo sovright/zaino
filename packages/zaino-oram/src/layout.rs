@@ -26,6 +26,8 @@ use crate::records::{
 
 mod atomic_store;
 
+#[cfg(feature = "rostl-experimental")]
+pub(crate) use atomic_store::rostl_insert_timing_probe;
 #[cfg(feature = "corpus-zaino")]
 pub(super) use atomic_store::{
     shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,

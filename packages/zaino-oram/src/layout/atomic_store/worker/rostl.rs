@@ -9,7 +9,7 @@
 use std::{fmt, marker::PhantomData};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use std::time::Instant;
+use std::{fs, time::Instant};
 
 use bytemuck::Pod;
 use rostl_primitives::traits::Cmov;
@@ -24,11 +24,16 @@ use super::{AtomicQueueCapacity, AtomicWorker, AtomicWorkerError};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::layout::FixedProbeLayout;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use crate::records::{AddressDirectory, AddressKey};
+use crate::records::{
+    AddressDirectory, AddressEventPage, AddressKey, UtxoEvent, UtxoScriptClass, TXID_BYTES,
+};
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use crate::records::{PersistentAddressDirectory, PersistentAddressEventPage};
+use crate::timing_equivalence::ArmMeasurement;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::timing_equivalence::TimedSchedulerDelta;
 use crate::timing_experiment::{Arm, PairedProbe};
+use crate::{RostlTimingError, RostlTimingRecordKind};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use rand::Rng as _;
@@ -161,9 +166,7 @@ where
     T: Cmov + Pod + Default + Clone + fmt::Debug,
 {
     fn new(capacity: usize) -> Result<Self, RostlStoreError> {
-        if capacity < 2 || capacity > u32::MAX as usize || !capacity.is_power_of_two() {
-            return Err(RostlStoreError::InvalidCapacity);
-        }
+        validate_capacity(capacity)?;
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
@@ -285,6 +288,14 @@ where
                 Err(RostlStoreError::UpstreamPanic)
             }
         }
+    }
+}
+
+fn validate_capacity(capacity: usize) -> Result<(), RostlStoreError> {
+    if capacity < 2 || capacity > u32::MAX as usize || !capacity.is_power_of_two() {
+        Err(RostlStoreError::InvalidCapacity)
+    } else {
+        Ok(())
     }
 }
 
@@ -439,78 +450,105 @@ fn build_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
     AtomicWorker::spawn(executor, queue_capacity).map_err(RostlWorkerBuildError::Worker)
 }
 
-/// Times one insertion against a freshly built, equal-occupancy table.
-///
-/// # Why a fresh table per measurement
-///
-/// The miss arm *mutates*: inserting an absent key raises occupancy by one. If
-/// both arms shared a table, whichever ran second would face a different
-/// occupancy and the experiment would measure table growth rather than the
-/// hit/miss distinction. Rebuilding per measurement is therefore required for
-/// correctness, not tidiness. Only the single insertion is timed; the rebuild
-/// is not.
-///
-/// # Why the probe key is the same in both arms
-///
-/// Both arms insert the *same* key and hold occupancy equal; only the filler
-/// set differs. The hit arm pre-inserts the probe key, the miss arm substitutes
-/// one other filler in its place. That removes key identity as a confound, so
-/// the arms differ in exactly the property under test.
+/// Opaque probe returned only to the crate's high-level timing entry point.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(crate) struct DirectoryInsertProbe {
+pub(crate) struct RostlInsertTimingProbe {
+    inner: RostlInsertTimingProbeKind,
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub(crate) struct RostlInsertTimingProbe;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+enum RostlInsertTimingProbeKind {
+    Directory(InsertProbe<PersistentAddressDirectory>),
+    Event(InsertProbe<PersistentAddressEventPage>),
+}
+
+pub(crate) fn rostl_insert_timing_probe(
+    kind: RostlTimingRecordKind,
     capacity: usize,
     occupancy: usize,
+) -> Result<RostlInsertTimingProbe, RostlTimingError> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        match kind {
+            RostlTimingRecordKind::Directory => {
+                InsertProbe::new(capacity, occupancy).map(|probe| RostlInsertTimingProbe {
+                    inner: RostlInsertTimingProbeKind::Directory(probe),
+                })
+            }
+            RostlTimingRecordKind::Event => {
+                InsertProbe::new(capacity, occupancy).map(|probe| RostlInsertTimingProbe {
+                    inner: RostlInsertTimingProbeKind::Event(probe),
+                })
+            }
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = (kind, capacity, occupancy);
+        Err(RostlTimingError::UnsupportedPlatform)
+    }
 }
 
-/// Why a timed measurement could not be taken.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbeError {
-    /// The requested shape cannot hold the fillers plus the probe key.
-    InvalidShape,
-    /// Building or filling the table failed.
-    Setup,
-    /// The timed insertion did not do what the arm required, so the
-    /// measurement does not describe the intended operation.
-    WrongOutcome,
+impl PairedProbe for RostlInsertTimingProbe {
+    type Error = RostlTimingError;
+
+    fn measure(&mut self, arm: Arm) -> Result<ArmMeasurement, Self::Error> {
+        match &mut self.inner {
+            RostlInsertTimingProbeKind::Directory(probe) => probe.measure(arm),
+            RostlInsertTimingProbeKind::Event(probe) => probe.measure(arm),
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+impl PairedProbe for RostlInsertTimingProbe {
+    type Error = RostlTimingError;
+
+    fn measure(&mut self, _arm: Arm) -> Result<ArmMeasurement, Self::Error> {
+        Err(RostlTimingError::UnsupportedPlatform)
+    }
+}
+
+/// Times one insertion against a freshly built, equal-occupancy table.
+///
+/// The miss arm mutates, so sharing a table would give the second arm a
+/// different occupancy. Both arms instead insert the same probe key into fresh
+/// tables; the hit arm pre-inserts that key while the miss arm substitutes one
+/// filler. Only the final insertion is timed.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct InsertProbe<T> {
+    capacity: usize,
+    occupancy: usize,
+    record: PhantomData<T>,
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl DirectoryInsertProbe {
-    /// The probe key, present for the hit arm and absent for the miss arm.
+impl<T> InsertProbe<T>
+where
+    T: TimingProbeRecord,
+{
     const PROBE_KEY: usize = 0;
 
-    /// Builds a probe over a table of `capacity` slots holding `occupancy`
-    /// records at the moment of measurement.
-    pub(crate) fn new(capacity: usize, occupancy: usize) -> Result<Self, ProbeError> {
-        // One spare filler index is needed so the miss arm can hold occupancy
-        // equal without pre-inserting the probe key, and admit_insert requires
-        // occupancy strictly below capacity.
-        if occupancy == 0 || occupancy + 1 >= capacity {
-            return Err(ProbeError::InvalidShape);
+    fn new(capacity: usize, occupancy: usize) -> Result<Self, RostlTimingError> {
+        if validate_capacity(capacity).is_err() || occupancy == 0 || occupancy >= capacity {
+            return Err(RostlTimingError::InvalidShape);
         }
         Ok(Self {
             capacity,
             occupancy,
+            record: PhantomData,
         })
-    }
-
-    fn filler(index: usize) -> PersistentAddressDirectory {
-        let byte = (index % 251) as u8 + 1;
-        PersistentAddressDirectory::from_business(&AddressDirectory::real(
-            index as u32,
-            AddressKey::new([byte; 32]),
-        ))
     }
 
     /// Builds a table holding exactly `occupancy` records, containing the probe
     /// key only when `include_probe_key` is set.
-    fn prepared(
-        &self,
-        include_probe_key: bool,
-    ) -> Result<RostlTable<PersistentAddressDirectory>, ProbeError> {
-        let mut table = RostlTable::<PersistentAddressDirectory>::new(self.capacity)
-            .map_err(|_| ProbeError::Setup)?;
+    fn prepared(&self, include_probe_key: bool) -> Result<RostlTable<T>, RostlTimingError> {
+        let mut table = RostlTable::<T>::new(self.capacity).map_err(|_| RostlTimingError::Setup)?;
         let mut inserted = 0usize;
         let mut key = 0usize;
         while inserted < self.occupancy {
@@ -519,8 +557,8 @@ impl DirectoryInsertProbe {
                 continue;
             }
             table
-                .insert_record_unique(key, Self::filler(key))
-                .map_err(|_| ProbeError::Setup)?;
+                .insert_record_unique(key, T::filler(key)?)
+                .map_err(|_| RostlTimingError::Setup)?;
             inserted += 1;
             key += 1;
         }
@@ -529,31 +567,118 @@ impl DirectoryInsertProbe {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl PairedProbe for DirectoryInsertProbe {
-    type Error = ProbeError;
+impl<T> PairedProbe for InsertProbe<T>
+where
+    T: TimingProbeRecord,
+{
+    type Error = RostlTimingError;
 
-    fn measure(&mut self, arm: Arm) -> Result<u64, ProbeError> {
+    fn measure(&mut self, arm: Arm) -> Result<ArmMeasurement, Self::Error> {
         let hit = matches!(arm, Arm::Hit);
         let mut table = self.prepared(hit)?;
-        let candidate = Self::filler(Self::PROBE_KEY);
+        let candidate = T::filler(Self::PROBE_KEY)?;
 
+        let scheduler_before = read_scheduler_counters()?;
         let started = Instant::now();
         let outcome = table.insert_record_unique(Self::PROBE_KEY, candidate);
         let elapsed = started.elapsed();
+        let scheduler_after = read_scheduler_counters()?;
+        let scheduler = scheduler_after.delta_from(scheduler_before)?;
 
-        // A measurement only describes the intended operation if the operation
-        // actually happened, so an unexpected outcome is discarded rather than
-        // silently contributing a timing.
-        let as_expected = match (hit, outcome) {
-            (true, Err(RostlStoreError::DuplicateKey)) => true,
-            (false, Ok(())) => true,
-            _ => false,
-        };
+        let as_expected = matches!(
+            (hit, outcome),
+            (true, Err(RostlStoreError::DuplicateKey)) | (false, Ok(()))
+        );
         if !as_expected {
-            return Err(ProbeError::WrongOutcome);
+            return Err(RostlTimingError::WrongOutcome);
         }
 
-        u64::try_from(elapsed.as_nanos()).map_err(|_| ProbeError::WrongOutcome)
+        let nanos =
+            u64::try_from(elapsed.as_nanos()).map_err(|_| RostlTimingError::WrongOutcome)?;
+        Ok(ArmMeasurement::with_scheduler(nanos, scheduler))
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy)]
+struct SchedulerCounters {
+    cpu_time_nanos: u64,
+    runqueue_wait_nanos: u64,
+    timeslices: u64,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl SchedulerCounters {
+    fn delta_from(self, before: Self) -> Result<TimedSchedulerDelta, RostlTimingError> {
+        Ok(TimedSchedulerDelta {
+            cpu_time_nanos: self
+                .cpu_time_nanos
+                .checked_sub(before.cpu_time_nanos)
+                .ok_or(RostlTimingError::SchedulerStats)?,
+            runqueue_wait_nanos: self
+                .runqueue_wait_nanos
+                .checked_sub(before.runqueue_wait_nanos)
+                .ok_or(RostlTimingError::SchedulerStats)?,
+            timeslices: self
+                .timeslices
+                .checked_sub(before.timeslices)
+                .ok_or(RostlTimingError::SchedulerStats)?,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_scheduler_counters() -> Result<SchedulerCounters, RostlTimingError> {
+    let schedstat =
+        fs::read_to_string("/proc/self/schedstat").map_err(|_| RostlTimingError::SchedulerStats)?;
+    let mut fields = schedstat.split_whitespace();
+    let mut next_counter = || {
+        fields
+            .next()
+            .ok_or(RostlTimingError::SchedulerStats)?
+            .parse::<u64>()
+            .map_err(|_| RostlTimingError::SchedulerStats)
+    };
+    Ok(SchedulerCounters {
+        cpu_time_nanos: next_counter()?,
+        runqueue_wait_nanos: next_counter()?,
+        timeslices: next_counter()?,
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+trait TimingProbeRecord: Cmov + Pod + Default + Clone + fmt::Debug {
+    fn filler(index: usize) -> Result<Self, RostlTimingError>;
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl TimingProbeRecord for PersistentAddressDirectory {
+    fn filler(index: usize) -> Result<Self, RostlTimingError> {
+        let slot = u32::try_from(index).map_err(|_| RostlTimingError::Setup)?;
+        let byte = (index % 251) as u8 + 1;
+        Ok(Self::from_business(&AddressDirectory::real(
+            slot,
+            AddressKey::new([byte; 32]),
+        )))
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl TimingProbeRecord for PersistentAddressEventPage {
+    fn filler(index: usize) -> Result<Self, RostlTimingError> {
+        let directory_slot = u32::try_from(index).map_err(|_| RostlTimingError::Setup)?;
+        let byte = (index % 251) as u8 + 1;
+        let event = UtxoEvent::created(
+            [byte; TXID_BYTES],
+            1,
+            50_000,
+            100,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [byte; 20],
+        );
+        let page = AddressEventPage::real(directory_slot, 0, event)
+            .map_err(|_| RostlTimingError::Setup)?;
+        Ok(Self::from_business(&page))
     }
 }
 
@@ -862,18 +987,23 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn probe_arms_hold_occupancy_equal_and_differ_only_in_the_probe_key(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let probe = DirectoryInsertProbe::new(64, 8)?;
-        let mut with_key = probe.prepared(true)?;
-        let mut without_key = probe.prepared(false)?;
+    ) -> Result<(), RostlStoreError> {
+        let probe =
+            InsertProbe::<PersistentAddressDirectory>::new(64, 8).expect("valid probe shape");
+        let mut with_key = probe
+            .prepared(true)
+            .expect("hit-arm probe preparation succeeds");
+        let mut without_key = probe
+            .prepared(false)
+            .expect("miss-arm probe preparation succeeds");
 
         assert_eq!(with_key.occupied_record_count()?, 8);
         assert_eq!(without_key.occupied_record_count()?, 8);
         assert!(with_key
-            .read_record(DirectoryInsertProbe::PROBE_KEY)?
+            .read_record(InsertProbe::<PersistentAddressDirectory>::PROBE_KEY)?
             .is_some());
         assert!(without_key
-            .read_record(DirectoryInsertProbe::PROBE_KEY)?
+            .read_record(InsertProbe::<PersistentAddressDirectory>::PROBE_KEY)?
             .is_none());
         Ok(())
     }
@@ -882,18 +1012,27 @@ mod tests {
     /// the arm required.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn probe_measures_both_arms_and_rejects_an_impossible_shape() -> Result<(), ProbeError> {
-        let mut probe = DirectoryInsertProbe::new(64, 8)?;
-        assert!(probe.measure(Arm::Hit)? > 0);
-        assert!(probe.measure(Arm::Miss)? > 0);
+    fn probes_measure_both_records_and_accept_near_full_tables() -> Result<(), RostlTimingError> {
+        for kind in [
+            RostlTimingRecordKind::Directory,
+            RostlTimingRecordKind::Event,
+        ] {
+            let mut probe = rostl_insert_timing_probe(kind, 8, 7)?;
+            probe.measure(Arm::Hit)?;
+            probe.measure(Arm::Miss)?;
+        }
 
         assert_eq!(
-            DirectoryInsertProbe::new(8, 0).err(),
-            Some(ProbeError::InvalidShape)
+            InsertProbe::<PersistentAddressDirectory>::new(8, 0).err(),
+            Some(RostlTimingError::InvalidShape)
         );
         assert_eq!(
-            DirectoryInsertProbe::new(8, 7).err(),
-            Some(ProbeError::InvalidShape)
+            InsertProbe::<PersistentAddressDirectory>::new(8, 8).err(),
+            Some(RostlTimingError::InvalidShape)
+        );
+        assert_eq!(
+            InsertProbe::<PersistentAddressDirectory>::new(7, 6).err(),
+            Some(RostlTimingError::InvalidShape)
         );
         Ok(())
     }
