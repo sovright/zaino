@@ -9,30 +9,13 @@
 )]
 
 use std::fmt;
+use zaino_oram::FixedEnvelopeRuntime;
+#[cfg(test)]
+use zaino_oram::{PendingFixedEnvelope, PrivateQueryUnavailable};
 
 use crate::private_proto;
 
 mod tonic_body;
-
-/// Crate-private port for one exact listener-free runtime round.
-trait FixedEnvelopeRuntime<const N: usize> {
-    /// Pending runtime response retained until the adapter result is dropped.
-    type PendingResponse: PendingFixedEnvelope<N>;
-
-    /// Handles one already validated request envelope.
-    fn query_page(&mut self, request: [u8; N])
-        -> Result<Self::PendingResponse, RuntimeUnavailable>;
-}
-
-/// Borrows response bytes only after the release-time check succeeds.
-trait PendingFixedEnvelope<const N: usize> {
-    /// Checks release-time currentness before returning one exact response.
-    fn try_release_bytes(&self) -> Result<&[u8; N], RuntimeUnavailable>;
-}
-
-/// Coarsened runtime-port rejection used only inside this adapter module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RuntimeUnavailable;
 
 /// Exact application envelope after validation at the private wire boundary.
 struct ValidatedFixedEnvelope<const N: usize> {
@@ -195,7 +178,7 @@ mod tests {
     }
 
     impl PendingFixedEnvelope<ENVELOPE_BYTES> for MockPendingResponse {
-        fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], RuntimeUnavailable> {
+        fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], PrivateQueryUnavailable> {
             Ok(&self.response)
         }
     }
@@ -218,10 +201,10 @@ mod tests {
         fn query_page(
             &mut self,
             _request: [u8; ENVELOPE_BYTES],
-        ) -> Result<Self::PendingResponse, RuntimeUnavailable> {
+        ) -> Result<Self::PendingResponse, PrivateQueryUnavailable> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.busy.swap(true, Ordering::SeqCst) {
-                return Err(RuntimeUnavailable);
+                return Err(PrivateQueryUnavailable);
             }
             Ok(MockPendingResponse {
                 response: self.response,

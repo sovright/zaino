@@ -23,6 +23,13 @@ const ENVELOPE_ASSOCIATED_DATA_BYTES: usize =
 const _: [(); ENVELOPE_NONCE_BYTES] = [(); NONCE_BYTES];
 const _: [(); ENVELOPE_AUTHENTICATION_BYTES] = [(); AUTHENTICATION_BYTES];
 
+pub(super) fn envelope_protector(
+    request_key: Zeroizing<[u8; KEY_BYTES]>,
+    response_key: Zeroizing<[u8; KEY_BYTES]>,
+) -> impl EnvelopeProtector {
+    XChaCha20EnvelopeProtector::new(request_key, response_key)
+}
+
 /// Separately owned request and response envelope role-key objects.
 struct XChaCha20EnvelopeProtector {
     request_key: XChaCha20ProtectionKey,

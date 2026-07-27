@@ -13,17 +13,21 @@ use std::{
     fmt,
     fs::{self, File},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use blake2::{
     digest::{KeyInit, Mac},
     Blake2s256, Blake2sMac256, Digest,
 };
-use tempfile::{Builder as TempfileBuilder, NamedTempFile};
 use zeroize::Zeroizing;
 
-use crate::canonical_chain::{CanonicalNetwork, PublicChainCheckpoint};
+use crate::{
+    canonical_chain::{CanonicalNetwork, PublicChainCheckpoint},
+    persistence::fs_atomic::{
+        create_unique_file, ensure_real_directory, sync_directory, RealDirectoryError,
+    },
+};
 
 const EVENT_LOG_ROOT_BYTES: usize = 32;
 const MANIFEST_DIGEST_BYTES: usize = 32;
@@ -787,9 +791,9 @@ where
     }
 
     fn ensure_directories(&self) -> Result<(), ProjectionManifestStoreError> {
-        ensure_real_directory(&self.recovery_directory)?;
-        ensure_real_directory(&self.manifest_directory())?;
-        ensure_real_directory(&self.staging_directory())?;
+        ensure_real_directory(&self.recovery_directory).map_err(map_real_directory_error)?;
+        ensure_real_directory(&self.manifest_directory()).map_err(map_real_directory_error)?;
+        ensure_real_directory(&self.staging_directory()).map_err(map_real_directory_error)?;
         if let Some(parent) = self
             .recovery_directory
             .parent()
@@ -1217,46 +1221,11 @@ fn manifest_filename(digest: ProjectionManifestDigest) -> String {
     name
 }
 
-fn create_unique_file(directory: &Path, label: &str) -> io::Result<NamedTempFile> {
-    let prefix = format!(".{label}.");
-    TempfileBuilder::new()
-        .prefix(&prefix)
-        .suffix(".tmp")
-        .tempfile_in(directory)
-}
-
-fn sync_directory(directory: &Path) -> io::Result<()> {
-    File::open(directory)?.sync_all()
-}
-
-fn ensure_real_directory(directory: &Path) -> Result<(), ProjectionManifestStoreError> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
-        Ok(_) => return Err(ProjectionManifestStoreError::UnsafeRecoveryPath),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+fn map_real_directory_error(error: RealDirectoryError) -> ProjectionManifestStoreError {
+    match error {
+        RealDirectoryError::Io(error) => ProjectionManifestStoreError::Io(error),
+        RealDirectoryError::UnsafePath => ProjectionManifestStoreError::UnsafeRecoveryPath,
     }
-
-    let parent = directory
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent_metadata = fs::symlink_metadata(parent)
-        .map_err(|_| ProjectionManifestStoreError::UnsafeRecoveryPath)?;
-    if !parent_metadata.file_type().is_dir() {
-        return Err(ProjectionManifestStoreError::UnsafeRecoveryPath);
-    }
-
-    match fs::create_dir(directory) {
-        Ok(()) => sync_directory(parent)?,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    let metadata = fs::symlink_metadata(directory)?;
-    if !metadata.file_type().is_dir() {
-        return Err(ProjectionManifestStoreError::UnsafeRecoveryPath);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
