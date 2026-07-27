@@ -8,6 +8,77 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Profile ID v6 and authenticated fixed-width replay-current format v3
+  (`ZORJCUR3`) for fresh replay-journal provisioning. Replay-entry v2
+  (`ZORJENT2`) remains unchanged, and all current/entry record widths remain
+  fixed. Current v3 persists a `u64` maintenance watermark: zero is the
+  sentinel for no classified bucket, and a nonzero value is the inclusive
+  recorded highest fully expired continuation expiry bucket for future
+  maintenance classification. The raw recorded value is not trusted-time,
+  epoch, profile, currentness, expiry, or retirement authority. A lower
+  proposal rejects; an equal proposal returns typed `NoAdvance` without a
+  write, receipt, or outer sequence advance; and a greater proposal durably
+  advances replay-current, mints a distinct move-only maintenance receipt, and
+  follows serialized replay-current -> outer-local -> witness ordering. A hard
+  witness rejection fresh-opens as `WitnessLocalMismatch`; witness
+  advance-then-error can reconcile on fresh open. The current-only advance
+  appends no entry and changes no claim set or count. Profile v6 requires fresh
+  provisioning and neither migrates nor dual-accepts profile-v5/current-v2 or
+  earlier state. The mutation/coordinator surface remains module-private with
+  no non-test caller and no trusted-time, epoch, or profile grant; any
+  visibility widening or runtime wiring must first consume a live
+  epoch/profile/currentness-bound move-only grant. This is recorded
+  classification metadata, not request expiry, deletion, count reduction,
+  compaction, reclamation, bounded retention, or garbage-collection
+  execution. Capacity remains lifetime cumulative. This is not TDX, mainnet,
+  target-load, or access-oblivious proof.
+- ADR 0009's production gate for one opaque, rollback-resistant runtime
+  security-state owner spanning key/projection epochs, sessions and distinct
+  role keys, request/server nonce ownership, trusted time, real-or-cover replay
+  durability, external freshness, lifecycle rotation, and release-time
+  currentness. The ADR defines required invariants and fail-closed
+  qualification evidence requirements; it does not select or implement a
+  provider.
+- Private opaque XChaCha20-Poly1305 dependency composition for the listener-free
+  runtime. An end-to-end test rejects a wrong request key before material or
+  replay work, then exercises real encrypted request/response pagination,
+  token-tamper rejection, a valid continuation claim, and replay rejection with
+  the same complete modeled trace. The composition retains deterministic
+  material and counting replay fixtures; it is not a production key/session,
+  nonce, clock, replay, owner, or service bundle.
+- Crate-internal XChaCha20-Poly1305 request-envelope, response-envelope, and
+  continuation-token protectors backed by separately owned, zeroized 256-bit
+  role-key objects. Distinct canonical associated-data domains authenticate all
+  existing profile, direction, session, and checkpoint context. A fixed vector
+  was cross-checked against Go's independent `x/crypto/chacha20poly1305` v0.47.0
+  implementation; tests also reject nonce, ciphertext, tag, associated-data,
+  context, direction, and key changes without exposing plaintext. The direct
+  dependency stays on the workspace-compatible RustCrypto 0.10.1 line, whose
+  upstream project reports an NCC Group audit; this integration still requires
+  independent cryptographic review. Version 0.11 currently conflicts with the
+  prerelease `crypto-common` version pinned by the Zcash dependency graph. This
+  slice does not select or expose service key establishment, derivation,
+  provisioning, rotation, nonce generation, trusted time, durable replay,
+  KMS/TDX ownership, or a public runtime factory.
+- A listener-free response-release gate inside the private process-lifetime
+  owner. One non-`Clone` permit keeps a completed response outstanding; while
+  it is held, later handle, refresh, and explicit shutdown attempts reject
+  before mutating owner or runtime state. Dropping the permit reopens the gate
+  unless it is already closed; a successful stop or owner drop closes it
+  permanently. The finalized-runtime pending round carries a narrow
+  first-release witness over its expected epoch identity, opaque capture, and
+  shared currentness observer. It atomically enters checking, re-observes and compares the source,
+  then authorizes the byte borrow; mismatch, observation failure, or owner
+  closure fails closed. Unpolled drop performs no observation, and the witness
+  retains no serving lease or finalized store. Once refresh has retired the
+  active epoch, cancellation never restores it. This is an internal ownership,
+  exclusion, and late-release contract only: it is not a service, listener,
+  transport-write, response-body, or currentness-at-write proof, and the
+  canonical source may advance immediately after the check. It establishes no
+  FIFO, queue, wait, deadline, drain, or underlying-worker shutdown behavior;
+  tests exercise the exact helper delegated to by the owner rather than a
+  successfully refreshed ready-owner lifecycle; a public owner factory and
+  private protobuf/body integration remain open.
 - A default-off crate-internal process-lifetime owner for the exact recent-chain
   refresh controller and one stable private-query runtime state. It retires the
   active epoch before capture, refreshes from the committed checkpoint of the
