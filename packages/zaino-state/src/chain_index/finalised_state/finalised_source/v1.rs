@@ -52,7 +52,7 @@ use zaino_proto::proto::{compact_formats::CompactBlock, utils::PoolTypeFilter};
 use zebra_chain::parameters::NetworkKind;
 use zebra_state::HashOrHeight;
 
-use super::LmdbLifecycle;
+use super::{super::SchemaAdmissionGuard, LmdbLifecycle};
 
 use corez::io::{self, Read};
 use dashmap::DashSet;
@@ -64,6 +64,7 @@ use std::collections::HashMap;
 use std::{
     collections::HashSet,
     fs,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -84,6 +85,7 @@ pub(crate) mod block_shielded;
 pub(crate) mod block_transparent;
 
 pub(crate) mod compact_block;
+mod finalised_outpoints;
 pub(crate) mod indexed_block;
 
 pub(crate) mod transparent_address_history;
@@ -130,12 +132,126 @@ pub(crate) const DB_SCHEMA_V1_HASH: [u8; 32] = [
     0x58, 0x8a, 0xb6, 0x49, 0xf7, 0xc4, 0x45, 0xcd, 0xa2, 0x8f, 0xaf, 0xb9, 0x6a, 0x95, 0xc8, 0x75,
 ];
 
+/// Canonical schema hashes written by completed historical migration steps.
+const DB_SCHEMA_V1_0_0_CANONICAL_HASH: [u8; 32] = [
+    0xbc, 0x13, 0x52, 0x47, 0xb4, 0x6b, 0xb4, 0x6a, 0x4a, 0x97, 0x1e, 0x4c, 0x27, 0x07, 0x82, 0x6f,
+    0x80, 0x95, 0xe6, 0x62, 0xb6, 0x91, 0x9d, 0x28, 0x87, 0x2c, 0x71, 0xb6, 0xbd, 0x67, 0x65, 0x93,
+];
+
+const DB_SCHEMA_V1_0_0_INITIAL_HASH: [u8; 32] = [
+    0xbf, 0x9a, 0xc7, 0x29, 0xa4, 0xb8, 0xa4, 0x1d, 0x63, 0x69, 0x85, 0x47, 0xe6, 0x40, 0x72, 0x74,
+    0x2a, 0x69, 0x67, 0x51, 0x8c, 0xce, 0xaa, 0x59, 0xc5, 0xbc, 0x82, 0x7c, 0xe1, 0x46, 0xfe, 0x93,
+];
+
+const DB_SCHEMA_V1_1_0_CANONICAL_HASH: [u8; 32] = [
+    0xa8, 0x19, 0x61, 0x50, 0xff, 0xb6, 0x9e, 0xf8, 0xb2, 0xb5, 0x31, 0x80, 0xdd, 0x90, 0xd0, 0x67,
+    0x41, 0x57, 0xfc, 0x51, 0x39, 0xa1, 0x3a, 0xbe, 0xce, 0x70, 0x4e, 0x51, 0x55, 0xc3, 0x3a, 0x0a,
+];
+
+const DB_SCHEMA_V1_2_0_INITIAL_HASH: [u8; 32] = [
+    0xdf, 0x23, 0xf3, 0xab, 0x88, 0x2d, 0xc1, 0x12, 0xa6, 0x80, 0x43, 0xcb, 0xb8, 0x13, 0x56, 0xe9,
+    0x8b, 0xd6, 0x62, 0x57, 0x86, 0x03, 0x3f, 0xb8, 0x9e, 0xa1, 0x12, 0xe4, 0xdf, 0xba, 0x3a, 0xa2,
+];
+
+const DB_SCHEMA_V1_2_0_INTERMEDIATE_HASH: [u8; 32] = [
+    0x50, 0x2b, 0x47, 0x4d, 0x57, 0x02, 0xaa, 0x70, 0xe1, 0x6b, 0x6a, 0x42, 0xd6, 0xc1, 0x8d, 0x08,
+    0xde, 0x15, 0xe9, 0x88, 0xba, 0xcd, 0x48, 0x25, 0xc7, 0x68, 0x7c, 0x8d, 0x65, 0x3a, 0xcc, 0x62,
+];
+
+const DB_SCHEMA_V1_2_X_CANONICAL_HASH: [u8; 32] = [
+    0x11, 0xb2, 0x6a, 0x12, 0x08, 0x67, 0xf0, 0x42, 0xf6, 0x31, 0x45, 0xea, 0x87, 0xe7, 0x23, 0x75,
+    0x40, 0x3b, 0xf2, 0x14, 0xaa, 0x2b, 0x00, 0x12, 0xec, 0xa4, 0x4d, 0x00, 0xe9, 0x0b, 0x07, 0x9b,
+];
+
+const DB_SCHEMA_V1_2_1_INITIAL_HASH: [u8; 32] = [
+    0x4d, 0x68, 0xd5, 0x0c, 0x74, 0x77, 0x31, 0x95, 0xa5, 0x0e, 0x24, 0xeb, 0xfe, 0x36, 0xec, 0x39,
+    0xa7, 0xf8, 0xba, 0xef, 0xaa, 0xc2, 0xf1, 0x61, 0x92, 0xb4, 0x4c, 0x7e, 0x21, 0x61, 0x84, 0x3f,
+];
+
 /// *Current* database V1 version.
 pub(crate) const DB_VERSION_V1: DbVersion = DbVersion {
     major: 1,
     minor: 3,
     patch: 0,
 };
+
+pub(in crate::chain_index::finalised_state) fn canonical_schema_hash(
+    version: DbVersion,
+) -> Option<[u8; 32]> {
+    match (version.major, version.minor, version.patch) {
+        (1, 0, 0) => Some(DB_SCHEMA_V1_0_0_CANONICAL_HASH),
+        (1, 1, 0) => Some(DB_SCHEMA_V1_1_0_CANONICAL_HASH),
+        (1, 2, 0) | (1, 2, 1) => Some(DB_SCHEMA_V1_2_X_CANONICAL_HASH),
+        (1, 3, 0) => Some(DB_SCHEMA_V1_HASH),
+        _ => None,
+    }
+}
+
+fn schema_hash_is_supported(version: DbVersion, schema_hash: [u8; 32]) -> bool {
+    match (version.major, version.minor, version.patch) {
+        (1, 0, 0) => matches!(
+            schema_hash,
+            DB_SCHEMA_V1_0_0_INITIAL_HASH | DB_SCHEMA_V1_0_0_CANONICAL_HASH
+        ),
+        (1, 1, 0) => schema_hash == DB_SCHEMA_V1_1_0_CANONICAL_HASH,
+        (1, 2, 0) => matches!(
+            schema_hash,
+            DB_SCHEMA_V1_2_0_INITIAL_HASH
+                | DB_SCHEMA_V1_2_0_INTERMEDIATE_HASH
+                | DB_SCHEMA_V1_2_X_CANONICAL_HASH
+        ),
+        (1, 2, 1) => matches!(
+            schema_hash,
+            DB_SCHEMA_V1_2_1_INITIAL_HASH | DB_SCHEMA_V1_2_X_CANONICAL_HASH
+        ),
+        (1, 3, 0) => schema_hash == DB_SCHEMA_V1_HASH,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_schema_hash_for_test(version: DbVersion) -> Option<[u8; 32]> {
+    canonical_schema_hash(version)
+}
+
+const HEADERS_DATABASE_NAME: &str = "headers_1_0_0";
+const TXIDS_DATABASE_NAME: &str = "txids_1_0_0";
+const TRANSPARENT_DATABASE_NAME: &str = "transparent_1_0_0";
+const SAPLING_DATABASE_NAME: &str = "sapling_1_0_0";
+const ORCHARD_DATABASE_NAME: &str = "orchard_1_0_0";
+const IRONWOOD_DATABASE_NAME: &str = "ironwood_1_3_0";
+const CURRENT_COMMITMENT_TREE_DATABASE_NAME: &str = "commitment_tree_data_1_3_0";
+const HISTORICAL_COMMITMENT_TREE_DATABASE_NAME: &str = "commitment_tree_data_1_0_0";
+const HEIGHTS_DATABASE_NAME: &str = "hashes_1_0_0";
+const SPENT_DATABASE_NAME: &str = "spent_1_0_0";
+const TXID_LOCATION_DATABASE_NAME: &str = "txid_location_1_0_0";
+const METADATA_DATABASE_NAME: &str = "metadata";
+#[cfg(feature = "transparent_address_history_experimental")]
+const ADDRESS_HISTORY_DATABASE_NAME: &str = "address_history_1_0_0";
+
+const COMMON_REQUIRED_DATABASE_NAMES: &[&str] = &[
+    HEADERS_DATABASE_NAME,
+    TXIDS_DATABASE_NAME,
+    TRANSPARENT_DATABASE_NAME,
+    SAPLING_DATABASE_NAME,
+    ORCHARD_DATABASE_NAME,
+    HEIGHTS_DATABASE_NAME,
+    METADATA_DATABASE_NAME,
+];
+
+const CURRENT_ADDITIONAL_REQUIRED_DATABASE_NAMES: &[&str] = &[
+    IRONWOOD_DATABASE_NAME,
+    CURRENT_COMMITMENT_TREE_DATABASE_NAME,
+    SPENT_DATABASE_NAME,
+    TXID_LOCATION_DATABASE_NAME,
+    TX_OUT_SET_INFO_ACCUMULATOR_DATABASE_NAME,
+];
+
+const V1_2_1_ADDITIONAL_REQUIRED_DATABASE_NAMES: &[&str] = &[
+    SPENT_DATABASE_NAME,
+    TXID_LOCATION_DATABASE_NAME,
+    TX_OUT_SET_INFO_ACCUMULATOR_DATABASE_NAME,
+];
 
 /// LMDB table name for the finalised txout-set accumulator.
 pub(crate) const TX_OUT_SET_INFO_ACCUMULATOR_DATABASE_NAME: &str =
@@ -275,6 +391,13 @@ impl LmdbLifecycle for DbV1 {
     fn status_atomic(&self) -> &NamedAtomicStatus {
         &self.status
     }
+}
+
+#[derive(Clone, Copy)]
+enum SchemaAdmission {
+    Current,
+    #[cfg(test)]
+    HistoricalFixture,
 }
 
 /// Zaino’s Finalised State database V1.
@@ -419,10 +542,16 @@ impl DbV1 {
     /// runs: the validator's `initial_block_scan` reads tables (e.g. `commitment_tree_data_1_3_0`)
     /// that a migration populates, so starting it concurrently with a migration races the migration
     /// and can fail on a not-yet-written row.
-    pub(crate) async fn spawn(config: &ChainIndexConfig) -> Result<Self, FinalisedStateError> {
+    pub(super) async fn spawn(
+        config: &ChainIndexConfig,
+        _schema_admission_guard: &SchemaAdmissionGuard,
+    ) -> Result<Self, FinalisedStateError> {
         let zaino_db = Self::open_env_and_dbs(config).await?;
 
-        // Validate (or initialise) the metadata entry before we touch any tables.
+        // Revalidate existing metadata (or initialize a fresh singleton) before reconciliation or
+        // serving. The caller's process-lifetime exclusive lease remains held across preflight,
+        // named-table opening, this defense-in-depth check, reconciliation, and any subsequent
+        // migration.
         zaino_db.check_schema_version().await?;
 
         // Temporary 0.4.0-alpha.1 compatibility: heal a cache whose alpha migration left the
@@ -434,15 +563,21 @@ impl DbV1 {
     }
 
     /// Opens the LMDB environment and every V1 named database, returning an *unstarted* [`DbV1`]
-    /// (status `Spawning`, `db_handler` = `None`, fresh atomics). Performs no metadata validation
-    /// and starts no background task — each caller (`spawn`, `spawn_v1_0_0`) adds its own tail.
+    /// (status `Spawning`, `db_handler` = `None`, fresh atomics). The production caller holds the
+    /// cross-process schema-admission guard across metadata preflight and named-table opening; no
+    /// background task is started.
     ///
     /// The `commitment_tree_data` handle is the up-to-date `commitment_tree_data_1_3_0` table
     /// (`StoredEntryVar`). The v1.0.0 fixture builder ([`DbV1::spawn_v1_0_0`]) opens the legacy
     /// `commitment_tree_data_1_0_0` table (`StoredEntryFixed`) instead, via
     /// [`DbV1::open_env_and_dbs_with_commitment_table`].
     async fn open_env_and_dbs(config: &ChainIndexConfig) -> Result<Self, FinalisedStateError> {
-        Self::open_env_and_dbs_with_commitment_table(config, "commitment_tree_data_1_3_0").await
+        Self::open_env_and_dbs_with_commitment_table(
+            config,
+            CURRENT_COMMITMENT_TREE_DATABASE_NAME,
+            SchemaAdmission::Current,
+        )
+        .await
     }
 
     /// [`DbV1::open_env_and_dbs`] with the commitment-tree table name as a parameter, so the
@@ -451,95 +586,76 @@ impl DbV1 {
     async fn open_env_and_dbs_with_commitment_table(
         config: &ChainIndexConfig,
         commitment_table: &str,
+        admission: SchemaAdmission,
     ) -> Result<Self, FinalisedStateError> {
         info!("Launching FinalisedState");
 
-        // Prepare database details and path.
-        let db_size_bytes = config.storage.database.size.to_byte_count();
-        let db_path_dir = match config.network.kind() {
-            NetworkKind::Mainnet => "mainnet",
-            NetworkKind::Testnet => "testnet",
-            NetworkKind::Regtest => "regtest",
-        };
-        let db_path = config.storage.database.path.join(db_path_dir).join("v1");
+        let db_path = Self::database_path(config);
+        let database_existed = db_path.join("data.mdb").exists();
         if !db_path.exists() {
             fs::create_dir_all(&db_path)?;
         }
 
-        // Check system rescources to set max db reeaders, clamped between 512 and 4096.
-        let cpu_cnt = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        // `NO_SYNC`: commits are not fsynced. The core write path performs many random-key inserts
+        // per block, so explicit checkpoints and graceful shutdown force durability instead.
+        // `WRITE_MAP` remains unset: local write-order-preserving filesystems retain LMDB's ACI
+        // guarantees, while a torn NFS/overlay cache still requires wipe-and-re-index recovery.
+        let env = Self::open_environment(
+            config,
+            &db_path,
+            EnvironmentFlags::NO_TLS | EnvironmentFlags::NO_READAHEAD | EnvironmentFlags::NO_SYNC,
+        )?;
 
-        // Sets LMDB max_readers based on CPU count (cpu * 32), clamped between 512 and 4096.
-        // Allows high async read concurrency while keeping memory use low (~192B per slot).
-        // The 512 min ensures reasonable capacity even on low-core systems.
-        let max_readers = u32::try_from((cpu_cnt * 32).clamp(512, 4096))
-            .expect("max_readers was clamped to fit in u32");
+        match admission {
+            SchemaAdmission::Current => {
+                if database_existed {
+                    tokio::task::block_in_place(|| Self::validate_existing_schema(&env))?;
+                }
+            }
+            #[cfg(test)]
+            SchemaAdmission::HistoricalFixture => {}
+        }
 
-        // Open LMDB environment and set environmental details.
-        //
-        // `NO_SYNC`: commits are not fsynced. The core write path now does many random-key
-        // inserts per block (the `spent` and `txid_location` B-trees are keyed by 32-byte
-        // hashes), which made per-commit fsync the dominant sync cost once those trees outgrew
-        // the page cache. Under `NO_SYNC` the OS batches that write-back; we force durability at
-        // explicit checkpoints (`SYNC_CHECKPOINT_INTERVAL`) and on graceful shutdown instead.
-        // `WRITE_MAP` is unset, so on a write-order-preserving local filesystem a crash does not
-        // corrupt the database — it only discards the unflushed tail of recent commits, which clean
-        // sync and migrations safely re-do. (On NFS / overlay filesystems or a hard pod eviction that
-        // drops the unflushed page cache, write order is not guaranteed and a crash *can* leave torn
-        // pages; the recovery there is to wipe and re-index. See `SYNC_CHECKPOINT_INTERVAL`.)
-        let env = Environment::new()
-            .set_max_dbs(16)
-            .set_map_size(db_size_bytes)
-            .set_max_readers(max_readers)
-            .set_flags(
-                EnvironmentFlags::NO_TLS
-                    | EnvironmentFlags::NO_READAHEAD
-                    | EnvironmentFlags::NO_SYNC,
-            )
-            .open(&db_path)?;
-
-        // Open individual LMDB DBs.
         let headers =
-            super::open_or_create_db(&env, "headers_1_0_0", DatabaseFlags::empty()).await?;
-        let txids = super::open_or_create_db(&env, "txids_1_0_0", DatabaseFlags::empty()).await?;
+            super::open_or_create_db(&env, HEADERS_DATABASE_NAME, DatabaseFlags::empty()).await?;
+        let txids =
+            super::open_or_create_db(&env, TXIDS_DATABASE_NAME, DatabaseFlags::empty()).await?;
         let transparent =
-            super::open_or_create_db(&env, "transparent_1_0_0", DatabaseFlags::empty()).await?;
+            super::open_or_create_db(&env, TRANSPARENT_DATABASE_NAME, DatabaseFlags::empty())
+                .await?;
         let sapling =
-            super::open_or_create_db(&env, "sapling_1_0_0", DatabaseFlags::empty()).await?;
+            super::open_or_create_db(&env, SAPLING_DATABASE_NAME, DatabaseFlags::empty()).await?;
         let orchard =
-            super::open_or_create_db(&env, "orchard_1_0_0", DatabaseFlags::empty()).await?;
+            super::open_or_create_db(&env, ORCHARD_DATABASE_NAME, DatabaseFlags::empty()).await?;
         let ironwood =
-            super::open_or_create_db(&env, "ironwood_1_3_0", DatabaseFlags::empty()).await?;
+            super::open_or_create_db(&env, IRONWOOD_DATABASE_NAME, DatabaseFlags::empty()).await?;
         let commitment_tree_data =
             super::open_or_create_db(&env, commitment_table, DatabaseFlags::empty()).await?;
-        let hashes = super::open_or_create_db(&env, "hashes_1_0_0", DatabaseFlags::empty()).await?;
-
-        let spent = super::open_or_create_db(&env, "spent_1_0_0", DatabaseFlags::empty()).await?;
-
+        let heights =
+            super::open_or_create_db(&env, HEIGHTS_DATABASE_NAME, DatabaseFlags::empty()).await?;
+        let spent =
+            super::open_or_create_db(&env, SPENT_DATABASE_NAME, DatabaseFlags::empty()).await?;
         let txid_location =
-            super::open_or_create_db(&env, "txid_location_1_0_0", DatabaseFlags::empty()).await?;
-
-        let metadata = super::open_or_create_db(&env, "metadata", DatabaseFlags::empty()).await?;
+            super::open_or_create_db(&env, TXID_LOCATION_DATABASE_NAME, DatabaseFlags::empty())
+                .await?;
+        let metadata =
+            super::open_or_create_db(&env, METADATA_DATABASE_NAME, DatabaseFlags::empty()).await?;
+        let tx_out_set_info_accumulator = super::open_or_create_db(
+            &env,
+            TX_OUT_SET_INFO_ACCUMULATOR_DATABASE_NAME,
+            DatabaseFlags::empty(),
+        )
+        .await?;
 
         #[cfg(feature = "transparent_address_history_experimental")]
         let address_history = super::open_or_create_db(
             &env,
-            "address_history_1_0_0",
+            ADDRESS_HISTORY_DATABASE_NAME,
             DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED,
         )
         .await?;
 
         Ok(Self {
-            // Opened inline here, before `env` is moved into its `Arc` below (struct fields are
-            // evaluated top-to-bottom).
-            tx_out_set_info_accumulator: super::open_or_create_db(
-                &env,
-                TX_OUT_SET_INFO_ACCUMULATOR_DATABASE_NAME,
-                DatabaseFlags::empty(),
-            )
-            .await?,
             env: Arc::new(env),
             headers,
             txids,
@@ -548,9 +664,10 @@ impl DbV1 {
             orchard,
             ironwood,
             commitment_tree_data,
-            heights: hashes,
+            heights,
             spent,
             txid_location,
+            tx_out_set_info_accumulator,
             #[cfg(feature = "transparent_address_history_experimental")]
             address_history,
             metadata,
@@ -561,6 +678,151 @@ impl DbV1 {
             status: NamedAtomicStatus::new("FinalisedState", StatusType::Spawning),
             config: config.clone(),
         })
+    }
+
+    fn validate_existing_schema(env: &Environment) -> Result<DbMetadata, FinalisedStateError> {
+        let metadata = match env.open_db(Some(METADATA_DATABASE_NAME)) {
+            Ok(metadata) => metadata,
+            Err(lmdb::Error::NotFound) => {
+                return Err(FinalisedStateError::Custom(
+                    "existing v1 database is missing the metadata table; remove the incomplete v1 \
+                     directory and restart to resync"
+                        .into(),
+                ));
+            }
+            Err(error) => return Err(FinalisedStateError::LmdbError(error)),
+        };
+        let txn = env.begin_ro_txn()?;
+        let raw_bytes = txn.get(metadata, b"metadata").map_err(|error| {
+            if error == lmdb::Error::NotFound {
+                FinalisedStateError::Custom(
+                    "existing v1 database is missing the metadata singleton; remove the incomplete \
+                     v1 directory and restart to resync"
+                        .into(),
+                )
+            } else {
+                FinalisedStateError::LmdbError(error)
+            }
+        })?;
+        let stored_metadata = Self::validate_stored_schema_metadata(raw_bytes)?;
+        drop(txn);
+
+        Self::validate_schema_tables(env, stored_metadata.version)?;
+
+        Ok(stored_metadata)
+    }
+
+    fn validate_schema_tables(
+        env: &Environment,
+        version: DbVersion,
+    ) -> Result<(), FinalisedStateError> {
+        Self::validate_required_schema_tables(env, version, COMMON_REQUIRED_DATABASE_NAMES)?;
+
+        match (version.major, version.minor, version.patch) {
+            (1, 0, 0) | (1, 1, 0) | (1, 2, 0) => Self::validate_required_schema_table(
+                env,
+                version,
+                HISTORICAL_COMMITMENT_TREE_DATABASE_NAME,
+            )?,
+            (1, 2, 1) => {
+                Self::validate_required_schema_table(
+                    env,
+                    version,
+                    HISTORICAL_COMMITMENT_TREE_DATABASE_NAME,
+                )?;
+                Self::validate_required_schema_tables(
+                    env,
+                    version,
+                    V1_2_1_ADDITIONAL_REQUIRED_DATABASE_NAMES,
+                )?;
+            }
+            (1, 3, 0) => Self::validate_required_schema_tables(
+                env,
+                version,
+                CURRENT_ADDITIONAL_REQUIRED_DATABASE_NAMES,
+            )?,
+            _ => {
+                return Err(FinalisedStateError::Custom(format!(
+                    "unsupported database schema version {version}"
+                )));
+            }
+        }
+
+        // `address_history` is feature-gated and can legitimately be absent from a database created
+        // by a build without the experimental feature; the enabled build initializes it below.
+        Ok(())
+    }
+
+    fn validate_required_schema_tables(
+        env: &Environment,
+        version: DbVersion,
+        table_names: &[&str],
+    ) -> Result<(), FinalisedStateError> {
+        for table_name in table_names {
+            Self::validate_required_schema_table(env, version, table_name)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_required_schema_table(
+        env: &Environment,
+        version: DbVersion,
+        table_name: &str,
+    ) -> Result<(), FinalisedStateError> {
+        match env.open_db(Some(table_name)) {
+            Ok(_) => Ok(()),
+            Err(lmdb::Error::NotFound) => {
+                let error = if version == DB_VERSION_V1 {
+                    format!(
+                        "current v1 database is missing required table {table_name}; remove the \
+                         incomplete v1 directory and restart to resync"
+                    )
+                } else {
+                    format!(
+                        "{version} database is missing required table {table_name}; remove the \
+                         incomplete v1 directory and restart to resync"
+                    )
+                };
+                Err(FinalisedStateError::Custom(error))
+            }
+            Err(error) => Err(FinalisedStateError::LmdbError(error)),
+        }
+    }
+
+    fn database_path(config: &ChainIndexConfig) -> PathBuf {
+        let db_path_dir = match config.network.kind() {
+            NetworkKind::Mainnet => "mainnet",
+            NetworkKind::Testnet => "testnet",
+            NetworkKind::Regtest => "regtest",
+        };
+
+        config.storage.database.path.join(db_path_dir).join("v1")
+    }
+
+    fn open_environment(
+        config: &ChainIndexConfig,
+        db_path: &Path,
+        flags: EnvironmentFlags,
+    ) -> Result<Environment, FinalisedStateError> {
+        // Check system resources to set max database readers, clamped between 512 and 4096.
+        let cpu_cnt = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        // Sets LMDB max_readers based on CPU count (cpu * 32), clamped between 512 and 4096.
+        // Allows high async read concurrency while keeping memory use low (~192B per slot).
+        // The 512 min ensures reasonable capacity even on low-core systems.
+        let max_readers = u32::try_from((cpu_cnt * 32).clamp(512, 4096))
+            .expect("max_readers was clamped to fit in u32");
+
+        Environment::new()
+            .set_max_dbs(16)
+            .set_map_size(config.storage.database.size.to_byte_count())
+            .set_max_readers(max_readers)
+            .set_flags(flags)
+            .open(db_path)
+            .map_err(FinalisedStateError::LmdbError)
     }
 
     /// A detached handle-copy of this DB for moving into a `spawn` / `spawn_blocking`
@@ -967,6 +1229,7 @@ impl DbV1 {
                 minor: 1,
                 patch: 0,
             };
+            metadata.schema_hash = DB_SCHEMA_V1_1_0_CANONICAL_HASH;
             metadata.migration_status = MigrationStatus::Empty;
 
             let entry = StoredEntryFixed::new(b"metadata", metadata);
@@ -1021,9 +1284,12 @@ impl DbV1 {
         // v1.2.1 -> v1.3.0 migration later rebuilds into the `commitment_tree_data_1_3_0`
         // `StoredEntryVar` table. This opener therefore opens the legacy commitment table and never
         // creates the v1.3.0 table.
-        let zaino_db =
-            Self::open_env_and_dbs_with_commitment_table(config, "commitment_tree_data_1_0_0")
-                .await?;
+        let zaino_db = Self::open_env_and_dbs_with_commitment_table(
+            config,
+            HISTORICAL_COMMITMENT_TREE_DATABASE_NAME,
+            SchemaAdmission::HistoricalFixture,
+        )
+        .await?;
 
         // Write the historical v1.0.0 metadata record. Intentionally skips `check_schema_version`
         // (see the method doc) — that is the behavioural difference from `spawn`.
@@ -1043,11 +1309,11 @@ impl DbV1 {
         Ok(zaino_db)
     }
 
-    /// Writes the historical v1.0.0 `"metadata"` record (version 1.0.0, zero schema hash, migration
-    /// status `Empty`) used only by [`DbV1::spawn_v1_0_0`]. Unlike [`DbV1::check_schema_version`],
-    /// this initialises metadata with the historical v1.0.0 value the migration tests require
-    /// instead of the current [`DB_VERSION_V1`] — which is why `spawn_v1_0_0` deliberately does not
-    /// call `check_schema_version`.
+    /// Writes the historical v1.0.0 `"metadata"` record (version 1.0.0, canonical v1.0.0 schema
+    /// hash, migration status `Empty`) used only by [`DbV1::spawn_v1_0_0`]. Unlike
+    /// [`DbV1::check_schema_version`], this initialises metadata with the historical v1.0.0 value
+    /// the migration tests require instead of the current [`DB_VERSION_V1`] — which is why
+    /// `spawn_v1_0_0` deliberately does not call `check_schema_version`.
     fn write_v1_0_0_metadata(&self) -> Result<(), FinalisedStateError> {
         tokio::task::block_in_place(|| {
             let mut txn = self.env.begin_rw_txn()?;
@@ -1060,7 +1326,7 @@ impl DbV1 {
                         minor: 0,
                         patch: 0,
                     },
-                    schema_hash: [0u8; 32],
+                    schema_hash: DB_SCHEMA_V1_0_0_CANONICAL_HASH,
                     migration_status: MigrationStatus::Empty,
                 },
             );
@@ -1081,6 +1347,58 @@ impl DbV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_schema_hashes_are_scoped_to_their_exact_versions() {
+        let v1_0_0 = DbVersion::new(1, 0, 0);
+        let v1_1_0 = DbVersion::new(1, 1, 0);
+        let v1_2_0 = DbVersion::new(1, 2, 0);
+        let v1_2_1 = DbVersion::new(1, 2, 1);
+
+        for (version, schema_hash) in [
+            (v1_0_0, DB_SCHEMA_V1_0_0_INITIAL_HASH),
+            (v1_0_0, DB_SCHEMA_V1_0_0_CANONICAL_HASH),
+            (v1_1_0, DB_SCHEMA_V1_1_0_CANONICAL_HASH),
+            (v1_2_0, DB_SCHEMA_V1_2_0_INITIAL_HASH),
+            (v1_2_0, DB_SCHEMA_V1_2_0_INTERMEDIATE_HASH),
+            (v1_2_0, DB_SCHEMA_V1_2_X_CANONICAL_HASH),
+            (v1_2_1, DB_SCHEMA_V1_2_1_INITIAL_HASH),
+            (v1_2_1, DB_SCHEMA_V1_2_X_CANONICAL_HASH),
+            (DB_VERSION_V1, DB_SCHEMA_V1_HASH),
+        ] {
+            assert!(
+                schema_hash_is_supported(version, schema_hash),
+                "known schema hash was rejected for {version}"
+            );
+        }
+
+        assert_eq!(
+            canonical_schema_hash(v1_0_0),
+            Some(DB_SCHEMA_V1_0_0_CANONICAL_HASH)
+        );
+        assert_eq!(
+            canonical_schema_hash(v1_1_0),
+            Some(DB_SCHEMA_V1_1_0_CANONICAL_HASH)
+        );
+        assert_eq!(
+            canonical_schema_hash(v1_2_0),
+            Some(DB_SCHEMA_V1_2_X_CANONICAL_HASH)
+        );
+        assert_eq!(
+            canonical_schema_hash(v1_2_1),
+            Some(DB_SCHEMA_V1_2_X_CANONICAL_HASH)
+        );
+        assert_eq!(
+            canonical_schema_hash(DB_VERSION_V1),
+            Some(DB_SCHEMA_V1_HASH)
+        );
+
+        assert!(!schema_hash_is_supported(
+            v1_0_0,
+            DB_SCHEMA_V1_1_0_CANONICAL_HASH
+        ));
+        assert!(!schema_hash_is_supported(v1_2_1, [0; 32]));
+    }
 
     #[test]
     fn spent_corruption_detail_reports_key_length_and_value_head() {
@@ -1144,7 +1462,12 @@ mod tests {
             network: ActivationHeights::default().to_regtest_network(),
         };
 
-        let db = DbV1::spawn(&config).await.expect("spawn empty v1 db");
+        let schema_admission_guard = SchemaAdmissionGuard::acquire(&config)
+            .await
+            .expect("acquire schema-admission guard");
+        let db = DbV1::spawn(&config, &schema_admission_guard)
+            .await
+            .expect("spawn empty v1 db");
 
         // Inject a malformed value under a valid outpoint key: a `StoredEntryFixed<TxLocation>` is 40
         // bytes beginning with a version tag of 1; this is 50 bytes of 0xfd (the "version tag 253"

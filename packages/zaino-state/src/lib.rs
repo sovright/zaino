@@ -72,7 +72,8 @@ pub use chain_index::source::{BlockchainSource, State, ValidatorConnector};
 pub use chain_index::encoding::*;
 pub use chain_index::mempool::Mempool;
 pub use chain_index::non_finalised_state::{
-    ChainIndexSnapshot, InitError, NodeConnectionError, NonFinalizedState, SyncError, UpdateError,
+    CanonicalRecentChainSnapshot, CanonicalRecentChainSnapshotError, ChainIndexSnapshot, InitError,
+    NodeConnectionError, NonFinalizedState, SyncError, UpdateError,
 };
 // NOTE: Should these be pub at all?
 pub use chain_index::types::{
