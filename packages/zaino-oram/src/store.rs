@@ -20,8 +20,7 @@ impl StoreSlot {
         }
     }
 
-    #[cfg(test)]
-    fn occupied(record: TransparentUtxo) -> Self {
+    pub(super) fn occupied(record: TransparentUtxo) -> Self {
         Self {
             occupied: true,
             record,

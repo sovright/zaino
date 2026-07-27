@@ -9,6 +9,11 @@ use std::fmt;
 pub(super) struct FixedEnvelope<const N: usize>([u8; N]);
 
 impl<const N: usize> FixedEnvelope<N> {
+    /// Builds an envelope from an already exact fixed array.
+    pub(super) const fn from_array(bytes: [u8; N]) -> Self {
+        Self(bytes)
+    }
+
     /// Builds an all-zero dummy envelope.
     pub(super) const fn zeroed() -> Self {
         Self([0; N])

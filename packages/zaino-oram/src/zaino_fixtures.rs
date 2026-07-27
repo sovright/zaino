@@ -9,7 +9,12 @@ use zaino_state::{
     TransparentCompactTx, TxInCompact, TxOutCompact,
 };
 
+use crate::canonical_chain::CanonicalNetwork;
+
 pub(super) type FixtureResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+pub(super) const SECOND_HASH: [u8; 32] = [0x92; 32];
+pub(super) const THIRD_HASH: [u8; 32] = [0x93; 32];
 
 pub(super) fn transaction(
     index: u64,
@@ -72,4 +77,61 @@ pub(super) fn indexed_block(
         transactions,
         commitment_tree_data,
     ))
+}
+
+pub(super) fn projection_chain() -> FixtureResult<[IndexedBlock; 3]> {
+    let address_a = [0xa1; 20];
+    let address_b = [0xb2; 20];
+    let address_c = [0xc3; 20];
+    let first_txid = [0x11; 32];
+    let second_txid = [0x22; 32];
+    let third_txid = [0x33; 32];
+
+    let first = transaction(
+        0,
+        first_txid,
+        vec![TxInCompact::null_prevout()],
+        vec![
+            output(50, address_a, ScriptType::P2PKH)?,
+            output(60, address_a, ScriptType::P2PKH)?,
+            output(70, [0xdd; 20], ScriptType::NonStandard)?,
+        ],
+    );
+    let same_block_spend = transaction(
+        1,
+        second_txid,
+        vec![TxInCompact::new(first_txid, 0)],
+        vec![output(40, address_b, ScriptType::P2SH)?],
+    );
+    let genesis = indexed_block(
+        0,
+        CanonicalNetwork::Regtest.genesis_hash().0,
+        [0; 32],
+        vec![first, same_block_spend],
+    )?;
+
+    let cross_block_spend = transaction(
+        0,
+        third_txid,
+        vec![TxInCompact::new(second_txid, 0)],
+        vec![
+            output(30, address_a, ScriptType::P2PKH)?,
+            output(20, address_c, ScriptType::P2SH)?,
+        ],
+    );
+    let second = indexed_block(
+        1,
+        SECOND_HASH,
+        CanonicalNetwork::Regtest.genesis_hash().0,
+        vec![cross_block_spend],
+    )?;
+
+    let nonstandard_spend = transaction(
+        0,
+        [0x44; 32],
+        vec![TxInCompact::new(first_txid, 2)],
+        Vec::new(),
+    );
+    let third = indexed_block(2, THIRD_HASH, SECOND_HASH, vec![nonstandard_spend])?;
+    Ok([genesis, second, third])
 }

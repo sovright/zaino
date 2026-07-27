@@ -1,5 +1,8 @@
 use std::fmt;
 
+#[cfg(feature = "corpus-zaino")]
+use blake2::{Blake2s256, Digest};
+
 /// Byte length of an address-derived ORAM key.
 pub(super) const ADDRESS_KEY_BYTES: usize = 32;
 
@@ -11,7 +14,7 @@ pub(super) const TXID_BYTES: usize = 32;
 /// The research corpus gate must confirm that every script accepted by the
 /// private transparent-address API fits this bound. Unsupported shapes fail
 /// closed instead of entering a variable-length fallback.
-const TRANSPARENT_SCRIPT_CAPACITY: usize = 34;
+pub(super) const TRANSPARENT_SCRIPT_CAPACITY: usize = 34;
 
 /// Exact byte width of the append-only event candidate exercised by the
 /// experimental ORAM adapter.
@@ -29,6 +32,9 @@ const UTXO_EVENT_FLAG_SPENT: u8 = 1 << 1;
 const UTXO_EVENT_KNOWN_FLAGS: u8 = UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT;
 const ADDRESS_CELL_FORMAT_VERSION: u8 = 1;
 const ADDRESS_CELL_FLAG_OCCUPIED: u8 = 1;
+#[cfg(feature = "corpus-zaino")]
+const PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN: &[u8] =
+    b"zaino-oram-persistent-utxo-event-commitment-v1";
 
 /// A domain-separated digest of a canonical transparent locking script.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,17 +108,17 @@ impl TransparentUtxo {
     }
 
     /// Returns the transaction identifier.
-    const fn txid(&self) -> &[u8; TXID_BYTES] {
+    pub(super) const fn txid(&self) -> &[u8; TXID_BYTES] {
         &self.txid
     }
 
     /// Returns the transparent output index.
-    const fn output_index(&self) -> u32 {
+    pub(super) const fn output_index(&self) -> u32 {
         self.output_index
     }
 
     /// Returns the output value in zatoshis.
-    const fn value_zat(&self) -> u64 {
+    pub(super) const fn value_zat(&self) -> u64 {
         self.value_zat
     }
 
@@ -122,12 +128,12 @@ impl TransparentUtxo {
     }
 
     /// Returns the occupied locking-script byte length.
-    const fn script_len(&self) -> usize {
+    pub(super) const fn script_len(&self) -> usize {
         self.script_len as usize
     }
 
     /// Returns every real and padded locking-script byte.
-    const fn padded_script(&self) -> &[u8; TRANSPARENT_SCRIPT_CAPACITY] {
+    pub(super) const fn padded_script(&self) -> &[u8; TRANSPARENT_SCRIPT_CAPACITY] {
         &self.script
     }
 }
@@ -318,11 +324,194 @@ impl UtxoEvent {
     pub(super) const fn script_hash(&self) -> &[u8; 20] {
         &self.script_hash
     }
+
+    fn has_canonical_finalized_state(&self) -> bool {
+        self.mined
+            && self.spent
+                == match self.kind {
+                    UtxoEventKind::Created => false,
+                    UtxoEventKind::Spent => true,
+                }
+    }
+
+    fn has_same_outpoint(&self, other: &Self) -> bool {
+        self.txid == other.txid && self.output_index == other.output_index
+    }
+
+    fn is_valid_spend_of(&self, created: &Self) -> bool {
+        self.kind == UtxoEventKind::Spent
+            && created.kind == UtxoEventKind::Created
+            && self.has_canonical_finalized_state()
+            && created.has_canonical_finalized_state()
+            && self.has_same_outpoint(created)
+            && self.value_zat == created.value_zat
+            && self.height >= created.height
+            && self.script_class == created.script_class
+            && self.script_hash == created.script_hash
+    }
+
+    fn created_utxo(&self) -> Option<TransparentUtxo> {
+        if self.kind != UtxoEventKind::Created || !self.has_canonical_finalized_state() {
+            return None;
+        }
+
+        let mut script = [0; TRANSPARENT_SCRIPT_CAPACITY];
+        let script_len = match self.script_class {
+            UtxoScriptClass::PayToPublicKeyHash => {
+                script[..3].copy_from_slice(&[0x76, 0xa9, 0x14]);
+                script[3..23].copy_from_slice(&self.script_hash);
+                script[23..25].copy_from_slice(&[0x88, 0xac]);
+                25
+            }
+            UtxoScriptClass::PayToScriptHash => {
+                script[..2].copy_from_slice(&[0xa9, 0x14]);
+                script[2..22].copy_from_slice(&self.script_hash);
+                script[22] = 0x87;
+                23
+            }
+            UtxoScriptClass::NonStandard => return None,
+        };
+        Some(TransparentUtxo {
+            txid: self.txid,
+            output_index: self.output_index,
+            value_zat: self.value_zat,
+            height: self.height,
+            script_len,
+            script,
+        })
+    }
 }
 
 impl fmt::Debug for UtxoEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("UtxoEvent { ..REDACTED.. }")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FinalizedCreation {
+    event: UtxoEvent,
+    utxo: TransparentUtxo,
+    spent: bool,
+}
+
+/// Identifier-free failure while folding one complete padded finalized history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FinalizedEventHistoryError {
+    /// Fixed scratch storage could not be reserved.
+    AllocationFailed,
+    /// The event sequence is not a canonical finalized create/spend history.
+    Invalid,
+}
+
+/// Folds a complete padded event history into one creation-order dense live slot.
+///
+/// Every event is validated before the selected slot is returned. Padding must
+/// be a contiguous suffix, creations must be unique, and each spend must match
+/// one earlier live creation. A spend at the creation height is valid because a
+/// later transaction in the same finalized block can consume the output.
+pub(super) fn finalized_live_utxo_at(
+    history: &[Option<UtxoEvent>],
+    logical_slot: usize,
+    maximum_finalized_height: u32,
+) -> Result<Option<TransparentUtxo>, FinalizedEventHistoryError> {
+    if logical_slot >= history.len() {
+        return Err(FinalizedEventHistoryError::Invalid);
+    }
+
+    let mut creations = Vec::new();
+    creations
+        .try_reserve_exact(history.len())
+        .map_err(|_| FinalizedEventHistoryError::AllocationFailed)?;
+    creations.resize(history.len(), None::<FinalizedCreation>);
+    let mut padding_started = false;
+    let mut last_height = None;
+    let mut invalid = false;
+    for entry in history {
+        let mut first_empty = None;
+        let mut matching_index = None;
+        let mut matching_count = 0_usize;
+        for (index, creation) in creations.iter().enumerate() {
+            match creation {
+                Some(creation)
+                    if entry.is_some_and(|event| creation.event.has_same_outpoint(&event)) =>
+                {
+                    matching_count = matching_count.saturating_add(1);
+                    if matching_index.is_none() {
+                        matching_index = Some(index);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if first_empty.is_none() {
+                        first_empty = Some(index);
+                    }
+                }
+            }
+        }
+
+        let Some(event) = entry else {
+            padding_started = true;
+            continue;
+        };
+        invalid |= padding_started
+            || !event.has_canonical_finalized_state()
+            || event.height > maximum_finalized_height
+            || last_height.is_some_and(|height| event.height < height);
+        last_height =
+            Some(last_height.map_or(event.height, |height: u32| height.max(event.height)));
+        match event.kind {
+            UtxoEventKind::Created => {
+                invalid |= matching_count != 0;
+                let utxo = event.created_utxo();
+                invalid |= utxo.is_none();
+                match (first_empty, utxo) {
+                    (Some(index), Some(utxo)) if matching_count == 0 => {
+                        creations[index] = Some(FinalizedCreation {
+                            event: *event,
+                            utxo,
+                            spent: false,
+                        });
+                    }
+                    (Some(_), Some(_)) | (Some(_), None) => {}
+                    (None, _) => invalid = true,
+                }
+            }
+            UtxoEventKind::Spent => {
+                invalid |= matching_count != 1;
+                if let Some(index) = matching_index {
+                    match creations.get_mut(index).and_then(Option::as_mut) {
+                        Some(created)
+                            if matching_count == 1
+                                && !created.spent
+                                && event.is_valid_spend_of(&created.event) =>
+                        {
+                            created.spent = true;
+                        }
+                        Some(_) | None => invalid = true,
+                    }
+                }
+            }
+        }
+    }
+
+    let mut selected = None;
+    let mut live_slot = 0_usize;
+    for creation in creations.into_iter().flatten() {
+        if !creation.spent {
+            if live_slot == logical_slot {
+                selected = Some(creation.utxo);
+            }
+            match live_slot.checked_add(1) {
+                Some(next) => live_slot = next,
+                None => invalid = true,
+            }
+        }
+    }
+    if invalid {
+        Err(FinalizedEventHistoryError::Invalid)
+    } else {
+        Ok(selected)
     }
 }
 
@@ -418,15 +607,23 @@ impl PersistentUtxoEvent {
             ),
         })
     }
+}
 
-    #[cfg(all(
-        feature = "rostl-experimental",
-        target_os = "linux",
-        target_arch = "x86_64"
-    ))]
-    pub(super) const fn zeroed() -> Self {
-        Self([0; PERSISTENT_UTXO_EVENT_BYTES])
-    }
+/// Commits to the exact named persistence-boundary encoding of one event.
+///
+/// Keeping this helper beside [`PersistentUtxoEvent`] prevents the projection
+/// accumulator from duplicating the on-disk field layout or adding byte
+/// accessors to the persistence-only type.
+#[cfg(feature = "corpus-zaino")]
+pub(super) fn persistent_utxo_event_commitment(src: &UtxoEvent) -> [u8; 32] {
+    let persistent = PersistentUtxoEvent::from_business(src);
+    let mut hasher = Blake2s256::new();
+    hasher.update(PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN);
+    hasher.update(persistent.0);
+    let digest = hasher.finalize();
+    let mut commitment = [0; 32];
+    commitment.copy_from_slice(&digest);
+    commitment
 }
 
 impl Default for PersistentUtxoEvent {
@@ -973,6 +1170,10 @@ pub(super) enum QueryOutcome {
     InvalidDomain,
     /// The store could not complete at least one logical read.
     StoreFailure,
+    /// The protected projection has no ready checkpoint for this query round.
+    ProjectionNotReady,
+    /// The opaque continuation was invalid, expired, mismatched, or replayed.
+    InvalidContinuation,
 }
 
 impl fmt::Debug for QueryOutcome {
@@ -1004,12 +1205,12 @@ impl UtxoResultSlot {
     }
 
     /// Returns whether this slot contains a real UTXO.
-    const fn is_occupied(&self) -> bool {
+    pub(super) const fn is_occupied(&self) -> bool {
         self.occupied
     }
 
     /// Returns the fixed record for both real and dummy slots.
-    const fn padded_utxo(&self) -> &TransparentUtxo {
+    pub(super) const fn padded_utxo(&self) -> &TransparentUtxo {
         &self.utxo
     }
 }
@@ -1051,6 +1252,11 @@ impl<const N: usize> UtxoResultPage<N> {
     /// Returns every real and dummy result slot.
     pub(super) const fn slots(&self) -> &[UtxoResultSlot; N] {
         &self.slots
+    }
+
+    /// Returns whether every fixed slot is the canonical dummy value.
+    pub(super) fn is_all_dummy(&self) -> bool {
+        self.slots.iter().all(|slot| !slot.is_occupied())
     }
 
     /// Counts real records inside the protected page.
@@ -1152,6 +1358,158 @@ mod tests {
             UtxoScriptClass::PayToScriptHash,
             [0x42; 20],
         )
+    }
+
+    fn created_event(
+        txid_byte: u8,
+        output_index: u32,
+        value_zat: u64,
+        height: u32,
+        script_class: UtxoScriptClass,
+        script_hash: [u8; 20],
+    ) -> UtxoEvent {
+        UtxoEvent::created(
+            [txid_byte; TXID_BYTES],
+            output_index,
+            value_zat,
+            height,
+            script_class,
+            script_hash,
+        )
+    }
+
+    fn matching_spend(created: UtxoEvent, height: u32) -> UtxoEvent {
+        UtxoEvent::spent(
+            *created.txid(),
+            created.output_index(),
+            created.value_zat(),
+            height,
+            created.script_class(),
+            *created.script_hash(),
+        )
+    }
+
+    #[test]
+    fn finalized_history_compacts_live_outputs_in_creation_order() {
+        let first = created_event(
+            0x11,
+            0,
+            11,
+            100,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xa1; 20],
+        );
+        let second = created_event(
+            0x22,
+            1,
+            22,
+            101,
+            UtxoScriptClass::PayToScriptHash,
+            [0xb2; 20],
+        );
+        let third = created_event(
+            0x33,
+            2,
+            33,
+            102,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xa1; 20],
+        );
+        let history = [
+            Some(first),
+            Some(second),
+            Some(matching_spend(first, 102)),
+            Some(third),
+            None,
+            None,
+        ];
+
+        assert_eq!(
+            finalized_live_utxo_at(&history, 0, 102),
+            Ok(second.created_utxo())
+        );
+        assert_eq!(
+            finalized_live_utxo_at(&history, 1, 102),
+            Ok(third.created_utxo())
+        );
+        assert_eq!(finalized_live_utxo_at(&history, 2, 102), Ok(None));
+    }
+
+    #[test]
+    fn same_block_spend_removes_the_creation_and_padding_is_accepted() {
+        let created = created_event(
+            0x44,
+            3,
+            44,
+            200,
+            UtxoScriptClass::PayToScriptHash,
+            [0xc3; 20],
+        );
+        let history = [Some(created), Some(matching_spend(created, 200)), None];
+
+        assert_eq!(finalized_live_utxo_at(&history, 0, 200), Ok(None));
+        assert_eq!(
+            finalized_live_utxo_at(&[Some(created), None, None], 0, 200),
+            Ok(created.created_utxo())
+        );
+    }
+
+    #[test]
+    fn finalized_history_rejects_every_malformed_sequence() {
+        let created = created_event(
+            0x55,
+            4,
+            55,
+            300,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xd4; 20],
+        );
+        let spend = matching_spend(created, 301);
+        let mut mismatched_value = spend;
+        mismatched_value.value_zat += 1;
+        let mut early_spend = spend;
+        early_spend.height = created.height - 1;
+        let mut noncanonical_create = created;
+        noncanonical_create.spent = true;
+        let nonstandard = created_event(0x66, 5, 66, 302, UtxoScriptClass::NonStandard, [0xe5; 20]);
+
+        let histories = [
+            [None, Some(created), None],
+            [Some(spend), None, None],
+            [Some(created), Some(created), None],
+            [Some(created), Some(spend), Some(spend)],
+            [Some(created), Some(mismatched_value), None],
+            [Some(created), Some(early_spend), None],
+            [Some(noncanonical_create), None, None],
+            [Some(nonstandard), None, None],
+        ];
+        for history in histories {
+            assert_eq!(
+                finalized_live_utxo_at(&history, 0, 302),
+                Err(FinalizedEventHistoryError::Invalid)
+            );
+        }
+        assert_eq!(
+            finalized_live_utxo_at(&[Some(created)], 1, 300),
+            Err(FinalizedEventHistoryError::Invalid)
+        );
+
+        let later = created_event(
+            0x77,
+            6,
+            77,
+            301,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xd4; 20],
+        );
+        assert_eq!(
+            finalized_live_utxo_at(&[Some(later), Some(created)], 0, 301),
+            Err(FinalizedEventHistoryError::Invalid)
+        );
+        assert_eq!(
+            finalized_live_utxo_at(&[Some(later), None], 0, 300),
+            Err(FinalizedEventHistoryError::Invalid)
+        );
     }
 
     #[test]
@@ -1620,6 +1978,8 @@ mod tests {
             QueryOutcome::ResultBudgetExceeded,
             QueryOutcome::InvalidDomain,
             QueryOutcome::StoreFailure,
+            QueryOutcome::ProjectionNotReady,
+            QueryOutcome::InvalidContinuation,
         ];
         for outcome in outcomes {
             assert_eq!(format!("{outcome:?}"), "QueryOutcome([REDACTED])");
