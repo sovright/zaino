@@ -1,0 +1,89 @@
+name: ORAM - Native Linux
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/oram-native-linux.yml'
+      - '.config/nextest.toml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'packages/zaino-common/**'
+      - 'packages/zaino-fetch/**'
+      - 'packages/zaino-oram/**'
+      - 'packages/zaino-proto/**'
+      - 'packages/zaino-state/**'
+      - 'packages/zainod-oram/**'
+      - 'rust-toolchain.toml'
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/oram-native-linux.yml'
+      - '.config/nextest.toml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'packages/zaino-common/**'
+      - 'packages/zaino-fetch/**'
+      - 'packages/zaino-oram/**'
+      - 'packages/zaino-proto/**'
+      - 'packages/zaino-state/**'
+      - 'packages/zainod-oram/**'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  zaino-oram:
+    name: zaino-oram (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify native architecture and pinned toolchain
+        run: |
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+          uname -a
+          rustup show active-toolchain
+          rustc --version --verbose
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: nextest@0.9.140
+          fallback: none
+
+      - name: Verify test runner
+        run: cargo nextest --version
+
+      - name: Run strict all-feature Clippy
+        run: >-
+          cargo clippy -p zaino-oram --all-features --all-targets --no-deps
+          --locked --
+          -D warnings -D clippy::unwrap_used
+
+      - name: Run all-feature tests natively
+        run: >-
+          cargo nextest run -p zaino-oram --all-features --locked
+          --no-tests fail --status-level fail
+
+      - name: Run strict typed-qualification runner Clippy
+        run: >-
+          cargo clippy -p zainod-oram --all-features --all-targets --no-deps
+          --locked --
+          -D warnings -D clippy::unwrap_used
+
+      - name: Run typed-qualification runner tests natively
+        run: >-
+          cargo nextest run -p zainod-oram --all-features --locked
+          --no-tests fail --status-level fail

@@ -1,5 +1,8 @@
 use std::fmt;
 
+#[cfg(feature = "corpus-zaino")]
+use blake2::{Blake2s256, Digest};
+
 /// Byte length of an address-derived ORAM key.
 pub(super) const ADDRESS_KEY_BYTES: usize = 32;
 
@@ -11,16 +14,27 @@ pub(super) const TXID_BYTES: usize = 32;
 /// The research corpus gate must confirm that every script accepted by the
 /// private transparent-address API fits this bound. Unsupported shapes fail
 /// closed instead of entering a variable-length fallback.
-const TRANSPARENT_SCRIPT_CAPACITY: usize = 34;
+pub(super) const TRANSPARENT_SCRIPT_CAPACITY: usize = 34;
 
 /// Exact byte width of the append-only event candidate exercised by the
 /// experimental ORAM adapter.
-pub(super) const PERSISTENT_UTXO_EVENT_BYTES: usize = 72;
+const PERSISTENT_UTXO_EVENT_BYTES: usize = 72;
+
+/// Exact byte width of one immutable protected-directory cell.
+const PERSISTENT_ADDRESS_DIRECTORY_BYTES: usize = 38;
+
+/// Exact byte width of one immutable one-event protected page.
+const PERSISTENT_ADDRESS_EVENT_PAGE_BYTES: usize = 82;
 
 const UTXO_EVENT_FORMAT_VERSION: u8 = 1;
 const UTXO_EVENT_FLAG_MINED: u8 = 1 << 0;
 const UTXO_EVENT_FLAG_SPENT: u8 = 1 << 1;
 const UTXO_EVENT_KNOWN_FLAGS: u8 = UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT;
+const ADDRESS_CELL_FORMAT_VERSION: u8 = 1;
+const ADDRESS_CELL_FLAG_OCCUPIED: u8 = 1;
+#[cfg(feature = "corpus-zaino")]
+const PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN: &[u8] =
+    b"zaino-oram-persistent-utxo-event-commitment-v1";
 
 /// A domain-separated digest of a canonical transparent locking script.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,7 +47,7 @@ impl AddressKey {
     }
 
     /// Returns the fixed digest bytes.
-    const fn as_bytes(&self) -> &[u8; ADDRESS_KEY_BYTES] {
+    pub(super) const fn as_bytes(&self) -> &[u8; ADDRESS_KEY_BYTES] {
         &self.0
     }
 }
@@ -94,17 +108,17 @@ impl TransparentUtxo {
     }
 
     /// Returns the transaction identifier.
-    const fn txid(&self) -> &[u8; TXID_BYTES] {
+    pub(super) const fn txid(&self) -> &[u8; TXID_BYTES] {
         &self.txid
     }
 
     /// Returns the transparent output index.
-    const fn output_index(&self) -> u32 {
+    pub(super) const fn output_index(&self) -> u32 {
         self.output_index
     }
 
     /// Returns the output value in zatoshis.
-    const fn value_zat(&self) -> u64 {
+    pub(super) const fn value_zat(&self) -> u64 {
         self.value_zat
     }
 
@@ -114,12 +128,12 @@ impl TransparentUtxo {
     }
 
     /// Returns the occupied locking-script byte length.
-    const fn script_len(&self) -> usize {
+    pub(super) const fn script_len(&self) -> usize {
         self.script_len as usize
     }
 
     /// Returns every real and padded locking-script byte.
-    const fn padded_script(&self) -> &[u8; TRANSPARENT_SCRIPT_CAPACITY] {
+    pub(super) const fn padded_script(&self) -> &[u8; TRANSPARENT_SCRIPT_CAPACITY] {
         &self.script
     }
 }
@@ -310,11 +324,194 @@ impl UtxoEvent {
     pub(super) const fn script_hash(&self) -> &[u8; 20] {
         &self.script_hash
     }
+
+    fn has_canonical_finalized_state(&self) -> bool {
+        self.mined
+            && self.spent
+                == match self.kind {
+                    UtxoEventKind::Created => false,
+                    UtxoEventKind::Spent => true,
+                }
+    }
+
+    fn has_same_outpoint(&self, other: &Self) -> bool {
+        self.txid == other.txid && self.output_index == other.output_index
+    }
+
+    fn is_valid_spend_of(&self, created: &Self) -> bool {
+        self.kind == UtxoEventKind::Spent
+            && created.kind == UtxoEventKind::Created
+            && self.has_canonical_finalized_state()
+            && created.has_canonical_finalized_state()
+            && self.has_same_outpoint(created)
+            && self.value_zat == created.value_zat
+            && self.height >= created.height
+            && self.script_class == created.script_class
+            && self.script_hash == created.script_hash
+    }
+
+    fn created_utxo(&self) -> Option<TransparentUtxo> {
+        if self.kind != UtxoEventKind::Created || !self.has_canonical_finalized_state() {
+            return None;
+        }
+
+        let mut script = [0; TRANSPARENT_SCRIPT_CAPACITY];
+        let script_len = match self.script_class {
+            UtxoScriptClass::PayToPublicKeyHash => {
+                script[..3].copy_from_slice(&[0x76, 0xa9, 0x14]);
+                script[3..23].copy_from_slice(&self.script_hash);
+                script[23..25].copy_from_slice(&[0x88, 0xac]);
+                25
+            }
+            UtxoScriptClass::PayToScriptHash => {
+                script[..2].copy_from_slice(&[0xa9, 0x14]);
+                script[2..22].copy_from_slice(&self.script_hash);
+                script[22] = 0x87;
+                23
+            }
+            UtxoScriptClass::NonStandard => return None,
+        };
+        Some(TransparentUtxo {
+            txid: self.txid,
+            output_index: self.output_index,
+            value_zat: self.value_zat,
+            height: self.height,
+            script_len,
+            script,
+        })
+    }
 }
 
 impl fmt::Debug for UtxoEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("UtxoEvent { ..REDACTED.. }")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FinalizedCreation {
+    event: UtxoEvent,
+    utxo: TransparentUtxo,
+    spent: bool,
+}
+
+/// Identifier-free failure while folding one complete padded finalized history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FinalizedEventHistoryError {
+    /// Fixed scratch storage could not be reserved.
+    AllocationFailed,
+    /// The event sequence is not a canonical finalized create/spend history.
+    Invalid,
+}
+
+/// Folds a complete padded event history into one creation-order dense live slot.
+///
+/// Every event is validated before the selected slot is returned. Padding must
+/// be a contiguous suffix, creations must be unique, and each spend must match
+/// one earlier live creation. A spend at the creation height is valid because a
+/// later transaction in the same finalized block can consume the output.
+pub(super) fn finalized_live_utxo_at(
+    history: &[Option<UtxoEvent>],
+    logical_slot: usize,
+    maximum_finalized_height: u32,
+) -> Result<Option<TransparentUtxo>, FinalizedEventHistoryError> {
+    if logical_slot >= history.len() {
+        return Err(FinalizedEventHistoryError::Invalid);
+    }
+
+    let mut creations = Vec::new();
+    creations
+        .try_reserve_exact(history.len())
+        .map_err(|_| FinalizedEventHistoryError::AllocationFailed)?;
+    creations.resize(history.len(), None::<FinalizedCreation>);
+    let mut padding_started = false;
+    let mut last_height = None;
+    let mut invalid = false;
+    for entry in history {
+        let mut first_empty = None;
+        let mut matching_index = None;
+        let mut matching_count = 0_usize;
+        for (index, creation) in creations.iter().enumerate() {
+            match creation {
+                Some(creation)
+                    if entry.is_some_and(|event| creation.event.has_same_outpoint(&event)) =>
+                {
+                    matching_count = matching_count.saturating_add(1);
+                    if matching_index.is_none() {
+                        matching_index = Some(index);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if first_empty.is_none() {
+                        first_empty = Some(index);
+                    }
+                }
+            }
+        }
+
+        let Some(event) = entry else {
+            padding_started = true;
+            continue;
+        };
+        invalid |= padding_started
+            || !event.has_canonical_finalized_state()
+            || event.height > maximum_finalized_height
+            || last_height.is_some_and(|height| event.height < height);
+        last_height =
+            Some(last_height.map_or(event.height, |height: u32| height.max(event.height)));
+        match event.kind {
+            UtxoEventKind::Created => {
+                invalid |= matching_count != 0;
+                let utxo = event.created_utxo();
+                invalid |= utxo.is_none();
+                match (first_empty, utxo) {
+                    (Some(index), Some(utxo)) if matching_count == 0 => {
+                        creations[index] = Some(FinalizedCreation {
+                            event: *event,
+                            utxo,
+                            spent: false,
+                        });
+                    }
+                    (Some(_), Some(_)) | (Some(_), None) => {}
+                    (None, _) => invalid = true,
+                }
+            }
+            UtxoEventKind::Spent => {
+                invalid |= matching_count != 1;
+                if let Some(index) = matching_index {
+                    match creations.get_mut(index).and_then(Option::as_mut) {
+                        Some(created)
+                            if matching_count == 1
+                                && !created.spent
+                                && event.is_valid_spend_of(&created.event) =>
+                        {
+                            created.spent = true;
+                        }
+                        Some(_) | None => invalid = true,
+                    }
+                }
+            }
+        }
+    }
+
+    let mut selected = None;
+    let mut live_slot = 0_usize;
+    for creation in creations.into_iter().flatten() {
+        if !creation.spent {
+            if live_slot == logical_slot {
+                selected = Some(creation.utxo);
+            }
+            match live_slot.checked_add(1) {
+                Some(next) => live_slot = next,
+                None => invalid = true,
+            }
+        }
+    }
+    if invalid {
+        Err(FinalizedEventHistoryError::Invalid)
+    } else {
+        Ok(selected)
     }
 }
 
@@ -410,15 +607,23 @@ impl PersistentUtxoEvent {
             ),
         })
     }
+}
 
-    #[cfg(all(
-        feature = "rostl-experimental",
-        target_os = "linux",
-        target_arch = "x86_64"
-    ))]
-    pub(super) const fn zeroed() -> Self {
-        Self([0; PERSISTENT_UTXO_EVENT_BYTES])
-    }
+/// Commits to the exact named persistence-boundary encoding of one event.
+///
+/// Keeping this helper beside [`PersistentUtxoEvent`] prevents the projection
+/// accumulator from duplicating the on-disk field layout or adding byte
+/// accessors to the persistence-only type.
+#[cfg(feature = "corpus-zaino")]
+pub(super) fn persistent_utxo_event_commitment(src: &UtxoEvent) -> [u8; 32] {
+    let persistent = PersistentUtxoEvent::from_business(src);
+    let mut hasher = Blake2s256::new();
+    hasher.update(PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN);
+    hasher.update(persistent.0);
+    let digest = hasher.finalize();
+    let mut commitment = [0; 32];
+    commitment.copy_from_slice(&digest);
+    commitment
 }
 
 impl Default for PersistentUtxoEvent {
@@ -430,15 +635,31 @@ impl Default for PersistentUtxoEvent {
 #[cfg(feature = "rostl-experimental")]
 impl rostl_primitives::traits::Cmov for PersistentUtxoEvent {
     fn cmov(&mut self, other: &Self, choice: bool) {
-        for (destination, source) in self.0.iter_mut().zip(other.0.iter()) {
-            rostl_primitives::traits::Cmov::cmov(destination, source, choice);
-        }
+        cmov_pod_bytes(self, other, choice);
     }
 
     fn cxchg(&mut self, other: &mut Self, choice: bool) {
-        for (left, right) in self.0.iter_mut().zip(other.0.iter_mut()) {
-            rostl_primitives::traits::Cmov::cxchg(left, right, choice);
-        }
+        cxchg_pod_bytes(self, other, choice);
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+fn cmov_pod_bytes<T: bytemuck::Pod>(destination: &mut T, source: &T, choice: bool) {
+    for (destination, source) in bytemuck::bytes_of_mut(destination)
+        .iter_mut()
+        .zip(bytemuck::bytes_of(source))
+    {
+        rostl_primitives::traits::Cmov::cmov(destination, source, choice);
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+fn cxchg_pod_bytes<T: bytemuck::Pod>(left: &mut T, right: &mut T, choice: bool) {
+    for (left, right) in bytemuck::bytes_of_mut(left)
+        .iter_mut()
+        .zip(bytemuck::bytes_of_mut(right))
+    {
+        rostl_primitives::traits::Cmov::cxchg(left, right, choice);
     }
 }
 
@@ -491,6 +712,395 @@ impl fmt::Display for PersistentUtxoEventError {
 }
 
 impl std::error::Error for PersistentUtxoEventError {}
+
+/// One immutable cell in a future protected address directory.
+///
+/// The stored slot is self-described identity, never a truncated address
+/// digest. This record layer validates its encoding only. A future protected
+/// layout must authenticate the stored slot and address key against the
+/// logical key used to read the cell before using it. Empty cells carry no
+/// address-bearing payload.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct AddressDirectory {
+    occupied: bool,
+    directory_slot: u32,
+    address_key: AddressKey,
+}
+
+impl AddressDirectory {
+    pub(super) const fn dummy() -> Self {
+        Self {
+            occupied: false,
+            directory_slot: 0,
+            address_key: AddressKey::new([0; ADDRESS_KEY_BYTES]),
+        }
+    }
+
+    pub(super) const fn real(directory_slot: u32, address_key: AddressKey) -> Self {
+        Self {
+            occupied: true,
+            directory_slot,
+            address_key,
+        }
+    }
+
+    pub(super) const fn is_occupied(&self) -> bool {
+        self.occupied
+    }
+
+    pub(super) const fn directory_slot(&self) -> u32 {
+        self.directory_slot
+    }
+
+    pub(super) const fn address_key(&self) -> &AddressKey {
+        &self.address_key
+    }
+}
+
+impl fmt::Debug for AddressDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AddressDirectory { ..REDACTED.. }")
+    }
+}
+
+/// One immutable event-table cell.
+///
+/// One event per cell is the compatibility baseline for the current append-only
+/// candidate. Filling a partially occupied multi-event page would require an
+/// upsert, which is unsafe with the current adapter. This record layer does not
+/// authenticate the stored directory slot or event ordinal against a logical
+/// read key, nor the event script against a directory address key. The future
+/// layout must validate all three bindings before using the event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct AddressEventPage {
+    event: Option<UtxoEvent>,
+    directory_slot: u32,
+    event_ordinal: u32,
+}
+
+impl AddressEventPage {
+    pub(super) const fn dummy() -> Self {
+        Self {
+            event: None,
+            directory_slot: 0,
+            event_ordinal: 0,
+        }
+    }
+
+    pub(super) fn real(
+        directory_slot: u32,
+        event_ordinal: u32,
+        event: UtxoEvent,
+    ) -> Result<Self, AddressEventPageError> {
+        if !is_standard_address_event(&event) {
+            return Err(AddressEventPageError::NonStandardEvent);
+        }
+        Ok(Self {
+            event: Some(event),
+            directory_slot,
+            event_ordinal,
+        })
+    }
+
+    pub(super) const fn is_occupied(&self) -> bool {
+        self.event.is_some()
+    }
+
+    pub(super) const fn directory_slot(&self) -> u32 {
+        self.directory_slot
+    }
+
+    pub(super) const fn event_ordinal(&self) -> u32 {
+        self.event_ordinal
+    }
+
+    pub(super) const fn event(&self) -> Option<&UtxoEvent> {
+        self.event.as_ref()
+    }
+}
+
+impl fmt::Debug for AddressEventPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AddressEventPage { ..REDACTED.. }")
+    }
+}
+
+fn is_standard_address_event(event: &UtxoEvent) -> bool {
+    matches!(
+        event.script_class(),
+        UtxoScriptClass::PayToPublicKeyHash | UtxoScriptClass::PayToScriptHash
+    )
+}
+
+/// A business event cannot enter the private address-event table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AddressEventPageError {
+    NonStandardEvent,
+}
+
+impl fmt::Display for AddressEventPageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonStandardEvent => {
+                f.write_str("private address-event page requires a standard address event")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AddressEventPageError {}
+
+/// Exact storage representation of [`AddressDirectory`].
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rostl-experimental",
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub(super) struct PersistentAddressDirectory([u8; PERSISTENT_ADDRESS_DIRECTORY_BYTES]);
+
+const _: [(); PERSISTENT_ADDRESS_DIRECTORY_BYTES] =
+    [(); std::mem::size_of::<PersistentAddressDirectory>()];
+
+impl PersistentAddressDirectory {
+    pub(super) fn from_business(src: &AddressDirectory) -> Self {
+        let mut bytes = [0; PERSISTENT_ADDRESS_DIRECTORY_BYTES];
+        bytes[0] = ADDRESS_CELL_FORMAT_VERSION;
+        if src.is_occupied() {
+            bytes[1] = ADDRESS_CELL_FLAG_OCCUPIED;
+            bytes[2..6].copy_from_slice(&src.directory_slot().to_le_bytes());
+            bytes[6..38].copy_from_slice(src.address_key().as_bytes());
+        }
+        Self(bytes)
+    }
+
+    pub(super) fn into_business(self) -> Result<AddressDirectory, PersistentAddressDirectoryError> {
+        let occupied =
+            decode_address_cell_header(&self.0).map_err(PersistentAddressDirectoryError::Header)?;
+        if !occupied {
+            if self.0[2..].iter().any(|byte| *byte != 0) {
+                return Err(PersistentAddressDirectoryError::NoncanonicalDummy);
+            }
+            return Ok(AddressDirectory::dummy());
+        }
+        let mut directory_slot = [0; 4];
+        directory_slot.copy_from_slice(&self.0[2..6]);
+        let mut address_key = [0; ADDRESS_KEY_BYTES];
+        address_key.copy_from_slice(&self.0[6..38]);
+        Ok(AddressDirectory::real(
+            u32::from_le_bytes(directory_slot),
+            AddressKey::new(address_key),
+        ))
+    }
+}
+
+impl Default for PersistentAddressDirectory {
+    /// Returns all-zero scratch storage, not a canonical persistent dummy.
+    ///
+    /// Callers may use this only as an ignored read buffer when the backend
+    /// reports that no record was found. Deserializing it correctly fails the
+    /// version check. Encode [`AddressDirectory::dummy`] for a real dummy cell.
+    fn default() -> Self {
+        Self([0; PERSISTENT_ADDRESS_DIRECTORY_BYTES])
+    }
+}
+
+impl fmt::Debug for PersistentAddressDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PersistentAddressDirectory([REDACTED])")
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl rostl_primitives::traits::Cmov for PersistentAddressDirectory {
+    fn cmov(&mut self, other: &Self, choice: bool) {
+        cmov_pod_bytes(self, other, choice);
+    }
+
+    fn cxchg(&mut self, other: &mut Self, choice: bool) {
+        cxchg_pod_bytes(self, other, choice);
+    }
+}
+
+/// Exact storage representation of [`AddressEventPage`].
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rostl-experimental",
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+pub(super) struct PersistentAddressEventPage([u8; PERSISTENT_ADDRESS_EVENT_PAGE_BYTES]);
+
+const _: [(); PERSISTENT_ADDRESS_EVENT_PAGE_BYTES] =
+    [(); std::mem::size_of::<PersistentAddressEventPage>()];
+
+impl PersistentAddressEventPage {
+    pub(super) fn from_business(src: &AddressEventPage) -> Self {
+        let mut bytes = [0; PERSISTENT_ADDRESS_EVENT_PAGE_BYTES];
+        bytes[0] = ADDRESS_CELL_FORMAT_VERSION;
+        if let Some(event) = src.event() {
+            bytes[1] = ADDRESS_CELL_FLAG_OCCUPIED;
+            bytes[2..6].copy_from_slice(&src.directory_slot().to_le_bytes());
+            bytes[6..10].copy_from_slice(&src.event_ordinal().to_le_bytes());
+            bytes[10..].copy_from_slice(&PersistentUtxoEvent::from_business(event).0);
+        }
+        Self(bytes)
+    }
+
+    pub(super) fn into_business(self) -> Result<AddressEventPage, PersistentAddressEventPageError> {
+        let occupied =
+            decode_address_cell_header(&self.0).map_err(PersistentAddressEventPageError::Header)?;
+        if !occupied {
+            if self.0[2..].iter().any(|byte| *byte != 0) {
+                return Err(PersistentAddressEventPageError::NoncanonicalDummy);
+            }
+            return Ok(AddressEventPage::dummy());
+        }
+        let mut directory_slot = [0; 4];
+        directory_slot.copy_from_slice(&self.0[2..6]);
+        let mut event_ordinal = [0; 4];
+        event_ordinal.copy_from_slice(&self.0[6..10]);
+        let mut event = [0; PERSISTENT_UTXO_EVENT_BYTES];
+        event.copy_from_slice(&self.0[10..]);
+        let event = PersistentUtxoEvent(event)
+            .into_business()
+            .map_err(PersistentAddressEventPageError::InvalidEvent)?;
+        AddressEventPage::real(
+            u32::from_le_bytes(directory_slot),
+            u32::from_le_bytes(event_ordinal),
+            event,
+        )
+        .map_err(|AddressEventPageError::NonStandardEvent| {
+            PersistentAddressEventPageError::NonStandardEvent
+        })
+    }
+}
+
+impl Default for PersistentAddressEventPage {
+    /// Returns all-zero scratch storage, not a canonical persistent dummy.
+    ///
+    /// Callers may use this only as an ignored read buffer when the backend
+    /// reports that no record was found. Deserializing it correctly fails the
+    /// version check. Encode [`AddressEventPage::dummy`] for a real dummy cell.
+    fn default() -> Self {
+        Self([0; PERSISTENT_ADDRESS_EVENT_PAGE_BYTES])
+    }
+}
+
+impl fmt::Debug for PersistentAddressEventPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PersistentAddressEventPage([REDACTED])")
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl rostl_primitives::traits::Cmov for PersistentAddressEventPage {
+    fn cmov(&mut self, other: &Self, choice: bool) {
+        cmov_pod_bytes(self, other, choice);
+    }
+
+    fn cxchg(&mut self, other: &mut Self, choice: bool) {
+        cxchg_pod_bytes(self, other, choice);
+    }
+}
+
+fn decode_address_cell_header(bytes: &[u8]) -> Result<bool, PersistentAddressCellHeaderError> {
+    if bytes[0] != ADDRESS_CELL_FORMAT_VERSION {
+        return Err(PersistentAddressCellHeaderError::UnsupportedVersion { actual: bytes[0] });
+    }
+    if bytes[1] & !ADDRESS_CELL_FLAG_OCCUPIED != 0 {
+        return Err(PersistentAddressCellHeaderError::InvalidFlags { actual: bytes[1] });
+    }
+    Ok(bytes[1] & ADDRESS_CELL_FLAG_OCCUPIED != 0)
+}
+
+/// Invalid common header bytes in a protected address cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PersistentAddressCellHeaderError {
+    UnsupportedVersion { actual: u8 },
+    InvalidFlags { actual: u8 },
+}
+
+impl fmt::Display for PersistentAddressCellHeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedVersion { actual } => {
+                write!(f, "unsupported persistent address-cell version {actual}")
+            }
+            Self::InvalidFlags { actual } => {
+                write!(f, "invalid persistent address-cell flags {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PersistentAddressCellHeaderError {}
+
+/// Invalid bytes in a protected directory cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PersistentAddressDirectoryError {
+    Header(PersistentAddressCellHeaderError),
+    NoncanonicalDummy,
+}
+
+impl fmt::Display for PersistentAddressDirectoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Header(error) => write!(f, "persistent address directory is invalid: {error}"),
+            Self::NoncanonicalDummy => {
+                f.write_str("persistent address-directory dummy has nonzero payload")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PersistentAddressDirectoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Header(error) => Some(error),
+            Self::NoncanonicalDummy => None,
+        }
+    }
+}
+
+/// Invalid bytes in a protected one-event page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PersistentAddressEventPageError {
+    Header(PersistentAddressCellHeaderError),
+    NoncanonicalDummy,
+    NonStandardEvent,
+    InvalidEvent(PersistentUtxoEventError),
+}
+
+impl fmt::Display for PersistentAddressEventPageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Header(error) => write!(f, "persistent address-event page is invalid: {error}"),
+            Self::NoncanonicalDummy => {
+                f.write_str("persistent address-event dummy has nonzero payload")
+            }
+            Self::NonStandardEvent => {
+                f.write_str("persistent address-event page contains a nonstandard event")
+            }
+            Self::InvalidEvent(error) => {
+                write!(
+                    f,
+                    "persistent address-event page contains an invalid event: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PersistentAddressEventPageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Header(error) => Some(error),
+            Self::InvalidEvent(error) => Some(error),
+            Self::NoncanonicalDummy | Self::NonStandardEvent => None,
+        }
+    }
+}
 
 /// A private transparent-UTXO query prepared for profile-bounded execution.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -560,6 +1170,10 @@ pub(super) enum QueryOutcome {
     InvalidDomain,
     /// The store could not complete at least one logical read.
     StoreFailure,
+    /// The protected projection has no ready checkpoint for this query round.
+    ProjectionNotReady,
+    /// The opaque continuation was invalid, expired, mismatched, or replayed.
+    InvalidContinuation,
 }
 
 impl fmt::Debug for QueryOutcome {
@@ -591,12 +1205,12 @@ impl UtxoResultSlot {
     }
 
     /// Returns whether this slot contains a real UTXO.
-    const fn is_occupied(&self) -> bool {
+    pub(super) const fn is_occupied(&self) -> bool {
         self.occupied
     }
 
     /// Returns the fixed record for both real and dummy slots.
-    const fn padded_utxo(&self) -> &TransparentUtxo {
+    pub(super) const fn padded_utxo(&self) -> &TransparentUtxo {
         &self.utxo
     }
 }
@@ -638,6 +1252,11 @@ impl<const N: usize> UtxoResultPage<N> {
     /// Returns every real and dummy result slot.
     pub(super) const fn slots(&self) -> &[UtxoResultSlot; N] {
         &self.slots
+    }
+
+    /// Returns whether every fixed slot is the canonical dummy value.
+    pub(super) fn is_all_dummy(&self) -> bool {
+        self.slots.iter().all(|slot| !slot.is_occupied())
     }
 
     /// Counts real records inside the protected page.
@@ -739,6 +1358,158 @@ mod tests {
             UtxoScriptClass::PayToScriptHash,
             [0x42; 20],
         )
+    }
+
+    fn created_event(
+        txid_byte: u8,
+        output_index: u32,
+        value_zat: u64,
+        height: u32,
+        script_class: UtxoScriptClass,
+        script_hash: [u8; 20],
+    ) -> UtxoEvent {
+        UtxoEvent::created(
+            [txid_byte; TXID_BYTES],
+            output_index,
+            value_zat,
+            height,
+            script_class,
+            script_hash,
+        )
+    }
+
+    fn matching_spend(created: UtxoEvent, height: u32) -> UtxoEvent {
+        UtxoEvent::spent(
+            *created.txid(),
+            created.output_index(),
+            created.value_zat(),
+            height,
+            created.script_class(),
+            *created.script_hash(),
+        )
+    }
+
+    #[test]
+    fn finalized_history_compacts_live_outputs_in_creation_order() {
+        let first = created_event(
+            0x11,
+            0,
+            11,
+            100,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xa1; 20],
+        );
+        let second = created_event(
+            0x22,
+            1,
+            22,
+            101,
+            UtxoScriptClass::PayToScriptHash,
+            [0xb2; 20],
+        );
+        let third = created_event(
+            0x33,
+            2,
+            33,
+            102,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xa1; 20],
+        );
+        let history = [
+            Some(first),
+            Some(second),
+            Some(matching_spend(first, 102)),
+            Some(third),
+            None,
+            None,
+        ];
+
+        assert_eq!(
+            finalized_live_utxo_at(&history, 0, 102),
+            Ok(second.created_utxo())
+        );
+        assert_eq!(
+            finalized_live_utxo_at(&history, 1, 102),
+            Ok(third.created_utxo())
+        );
+        assert_eq!(finalized_live_utxo_at(&history, 2, 102), Ok(None));
+    }
+
+    #[test]
+    fn same_block_spend_removes_the_creation_and_padding_is_accepted() {
+        let created = created_event(
+            0x44,
+            3,
+            44,
+            200,
+            UtxoScriptClass::PayToScriptHash,
+            [0xc3; 20],
+        );
+        let history = [Some(created), Some(matching_spend(created, 200)), None];
+
+        assert_eq!(finalized_live_utxo_at(&history, 0, 200), Ok(None));
+        assert_eq!(
+            finalized_live_utxo_at(&[Some(created), None, None], 0, 200),
+            Ok(created.created_utxo())
+        );
+    }
+
+    #[test]
+    fn finalized_history_rejects_every_malformed_sequence() {
+        let created = created_event(
+            0x55,
+            4,
+            55,
+            300,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xd4; 20],
+        );
+        let spend = matching_spend(created, 301);
+        let mut mismatched_value = spend;
+        mismatched_value.value_zat += 1;
+        let mut early_spend = spend;
+        early_spend.height = created.height - 1;
+        let mut noncanonical_create = created;
+        noncanonical_create.spent = true;
+        let nonstandard = created_event(0x66, 5, 66, 302, UtxoScriptClass::NonStandard, [0xe5; 20]);
+
+        let histories = [
+            [None, Some(created), None],
+            [Some(spend), None, None],
+            [Some(created), Some(created), None],
+            [Some(created), Some(spend), Some(spend)],
+            [Some(created), Some(mismatched_value), None],
+            [Some(created), Some(early_spend), None],
+            [Some(noncanonical_create), None, None],
+            [Some(nonstandard), None, None],
+        ];
+        for history in histories {
+            assert_eq!(
+                finalized_live_utxo_at(&history, 0, 302),
+                Err(FinalizedEventHistoryError::Invalid)
+            );
+        }
+        assert_eq!(
+            finalized_live_utxo_at(&[Some(created)], 1, 300),
+            Err(FinalizedEventHistoryError::Invalid)
+        );
+
+        let later = created_event(
+            0x77,
+            6,
+            77,
+            301,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xd4; 20],
+        );
+        assert_eq!(
+            finalized_live_utxo_at(&[Some(later), Some(created)], 0, 301),
+            Err(FinalizedEventHistoryError::Invalid)
+        );
+        assert_eq!(
+            finalized_live_utxo_at(&[Some(later), None], 0, 300),
+            Err(FinalizedEventHistoryError::Invalid)
+        );
     }
 
     #[test]
@@ -915,6 +1686,270 @@ mod tests {
     }
 
     #[test]
+    fn address_directory_round_trips_real_and_canonical_dummy_cells(
+    ) -> Result<(), PersistentAddressDirectoryError> {
+        let dummy = AddressDirectory::dummy();
+        let real = AddressDirectory::real(17, AddressKey::new([0x5a; ADDRESS_KEY_BYTES]));
+        let zero_identity = AddressDirectory::real(0, AddressKey::new([0; ADDRESS_KEY_BYTES]));
+        let max_slot = AddressDirectory::real(u32::MAX, AddressKey::new([0xa5; ADDRESS_KEY_BYTES]));
+
+        for business in [dummy, real, zero_identity, max_slot] {
+            let persistent = PersistentAddressDirectory::from_business(&business);
+            assert_eq!(
+                std::mem::size_of_val(&persistent),
+                PERSISTENT_ADDRESS_DIRECTORY_BYTES
+            );
+            assert_eq!(persistent.into_business()?, business);
+        }
+        assert!(zero_identity.is_occupied());
+
+        let dummy_bytes = PersistentAddressDirectory::from_business(&dummy).0;
+        assert_eq!(dummy_bytes[0], ADDRESS_CELL_FORMAT_VERSION);
+        assert!(dummy_bytes[1..].iter().all(|byte| *byte == 0));
+        let real_bytes = PersistentAddressDirectory::from_business(&real).0;
+        assert_eq!(real_bytes[1], ADDRESS_CELL_FLAG_OCCUPIED);
+        assert_eq!(&real_bytes[2..6], &17_u32.to_le_bytes());
+        assert_eq!(&real_bytes[6..], &[0x5a; ADDRESS_KEY_BYTES]);
+        Ok(())
+    }
+
+    #[test]
+    fn address_directory_revalidates_header_and_every_dummy_payload_byte() {
+        let valid_dummy = PersistentAddressDirectory::from_business(&AddressDirectory::dummy());
+        let mut wrong_version = valid_dummy.0;
+        wrong_version[0] = 2;
+        assert_eq!(
+            PersistentAddressDirectory(wrong_version).into_business(),
+            Err(PersistentAddressDirectoryError::Header(
+                PersistentAddressCellHeaderError::UnsupportedVersion { actual: 2 }
+            ))
+        );
+        let mut wrong_flags = valid_dummy.0;
+        wrong_flags[1] = 2;
+        assert_eq!(
+            PersistentAddressDirectory(wrong_flags).into_business(),
+            Err(PersistentAddressDirectoryError::Header(
+                PersistentAddressCellHeaderError::InvalidFlags { actual: 2 }
+            ))
+        );
+        for index in 2..PERSISTENT_ADDRESS_DIRECTORY_BYTES {
+            let mut noncanonical = valid_dummy.0;
+            noncanonical[index] = 1;
+            assert_eq!(
+                PersistentAddressDirectory(noncanonical).into_business(),
+                Err(PersistentAddressDirectoryError::NoncanonicalDummy)
+            );
+        }
+    }
+
+    #[test]
+    fn all_zero_address_cell_scratch_is_not_a_canonical_dummy() {
+        assert_eq!(
+            PersistentAddressDirectory::default().into_business(),
+            Err(PersistentAddressDirectoryError::Header(
+                PersistentAddressCellHeaderError::UnsupportedVersion { actual: 0 }
+            ))
+        );
+        assert_eq!(
+            PersistentAddressEventPage::default().into_business(),
+            Err(PersistentAddressEventPageError::Header(
+                PersistentAddressCellHeaderError::UnsupportedVersion { actual: 0 }
+            ))
+        );
+    }
+
+    #[test]
+    fn one_event_page_round_trips_standard_events_and_canonical_dummy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dummy = AddressEventPage::dummy();
+        assert!(!dummy.is_occupied());
+        let pages = [
+            AddressEventPage::real(9, 0, sample_created_event())?,
+            AddressEventPage::real(9, 1, sample_spent_event())?,
+            AddressEventPage::real(u32::MAX, u32::MAX, sample_created_event())?,
+        ];
+        for page in pages {
+            let persistent = PersistentAddressEventPage::from_business(&page);
+            assert_eq!(
+                std::mem::size_of_val(&persistent),
+                PERSISTENT_ADDRESS_EVENT_PAGE_BYTES
+            );
+            assert_eq!(persistent.into_business()?, page);
+        }
+
+        let dummy_bytes = PersistentAddressEventPage::from_business(&dummy).0;
+        assert_eq!(dummy_bytes[0], ADDRESS_CELL_FORMAT_VERSION);
+        assert!(dummy_bytes[1..].iter().all(|byte| *byte == 0));
+        let real_bytes = PersistentAddressEventPage::from_business(&pages[0]).0;
+        assert_eq!(real_bytes[1], ADDRESS_CELL_FLAG_OCCUPIED);
+        assert_eq!(&real_bytes[2..6], &9_u32.to_le_bytes());
+        assert_eq!(&real_bytes[6..10], &0_u32.to_le_bytes());
+        assert_eq!(
+            &real_bytes[10..],
+            &PersistentUtxoEvent::from_business(&sample_created_event()).0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn one_event_page_rejects_nonstandard_business_events() {
+        let event = UtxoEvent::created(
+            [0x71; TXID_BYTES],
+            2,
+            50_000,
+            200,
+            UtxoScriptClass::NonStandard,
+            [0x72; 20],
+        );
+        assert_eq!(
+            AddressEventPage::real(3, 4, event),
+            Err(AddressEventPageError::NonStandardEvent)
+        );
+    }
+
+    #[test]
+    fn one_event_page_revalidates_header_and_every_dummy_payload_byte() {
+        let valid_dummy = PersistentAddressEventPage::from_business(&AddressEventPage::dummy());
+        let mut wrong_version = valid_dummy.0;
+        wrong_version[0] = 2;
+        assert_eq!(
+            PersistentAddressEventPage(wrong_version).into_business(),
+            Err(PersistentAddressEventPageError::Header(
+                PersistentAddressCellHeaderError::UnsupportedVersion { actual: 2 }
+            ))
+        );
+        let mut wrong_flags = valid_dummy.0;
+        wrong_flags[1] = 2;
+        assert_eq!(
+            PersistentAddressEventPage(wrong_flags).into_business(),
+            Err(PersistentAddressEventPageError::Header(
+                PersistentAddressCellHeaderError::InvalidFlags { actual: 2 }
+            ))
+        );
+        for index in 2..PERSISTENT_ADDRESS_EVENT_PAGE_BYTES {
+            let mut noncanonical = valid_dummy.0;
+            noncanonical[index] = 1;
+            assert_eq!(
+                PersistentAddressEventPage(noncanonical).into_business(),
+                Err(PersistentAddressEventPageError::NoncanonicalDummy)
+            );
+        }
+    }
+
+    #[test]
+    fn one_event_page_revalidates_nested_events_and_standard_class() {
+        let page =
+            AddressEventPage::real(4, 5, sample_created_event()).expect("sample event is standard");
+        let valid = PersistentAddressEventPage::from_business(&page);
+        let mut invalid_event = valid.0;
+        invalid_event[10] = 2;
+        assert_eq!(
+            PersistentAddressEventPage(invalid_event).into_business(),
+            Err(PersistentAddressEventPageError::InvalidEvent(
+                PersistentUtxoEventError::UnsupportedVersion { actual: 2 }
+            ))
+        );
+
+        let mut zero_event = valid.0;
+        zero_event[10..].fill(0);
+        assert_eq!(
+            PersistentAddressEventPage(zero_event).into_business(),
+            Err(PersistentAddressEventPageError::InvalidEvent(
+                PersistentUtxoEventError::UnsupportedVersion { actual: 0 }
+            ))
+        );
+
+        let nonstandard = UtxoEvent::created(
+            [0x81; TXID_BYTES],
+            6,
+            60_000,
+            300,
+            UtxoScriptClass::NonStandard,
+            [0x82; 20],
+        );
+        let mut nonstandard_page = valid.0;
+        nonstandard_page[10..].copy_from_slice(&PersistentUtxoEvent::from_business(&nonstandard).0);
+        assert_eq!(
+            PersistentAddressEventPage(nonstandard_page).into_business(),
+            Err(PersistentAddressEventPageError::NonStandardEvent)
+        );
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn address_records_satisfy_pod_and_cmov_constraints_and_semantics() {
+        fn assert_semantics<T>(left: T, right: T)
+        where
+            T: bytemuck::Pod + rostl_primitives::traits::Cmov + Copy + PartialEq + fmt::Debug,
+        {
+            let mut destination = left;
+            destination.cmov(&right, false);
+            assert_eq!(destination, left);
+            destination.cmov(&right, true);
+            assert_eq!(destination, right);
+
+            let mut exchange_left = left;
+            let mut exchange_right = right;
+            exchange_left.cxchg(&mut exchange_right, false);
+            assert_eq!((exchange_left, exchange_right), (left, right));
+            exchange_left.cxchg(&mut exchange_right, true);
+            assert_eq!((exchange_left, exchange_right), (right, left));
+        }
+
+        assert_semantics(
+            PersistentUtxoEvent::from_business(&sample_created_event()),
+            PersistentUtxoEvent::from_business(&sample_spent_event()),
+        );
+        assert_semantics(
+            PersistentAddressDirectory::from_business(&AddressDirectory::dummy()),
+            PersistentAddressDirectory::from_business(&AddressDirectory::real(
+                u32::MAX,
+                AddressKey::new([0x70; ADDRESS_KEY_BYTES]),
+            )),
+        );
+        assert_semantics(
+            PersistentAddressEventPage::from_business(&AddressEventPage::dummy()),
+            PersistentAddressEventPage::from_business(
+                &AddressEventPage::real(u32::MAX, u32::MAX, sample_created_event())
+                    .expect("sample event is standard"),
+            ),
+        );
+    }
+
+    #[test]
+    fn address_cell_debug_surfaces_are_redacted() {
+        let directory = AddressDirectory::real(0x5151, AddressKey::new([0x52; 32]));
+        let page = AddressEventPage::real(0x5151, 0x5353, sample_created_event())
+            .expect("sample event is standard");
+        let persistent_directory = PersistentAddressDirectory::from_business(&directory);
+        let persistent_page = PersistentAddressEventPage::from_business(&page);
+
+        assert_eq!(
+            format!("{directory:?}"),
+            "AddressDirectory { ..REDACTED.. }"
+        );
+        assert_eq!(format!("{page:?}"), "AddressEventPage { ..REDACTED.. }");
+        assert_eq!(
+            format!("{persistent_directory:?}"),
+            "PersistentAddressDirectory([REDACTED])"
+        );
+        assert_eq!(
+            format!("{persistent_page:?}"),
+            "PersistentAddressEventPage([REDACTED])"
+        );
+        for formatted in [
+            format!("{directory:?}"),
+            format!("{page:?}"),
+            format!("{persistent_directory:?}"),
+            format!("{persistent_page:?}"),
+        ] {
+            assert!(!formatted.contains("5151"));
+            assert!(!formatted.contains("5353"));
+            assert!(!formatted.contains("5252"));
+        }
+    }
+
+    #[test]
     fn untrusted_invalid_key_becomes_fixed_dummy_query() {
         let query = UtxoQuery::from_untrusted_address_key(&[0x44; 31], 10);
         assert!(!query.domain_valid());
@@ -943,6 +1978,8 @@ mod tests {
             QueryOutcome::ResultBudgetExceeded,
             QueryOutcome::InvalidDomain,
             QueryOutcome::StoreFailure,
+            QueryOutcome::ProjectionNotReady,
+            QueryOutcome::InvalidContinuation,
         ];
         for outcome in outcomes {
             assert_eq!(format!("{outcome:?}"), "QueryOutcome([REDACTED])");
