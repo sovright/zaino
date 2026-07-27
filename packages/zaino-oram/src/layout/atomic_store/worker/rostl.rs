@@ -106,9 +106,9 @@ fn admit_insert(occupied_records: u64, capacity: u64) -> Result<(), RostlStoreEr
 ///
 /// `#[inline(never)]` is load-bearing rather than a performance hint: it keeps
 /// each monomorphization as its own symbol so `check-oram-codegen` can
-/// disassemble the access path and reject any conditional jump in it. One call
-/// per insertion is negligible against the measured fixed-work floor of
-/// 13,440,092 logical accesses per request.
+/// disassemble the access path and reject any branch that could carry the
+/// secret. One call per insertion is negligible against the measured fixed-work
+/// floor of 13,440,092 logical accesses per request.
 #[inline(never)]
 fn fixed_unique_insert<T, A>(
     access: &mut A,
