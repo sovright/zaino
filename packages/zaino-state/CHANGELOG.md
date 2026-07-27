@@ -8,10 +8,36 @@ and this library adheres to Rust's notion of
 ## [Unreleased]
 
 ### Added
+- A crate-private `CanonicalTransparentProjectionInput` acquisition seam joins
+  one immutable canonical recent-chain value to transparent outpoint states at
+  its exact retained finalized checkpoint. The V1 materializer executes one
+  LMDB read transaction across current metadata, tip identity, spent and txid
+  location indices, and checksum/Merkle-verified header, txid, and transparent
+  rows. It rematerializes creators and spenders, rejects impossible ordering or
+  index disagreement, and deduplicates requests deterministically. Outpoints
+  proven newly created by the recent segment may resolve to `NeverSeen` at the
+  checkpoint; cross-seam references must exist and fail closed when their
+  reverse-index or output row is absent. The subscriber reads only published
+  NFS state, with no validator fallback. This
+  remains a staged crate-private input with no production caller; projection
+  epochs, publication control, serving-epoch freshness, and ORAM conversion
+  remain outside `zaino-state` and follow in the stacked consumer change.
+- `ChainIndexSnapshot::canonical_recent_chain` derives one structurally
+  consistent, snapshot-only canonical segment strictly above an exact
+  finalized height/hash seam. It returns cloned `IndexedBlock`s
+  oldest-to-newest and rejects syncing state, seam/tip disagreement, gaps,
+  missing or mismatched payloads, and broken parent links without falling
+  through to finalized storage or a backing validator. This value-binds a
+  caller-supplied checkpoint to one immutable NFS snapshot; it is not an atomic
+  capture of finalized storage and NFS. This is an ORAM-agnostic public-chain
+  seam; it does not perform projection conversion or service publication.
 - A pure `extract_transparent_events` business-layer seam for deterministic,
   checked transparent create/spend extraction from `IndexedBlock`, used by the
   ORAM research projection without adding an internal-runtime dependency to
   this publishable crate.
+- A `test_dependencies`-only ordinary-UTXO fixture binds full Zebra block data
+  and `IndexedBlock` materialization to one immutable checkpoint for cross-crate
+  ORAM shadow-parity tests; it does not alter the shipped query surface.
 - The chain index tracks Ironwood (NU6.3) note-commitment treestate roots,
   storing `None` while the pool has no treestate rather than fabricating a
   root.
@@ -55,6 +81,26 @@ and this library adheres to Rust's notion of
 ### Deprecated
 ### Removed
 ### Fixed
+- Finalised-database startup now maps capabilities by exact supported schema
+  version and rejects incomplete, unknown, or newer V1 metadata before
+  constructing the request router. Existing databases must match a known
+  version/hash pair and contain that version's required named tables before any
+  create-on-open call can mutate the environment; the current version also
+  requires an empty migration status. Each completed migration now records the
+  canonical hash for its target version, keeping crash-resume admission valid.
+  Builds with experimental transparent address history reject historical
+  migrations until a correct address-history backfill exists. Cross-process
+  admission uses one
+  process-lifetime exclusive lease scoped to each network namespace, preventing
+  concurrent normal Zaino writers from opening the same LMDB environment.
+  Failed or panicked migrations close read and write routing while retaining
+  ownership until the router is dropped; shutdown waits for its owned migration
+  task before closing the backends. Data-only LMDB restores are still discovered
+  and migrated. The lock sidecars are operational coordination state, not
+  database tables or a schema revision; the migration-only target-version helper
+  enforces the same fail-closed rule. The first rollout requires a quiescent
+  cutover because older binaries do not honor the lease. No schema bytes or
+  version change in this fix.
 - The finalised-state txout-set accumulator rebuild at chain tip no longer
   OOM-crashes on memory-constrained hosts. It auto-shards its in-memory spent set
   by creating-txid prefix and now enforces the per-shard budget *strictly*: each
