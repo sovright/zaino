@@ -28,7 +28,7 @@ use super::SESSION_BINDING_BYTES;
 
 const SERVICE_ID_BYTES: usize = 16;
 const SECURITY_EPOCH_BINDING_BYTES: usize = 32;
-const STATE_DIGEST_BYTES: usize = 32;
+pub(super) const STATE_DIGEST_BYTES: usize = 32;
 const SECURITY_STATE_FILE_MAGIC: &[u8; 8] = b"ZORAMSS1";
 const SECURITY_STATE_FILE_VERSION: u16 = 1;
 const SECURITY_STATE_DIGEST_VERSION: u16 = 1;
@@ -108,7 +108,7 @@ impl SecurityStateEpochs {
 
 /// Stable identity of one future active security owner.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct SecurityStateIdentity {
+pub(super) struct SecurityStateIdentity {
     service_id: [u8; SERVICE_ID_BYTES],
     epochs: SecurityStateEpochs,
     profile_id: [u8; PROFILE_ID_BYTES],
@@ -143,6 +143,10 @@ impl SecurityStateIdentity {
             session_binding,
             security_epoch_binding,
         })
+    }
+
+    pub(super) const fn profile_id(&self) -> &[u8; PROFILE_ID_BYTES] {
+        &self.profile_id
     }
 
     /// Validates one same-namespace state update or complete owner rotation.
@@ -185,6 +189,27 @@ impl SecurityStateIdentity {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_security_state_identity(
+    byte: u8,
+) -> Result<SecurityStateIdentity, SecurityStateValueError> {
+    test_security_state_identity_with_profile_id(byte, [byte.wrapping_add(1); PROFILE_ID_BYTES])
+}
+
+#[cfg(test)]
+pub(super) fn test_security_state_identity_with_profile_id(
+    byte: u8,
+    profile_id: [u8; PROFILE_ID_BYTES],
+) -> Result<SecurityStateIdentity, SecurityStateValueError> {
+    SecurityStateIdentity::new(
+        [byte; SERVICE_ID_BYTES],
+        SecurityStateEpochs::new(1, 2, 3, 4)?,
+        profile_id,
+        [byte.wrapping_add(2); SESSION_BINDING_BYTES],
+        [byte.wrapping_add(3); SECURITY_EPOCH_BINDING_BYTES],
+    )
 }
 
 impl fmt::Debug for SecurityStateIdentity {
@@ -261,6 +286,32 @@ pub(super) struct SecurityStateSnapshot {
 }
 
 impl SecurityStateSnapshot {
+    pub(super) fn initial_with_component_state_digest(
+        identity: SecurityStateIdentity,
+        serving_identity_digest: [u8; STATE_DIGEST_BYTES],
+        component_state_digest: [u8; STATE_DIGEST_BYTES],
+    ) -> Result<Self, SecurityStateValueError> {
+        let commitment = SecurityStateCommitment::new(
+            identity,
+            serving_identity_digest,
+            component_state_digest,
+        )?;
+        Self::new(1, commitment)
+    }
+
+    pub(super) fn successor_with_component_state_digest(
+        &self,
+        component_state_digest: [u8; STATE_DIGEST_BYTES],
+    ) -> Result<Self, SecurityStateValueError> {
+        let sequence = self.checked_successor_sequence()?;
+        let commitment = SecurityStateCommitment::new(
+            self.commitment.identity,
+            self.commitment.serving_identity_digest,
+            component_state_digest,
+        )?;
+        Self::new(sequence, commitment)
+    }
+
     fn new(
         sequence: u64,
         commitment: SecurityStateCommitment,
@@ -276,6 +327,31 @@ impl SecurityStateSnapshot {
 
     const fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub(super) const fn checked_successor_sequence(&self) -> Result<u64, SecurityStateValueError> {
+        match self.sequence.checked_add(1) {
+            Some(sequence) => Ok(sequence),
+            None => Err(SecurityStateValueError::SequenceOverflow),
+        }
+    }
+
+    pub(super) const fn profile_id(&self) -> &[u8; PROFILE_ID_BYTES] {
+        self.commitment.identity.profile_id()
+    }
+
+    #[cfg(test)]
+    pub(super) const fn test_sequence(&self) -> u64 {
+        self.sequence()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_with_sequence(self, sequence: u64) -> Result<Self, SecurityStateValueError> {
+        Self::new(sequence, self.commitment)
+    }
+
+    pub(super) const fn component_state_digest(&self) -> [u8; STATE_DIGEST_BYTES] {
+        self.commitment.component_state_digest
     }
 
     fn freshness(&self) -> SecurityFreshness {
@@ -305,6 +381,7 @@ pub(super) enum SecurityStateValueError {
     ServingIdentityDigestIsEmpty,
     ComponentStateDigestIsEmpty,
     SequenceIsMissing,
+    SequenceOverflow,
 }
 
 impl fmt::Display for SecurityStateValueError {
@@ -333,6 +410,7 @@ impl fmt::Display for SecurityStateValueError {
                 f.write_str("security state has a zero component-state digest")
             }
             Self::SequenceIsMissing => f.write_str("security state has a zero sequence"),
+            Self::SequenceOverflow => f.write_str("security state sequence overflowed"),
         }
     }
 }
@@ -340,7 +418,7 @@ impl fmt::Display for SecurityStateValueError {
 impl std::error::Error for SecurityStateValueError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecurityStateSuccessorError {
+pub(super) enum SecurityStateSuccessorError {
     ServiceIdentityChanged,
     ProtocolVersionChanged,
     ProfileIdentityChanged,
@@ -372,7 +450,7 @@ impl fmt::Debug for SecurityStateDigest {
 
 /// Monotonic sequence and exact state digest named by an external authority.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct SecurityFreshness {
+pub(super) struct SecurityFreshness {
     sequence: u64,
     state_digest: SecurityStateDigest,
 }
@@ -395,7 +473,7 @@ impl fmt::Debug for SecurityFreshness {
 /// reject every successful transition except `None -> 1` or exact
 /// `n -> n + 1`. An `Err` is indeterminate: the witness may be unchanged or
 /// may already contain `next`, so the caller must fail closed and reconcile.
-trait SecurityFreshnessWitness {
+pub(super) trait SecurityFreshnessWitness {
     type Error;
 
     fn current(&mut self) -> Result<Option<SecurityFreshness>, Self::Error>;
@@ -544,7 +622,7 @@ impl std::error::Error for PersistentSecurityStateError {
 
 /// Local/witness reconciliation or commit failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecurityStateStoreError {
+pub(super) enum SecurityStateStoreError {
     LatchedIndeterminate,
     WitnessUnavailable,
     UnexpectedLocalStateWithoutWitness,
@@ -622,7 +700,7 @@ enum LocalStateLoadError {
 }
 
 /// Local snapshot store coupled to an externally authoritative witness.
-struct SecurityStateStore<W> {
+pub(super) struct SecurityStateStore<W> {
     recovery_directory: PathBuf,
     witness: W,
     health: SecurityStateStoreHealth,
@@ -642,7 +720,7 @@ struct DurableSecurityStateAdvance {
 }
 
 impl<W> SecurityStateStore<W> {
-    fn new(root: impl Into<PathBuf>, witness: W) -> Self {
+    pub(super) fn new(root: impl Into<PathBuf>, witness: W) -> Self {
         Self {
             recovery_directory: root.into(),
             witness,
@@ -724,7 +802,9 @@ where
     W: SecurityFreshnessWitness,
 {
     /// Returns only local state that exactly matches the external witness.
-    fn current(&mut self) -> Result<Option<SecurityStateSnapshot>, SecurityStateStoreError> {
+    pub(super) fn current(
+        &mut self,
+    ) -> Result<Option<SecurityStateSnapshot>, SecurityStateStoreError> {
         if self.health == SecurityStateStoreHealth::Indeterminate {
             return Err(SecurityStateStoreError::LatchedIndeterminate);
         }
@@ -736,7 +816,7 @@ where
     }
 
     /// Advances the exact state after committing it locally and before return.
-    fn compare_and_advance(
+    pub(super) fn compare_and_advance(
         &mut self,
         expected: Option<SecurityStateSnapshot>,
         next: SecurityStateSnapshot,
@@ -759,8 +839,8 @@ where
         let valid_sequence = match current {
             None => next.sequence() == 1,
             Some(state) => state
-                .sequence()
-                .checked_add(1)
+                .checked_successor_sequence()
+                .ok()
                 .is_some_and(|sequence| sequence == next.sequence()),
         };
         if !valid_sequence {
@@ -1219,6 +1299,80 @@ mod tests {
         assert_eq!(
             SecurityStateSnapshot::new(0, commitment(1)?),
             Err(SecurityStateValueError::SequenceIsMissing)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn component_state_snapshot_initializes_and_advances_only_mutable_state() -> TestResult {
+        let identity = identity(21)?;
+        let serving_identity_digest = [25; STATE_DIGEST_BYTES];
+        let initial_component_state_digest = [26; STATE_DIGEST_BYTES];
+        let initial = SecurityStateSnapshot::initial_with_component_state_digest(
+            identity,
+            serving_identity_digest,
+            initial_component_state_digest,
+        )?;
+
+        assert_eq!(initial.sequence(), 1);
+        assert_eq!(initial.commitment.identity, identity);
+        assert_eq!(
+            initial.commitment.serving_identity_digest,
+            serving_identity_digest
+        );
+        assert_eq!(
+            initial.component_state_digest(),
+            initial_component_state_digest
+        );
+
+        let next_component_state_digest = [27; STATE_DIGEST_BYTES];
+        let successor =
+            initial.successor_with_component_state_digest(next_component_state_digest)?;
+
+        assert_eq!(successor.sequence(), 2);
+        assert_eq!(successor.commitment.identity, initial.commitment.identity);
+        assert_eq!(
+            successor.commitment.serving_identity_digest,
+            initial.commitment.serving_identity_digest
+        );
+        assert_eq!(
+            successor.component_state_digest(),
+            next_component_state_digest
+        );
+        assert_ne!(
+            successor.component_state_digest(),
+            initial.component_state_digest()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn component_state_snapshot_helpers_reject_zero_digest_and_sequence_overflow() -> TestResult {
+        let identity = identity(22)?;
+        let serving_identity_digest = [26; STATE_DIGEST_BYTES];
+        assert_eq!(
+            SecurityStateSnapshot::initial_with_component_state_digest(
+                identity,
+                serving_identity_digest,
+                [0; STATE_DIGEST_BYTES],
+            ),
+            Err(SecurityStateValueError::ComponentStateDigestIsEmpty)
+        );
+
+        let initial = SecurityStateSnapshot::initial_with_component_state_digest(
+            identity,
+            serving_identity_digest,
+            [27; STATE_DIGEST_BYTES],
+        )?;
+        assert_eq!(
+            initial.successor_with_component_state_digest([0; STATE_DIGEST_BYTES]),
+            Err(SecurityStateValueError::ComponentStateDigestIsEmpty)
+        );
+
+        let exhausted = SecurityStateSnapshot::new(u64::MAX, initial.commitment)?;
+        assert_eq!(
+            exhausted.successor_with_component_state_digest([28; STATE_DIGEST_BYTES]),
+            Err(SecurityStateValueError::SequenceOverflow)
         );
         Ok(())
     }
