@@ -36,15 +36,15 @@ offline dependency experiment:
   boundary correctness only—not physical table exhaustion, random or
   adversarial target-load behavior, performance, recovery, TDX, or mainnet
   readiness;
-- compiled privacy-profile-v5 validation that binds the logical store and
+- compiled privacy-profile-v6 validation that binds the logical store and
   recent-snapshot budgets, padded inputs, fixed response/envelope shapes,
   cover/token lifetime, timeout bucket, and a single-worker FIFO
   queue/overload policy, plus total committed replay-transaction capacity,
   the parameter named public trusted-time expiry-bucket width, and the parameter
   named proactive fixed garbage-collection interval. These replay-policy values
-  contribute to profile identity; v5 also binds the authenticated replay-entry
-  v2 semantics. It does not provide trusted time or execute expiry, garbage
-  collection, deletion, or capacity reclamation.
+  contribute to profile identity; v6 binds authenticated replay-entry-v2 and
+  replay-current-v3 semantics. It does not provide trusted time or execute
+  expiry, garbage collection, deletion, or capacity reclamation.
   Runtime fixtures bind a nonzero recent-snapshot shape and execute its complete
   ordinal-only scan through a concrete runtime-owned
   `FrozenRecentSnapshot<N>`. Each frozen snapshot binds an in-memory generation,
@@ -89,12 +89,14 @@ offline dependency experiment:
   runtime caller for this foundation;
 - a module-private crash-durable local replay-journal foundation. It implements
   the existing atomic request plus real-or-cover continuation guard seam using
-  a fixed-size sealed version-two current-state record and version-two entry
-  records (`ZORJENT2`). Each persisted real continuation claim is one
+  a fixed-size sealed version-three current-state record (`ZORJCUR3`) and
+  unchanged version-two entry records (`ZORJENT2`). Each persisted real
+  continuation claim is one
   authenticated typed value containing its opaque replay key and a nonzero,
   one-based ceiling expiry-bucket ordinal. The authenticated current record
-  remains version two and binds the exact compiled profile ID; protection also
-  binds an opaque journal context, and all fixed record widths are unchanged.
+  binds the exact compiled profile ID and a `u64` maintenance watermark;
+  protection also binds an opaque journal context, and all fixed record widths
+  are unchanged.
   The next sequence candidate becomes durable before
   `current.bin`, the sole local commit marker, and committed entries are then
   immutable. Startup opens only the exact committed sequence paths and never
@@ -123,20 +125,30 @@ offline dependency experiment:
   advance-then-error can fresh-open successfully when the witness did advance.
   No non-test runtime or security-owner caller constructs the coordinator in
   this slice. Replay, outer-snapshot, and witness advancement are not one atomic
-  transaction. Profile ID v5 binds total committed replay-transaction capacity
+  transaction. Profile ID v6 binds total committed replay-transaction capacity
   and the named expiry-bucket-width and garbage-collection-interval parameters
-  together with the entry-v2 semantics. Journal/coordinator construction
+  together with entry-v2 and current-v3 semantics. Journal/coordinator construction
   derives the lifetime-cumulative transaction bound from the compiled profile,
   and outer-sequence exhaustion is rejected before replay commit. There is no
-  trusted-time provider, replay-maintenance expiry or eligibility
-  classification, maintenance state or watermark, deletion, count reduction,
-  compaction, reclamation, or garbage-collection path. Request claims have no
-  expiry. V5 requires fresh provisioning and does not migrate or dual-accept v4
-  state; any
-  later incompatible persisted replay successor requires another profile
-  identity. A future maintenance mutation must mint a dedicated receipt
-  consumed through the serialized replay-current -> outer-local -> witness
-  path. Runtime/owner wiring remains open;
+  trusted-time provider or maintenance authority. The current-v3 watermark is
+  a `u64`: zero means no bucket is classified, while a nonzero value is the
+  inclusive recorded highest fully expired continuation expiry bucket for
+  future maintenance classification. It is recorded metadata, not authority.
+  A lower proposal rejects; an equal proposal returns typed `NoAdvance` with no
+  write, receipt, or outer sequence change; and a greater proposal durably
+  updates only replay-current, mints a distinct move-only maintenance receipt,
+  and follows replay-current -> outer-local -> witness ordering. It appends no
+  entry and changes no claim set or count. Hard witness rejection fresh-opens
+  as `WitnessLocalMismatch`, while witness advance-then-error can reconcile on
+  fresh open. Profile v6 requires fresh provisioning and neither migrates nor
+  dual-accepts profile-v5/current-v2 or earlier state. The module-private
+  mutation/coordinator surface has no non-test caller and no trusted-time,
+  epoch, or profile grant. Any visibility widening or runtime wiring must first
+  consume a live epoch/profile/currentness-bound move-only grant. There is no
+  request expiry, deletion, count reduction, compaction, reclamation, bounded
+  retention, or garbage-collection execution; capacity remains lifetime
+  cumulative. Runtime/owner wiring remains open, and this is not TDX, mainnet,
+  target-load, or access-oblivious proof;
 - a module-private listener-free runtime adapter that executes a versioned
   ten-phase logical schedule across decode, server material, token open,
   replay access, readiness selection, complete recent-snapshot and finalized
@@ -333,38 +345,49 @@ The separate security-state store fixes local-before-witness ordering and exact
 startup reconciliation for a future composite-state digest, but it has no
 production freshness witness and does not persist nonce reservations, trusted
 time, or keys. A separate local replay journal now persists the logical request
-and continuation claim sets, but remains runtime-unwired, unwitnessed, and
-protected only by a test fixture; runtime replay state therefore remains
-volatile. A module-private coordinator owns both stores in this foundation.
-Explicit initial provisioning is distinct from existing-state open, which
-requires the outer snapshot to match the current replay digest exactly. A
-successful replay commit's sealed durable path mints a move-only receipt that
-binds its opaque per-open journal identity and pre/post digests. The coordinator
-accepts it only from that same live journal and while its post-digest remains
-current, then advances the outer local snapshot and injected witness. It
-performs no direction inference or repair. A post-replay outer error latches the
-same instance; a hard witness rejection fresh-opens as
-`WitnessLocalMismatch`, while witness advance-then-error can reconcile on a
-fresh open. No non-test runtime or security-owner caller constructs the
-coordinator. The three ordered persistence/authority steps are not one atomic
-transaction.
-Profile ID v5 binds replay capacity and the named public trusted-time
-expiry-bucket-width and proactive fixed garbage-collection-interval parameters
-and the authenticated replay-entry v2 semantics. Each persisted real
-continuation claim is one typed value containing its opaque replay key and
-nonzero, one-based ceiling expiry-bucket ordinal. The journal derives its
-lifetime-cumulative persisted capacity from the compiled profile and seals that
-exact profile ID in its unchanged version-two current record; all fixed record
-widths remain unchanged. The ordinal is metadata, not an expiry or deletion
-decision. There is no trusted-time provider, replay-maintenance expiry or
-eligibility classification, maintenance state or watermark, request-claim
-expiry, garbage
-collection, committed-entry deletion, count reduction, compaction, or capacity
-reclamation. V5 state requires fresh provisioning and has no v4 migration or
-dual acceptance. Any later incompatible persisted replay successor requires a
-new profile identity. A future maintenance mutation must mint a dedicated
-receipt consumed through the serialized replay-current -> outer-local ->
-witness path. The available XChaCha20-Poly1305 protectors are wired only
+and continuation claim sets plus a recorded maintenance watermark, but remains
+runtime-unwired, unwitnessed, and protected only by a test fixture; runtime
+replay state therefore remains volatile. A module-private coordinator owns both
+stores in this foundation. Explicit initial provisioning is distinct from
+existing-state open, which requires the outer snapshot to match the current
+replay digest exactly. A successful query replay commit's sealed durable path
+mints a move-only replay receipt; a greater watermark advance mints a distinct
+move-only maintenance receipt. Each binds its opaque per-open journal identity
+and pre/post digests. The coordinator accepts either only from that same live
+journal and while its post-digest remains current, then advances the outer
+local snapshot and injected witness. It performs no direction inference or
+repair. A post-replay-current outer error latches the same instance; a hard
+witness rejection fresh-opens as `WitnessLocalMismatch`, while witness
+advance-then-error can reconcile on a fresh open. The serialized
+replay-current -> outer-local -> witness steps are not one atomic transaction.
+
+Profile ID v6 binds replay capacity, the named public trusted-time
+expiry-bucket-width and proactive fixed garbage-collection-interval parameters,
+authenticated replay-entry-v2 semantics, and replay-current-v3 semantics.
+Entry v2 (`ZORJENT2`) remains unchanged. Each persisted real continuation claim
+is one typed value containing its opaque replay key and nonzero, one-based
+ceiling expiry-bucket ordinal. Current v3 (`ZORJCUR3`) adds a `u64` maintenance
+watermark without changing any fixed record width. Zero is the sentinel for no
+classified bucket; a nonzero value is the inclusive recorded highest fully
+expired continuation expiry bucket for future maintenance classification. The
+raw recorded value is not trusted-time, epoch, profile, currentness, expiry, or
+retirement authority.
+
+A lower watermark proposal rejects. An equal proposal returns typed
+`NoAdvance` without a current write, receipt, or outer sequence advance. A
+greater proposal durably advances replay-current, mints the distinct
+maintenance receipt, and follows the coordinator ordering above without
+appending an entry or changing claim sets or counts. The journal derives its
+lifetime-cumulative persisted capacity from the compiled profile. Profile v6
+requires fresh provisioning and neither migrates nor dual-accepts
+profile-v5/current-v2 or earlier state. The mutation/coordinator surface
+remains module-private, has no non-test caller, and receives no trusted-time,
+epoch, or profile grant. Any visibility widening or runtime wiring must first
+consume a live epoch/profile/currentness-bound move-only grant. There is no
+request expiry, committed-entry deletion, count reduction, compaction,
+reclamation, bounded retention, or garbage-collection execution.
+
+The available XChaCha20-Poly1305 protectors are wired only
 through a private fixture-backed runtime composition, not a production
 key/session owner; the clock/material source and nonce/replay mechanisms are
 not production implementations. The frozen snapshot's lineage digest binds
@@ -374,14 +397,17 @@ commitment, but does not authenticate that metadata or prove its canonical
 ancestry. Neither commitment is an authenticated canonical/live Zaino snapshot
 root. This slice supplies no durable persistence, authenticated provenance,
 production cryptographic ownership, physical-obliviousness, allocator or timing
-equivalence, rollback resistance, TDX, target-load, or mainnet evidence.
+equivalence, rollback resistance, TDX, or target-load evidence.
 The listener-free `zainod-oram corpus capture` runner can feed canonical
 mainnet blocks into the core and atomically publish a revalidated
 measurement artifact without sizing assumptions. The fully offline
 `zainod-oram corpus size` command revalidates that complete artifact and applies
-one explicit model into a separate digest-bound atomic qualification. No
-full-mainnet capture or sizing artifact exists yet. Static fixture parity is
-not live-backend, finalised-database, reorg, or mainnet shadow evidence.
+one explicit model into a separate digest-bound atomic qualification. A
+full-Mainnet aggregate capture and current-corpus logical sizing now exist; see
+the
+[dated capture log](../../docs/notes/oram-phase0-mainnet-capture-log-2026-07-26.md).
+Static fixture parity is not live-backend, finalised-database, reorg, or mainnet
+shadow evidence.
 The follow-on load-foundation slice adds read-only access to the explicit table
 capacity and admission inputs. The companion `zainod-oram corpus
 validate-sizing` command reopens an existing capture and sizing directory,
@@ -389,8 +415,9 @@ revalidates both existing bundles, and recomputes the sizing qualification
 against the captured measurement. This creates no artifact and instantiates no
 ORAM backend, store, or worker; it does not execute a load, measure performance,
 or provide mainnet evidence.
-Upstream `rostl` panic/recovery, persistence, side-channel, and licensing gates
-remain unresolved.
+Upstream `rostl` panic/recovery, persistence, and side-channel gates remain
+unresolved. Its license/notice inventory is a tracked distribution-readiness
+concern, not a Phase 0 blocker.
 The event coordinator is a portable sink/checkpoint ordering model. A private
 offline owner composes it with the business-command worker and, on supported
 hosts, the typed `rostl` stores, but no runtime or service calls that owner. The
