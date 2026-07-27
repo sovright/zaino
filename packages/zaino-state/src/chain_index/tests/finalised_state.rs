@@ -2,6 +2,7 @@
 mod ephemeral;
 mod migrations;
 pub(crate) mod v1;
+mod version_admission;
 
 use std::future::Future;
 use tempfile::TempDir;

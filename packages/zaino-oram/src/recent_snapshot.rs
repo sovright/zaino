@@ -4,19 +4,39 @@
 //! cannot receive an address, transaction identifier, or query-derived key.
 //! Occupied transitions use canonical oldest-to-newest ordinal order; larger
 //! ordinals are later effects when the same outpoint appears twice.
-//! This is an injected in-trust-domain research seam, not a live Zaino NFS
-//! adapter or evidence of race-free snapshot acquisition.
+//! The optional Zaino adapter builds from one value-coherent chain-index
+//! capture and binds its opaque non-finalized revision into a whole-serving-
+//! epoch lease. The listener-free runtime returns a response only after
+//! re-observing that exact boundary and passing the lease's final double
+//! currentness check.
+//! This remains a listener-free research model; it does not supply a
+//! process-wide service owner or keep the lease through a transport write.
 
 use std::fmt;
 
 use blake2::{Blake2s256, Digest};
 
+#[cfg(feature = "corpus-zaino")]
+use crate::canonical_chain::CanonicalNetwork;
 use crate::records::{AddressKey, TransparentUtxo, ADDRESS_KEY_BYTES};
 
 mod publication;
 #[cfg(test)]
+pub(crate) use publication::serving_epoch_for_tests;
+#[cfg(feature = "corpus-zaino")]
+pub(super) use publication::FinalizedServingStore;
+#[cfg(test)]
 use publication::RecentSnapshotLineageError;
+#[cfg(feature = "corpus-zaino")]
+pub(super) use publication::ServingEpochReleaseWitness;
+#[cfg(feature = "corpus-zaino")]
+pub(crate) use publication::{CanonicalServingEpochCurrentness, RecentSnapshotRefreshController};
 pub(super) use publication::{FrozenRecentSnapshot, RecentSnapshotLineage};
+pub(super) use publication::{
+    ServingEpochBoundary, ServingEpochCurrentness, ServingEpochLease, ServingEpochStore,
+};
+#[cfg(test)]
+pub(crate) use publication::{ServingEpochObservation, ServingEpochUnavailable};
 #[cfg(feature = "corpus-zaino")]
 mod zaino;
 
@@ -36,6 +56,31 @@ pub(super) struct RecentSnapshotIdentity {
 }
 
 impl RecentSnapshotIdentity {
+    #[cfg(feature = "corpus-zaino")]
+    /// Derives the shared finalized-serving identity from typed projection fields.
+    pub(super) const fn from_finalized_projection(
+        network: CanonicalNetwork,
+        finalized_height: u32,
+        finalized_hash_display: [u8; 32],
+        schema_version: u32,
+        projection_epoch: u64,
+        key_epoch: u64,
+    ) -> Self {
+        let network_tag = match network {
+            CanonicalNetwork::Mainnet => 0,
+            CanonicalNetwork::Testnet => 1,
+            CanonicalNetwork::Regtest => 2,
+        };
+        Self::new(
+            network_tag,
+            finalized_height,
+            finalized_hash_display,
+            schema_version,
+            projection_epoch,
+            key_epoch,
+        )
+    }
+
     pub(super) const fn new(
         network_tag: u8,
         finalized_height: u32,
@@ -54,7 +99,7 @@ impl RecentSnapshotIdentity {
         }
     }
 
-    const fn network_tag(&self) -> u8 {
+    pub(super) const fn network_tag(&self) -> u8 {
         self.network_tag
     }
 
@@ -66,15 +111,15 @@ impl RecentSnapshotIdentity {
         &self.finalized_hash_display
     }
 
-    const fn schema_version(&self) -> u32 {
+    pub(super) const fn schema_version(&self) -> u32 {
         self.schema_version
     }
 
-    const fn projection_epoch(&self) -> u64 {
+    pub(super) const fn projection_epoch(&self) -> u64 {
         self.projection_epoch
     }
 
-    const fn key_epoch(&self) -> u64 {
+    pub(super) const fn key_epoch(&self) -> u64 {
         self.key_epoch
     }
 }
