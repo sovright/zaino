@@ -9,6 +9,118 @@ and this library adheres to Rust's notion of
 
 ### Added
 
+- ORAM research: freeze later feature slices behind the Phase 0 stop gate,
+  split implementation chronology out of the normative architecture plan, and
+  add a concise kill-gate report covering the completed Mainnet capture,
+  compiled secret-dependent branch finding, tracked redistribution-license
+  concern, TDX target candidates, and `rostl` fork-or-replace decision.
+- `zaino-oram`: supersede profile ID v5 with v6 and replay-current v2 with
+  fixed-width v3 (`ZORJCUR3`) for fresh replay-journal provisioning. Entry v2
+  (`ZORJENT2`) and every current/entry record width remain unchanged. Current
+  v3 persists a `u64` maintenance watermark: zero is the sentinel for no
+  classified bucket, and a nonzero value is the inclusive recorded highest
+  fully expired continuation expiry bucket for future maintenance
+  classification. The raw recorded value is not trusted-time, epoch, profile,
+  currentness, expiry, or retirement authority. A lower proposal rejects; an
+  equal proposal returns typed `NoAdvance` without a write, receipt, or outer
+  sequence advance; and a greater proposal durably advances replay-current,
+  mints a distinct move-only maintenance receipt, and proceeds through the
+  serialized replay-current -> outer-local -> witness coordinator path.
+  Recovery retains the same fail-closed ordering: hard witness rejection
+  fresh-opens as `WitnessLocalMismatch`, while witness advance-then-error can
+  reconcile on fresh open. The advance appends no replay entry and changes no
+  claim set or count. Profile v6 neither migrates nor dual-accepts
+  profile-v5/current-v2 or earlier state. The mutation/coordinator surface
+  remains module-private with no non-test caller and no trusted-time,
+  epoch, or profile grant; visibility widening or runtime wiring must first
+  consume a live epoch/profile/currentness-bound move-only grant. This slice
+  provides no request expiry, deletion, count reduction, compaction,
+  reclamation, bounded retention, or garbage-collection execution, so replay
+  capacity remains lifetime cumulative. It supplies no TDX, mainnet,
+  target-load, or access-oblivious proof.
+- `zaino-oram`: add a module-private replay-component construction and
+  verification foundation for the outer security-state snapshot. A versioned,
+  domain-separated composite security-component digest currently commits the
+  replay-journal component digest. Initial provisioning is explicit; its
+  restart-verification seam
+  accepts only an exact match between the outer snapshot and the current replay
+  state, and any mismatch fails closed. A journal latched indeterminate cannot
+  supply component state. Live successor construction requires the caller to
+  retain the pre-advance replay digest and reads the real post-advance digest
+  from a ready concrete journal. Supplying the same authoritative journal
+  instance and an allowed commit count remains a coordinator obligation, so the
+  binding never infers transition direction or repairs either component
+  automatically. This is a construction and reconciliation foundation, not
+  coordinated witness advancement or an atomic combined transaction.
+  Profile ID v4 now binds total committed replay-transaction capacity, public
+  trusted-time expiry-bucket width, and proactive fixed garbage-collection
+  interval. Journal/coordinator construction derives the persisted transaction
+  bound from the compiled profile, and outer-sequence exhaustion is rejected
+  before replay commit. No non-test runtime or security-owner caller can
+  construct and coordinate both private stores in this slice; owner integration,
+  maintenance execution, production protector/nonce/time/key ownership, and
+  rollback, TDX, and access-oblivious qualification remain deferred.
+- `zaino-oram`: add a crate-private crash-durable local replay-journal
+  foundation for the atomic request plus real-or-cover continuation contract.
+  Version-two current-state and version-one immutable-entry records have exact
+  fixed sizes and keep the compiled profile ID, replay identities, lane tags,
+  counters, and chain state inside a context-bound sealed-record boundary; this
+  slice supplies only a
+  deterministic test protector. The next sequence candidate is synchronized
+  before `current.bin`, which remains the sole local commit marker; committed
+  entries are then immutable. Restart reads only the exact authoritative
+  sequence range and never opens the next candidate, while every retry replaces
+  that non-authoritative candidate without inspecting its contents. Real commit
+  phases and focused synchronous tests cover semantic duplicates, the one
+  public transaction bound, authentication, exact-size reads, restart,
+  candidate overwrite, direct-component path rejection, and crash prefixes.
+  The store implements the existing replay-guard seam but is not wired into the
+  runtime. At this earlier journal-only step, its transaction bound was not yet
+  profile-derived, and there is no
+  production protector/key/nonce owner, coordinated external freshness-witness
+  advancement, rollback resistance, nonce or trusted-time journal,
+  single-writer process lock, access-oblivious memory or persistence, listener
+  integration, or production qualification claim. Until witness integration,
+  an absent `current.bin` opens as empty and cannot distinguish first
+  initialization from loss of a previously committed marker.
+- `zaino-oram`: add a crate-private witness-bound security-state persistence
+  foundation. One fixed-width, versioned snapshot binds stable service,
+  protocol, owner, key, projection, profile, session, and security-epoch
+  identity to opaque serving and component-state digests. Mutations stage and
+  synchronize the local snapshot before advancing an injected exact
+  sequence-and-digest freshness witness; startup accepts only an exact
+  local/witness match, and post-replace or witness ambiguity fails closed.
+  Version-one transitions keep service/protocol/profile identity stable,
+  prevent owner/key/projection epoch regression, and require a new owner
+  generation plus new session/security bindings for any identity rotation.
+  Crash-boundary tests cover staged-but-unpublished state, a durable local
+  advance without witness authority, rejected witness advancement, and an
+  advance-then-error reconciliation. This foundation supplies no concrete
+  witness, runtime/owner construction path, coordinated replay-journal and
+  witness advancement, trusted-time or nonce journal, key owner, rollback
+  deployment evidence, or production privacy claim.
+- `zaino-oram`: add a crate-private, fixture-only runtime security contract
+  API. Canonical versioned identities separate authenticated request-nonce
+  replay from continuation replay, while one atomic in-memory seam completes
+  both the request lane and its real-or-cover continuation lane. Distinct
+  non-`Clone` round-material reservation and replay-commit authorities are
+  retained through response construction and validated together under an
+  opaque in-process security epoch at release; unavailable or retired state
+  fails closed. This does not change profile ID v3 or the existing ten-phase
+  logical schedule, and it supplies no production durable replay, trusted
+  clock, nonce ledger, key management, rollback resistance, TDX, listener,
+  transport-write, or peer-delivery evidence.
+- `zaino-oram` / `zainod-oram`: make one internal, profile-bound, non-`Clone`
+  `ActiveSecurityLease` the sole owner of runtime security state, with full raw
+  security-bundle fixture assembly restricted to `#[cfg(test)]`. `zaino-oram`
+  exports only the lifetime-safe `FixedEnvelopeRuntime`,
+  `PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade, which
+  `zainod-oram` consumes without extracting detached response bytes. The
+  concrete runtime owner remains private and has no public constructor or
+  factory. A production protector/replay/material-provider bundle, generated
+  route/listener, durable replay, trusted clock, nonce ledger, key management,
+  rollback resistance, TDX, and transport evidence remain open. Profile ID v3
+  and the ten-phase logical schedule are unchanged.
 - `zaino-oram` / `zaino-state`: add a private generation-bound serving-epoch
   contract. The refresh controller invalidates publication before its sole
   await, validates one coherent transparent-projection capture, activates the

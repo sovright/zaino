@@ -30,6 +30,8 @@ mod envelope;
 mod full_map_saturation;
 mod inner_codec;
 mod layout;
+mod persistence;
+mod private_runtime;
 #[cfg(feature = "corpus-zaino")]
 mod process_memory;
 mod profile;
@@ -42,6 +44,7 @@ mod protection;
 mod qualification;
 mod recent_snapshot;
 mod records;
+mod runtime_security;
 mod sizing;
 mod store;
 #[cfg(feature = "corpus-zaino")]
@@ -60,6 +63,7 @@ pub use full_map_saturation::{
     run_typed_worker_full_map_saturation, TypedWorkerFullMapSaturationError,
     TypedWorkerFullMapSaturationProfile, TypedWorkerFullMapSaturationReport,
 };
+pub use private_runtime::{FixedEnvelopeRuntime, PendingFixedEnvelope, PrivateQueryUnavailable};
 #[cfg(feature = "corpus-zaino")]
 pub use projection_owner::{
     TypedWorkerColdRebuildError, TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport,
