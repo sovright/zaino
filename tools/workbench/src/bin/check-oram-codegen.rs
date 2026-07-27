@@ -20,8 +20,9 @@
 //!   drop-path jump (`decq 0x0(%r13)` then `jne`).
 //!
 //! Neither depends on the secret, so rejecting every conditional jump would
-//! reject a correct implementation. This check therefore permits exactly those
-//! two structurally-identified shapes and rejects everything else.
+//! reject a correct implementation. This check therefore permits only the
+//! exact measured operands for those shapes, requires one known record loop and
+//! two RNG refcount branches per monomorphization, and rejects everything else.
 //!
 //! The historical failure — a *forward* jump immediately after a compare
 //! against the returned boolean (`cmp $0x0,%al` then `je`) — matches neither
@@ -44,6 +45,13 @@ const GUARDED: &str = "fixed_unique_insert";
 /// and the 82-byte event record. Finding fewer means the build did not select
 /// the typed backend and the check would otherwise pass vacuously.
 const EXPECTED_MONOMORPHIZATIONS: usize = 2;
+
+/// Exact fixed-size `Cmov` loop bounds measured for the two guarded records.
+const DIRECTORY_RECORD_LOOP_COMPARE: &str = "$0x26,%rax";
+const EVENT_RECORD_LOOP_COMPARE: &str = "$0x52,%rax";
+
+/// Exact thread-local RNG refcount decrement measured on the pinned toolchain.
+const RNG_REFCOUNT_DECREMENT: &str = "0x0(%r13)";
 
 fn main() {
     run("check-oram-codegen", check, |report: Report| {
@@ -71,6 +79,7 @@ struct Inspected {
     name: String,
     instructions: usize,
     allowed: Vec<String>,
+    record_loop: RecordLoop,
 }
 
 /// One defined symbol with a known address and size.
@@ -94,19 +103,42 @@ enum Verdict {
     /// Not a branch at all, or an unconditional direct jump.
     Branchless,
     /// A branch that is structurally independent of the secret.
-    Allowed(&'static str),
+    Allowed(Allowance),
     /// A branch that could carry the secret.
     Rejected(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Allowance {
+    DirectoryRecordLoop,
+    EventRecordLoop,
+    RngRefcountDrop,
+}
+
+impl Allowance {
+    const fn description(self) -> &'static str {
+        match self {
+            Self::DirectoryRecordLoop => "38-byte record Cmov loop back-edge",
+            Self::EventRecordLoop => "82-byte record Cmov loop back-edge",
+            Self::RngRefcountDrop => "thread-local RNG reference-count drop branch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordLoop {
+    Directory,
+    Event,
 }
 
 fn check() -> Result<Report, Vec<String>> {
     let artifact = artifact_path()?;
     let symbols = guarded_symbols(&artifact)?;
 
-    if symbols.len() < EXPECTED_MONOMORPHIZATIONS {
+    if symbols.len() != EXPECTED_MONOMORPHIZATIONS {
         return Err(vec![
             format!(
-                "found {} `{GUARDED}` symbol(s) in {}, expected at least {EXPECTED_MONOMORPHIZATIONS}",
+                "found {} `{GUARDED}` symbol(s) in {}, expected exactly {EXPECTED_MONOMORPHIZATIONS}",
                 symbols.len(),
                 artifact.display()
             ),
@@ -131,6 +163,21 @@ fn check() -> Result<Report, Vec<String>> {
                 .to_string(),
         );
         return Err(failures);
+    }
+
+    let directory = inspected
+        .iter()
+        .filter(|symbol| symbol.record_loop == RecordLoop::Directory)
+        .count();
+    let event = inspected
+        .iter()
+        .filter(|symbol| symbol.record_loop == RecordLoop::Event)
+        .count();
+    if directory != 1 || event != 1 {
+        return Err(vec![format!(
+            "guarded symbols did not contain exactly one 38-byte and one 82-byte record loop; \
+             found directory={directory}, event={event}"
+        )]);
     }
     Ok(Report { symbols: inspected })
 }
@@ -210,16 +257,19 @@ fn inspect(artifact: &Path, symbol: &Symbol) -> Result<Inspected, Vec<String>> {
     if !scanned.failures.is_empty() {
         return Err(scanned.failures);
     }
+    let record_loop = validate_allowances(&scanned, &symbol.name)?;
     Ok(Inspected {
         name: symbol.name.clone(),
         instructions: scanned.instructions,
         allowed: scanned.allowed,
+        record_loop,
     })
 }
 
 struct Scan {
     instructions: usize,
     allowed: Vec<String>,
+    allowances: Vec<Allowance>,
     failures: Vec<String>,
 }
 
@@ -228,6 +278,7 @@ struct Scan {
 fn scan(disassembly: &str, symbol: &str) -> Scan {
     let mut instructions = 0;
     let mut allowed = Vec::new();
+    let mut allowances = Vec::new();
     let mut failures = Vec::new();
     let mut previous: Option<Instruction> = None;
 
@@ -238,10 +289,16 @@ fn scan(disassembly: &str, symbol: &str) -> Scan {
         instructions += 1;
         match classify(previous.as_ref(), &current) {
             Verdict::Branchless => {}
-            Verdict::Allowed(reason) => allowed.push(format!(
-                "{symbol}: {reason} at {:x}: {} {}",
-                current.address, current.mnemonic, current.operands
-            )),
+            Verdict::Allowed(allowance) => {
+                allowances.push(allowance);
+                allowed.push(format!(
+                    "{symbol}: {} at {:x}: {} {}",
+                    allowance.description(),
+                    current.address,
+                    current.mnemonic,
+                    current.operands
+                ));
+            }
             Verdict::Rejected(reason) => failures.push(format!(
                 "{symbol}: {reason} at {:x}: {} {}",
                 current.address, current.mnemonic, current.operands
@@ -253,18 +310,58 @@ fn scan(disassembly: &str, symbol: &str) -> Scan {
     Scan {
         instructions,
         allowed,
+        allowances,
         failures,
     }
 }
 
+fn validate_allowances(scanned: &Scan, symbol: &str) -> Result<RecordLoop, Vec<String>> {
+    let directory_loops = scanned
+        .allowances
+        .iter()
+        .filter(|allowance| **allowance == Allowance::DirectoryRecordLoop)
+        .count();
+    let event_loops = scanned
+        .allowances
+        .iter()
+        .filter(|allowance| **allowance == Allowance::EventRecordLoop)
+        .count();
+    let refcount_drops = scanned
+        .allowances
+        .iter()
+        .filter(|allowance| **allowance == Allowance::RngRefcountDrop)
+        .count();
+
+    let record_loop = match (directory_loops, event_loops) {
+        (1, 0) => RecordLoop::Directory,
+        (0, 1) => RecordLoop::Event,
+        _ => {
+            return Err(vec![format!(
+                "{symbol}: expected exactly one known fixed-record Cmov loop; \
+                 found directory={directory_loops}, event={event_loops}"
+            )]);
+        }
+    };
+    if refcount_drops != 2 {
+        return Err(vec![format!(
+            "{symbol}: expected exactly two known thread-local RNG refcount branches; \
+             found {refcount_drops}"
+        )]);
+    }
+    Ok(record_loop)
+}
+
 /// Classifies one instruction, given the instruction immediately before it.
 ///
-/// The two allowances are deliberately narrow and structural: each requires a
-/// specific preceding instruction, so a secret-carrying branch cannot fall into
-/// them by accident.
+/// The allowances are deliberately pinned to exact measured operands. A
+/// separate profile check also requires their exact multiplicity, so an added
+/// conditional branch cannot pass merely by resembling one benign shape.
 fn classify(previous: Option<&Instruction>, current: &Instruction) -> Verdict {
     if current.mnemonic.starts_with("loop") {
         return Verdict::Rejected("looping branch");
+    }
+    if current.mnemonic.starts_with("call") && current.operands.starts_with('*') {
+        return Verdict::Rejected("indirect call");
     }
     if !current.mnemonic.starts_with('j') {
         return Verdict::Branchless;
@@ -278,23 +375,27 @@ fn classify(previous: Option<&Instruction>, current: &Instruction) -> Verdict {
             Verdict::Branchless
         };
     }
-
     let Some(previous) = previous else {
         return Verdict::Rejected("conditional jump");
     };
 
     // A refcount decrement drives the drop path, not the secret.
-    if previous.mnemonic.starts_with("dec") && previous.operands.contains('(') {
-        return Verdict::Allowed("reference-count drop branch");
+    if previous.mnemonic == "decq" && previous.operands == RNG_REFCOUNT_DECREMENT {
+        return Verdict::Allowed(Allowance::RngRefcountDrop);
     }
 
-    // A backward jump bounded by a compare against an immediate is a loop with
-    // a compile-time trip count, such as the byte-wise `Cmov` over a record.
-    if previous.mnemonic == "cmp" && previous.operands.starts_with('$') {
-        if let Some(target) = jump_target(&current.operands) {
-            if target < current.address {
-                return Verdict::Allowed("fixed-count loop back-edge");
-            }
+    // The pinned release build emits exactly one byte-wise `Cmov` loop for
+    // each known record width. Requiring the complete compare operand keeps a
+    // secret-derived register or a different immediate from borrowing this
+    // allowance.
+    let record_loop = match (previous.mnemonic.as_str(), previous.operands.as_str()) {
+        ("cmp", DIRECTORY_RECORD_LOOP_COMPARE) => Some(Allowance::DirectoryRecordLoop),
+        ("cmp", EVENT_RECORD_LOOP_COMPARE) => Some(Allowance::EventRecordLoop),
+        _ => None,
+    };
+    if let Some(allowance) = record_loop {
+        if jump_target(&current.operands).is_some_and(|target| target < current.address) {
+            return Verdict::Allowed(allowance);
         }
     }
 
@@ -395,9 +496,13 @@ mod tests {
         let scanned = scan(MEASURED, "directory");
         assert_eq!(scanned.failures, Vec::<String>::new());
         assert_eq!(scanned.allowed.len(), 3);
-        assert!(scanned.allowed[0].contains("fixed-count loop back-edge"));
+        assert!(scanned.allowed[0].contains("38-byte record Cmov loop back-edge"));
         assert!(scanned.allowed[1].contains("reference-count drop branch"));
         assert!(scanned.allowed[2].contains("reference-count drop branch"));
+        assert_eq!(
+            validate_allowances(&scanned, "directory"),
+            Ok(RecordLoop::Directory)
+        );
     }
 
     /// A forward jump after a compare is the failing shape, not a loop, even
@@ -421,7 +526,7 @@ mod tests {
         };
         assert_eq!(
             classify(Some(&previous), &backward),
-            Verdict::Allowed("fixed-count loop back-edge")
+            Verdict::Allowed(Allowance::DirectoryRecordLoop)
         );
         assert_eq!(
             classify(Some(&previous), &forward),
@@ -460,7 +565,7 @@ mod tests {
             Verdict::Rejected("conditional jump")
         );
 
-        // A register decrement is not a refcount drop through memory.
+        // A register decrement is not the measured RNG refcount drop.
         let register_decrement = Instruction {
             address: 0x100,
             mnemonic: "dec".to_string(),
@@ -470,6 +575,36 @@ mod tests {
             classify(Some(&register_decrement), &jump),
             Verdict::Rejected("conditional jump")
         );
+
+        // Neither a different immediate nor a secret-carrying register may
+        // borrow the known fixed-record loop allowance.
+        for operands in ["$0x1,%rax", "$0x26,%rbx", "$0x52,%al"] {
+            let near_miss = Instruction {
+                address: 0x100,
+                mnemonic: "cmp".to_string(),
+                operands: operands.to_string(),
+            };
+            assert_eq!(
+                classify(Some(&near_miss), &jump),
+                Verdict::Rejected("conditional jump"),
+                "{operands}"
+            );
+        }
+
+        // A decrement through arbitrary memory is not enough: the allowance
+        // is tied to the exact TLS refcount instruction in the pinned build.
+        for operands in ["-0x8(%rsp)", "0x0(%r12)", "(%rax)"] {
+            let near_miss = Instruction {
+                address: 0x100,
+                mnemonic: "decq".to_string(),
+                operands: operands.to_string(),
+            };
+            assert_eq!(
+                classify(Some(&near_miss), &jump),
+                Verdict::Rejected("conditional jump"),
+                "{operands}"
+            );
+        }
     }
 
     #[test]
@@ -531,6 +666,45 @@ mod tests {
                 Verdict::Rejected("indirect jump (jump table)")
             );
         }
+    }
+
+    #[test]
+    fn indirect_calls_are_rejected() {
+        for operands in ["*%rax", "*0x18(%rip)"] {
+            let indirect = Instruction {
+                address: 0x100,
+                mnemonic: "call".to_string(),
+                operands: operands.to_string(),
+            };
+            assert_eq!(
+                classify(None, &indirect),
+                Verdict::Rejected("indirect call")
+            );
+        }
+    }
+
+    #[test]
+    fn an_incomplete_or_expanded_allowance_profile_is_rejected() {
+        let missing_drop = Scan {
+            instructions: 1,
+            allowed: Vec::new(),
+            allowances: vec![Allowance::DirectoryRecordLoop, Allowance::RngRefcountDrop],
+            failures: Vec::new(),
+        };
+        assert!(validate_allowances(&missing_drop, "directory").is_err());
+
+        let extra_loop = Scan {
+            instructions: 1,
+            allowed: Vec::new(),
+            allowances: vec![
+                Allowance::DirectoryRecordLoop,
+                Allowance::EventRecordLoop,
+                Allowance::RngRefcountDrop,
+                Allowance::RngRefcountDrop,
+            ],
+            failures: Vec::new(),
+        };
+        assert!(validate_allowances(&extra_loop, "mixed").is_err());
     }
 
     /// A refcount drop allowance must not launder a `loop` instruction.
