@@ -161,3 +161,7 @@ opt-level = 3
 debug = true
 
 [patch.crates-io]
+# Source-bound backport of ZcashFoundation/zebra#10841 with a stricter
+# post-catch-up canonical (height, hash) replay guard. Remove this patch after
+# that guard is available in a compatible published Zebra dependency cohort.
+zebra-rpc = { git = "https://github.com/sovright/zebra.git", rev = "68ba61488a3c4386e6a3bd0370583f4ead153770" }
