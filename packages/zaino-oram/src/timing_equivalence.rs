@@ -75,6 +75,10 @@ impl EquivalenceBound {
 pub struct Seed(u64);
 
 impl Seed {
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
+
     /// Records the seed a published result can be recomputed from.
     pub const fn new(seed: u64) -> Self {
         Self(seed)
@@ -264,10 +268,10 @@ fn classifier_auc(pairs: &[Pair]) -> f64 {
 
 /// Small deterministic xorshift, so a published result is reproducible from its
 /// recorded seed without depending on an external generator's version.
-struct Rng(u64);
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(
             seed.wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407)
@@ -275,7 +279,7 @@ impl Rng {
         )
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         let mut state = self.0;
         state ^= state >> 12;
         state ^= state << 25;
@@ -284,7 +288,7 @@ impl Rng {
         state.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
-    fn below(&mut self, bound: usize) -> usize {
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
         (self.next_u64() % bound as u64) as usize
     }
 }
