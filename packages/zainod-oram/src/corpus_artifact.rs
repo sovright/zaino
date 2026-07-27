@@ -351,6 +351,24 @@ pub(super) fn load_sizing(
     })
 }
 
+/// Revalidates the common capture-to-sizing lineage for derived evidence.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn validate_derived_source_lineage(
+    capture: &ValidatedCapture,
+    sizing: &ValidatedSizing,
+) -> Result<(), ArtifactError> {
+    sizing
+        .qualification()
+        .validate_against(capture.measurement())
+        .map_err(ArtifactError::Qualification)?;
+    if sizing.measurement_blake2s256() != capture.measurement_blake2s256() {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "derived artifact capture and sizing lineage mismatch",
+        });
+    }
+    Ok(())
+}
+
 /// Publishes a complete offline sizing result into a new output directory.
 pub(super) fn publish_sizing(
     output_dir: &Path,
