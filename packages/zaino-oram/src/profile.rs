@@ -8,7 +8,7 @@ use crate::{
 };
 
 pub(super) const PROFILE_ID_BYTES: usize = 16;
-const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v4";
+const PROFILE_ID_DOMAIN: &[u8] = b"zaino-oram/privacy-profile/v6";
 const UNARY_FIXED_ENVELOPE_TAG: u8 = 1;
 const SINGLE_WORKER_FIFO_TAG: u8 = 1;
 const REJECT_AT_CAPACITY_TAG: u8 = 1;
@@ -93,8 +93,13 @@ impl CompiledReplayPolicy {
     }
 
     /// Returns the public replay-expiry bucket width.
+    pub(super) const fn expiry_bucket_width(&self) -> NonZeroU64 {
+        self.expiry_bucket_width_seconds
+    }
+
+    /// Returns the public replay-expiry bucket width in seconds.
     pub(super) const fn expiry_bucket_width_seconds(&self) -> u64 {
-        self.expiry_bucket_width_seconds.get()
+        self.expiry_bucket_width().get()
     }
 
     /// Returns the fixed proactive garbage-collection interval.
@@ -717,6 +722,10 @@ mod tests {
             TEST_REPLAY_EXPIRY_BUCKET_WIDTH_SECONDS
         );
         assert_eq!(
+            replay.expiry_bucket_width().get(),
+            TEST_REPLAY_EXPIRY_BUCKET_WIDTH_SECONDS
+        );
+        assert_eq!(
             replay.garbage_collection_interval_seconds(),
             TEST_REPLAY_GARBAGE_COLLECTION_INTERVAL_SECONDS
         );
@@ -829,7 +838,7 @@ mod tests {
         let baseline = profile();
         assert_eq!(
             baseline.profile_id(),
-            &[186, 86, 204, 161, 207, 240, 191, 220, 170, 11, 25, 168, 107, 104, 66, 23,]
+            &[242, 71, 113, 71, 227, 192, 130, 40, 112, 11, 108, 206, 85, 56, 119, 181,]
         );
         let mut relabeled = definition();
         relabeled.label = "renamed";
