@@ -72,7 +72,10 @@ use crate::{
             },
             finalised_source::ephemeral::EphemeralFinalisedState,
         },
-        types::{db::metadata::FinalisedTxOutSetInfoAccumulator, TransactionHash},
+        types::{
+            db::metadata::FinalisedTxOutSetInfoAccumulator, BlockIndex, FinalizedOutpointSnapshot,
+            TransactionHash,
+        },
     },
     config::ChainIndexConfig,
     error::FinalisedStateError,
@@ -352,6 +355,23 @@ impl<T: BlockchainSource> FinalisedSource<T> {
             Self::V1(db) => Ok(db.as_ref()),
             Self::Ephemeral(_) => Err(FinalisedStateError::FeatureUnavailable(feature)),
         }
+    }
+
+    /// Materializes outpoint state at an exact finalized checkpoint.
+    ///
+    /// `expected_new_outpoints` are proven by the caller's canonical recent snapshot to be created
+    /// after the checkpoint; their pre-checkpoint absence becomes `NeverSeen`, while an indexed
+    /// collision is returned verbatim. Every `required_outpoint` is asserted to have existed at
+    /// the checkpoint, so an absent creator or output is an integrity error.
+    pub(super) async fn materialize_finalized_outpoints(
+        &self,
+        checkpoint: BlockIndex,
+        expected_new_outpoints: Vec<Outpoint>,
+        required_outpoints: Vec<Outpoint>,
+    ) -> Result<FinalizedOutpointSnapshot, FinalisedStateError> {
+        self.require_v1("finalized outpoint materialization")?
+            .materialize_outpoint_snapshot(checkpoint, expected_new_outpoints, required_outpoints)
+            .await
     }
 
     /// Return an arc clone of the underlying LMDB environment, used during some DB migrations.

@@ -35,6 +35,7 @@
 pub mod block_context;
 pub mod db;
 pub mod helpers;
+mod oram;
 pub mod primitives;
 mod transparent_events;
 pub mod wire;
@@ -45,6 +46,8 @@ pub use db::{CommitmentTreeData, CommitmentTreeRoots, CommitmentTreeSizes};
 
 // Re-export business-layer primitives and containers
 pub use block_context::BlockContext;
+pub(super) use oram::FinalizedOutpointSnapshot;
+pub use oram::FinalizedOutpointState;
 pub use primitives::{
     BlockIndex, ChainWork, ChainWorkError, CompactDifficulty, CompactDifficultyError,
 };

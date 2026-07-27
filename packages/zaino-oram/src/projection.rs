@@ -1005,6 +1005,22 @@ where
         (status, sink)
     }
 
+    /// Extracts the exact configuration, checkpoint, and sink only after finish.
+    pub(super) fn into_ready_parts(
+        mut self,
+    ) -> Option<(ProjectionConfig, PublicChainCheckpoint, S)> {
+        let ready = self
+            .projection
+            .ready_checkpoint()
+            .ok()
+            .map(|checkpoint| checkpoint.chain());
+        self.drop_publisher();
+        match (ready, self.sink.take()) {
+            (Some(checkpoint), Some(sink)) => Some((self.projection.config, checkpoint, sink)),
+            (Some(_), None) | (None, _) => None,
+        }
+    }
+
     fn append_staged_events(&mut self, events: &[UtxoEvent]) -> Result<(), ()> {
         let Some(sink) = self.sink.as_mut() else {
             return Err(());
