@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add an explicit, bounded `corpus capture --fetch-concurrency` option that
+  keeps indexed-block reads in flight while reducing them strictly in height
+  order; the conservative default remains sequential.
 - Add a crate-private, mock-backed custom Tonic codec and body adapter that
   retains a non-`Clone` pending response without an eager byte copy, performs
   its fallible currentness check at the first outbound body poll, emits the

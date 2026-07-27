@@ -77,21 +77,20 @@ LICENSE                            Apache-2.0 license text
 
 ## ORAM research-fork status
 
-The non-published `zaino-oram` research crate now keeps one profile-bound,
-non-`Clone` `ActiveSecurityLease` as the sole internal owner of runtime
-security state. Full raw security-bundle assembly is available only to tests.
-The crate exports only the small lifetime-safe `FixedEnvelopeRuntime`,
-`PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade consumed by
-`zainod-oram`; pending responses retain their release authority and never
-export detached response bytes. The concrete runtime owner remains private,
-with no public constructor or factory.
+The ORAM work is an experimental, non-published, default-off research
+subsystem. Phase 0 remains **NO-GO for private-server integration** on technical
+grounds. A reproducible full-Mainnet aggregate capture and honest current-corpus
+logical sizing now exist, but target-TDX RSS/headroom, growth, backend
+calibration, insertion/failure bounds, and compiled obliviousness remain
+unresolved. The pinned dependency manifests declare `MIT OR Apache-2.0`, while
+authoritative repository license and notice files remain unconfirmed; this is
+tracked as distribution-readiness due diligence, not a Phase 0 blocker.
 
-This is still source-level research evidence. A production protector/replay/
-material-provider bundle, generated route and listener, durable replay,
-trusted clock, nonce ledger, key management, rollback resistance, TDX, and
-transport-write or peer-delivery evidence remain open. Profile ID v3 and the
-existing ten-phase logical schedule are unchanged. See the
+Detailed implementation chronology belongs outside this README. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
+[implementation status](./docs/notes/oram-implementation-status.md),
+[Phase 0 kill-gate report](./docs/notes/oram-phase0-kill-gates-2026-07-23.md),
+[mainnet capture log](./docs/notes/oram-phase0-mainnet-capture-log-2026-07-26.md),
 [feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and
 [runtime security-owner ADR](./docs/adr/0009-private-query-runtime-security-state-owner.md).
 

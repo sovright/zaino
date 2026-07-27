@@ -30,6 +30,7 @@ mod envelope;
 mod full_map_saturation;
 mod inner_codec;
 mod layout;
+mod persistence;
 mod private_runtime;
 #[cfg(feature = "corpus-zaino")]
 mod process_memory;
