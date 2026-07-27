@@ -118,6 +118,31 @@ impl MainnetSizingModel {
         self.parts().map(|_| ())
     }
 
+    /// Returns the configured directory-table capacity.
+    pub const fn directory_capacity(&self) -> u64 {
+        self.directory_capacity
+    }
+
+    /// Returns the configured directory-table admission limit.
+    pub const fn directory_admission_limit(&self) -> u64 {
+        self.directory_admission_limit
+    }
+
+    /// Returns the configured event-table capacity.
+    pub const fn event_capacity(&self) -> u64 {
+        self.event_capacity
+    }
+
+    /// Returns the configured event-table admission limit.
+    pub const fn event_admission_limit(&self) -> u64 {
+        self.event_admission_limit
+    }
+
+    /// Returns the configured per-address event limit.
+    pub const fn max_events_per_address(&self) -> u64 {
+        self.max_events_per_address
+    }
+
     fn parts(&self) -> Result<(GrowthAssumption, SizingParameters), MainnetCorpusError> {
         let growth = GrowthAssumption::new(self.growth_horizon_years, self.annual_growth_bps)
             .map_err(ZainoCorpusError::Aggregate)?;
@@ -297,6 +322,10 @@ impl MainnetCorpusMeasurement {
     /// Returns the verified public checkpoint for this measurement.
     pub const fn checkpoint(&self) -> &MainnetCorpusCheckpoint {
         &self.checkpoint
+    }
+
+    pub(super) const fn output_count(&self) -> u64 {
+        self.aggregate.output_count()
     }
 
     /// Revalidates every redundant aggregate field after deserialization.
@@ -499,6 +528,12 @@ impl MainnetSizingQualification {
     /// Returns the explicit model applied to the captured measurement.
     pub const fn model(&self) -> &MainnetSizingModel {
         &self.model
+    }
+
+    pub(super) fn captured_corpus_fits_configured_limits(&self) -> bool {
+        self.projections
+            .first()
+            .is_some_and(|projection| projection.year == 0 && projection.fits_configured_limits)
     }
 
     /// Revalidates the model, compiled widths, projection arithmetic, and

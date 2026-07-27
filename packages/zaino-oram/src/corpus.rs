@@ -504,6 +504,11 @@ impl CorpusMeasurement {
         self.blocks
     }
 
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn output_count(&self) -> u64 {
+        self.outputs
+    }
+
     pub(super) const fn distinct_standard_addresses(&self) -> u64 {
         self.distinct_standard_addresses
     }
