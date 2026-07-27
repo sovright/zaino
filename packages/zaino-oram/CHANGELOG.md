@@ -8,6 +8,167 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Profile ID v6 and authenticated fixed-width replay-current format v3
+  (`ZORJCUR3`) for fresh replay-journal provisioning. Replay-entry v2
+  (`ZORJENT2`) remains unchanged, and all current/entry record widths remain
+  fixed. Current v3 persists a `u64` maintenance watermark: zero is the
+  sentinel for no classified bucket, and a nonzero value is the inclusive
+  recorded highest fully expired continuation expiry bucket for future
+  maintenance classification. The raw recorded value is not trusted-time,
+  epoch, profile, currentness, expiry, or retirement authority. A lower
+  proposal rejects; an equal proposal returns typed `NoAdvance` without a
+  write, receipt, or outer sequence advance; and a greater proposal durably
+  advances replay-current, mints a distinct move-only maintenance receipt, and
+  follows serialized replay-current -> outer-local -> witness ordering. A hard
+  witness rejection fresh-opens as `WitnessLocalMismatch`; witness
+  advance-then-error can reconcile on fresh open. The current-only advance
+  appends no entry and changes no claim set or count. Profile v6 requires fresh
+  provisioning and neither migrates nor dual-accepts profile-v5/current-v2 or
+  earlier state. The mutation/coordinator surface remains module-private with
+  no non-test caller and no trusted-time, epoch, or profile grant; any
+  visibility widening or runtime wiring must first consume a live
+  epoch/profile/currentness-bound move-only grant. This is recorded
+  classification metadata, not request expiry, deletion, count reduction,
+  compaction, reclamation, bounded retention, or garbage-collection
+  execution. Capacity remains lifetime cumulative. This is not TDX, mainnet,
+  target-load, or access-oblivious proof.
+- ADR 0009's production gate for one opaque, rollback-resistant runtime
+  security-state owner spanning key/projection epochs, sessions and distinct
+  role keys, request/server nonce ownership, trusted time, real-or-cover replay
+  durability, external freshness, lifecycle rotation, and release-time
+  currentness. The ADR defines required invariants and fail-closed
+  qualification evidence requirements; it does not select or implement a
+  provider.
+- Private opaque XChaCha20-Poly1305 dependency composition for the listener-free
+  runtime. An end-to-end test rejects a wrong request key before material or
+  replay work, then exercises real encrypted request/response pagination,
+  token-tamper rejection, a valid continuation claim, and replay rejection with
+  the same complete modeled trace. The composition retains deterministic
+  material and counting replay fixtures; it is not a production key/session,
+  nonce, clock, replay, owner, or service bundle.
+- Crate-internal XChaCha20-Poly1305 request-envelope, response-envelope, and
+  continuation-token protectors backed by separately owned, zeroized 256-bit
+  role-key objects. Distinct canonical associated-data domains authenticate all
+  existing profile, direction, session, and checkpoint context. A fixed vector
+  was cross-checked against Go's independent `x/crypto/chacha20poly1305` v0.47.0
+  implementation; tests also reject nonce, ciphertext, tag, associated-data,
+  context, direction, and key changes without exposing plaintext. The direct
+  dependency stays on the workspace-compatible RustCrypto 0.10.1 line, whose
+  upstream project reports an NCC Group audit; this integration still requires
+  independent cryptographic review. Version 0.11 currently conflicts with the
+  prerelease `crypto-common` version pinned by the Zcash dependency graph. This
+  slice does not select or expose service key establishment, derivation,
+  provisioning, rotation, nonce generation, trusted time, durable replay,
+  KMS/TDX ownership, or a public runtime factory.
+- A listener-free response-release gate inside the private process-lifetime
+  owner. One non-`Clone` permit keeps a completed response outstanding; while
+  it is held, later handle, refresh, and explicit shutdown attempts reject
+  before mutating owner or runtime state. Dropping the permit reopens the gate
+  unless it is already closed; a successful stop or owner drop closes it
+  permanently. The finalized-runtime pending round carries a narrow
+  first-release witness over its expected epoch identity, opaque capture, and
+  shared currentness observer. It atomically enters checking, re-observes and compares the source,
+  then authorizes the byte borrow; mismatch, observation failure, or owner
+  closure fails closed. Unpolled drop performs no observation, and the witness
+  retains no serving lease or finalized store. Once refresh has retired the
+  active epoch, cancellation never restores it. This is an internal ownership,
+  exclusion, and late-release contract only: it is not a service, listener,
+  transport-write, response-body, or currentness-at-write proof, and the
+  canonical source may advance immediately after the check. It establishes no
+  FIFO, queue, wait, deadline, drain, or underlying-worker shutdown behavior;
+  tests exercise the exact helper delegated to by the owner rather than a
+  successfully refreshed ready-owner lifecycle; a public owner factory and
+  private protobuf/body integration remain open.
+- A default-off crate-internal process-lifetime owner for the exact recent-chain
+  refresh controller and one stable private-query runtime state. It retires the
+  active epoch before capture, refreshes from the committed checkpoint of the
+  supplied exact finalized store, pins the controller-published epoch, and
+  derives the protected runtime checkpoint only from that store-bound lease
+  identity. Epoch replacement preserves the injected envelope/token protectors,
+  replay guard, material source, codec session binding, compiled profile, and
+  monotonic fail-closed health. Failed refresh, pinning, or epoch construction
+  leaves no active epoch and never falls back to the retired one. Its logical
+  stop is idempotent. This is not an enforced process singleton or service
+  caller, and it does not establish concurrent admission, FIFO/queue/overload or
+  draining behavior, a transport-write guard, clean underlying-worker shutdown,
+  persistence, authenticated provenance, production cryptography, trusted time,
+  nonce uniqueness, durable replay, physical or timing obliviousness, TDX,
+  target-load, or mainnet readiness.
+- A default-off crate-internal exact-lease runtime factory. It consumes one
+  already-pinned serving-epoch lease specialized to
+  `FinalizedProjectionServingStore`, derives all six protected
+  `PrivateQueryCheckpoint` fields from the lease identity, and constructs the
+  existing listener-free `PrivateQueryRuntime` without accepting an independent
+  checkpoint, store, or currentness observer. The process-lifetime owner above
+  now uses the same exact-lease activation seam after pinning from its owned
+  controller; the standalone factory still does not enforce unique
+  construction, query-level concurrency, service lifecycle, or transport-write
+  completion.
+- A private Ready-only finalized serving-store adapter. Consuming an
+  `OfflineProjectionOwner` now transfers its exact `AtomicWorker` into a
+  non-cloneable read-only facade, derives the finalized serving identity within
+  the owner boundary, and rejects Building or failed-closed owners while
+  shutting their workers down. Each successful in-profile `AddressKey`/slot
+  read, absent a backend or worker failure, performs a complete fixed-profile
+  directory and padded event-history command, validates and folds the full
+  append-only history into dense creation-order live UTXOs, and uses no
+  cross-call cache or query-derived fallback. Decreasing event heights and
+  events above the owner-bound committed checkpoint fail closed. This is a
+  concrete logical adapter for the existing serving-epoch contract and is
+  consumed through the exact-lease runtime path by the process-lifetime owner
+  above. It still has no service caller and establishes neither persistence nor
+  physical or timing obliviousness, production cryptography, TDX, target-load,
+  or mainnet readiness.
+- A private generation-bound serving-epoch contract. The refresh controller
+  invalidates before its sole await, validates a coherent transparent-projection
+  capture, activates the owner-generated recent generation, and publishes one
+  serving-epoch `Arc` last. The epoch binds an owner-issued finalized store with
+  matching identity, the exact recent generation, the opaque NFS revision, and
+  a query-independent currentness capability. A separately tested
+  listener-free runtime contract accepts the same lease shape, derives its
+  finalized store and currentness observer from that lease, completes and
+  protects the fixed-work response, and then discards it on a failed final
+  observation or double currentness check. The exact-lease factory above now
+  provides a non-test construction path after a caller has already pinned the
+  epoch. The process-lifetime owner above now supplies the private
+  controller-to-runtime pinning and replacement path. There remains no enforced
+  process singleton, service or listener caller, or transport-write guard. The
+  concrete private adapter above supersedes only the then-current lack of an
+  implementation.
+- The default-off `corpus-zaino` integration now has a private conversion
+  candidate that consumes one `CanonicalRecentChainSnapshot` and an immutable,
+  identity-pinned finalized-outpoint classifier. It preserves dense
+  standard-event slots in canonical order and tracks nonstandard states without
+  treating them as ordinary address events, and the candidate remains
+  generation-free. The private single-writer publication owner remains the sole
+  generation authority: it accepts a candidate only through its current
+  outstanding ticket, requires exact finalized and recent-tip metadata, and
+  moves the candidate's slots into `FrozenRecentSnapshot`. Direct raw-slot
+  activation is test-only. This entry records the earlier conversion-only
+  slice: at that head, begin-update-before-conversion was a control-flow
+  obligation and no refresh controller or serving epoch enforced it. The
+  private controller and serving-epoch contracts above supersede those
+  then-current implementation limitations, but not the lack of non-test
+  composition, durability, authenticated provenance, production cryptography,
+  TDX, or mainnet evidence.
+- Frozen recent snapshots now bind an in-memory monotonic generation, exact
+  finalized identity, recent tip height/hash, and the internally computed
+  fixed-slot commitment into one lineage digest. The listener-free runtime
+  recomputes that binding after every complete scan and continuation query
+  binding v2 rejects a token from any other lineage even when its transparent
+  slot contents are identical. A private single-writer publication model clears
+  the active generation before refresh, admits only the opaque outstanding
+  build ticket, retains immutable leases, and supports a final
+  current-generation check. Its tests cover advances, same-height and
+  shortening reorgs, stale tickets, failed builds, finalized rollback, and
+  generation overflow. A replacement owner must roll the durable projection
+  epoch because its in-memory generation restarts at one. This entry records
+  the earlier snapshot-owner contract, which then had no runtime consumer or
+  serving epoch. The private serving-epoch and runtime contracts above
+  supersede that implementation-status limitation; they still do not
+  authenticate tip or slot provenance, durably prevent rollback, establish a
+  non-test composition path, or provide physical, TDX, mainnet, or
+  production-readiness evidence.
 - Profile ID v3 now binds padded input slots, a distinct recent-snapshot scan
   budget, a fixed timeout bucket, and the explicit single-worker FIFO
   execution/queue/reject-at-capacity policy. The allocation-free recorder
