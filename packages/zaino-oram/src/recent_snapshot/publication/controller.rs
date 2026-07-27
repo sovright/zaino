@@ -3,9 +3,9 @@
 //! This private build-stage controller publishes one atomic serving epoch only
 //! after binding an owner-issued finalized store generation and identity, the
 //! owner-assigned recent generation, opaque source boundary, and release-time
-//! currentness capability. Its caller must still serialize refresh against
-//! committed-finalized publication and retain the release guard through the
-//! eventual transport boundary.
+//! currentness capability. The process-lifetime runtime owner serializes
+//! refresh against query handling and retains the lease through runtime return;
+//! the eventual service must still retain a guard through transport completion.
 
 use std::{fmt, future::Future};
 
@@ -35,11 +35,11 @@ use crate::{
 
 /// Builds and publishes recent snapshots from one live chain-index subscriber.
 ///
-/// This type is intentionally private until the service layer supplies the
-/// process-wide owner and transport integration. Within one instance it is the
-/// only path from a coherent Zaino capture to an owner-assigned generation and
-/// its atomic serving-epoch publication.
-struct RecentSnapshotRefreshController<const N: usize, S, C> {
+/// This type is crate-visible only so the process-lifetime runtime owner can
+/// encapsulate it. Within one instance it is the only path from a coherent
+/// Zaino capture to an owner-assigned generation and its atomic serving-epoch
+/// publication.
+pub(crate) struct RecentSnapshotRefreshController<const N: usize, S, C> {
     owner: RecentSnapshotPublicationOwner<N>,
     serving_epoch: ServingEpochPublicationOwner<N, CanonicalTransparentProjectionBoundary, S, C>,
     network: CanonicalNetwork,
@@ -53,7 +53,7 @@ where
     S: FinalizedServingStore,
     C: ServingEpochCurrentness<CanonicalTransparentProjectionBoundary>,
 {
-    fn new(
+    pub(crate) fn new(
         network: CanonicalNetwork,
         schema_version: u32,
         projection_epoch: u64,
@@ -95,7 +95,7 @@ where
     {
         // Invalidate before the only await point. If this future is cancelled
         // during capture, no prior generation remains eligible for service.
-        self.invalidate_before_capture();
+        self.invalidate_publication();
         let input = match capture.await {
             Ok(input) => input,
             Err(_) => return Err(RecentSnapshotRefreshError::CaptureUnavailable),
@@ -212,12 +212,17 @@ where
             .map_err(map_publication_error)
     }
 
-    fn invalidate_before_capture(&mut self) {
+    /// Clears every controller-owned capability for the prior publication.
+    ///
+    /// The process-lifetime owner also calls this when runtime activation or
+    /// terminal lifecycle handling fails after a controller refresh.
+    pub(crate) fn invalidate_publication(&mut self) {
         self.serving_epoch.clear();
         self.owner.clear_publication();
     }
 
-    fn pin_serving_epoch(
+    /// Pins the exact atomic epoch published by the latest successful refresh.
+    pub(crate) fn pin_serving_epoch(
         &self,
     ) -> Option<ServingEpochLease<N, CanonicalTransparentProjectionBoundary, S, C>> {
         self.serving_epoch.pin()
@@ -237,7 +242,7 @@ where
     /// committed checkpoint through this call. The final source recheck rejects
     /// drift visible during the build; the bound observer repeats the check when
     /// runtime is ready to release a response.
-    async fn refresh(
+    pub(crate) async fn refresh(
         &mut self,
         subscriber: &NodeBackedChainIndexSubscriber<Source>,
         committed_finalized: PublicChainCheckpoint,
@@ -274,7 +279,8 @@ where
     }
 }
 
-struct CanonicalServingEpochCurrentness<Source: BlockchainSource> {
+/// Live source observer bound to one exact canonical projection capture.
+pub(crate) struct CanonicalServingEpochCurrentness<Source: BlockchainSource> {
     subscriber: NodeBackedChainIndexSubscriber<Source>,
     network: CanonicalNetwork,
     schema_version: u32,
@@ -458,7 +464,7 @@ const fn serving_identity(
 
 /// Coarsened controller failure without outpoint or checkpoint identifiers.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RecentSnapshotRefreshError {
+pub(crate) enum RecentSnapshotRefreshError {
     InvalidConfiguration,
     CaptureUnavailable,
     InputRejected,
@@ -745,6 +751,7 @@ mod tests {
         }
 
         assert!(controller.owner.pin().is_none());
+        assert!(controller.pin_serving_epoch().is_none());
         assert!(controller.owner.outstanding.is_none());
 
         rebuild(&mut controller, finalized)?;

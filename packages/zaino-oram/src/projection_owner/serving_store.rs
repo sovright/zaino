@@ -17,7 +17,7 @@ use super::OfflineProjectionOwner;
 /// Construction consumes the offline owner so no append-capable handle remains
 /// beside this read-only facade. This is a logical fixed-shape adapter over the
 /// research worker; it does not establish persistence or physical obliviousness.
-pub(super) struct FinalizedProjectionServingStore {
+pub(crate) struct FinalizedProjectionServingStore {
     checkpoint: PublicChainCheckpoint,
     identity: RecentSnapshotIdentity,
     slots_per_key: usize,
@@ -58,7 +58,7 @@ where
 
 impl FinalizedProjectionServingStore {
     /// Returns the public checkpoint captured by the consumed Ready owner.
-    pub(super) const fn committed_checkpoint(&self) -> PublicChainCheckpoint {
+    pub(crate) const fn committed_checkpoint(&self) -> PublicChainCheckpoint {
         self.checkpoint
     }
 }
@@ -112,7 +112,7 @@ impl std::error::Error for FinalizedProjectionServingStoreBuildError {}
 
 /// A finalized serving read failed without exposing protected identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FinalizedProjectionServingStoreUnavailable;
+pub(crate) struct FinalizedProjectionServingStoreUnavailable;
 
 impl fmt::Display for FinalizedProjectionServingStoreUnavailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -2947,6 +2947,20 @@ mod verify_reported_upgrades {
             .expect("mainnet Sapling at 419200 matches the compiled parameters");
     }
 
+    /// Regression for the mainnet-corpus preflight: Zebra 11.0 knew the
+    /// upgrade variant but did not yet carry its Mainnet activation height.
+    #[test]
+    fn accepts_mainnet_nu6_3_at_the_compiled_height() {
+        let upgrades = upgrades_map(
+            r#"{
+                "37a5165b": { "name": "NU6.3", "activationheight": 3428143, "status": "pending" }
+            }"#,
+        );
+
+        super::verify_reported_upgrades(&zebra_chain::parameters::Network::Mainnet, &upgrades)
+            .expect("mainnet NU6.3 at 3428143 matches the compiled parameters");
+    }
+
     /// A reported height disagreeing with the compiled schedule fails loud —
     /// the wrong-schedule / wrong-network drift class.
     #[test]
