@@ -77,98 +77,20 @@ LICENSE                            Apache-2.0 license text
 
 ## ORAM research-fork status
 
-The non-published `zaino-oram` research crate now keeps one profile-bound,
-non-`Clone` `ActiveSecurityLease` as the sole internal owner of runtime
-security state. Full raw security-bundle assembly is available only to tests.
-The crate exports only the small lifetime-safe `FixedEnvelopeRuntime`,
-`PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade consumed by
-`zainod-oram`; pending responses retain their release authority and never
-export detached response bytes. The concrete runtime owner remains private,
-with no public constructor or factory.
+The ORAM work is an experimental, non-published, default-off research
+subsystem. Phase 0 remains **NO-GO for private-server integration** on technical
+grounds. A reproducible full-Mainnet aggregate capture and honest current-corpus
+logical sizing now exist, but target-TDX RSS/headroom, growth, backend
+calibration, insertion/failure bounds, and compiled obliviousness remain
+unresolved. The pinned dependency manifests declare `MIT OR Apache-2.0`, while
+authoritative repository license and notice files remain unconfirmed; this is
+tracked as distribution-readiness due diligence, not a Phase 0 blocker.
 
-The crate also contains a private, fixed-width security-state persistence
-foundation. It binds the complete security identity to opaque serving and
-component-state digests, commits local state durably before advancing an
-injected exact freshness witness, and accepts startup state only when the local
-sequence/digest exactly matches that witness. Ambiguous replacement or witness
-advancement fails closed. No production witness or runtime owner uses this
-store yet.
-
-Alongside it, a crate-private local replay-journal foundation durably orders
-one request lane with one real-or-cover continuation lane. Its fixed-size
-version-two entry records (`ZORJENT2`) seal replay identities and semantic state
-behind an injected protector, bind that protection to an opaque journal
-context, and synchronize the next sequence candidate before the sole
-`current.bin` commit marker. Each persisted real continuation claim is one
-typed value containing its opaque replay key and a nonzero, one-based ceiling
-expiry-bucket ordinal. The fixed-width version-three current record
-(`ZORJCUR3`) additionally records a `u64` maintenance watermark without
-changing any record width; entry v2 remains unchanged. Recovery rebuilds only
-the exact committed sequence range, restores that separately persisted
-watermark, and never inspects a later candidate; retries replace that
-non-authoritative candidate uniformly. It is not connected to the runtime and
-has only a deterministic test protector. Its total committed-transaction bound
-is derived from compiled profile v6, and it assumes a single live writer
-without enforcing a process lock.
-
-A module-private coordinator now joins those two local foundations. Initial
-provisioning is an explicit operation distinct from opening existing state, and
-an existing open accepts only an exact match between the outer snapshot and the
-current versioned, domain-separated replay-component digest. Each successful
-replay commit's sealed durable path produces one move-only replay receipt
-binding its opaque per-open journal identity and pre- and post-commit digests.
-A greater maintenance watermark instead produces a distinct move-only
-maintenance receipt that cannot be consumed as query-commit evidence. Before
-advancing the outer local snapshot and injected witness, the coordinator checks
-that the same live journal recognizes the applicable receipt and its
-post-transition digest is still current. Both transitions therefore retain the
-serialized replay-current -> outer-local -> witness order. It never infers
-transition direction or repairs either store. Any outer failure after the
-replay transition latches that coordinator instance fail closed. After a hard
-witness rejection, a fresh open rejects the durable-local/witness mismatch with
-`WitnessLocalMismatch`; if the witness advanced before returning an error, a
-fresh open can reconcile and succeed.
-
-This protocol is not one atomic transaction across the replay journal, outer
-snapshot, and witness. No non-test runtime or security-owner caller constructs
-the coordinator in this slice; owner integration remains separate.
-
-The private profile identifier is now v6. It retains the replay-policy and
-version-two entry bindings while selecting current-state v3 (`ZORJCUR3`).
-Profile v6 requires fresh profile-bound journal and outer-state provisioning:
-there is no in-place migration or dual acceptance of profile-v5/current-v2 or
-earlier state. All current and entry record widths remain unchanged. Replay
-journal and coordinator construction derive the lifetime-cumulative
-transaction bound from the compiled profile, and the coordinator rejects an
-exhausted outer sequence before committing replay.
-
-The persisted maintenance watermark is a `u64`: zero is the sentinel for no
-classified bucket, and a nonzero value is the inclusive recorded highest fully
-expired continuation expiry bucket for future maintenance classification. The
-raw recorded value is not itself trusted-time, epoch, profile, currentness, or
-retirement authority. A lower proposal is rejected. An equal proposal returns
-the typed `NoAdvance` outcome without a current-record write, receipt, or outer
-sequence advance. A greater proposal durably advances only `ZORJCUR3`, mints
-the distinct maintenance receipt, and then follows the coordinator ordering
-above. It does not append an entry or change either claim set or counter.
-
-The mutation/coordinator surface remains module-private, has no non-test caller,
-and receives no trusted-time/epoch/profile grant. Any visibility widening or
-runtime wiring must first consume a live, epoch/profile/currentness-bound,
-move-only grant. The expiry ordinal and recorded watermark are classification
-metadata only: this slice adds no request expiry, replay-entry deletion,
-claim-count reduction, compaction, reclamation, bounded retention, or
-garbage-collection execution. Capacity remains lifetime cumulative.
-
-This is still source-level research evidence. A production protector/replay/
-material-provider bundle, generated route and listener, runtime-integrated
-witness-backed replay, trusted clock, nonce ledger, key management, production
-freshness-witness ownership and advancement, proactive replay maintenance,
-atomic combined persistence, rollback deployment evidence, TDX,
-mainnet, target-load, access-oblivious qualification, and transport-write or
-peer-delivery evidence remain open. The existing ten-phase logical schedule is
-unchanged. See the
+Detailed implementation chronology belongs outside this README. See the
 [implementation plan](./docs/notes/oram-enabled-zaino-plan.md),
+[implementation status](./docs/notes/oram-implementation-status.md),
+[Phase 0 kill-gate report](./docs/notes/oram-phase0-kill-gates-2026-07-23.md),
+[mainnet capture log](./docs/notes/oram-phase0-mainnet-capture-log-2026-07-26.md),
 [feasibility report](./docs/notes/oram-phase0-1-feasibility-report.md), and
 [runtime security-owner ADR](./docs/adr/0009-private-query-runtime-security-state-owner.md).
 
