@@ -116,6 +116,21 @@ impl AtomicWorker {
             .map_err(AtomicQualificationCommandError::from_worker)
     }
 
+    /// Reads one creation-order dense live slot through the complete fixed profile.
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn serving_read_slot(
+        &self,
+        address_key: &AddressKey,
+        slot: usize,
+        maximum_finalized_height: u32,
+    ) -> Result<Option<TransparentUtxo>, ()> {
+        self.handle
+            .try_read_live_slot(address_key, slot, maximum_finalized_height)
+            .map_err(|_| ())?
+            .wait()
+            .map_err(|_| ())
+    }
+
     #[cfg(feature = "corpus-zaino")]
     pub(crate) fn qualification_append(
         &self,
@@ -297,6 +312,27 @@ struct AtomicWorkerHandle {
 }
 
 impl AtomicWorkerHandle {
+    fn try_read_live_slot(
+        &self,
+        address_key: &AddressKey,
+        logical_slot: usize,
+        maximum_finalized_height: u32,
+    ) -> Result<AtomicWorkerReply<Option<TransparentUtxo>>, AtomicWorkerError> {
+        let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
+        self.admit(WorkerCommand::ReadLiveSlot {
+            address_key: *address_key,
+            logical_slot,
+            maximum_finalized_height,
+            reply,
+        })?;
+        Ok(AtomicWorkerReply {
+            response,
+            shared: Arc::clone(&self.shared),
+            consumed: false,
+            terminal_on_abandonment: false,
+        })
+    }
+
     fn try_read_history(
         &self,
         address: StandardAddress,
@@ -600,6 +636,12 @@ fn lock_state(shared: &WorkerShared) -> MutexGuard<'_, WorkerState> {
 }
 
 enum WorkerCommand {
+    ReadLiveSlot {
+        address_key: AddressKey,
+        logical_slot: usize,
+        maximum_finalized_height: u32,
+        reply: SyncSender<Result<Option<TransparentUtxo>, AtomicWorkerError>>,
+    },
     ReadHistory {
         address: StandardAddress,
         reply: SyncSender<Result<FixedEventHistory, AtomicWorkerError>>,
@@ -668,6 +710,18 @@ where
             }
         };
         match command {
+            WorkerCommand::ReadLiveSlot {
+                address_key,
+                logical_slot,
+                maximum_finalized_height,
+                reply,
+            } => {
+                mark_dequeued(shared);
+                let result = execute_command(executor, shared, |executor| {
+                    executor.read_live_slot(&address_key, logical_slot, maximum_finalized_height)
+                });
+                send_reply(reply, result);
+            }
             WorkerCommand::ReadHistory { address, reply } => {
                 mark_dequeued(shared);
                 let result =
@@ -801,6 +855,10 @@ fn increment_reply_delivery_failed(shared: &WorkerShared) {
 fn drain_failed_commands(receiver: &Receiver<WorkerCommand>, shared: &WorkerShared) {
     loop {
         match receiver.try_recv() {
+            Ok(WorkerCommand::ReadLiveSlot { reply, .. }) => {
+                resolve_queued_failure(shared);
+                send_reply(reply, Err(AtomicWorkerError::FailedClosed));
+            }
             Ok(WorkerCommand::ReadHistory { reply, .. }) => {
                 resolve_queued_failure(shared);
                 send_reply(reply, Err(AtomicWorkerError::FailedClosed));
@@ -1303,6 +1361,45 @@ mod tests {
             UtxoScriptClass::PayToPublicKeyHash,
             address.hash,
         )
+    }
+
+    #[test]
+    #[cfg(feature = "corpus-zaino")]
+    fn serving_slot_uses_one_complete_worker_command_and_unit_errors() -> TestResult<()> {
+        let (worker, observation) = worker_with_max_events(MAX_EVENTS)?;
+        let owner = address(0x28);
+        let created = event(owner, 0x48);
+        worker.qualification_append_typed(owner, created)?;
+        let address_key = derive_standard_address_key(LayoutNetwork::Mainnet, 1, owner);
+        lock_test(&observation).clear();
+
+        let selected = worker
+            .serving_read_slot(&address_key, 0, 172)
+            .map_err(|()| "valid serving read failed")?
+            .ok_or("created output must be live")?;
+        assert_eq!(selected.txid(), &[0x48; TXID_BYTES]);
+        assert_eq!(
+            lock_test(&observation)
+                .iter()
+                .filter(|call| call.operation == OperationKind::Read)
+                .count(),
+            DIRECTORY_PROBES
+                + usize::try_from(MAX_EVENTS).expect("test maximum fits usize") * EVENT_PROBES
+        );
+        assert_eq!(
+            worker.serving_read_slot(
+                &address_key,
+                usize::try_from(MAX_EVENTS).expect("test maximum fits usize"),
+                172,
+            ),
+            Err(())
+        );
+        assert!(worker
+            .serving_read_slot(&address_key, 0, 172)
+            .map_err(|()| "worker did not recover from invalid public slot")?
+            .is_some());
+        worker.shutdown()?;
+        Ok(())
     }
 
     #[test]
