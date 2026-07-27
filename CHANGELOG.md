@@ -8,35 +8,314 @@ and this library adheres to Rust's notion of
 ## Unreleased
 
 ### Added
+
+- ORAM research: freeze later feature slices behind the Phase 0 stop gate,
+  split implementation chronology out of the normative architecture plan, and
+  add a concise kill-gate report covering the completed Mainnet capture,
+  compiled secret-dependent branch finding, tracked redistribution-license
+  concern, TDX target candidates, and `rostl` fork-or-replace decision.
+- `zaino-oram`: supersede profile ID v5 with v6 and replay-current v2 with
+  fixed-width v3 (`ZORJCUR3`) for fresh replay-journal provisioning. Entry v2
+  (`ZORJENT2`) and every current/entry record width remain unchanged. Current
+  v3 persists a `u64` maintenance watermark: zero is the sentinel for no
+  classified bucket, and a nonzero value is the inclusive recorded highest
+  fully expired continuation expiry bucket for future maintenance
+  classification. The raw recorded value is not trusted-time, epoch, profile,
+  currentness, expiry, or retirement authority. A lower proposal rejects; an
+  equal proposal returns typed `NoAdvance` without a write, receipt, or outer
+  sequence advance; and a greater proposal durably advances replay-current,
+  mints a distinct move-only maintenance receipt, and proceeds through the
+  serialized replay-current -> outer-local -> witness coordinator path.
+  Recovery retains the same fail-closed ordering: hard witness rejection
+  fresh-opens as `WitnessLocalMismatch`, while witness advance-then-error can
+  reconcile on fresh open. The advance appends no replay entry and changes no
+  claim set or count. Profile v6 neither migrates nor dual-accepts
+  profile-v5/current-v2 or earlier state. The mutation/coordinator surface
+  remains module-private with no non-test caller and no trusted-time,
+  epoch, or profile grant; visibility widening or runtime wiring must first
+  consume a live epoch/profile/currentness-bound move-only grant. This slice
+  provides no request expiry, deletion, count reduction, compaction,
+  reclamation, bounded retention, or garbage-collection execution, so replay
+  capacity remains lifetime cumulative. It supplies no TDX, mainnet,
+  target-load, or access-oblivious proof.
+- `zaino-oram`: add a module-private replay-component construction and
+  verification foundation for the outer security-state snapshot. A versioned,
+  domain-separated composite security-component digest currently commits the
+  replay-journal component digest. Initial provisioning is explicit; its
+  restart-verification seam
+  accepts only an exact match between the outer snapshot and the current replay
+  state, and any mismatch fails closed. A journal latched indeterminate cannot
+  supply component state. Live successor construction requires the caller to
+  retain the pre-advance replay digest and reads the real post-advance digest
+  from a ready concrete journal. Supplying the same authoritative journal
+  instance and an allowed commit count remains a coordinator obligation, so the
+  binding never infers transition direction or repairs either component
+  automatically. This is a construction and reconciliation foundation, not
+  coordinated witness advancement or an atomic combined transaction.
+  Profile ID v4 now binds total committed replay-transaction capacity, public
+  trusted-time expiry-bucket width, and proactive fixed garbage-collection
+  interval. Journal/coordinator construction derives the persisted transaction
+  bound from the compiled profile, and outer-sequence exhaustion is rejected
+  before replay commit. No non-test runtime or security-owner caller can
+  construct and coordinate both private stores in this slice; owner integration,
+  maintenance execution, production protector/nonce/time/key ownership, and
+  rollback, TDX, and access-oblivious qualification remain deferred.
+- `zaino-oram`: add a crate-private crash-durable local replay-journal
+  foundation for the atomic request plus real-or-cover continuation contract.
+  Version-two current-state and version-one immutable-entry records have exact
+  fixed sizes and keep the compiled profile ID, replay identities, lane tags,
+  counters, and chain state inside a context-bound sealed-record boundary; this
+  slice supplies only a
+  deterministic test protector. The next sequence candidate is synchronized
+  before `current.bin`, which remains the sole local commit marker; committed
+  entries are then immutable. Restart reads only the exact authoritative
+  sequence range and never opens the next candidate, while every retry replaces
+  that non-authoritative candidate without inspecting its contents. Real commit
+  phases and focused synchronous tests cover semantic duplicates, the one
+  public transaction bound, authentication, exact-size reads, restart,
+  candidate overwrite, direct-component path rejection, and crash prefixes.
+  The store implements the existing replay-guard seam but is not wired into the
+  runtime. At this earlier journal-only step, its transaction bound was not yet
+  profile-derived, and there is no
+  production protector/key/nonce owner, coordinated external freshness-witness
+  advancement, rollback resistance, nonce or trusted-time journal,
+  single-writer process lock, access-oblivious memory or persistence, listener
+  integration, or production qualification claim. Until witness integration,
+  an absent `current.bin` opens as empty and cannot distinguish first
+  initialization from loss of a previously committed marker.
+- `zaino-oram`: add a crate-private witness-bound security-state persistence
+  foundation. One fixed-width, versioned snapshot binds stable service,
+  protocol, owner, key, projection, profile, session, and security-epoch
+  identity to opaque serving and component-state digests. Mutations stage and
+  synchronize the local snapshot before advancing an injected exact
+  sequence-and-digest freshness witness; startup accepts only an exact
+  local/witness match, and post-replace or witness ambiguity fails closed.
+  Version-one transitions keep service/protocol/profile identity stable,
+  prevent owner/key/projection epoch regression, and require a new owner
+  generation plus new session/security bindings for any identity rotation.
+  Crash-boundary tests cover staged-but-unpublished state, a durable local
+  advance without witness authority, rejected witness advancement, and an
+  advance-then-error reconciliation. This foundation supplies no concrete
+  witness, runtime/owner construction path, coordinated replay-journal and
+  witness advancement, trusted-time or nonce journal, key owner, rollback
+  deployment evidence, or production privacy claim.
+- `zaino-oram`: add a crate-private, fixture-only runtime security contract
+  API. Canonical versioned identities separate authenticated request-nonce
+  replay from continuation replay, while one atomic in-memory seam completes
+  both the request lane and its real-or-cover continuation lane. Distinct
+  non-`Clone` round-material reservation and replay-commit authorities are
+  retained through response construction and validated together under an
+  opaque in-process security epoch at release; unavailable or retired state
+  fails closed. This does not change profile ID v3 or the existing ten-phase
+  logical schedule, and it supplies no production durable replay, trusted
+  clock, nonce ledger, key management, rollback resistance, TDX, listener,
+  transport-write, or peer-delivery evidence.
+- `zaino-oram` / `zainod-oram`: make one internal, profile-bound, non-`Clone`
+  `ActiveSecurityLease` the sole owner of runtime security state, with full raw
+  security-bundle fixture assembly restricted to `#[cfg(test)]`. `zaino-oram`
+  exports only the lifetime-safe `FixedEnvelopeRuntime`,
+  `PendingFixedEnvelope`, and `PrivateQueryUnavailable` facade, which
+  `zainod-oram` consumes without extracting detached response bytes. The
+  concrete runtime owner remains private and has no public constructor or
+  factory. A production protector/replay/material-provider bundle, generated
+  route/listener, durable replay, trusted clock, nonce ledger, key management,
+  rollback resistance, TDX, and transport evidence remain open. Profile ID v3
+  and the ten-phase logical schedule are unchanged.
+- `zaino-oram` / `zaino-state`: add a private generation-bound serving-epoch
+  contract. The refresh controller invalidates publication before its sole
+  await, validates one coherent transparent-projection capture, activates the
+  owner-generated recent generation, and publishes one serving-epoch `Arc`
+  last. That epoch binds an owner-issued finalized store whose identity must
+  match, the exact recent generation, the opaque NFS revision, and a
+  query-independent currentness capability. A separately tested listener-free
+  runtime contract accepts the same lease shape, derives both its finalized
+  store and currentness observer from it, completes the fixed-work response,
+  and then fails closed if the final observation or double currentness check
+  fails. These are separately tested compatible private contracts: there is no
+  non-test controller-to-runtime composition path, process-wide service owner,
+  production finalized-store implementation or caller, listener, or
+  transport-write guard. This slice therefore makes no production service,
+  physical-obliviousness, TDX, target-load, or mainnet claim.
+- `zaino-state`: add a crate-private, ORAM-agnostic transparent-projection input
+  that joins one immutable canonical recent-chain snapshot to finalized
+  outpoint classifications at its exact retained height/hash seam. The
+  finalized materializer deduplicates requests and executes metadata,
+  checkpoint, creator, spender, reverse-index, and verified forward-row reads
+  in one LMDB read transaction; checksum, row-length, Merkle-root, location,
+  spend-input, and ordering mismatches fail closed rather than becoming
+  `NeverSeen`. Acquisition reads only the already-published NFS value and never
+  falls through to the validator. At the time of this staged chain-data slice,
+  projection/key-epoch ownership and whole-serving-epoch freshness binding were
+  follow-on work. The private controller and lease contracts described above
+  supersede that then-current implementation limitation; production ownership,
+  retry policy, ORAM persistence, physical obliviousness, TDX, target-load, and
+  mainnet evidence remain open.
+- `zaino-oram`: the default-off `corpus-zaino` path now contains a private
+  conversion candidate that consumes a `CanonicalRecentChainSnapshot` together
+  with an immutable, identity-pinned finalized-outpoint classifier. It preserves
+  dense standard-event slots in canonical order while tracking nonstandard
+  states separately and remains generation-free. The private single-writer
+  publication owner is the sole generation authority: through its current
+  outstanding ticket it requires exact candidate finalized and recent-tip
+  metadata, then moves the candidate's slots into `FrozenRecentSnapshot`. Direct
+  raw-slot activation is test-only. This entry records the earlier
+  conversion-only slice: at that head, begin-update-before-conversion remained
+  a control-flow obligation and no refresh controller or serving epoch enforced
+  it. The private controller and serving-epoch contracts described above
+  supersede those then-current controller/runtime limitations, but not the lack
+  of non-test composition, durability, authenticated provenance, production
+  cryptography, TDX, or mainnet evidence.
+- `zaino-state`: add a synchronous immutable-snapshot API that verifies an
+  exact finalized height/hash seam and returns only canonical recent
+  `IndexedBlock`s above it, oldest-to-newest. The API checks structural
+  consistency of the retained seam payload, declared tip, contiguous height
+  map, block identities, and parent links while excluding side branches and
+  structurally preventing DB or validator fallback. It value-binds a
+  caller-supplied checkpoint to one immutable NFS snapshot rather than
+  atomically capturing finalized storage with NFS. At that slice, production
+  finalized-outpoint resolution, live DB/NFS acquisition, runtime wiring, and
+  serving-epoch publication remained open. The current private controller/lease
+  contracts build on this seam, but still provide no non-test composition path
+  or production service publication.
+- `zaino-oram`: frozen recent snapshots now bind an in-memory monotonic
+  generation, exact finalized identity, recent tip height/hash, and the
+  internally computed fixed-slot commitment into one lineage digest. The
+  listener-free runtime recomputes that binding after every complete scan and
+  continuation query binding v2 rejects a token from any other lineage even
+  when its transparent slot contents are identical. A private single-writer
+  publication model clears the active generation before a refresh, admits only
+  the opaque outstanding build ticket, retains immutable leases, and supports a
+  final current-generation check. Its tests cover advances, same-height and
+  shortening reorgs, stale tickets, failed builds, finalized rollback, and
+  generation overflow. A replacement owner must roll the durable projection
+  epoch because its in-memory generation restarts at one. This entry records
+  the earlier snapshot-owner contract, which then had no runtime consumer or
+  serving epoch. The private serving-epoch and runtime contracts above
+  supersede that implementation-status limitation; they still do not
+  authenticate tip or slot provenance, durably prevent rollback, establish a
+  non-test composition path, or provide physical, TDX, mainnet, or
+  production-readiness evidence.
+- `zaino-oram`: profile ID v3 now binds padded input slots, a distinct
+  recent-snapshot scan budget, timeout bucket, and explicit single-worker FIFO
+  execution/queue/reject-at-capacity policy. The logical recorder validates
+  ordered recent-snapshot scan ordinals separately from forbidden
+  query-derived source calls. The listener-free runtime now executes a nonzero,
+  profile-bound, ordinal-only full scan over a concrete runtime-owned
+  `FrozenRecentSnapshot<N>` and merges its create/spend changes before
+  paginating across one combined finalized-plus-recent cursor domain. The
+  frozen type computes its fixed-slot content commitment internally rather than
+  accepting a generic source-reported digest; fault and post-construction
+  corruption hooks exist only under `#[cfg(test)]` and are absent from the
+  production API. The commitment is bound into the continuation query digest,
+  and every round completes the scan before rechecking both exact checkpoint
+  identity and recomputed content commitment. Malformed same-outpoint
+  sequences, owner mismatches against finalized outputs, and duplicate creates
+  fail closed as protected `ProjectionNotReady` only after the full modeled
+  work, while query-derived source calls remain zero. This is logical mock
+  evidence only: the commitment is not an authenticated canonical/live Zaino
+  snapshot root, and the slice does not supply live NFS acquisition, canonical
+  or reorg-safe snapshot publication, physical obliviousness, allocator or
+  timing equivalence, TDX, mainnet, or target-load evidence.
+- `zaino-oram`: a crate-internal authenticated public-manifest and volatile
+  rebuild foundation now binds publication lineage, projection identity/epoch,
+  finalized checkpoint, event count, and a deterministic semantic event-log
+  root to a fixed-width keyed-MAC record plus an injected digest-bound external
+  freshness witness. Content-addressed publication, a non-authoritative atomic
+  hint, crash-boundary failpoints, and restart tests fail closed on stale,
+  corrupt, equivocating, or incomplete public state. Restart always allocates a
+  fresh worker and replays genesis-forward under a new projection epoch; the
+  underlying ROSTL tables, position maps, stash, and read mutations remain
+  volatile, with no production witness/key integration or measured RTO.
 - `zaino-oram`: a non-published, dependency-free research foundation for
   private transparent-UTXO queries, including fixed records and envelopes,
   exact compiled profile shapes, a bounded plaintext mock store, and tests for
   equal logical store-call schedules. This slice does not claim equal physical
   work. ADR-0007 defines the privacy boundary and keeps the experimental runtime
   outside the publishable Zaino dependency graph.
-- `zaino-oram`: aggregate corpus/sizing models, a fixed continuation-token
-  contract, an exact 72-byte append-only event candidate, and a pinned volatile
-  `rostl` feasibility adapter. These remain offline research components and do
-  not establish a production host-obliviousness claim.
+- `zaino-oram`: initial aggregate corpus/page-capacity models, a fixed
+  continuation-token contract, an exact 72-byte append-only event candidate,
+  and a pinned volatile `rostl` feasibility adapter. These remain offline
+  research components and do not establish a production host-obliviousness
+  claim.
+- `zaino-oram`: a crate-internal fixed request/response codec now binds a
+  complete-budget-derived profile ID, checkpoint, session, query, opaque
+  continuation field, protected outcome, and canonical result slots inside one
+  direction-separated fixed envelope. Profile/session/direction are supplied
+  as protection context, checked layout arithmetic rejects impossible shapes,
+  and exact digest/canonicality tests cover the whole envelope. The injected
+  deterministic protector is a non-cryptographic test fixture only; there is
+  no production AEAD, nonce lifecycle, listener, or physical fixed-work claim.
+- `zaino-oram`: a private listener-free runtime adapter now composes canonical
+  request decode, one server-material acquisition, real-or-cover token open and
+  replay access, complete finalized-store and runtime-owned frozen-snapshot
+  scans, fixed result normalization, one real-or-cover token issue, and
+  protected response encode into a versioned ten-phase logical trace. Absolute
+  cursors in the combined finalized-plus-recent domain paginate without skips or
+  duplicates; invalid, expired, mismatched, and replayed tokens complete the
+  same modeled schedule and return one protected `InvalidContinuation` shape
+  when no higher-priority store or projection-readiness failure applies.
+  Token protection binds the checkpoint and codec session, and each completed
+  protected round after server-material acquisition models one replay lookup
+  plus write-back without cover writes entering the real-token namespace.
+  The profile ID now binds the phase schedule and continuation lifetime. This
+  is deterministic logical-model evidence only, not production AEAD, trusted
+  time/nonces, transport, timing, physical ORAM, or TDX evidence.
 - `zaino-state`: a reusable transparent create/spend event-extraction seam for
   ORAM-agnostic projection consumers.
 - `zaino-oram` / `zaino-state`: a default-off offline shadow fixture compares
   the plaintext projection with ordinary-source UTXO results for every standard
   address observed at one identical immutable regtest-vector checkpoint. The
   supporting `zaino-state` surface exists only under `test_dependencies`.
-- `zaino-oram`: the volatile `rostl` experiment now has a bounded,
-  single-owner worker for serialized reads and inserts, FIFO shutdown draining,
-  fail-closed backend faults, and identifier-free aggregate telemetry. It is
-  not connected to the projection or query engine.
+- `zaino-oram`: the exclusive two-table command core now has a bounded,
+  single-owner worker that admits only whole history-read/append commands,
+  drains accepted FIFO work on shutdown, fails not-yet-entered work without
+  touching the executor after a terminal fault, and keeps internal telemetry
+  identifier-free. Export cadence and suppression remain unset. The old raw
+  read/insert worker surface is removed.
 - `zaino-oram`: exact immutable protected-table candidates now encode a
   38-byte directory cell and an 82-byte one-event page with canonical dummies,
-  named persistence conversions, and `Pod`/`Cmov` proofs. Table allocation and
-  adapter integration remain separate work.
+  named persistence conversions, and `Pod`/`Cmov` proofs. Linux-only table
+  allocation and an offline worker constructor now bind separate exact typed
+  `rostl` stores; projection/service ownership remains separate work.
+- CI: a path-scoped Ubuntu 24.04 x86_64 lane with immutable action pins runs
+  locked strict Clippy and the complete all-feature `zaino-oram` suite with the
+  pinned Rust/nextest tools against the native volatile `rostl` backend. This
+  is generic functional validation, not target-capacity,
+  physical-obliviousness, persistence, performance, or TDX evidence.
 - `zaino-oram`: a pure two-table layout model now derives canonical
   network/schema-separated address keys, generates distinct keyed fixed probes,
   validates complete directory/event probe arrays, and prepares opaque
-  immutable inserts only after a clean scan. It is not backend-integrated or a
-  content-authentication, sizing, or physical-obliviousness claim.
+  immutable inserts only after a clean scan. A private command worker now binds
+  the plan to exact typed stores offline; it is not a projection-owner,
+  content-authentication, or physical-obliviousness claim.
+- `zaino-oram` / `zainod-oram`: the aggregate capacity model and corpus CLI now
+  charge full allocated 38-byte directory and 82-byte event tables plus both
+  complete position-map domains. Version-2 reports separate admission,
+  hot-address, modeled-memory, and combined modeled fit with explicit negative
+  evidence markers; backend expansion remains an uncalibrated research
+  assumption rather than measured RSS evidence.
+- `zaino-oram` / `zainod-oram`: add a source-bound
+  `BuilderFoundationV1` target-load foundation for generic Linux x86_64
+  builders. It consumes validated capture and sizing artifacts inside a fixed
+  64..=512-directory/128..=4096-event envelope, reserves 16 directory and 48
+  event admission slots during warmup, then measures exactly 256 shuffled
+  single-caller commands: 160 hot reads, 48 reads from the resident non-hot
+  warmup set (the fixed `cold` class), 32 unique hot appends, and 16 unique cold
+  appends. The distinct read-back-verified artifact records typed-worker call
+  latency, mixed-phase wall-clock completion rates, process-wide RSS plus the
+  process-lifetime HWM, clean-shutdown lifecycle counters, and logical probe collisions,
+  while marking queue contention unmeasured and stash/physical access
+  `backend-unobservable`. This is research-only generic-builder evidence, not
+  target hardware/TDX, persistence/recovery, `10^9` operations, full-mainnet,
+  attestation, physical-obliviousness, or mainnet-readiness qualification.
+- `zaino-oram`: a module-private synchronous command core now owns two typed
+  fake table handles, validates their public capacity shape, performs a full
+  directory plus bounded-history successful preflight, derives the next
+  ordinal from owned-backend state, and terminal-latches after uncertain or
+  partial writes. Generic native CI exercises the corresponding exact typed
+  `rostl` executor behind the business worker; projection ownership,
+  persistence, crash recovery, target load, and physical-trace integration
+  remain follow-up work.
 - `zainod-oram`: a non-published, listener-free one-shot runner that scans one
   fixed mainnet tip using an NFS snapshot and chain-continuity validation into
   identifier-free corpus aggregates.
@@ -90,6 +369,26 @@ and this library adheres to Rust's notion of
   fixed 60s).
 
 ### Fixed
+- `zaino-state`: finalised-database startup now classifies exact supported
+  schema versions and rejects incomplete, unknown, or newer V1 metadata before
+  constructing the request router. Existing databases must match a known
+  version/hash pair and contain that version's required named tables before any
+  create-on-open call can mutate the environment; the current version also
+  requires an empty migration status. Each completed migration now records the
+  canonical hash for its target version, keeping crash-resume admission valid.
+  Builds with experimental transparent address history reject historical
+  migrations until a correct address-history backfill exists. Cross-process
+  admission uses one
+  process-lifetime exclusive lease scoped to each network namespace, preventing
+  concurrent normal Zaino writers from opening the same LMDB environment.
+  Failed or panicked migrations close read and write routing while retaining
+  ownership until the router is dropped; shutdown waits for its owned migration
+  task before closing the backends. Data-only LMDB restores are still discovered
+  and migrated. The lock sidecars are operational coordination state, not
+  database tables or a schema revision; the migration-only target-version helper
+  applies the same fail-closed rule. The first rollout requires a quiescent
+  cutover because older binaries do not honor the lease. This changes no schema
+  bytes or version.
 - Zaino no longer OOM-crashes during the txout-set accumulator rebuild when it
   reaches mainnet chain tip on memory-constrained hosts; the rebuild auto-shards
   its in-memory spent set to fit the configured `sync_write_batch_size` budget.

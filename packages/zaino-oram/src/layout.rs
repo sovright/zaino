@@ -1,12 +1,15 @@
-//! Pure fixed-probe planning and record-binding model.
+//! Fixed-probe planning, record binding, and exclusive-command model.
 //!
-//! This module performs no backend I/O. It models two separate sparse tables,
+//! The parent module is a pure planner: it models two separate sparse tables,
 //! validates every fixed probe observation before producing a match or an
 //! insertion capability, and keeps layout identity separate from persistent
-//! record encoding. Vacancies and occupancy counts are caller-supplied model
-//! inputs, not authenticated current backend state. This module does not
-//! authenticate record contents, persist the secret seed, make
-//! scan-then-insert atomic, or establish a physical obliviousness claim.
+//! record encoding. Its vacancies and occupancy counts remain caller-supplied
+//! model inputs. The private child command core joins that planner to two typed
+//! backend interfaces under one synchronous owner and terminal-latches an
+//! uncertain generation. Neither layer authenticates record contents, persists
+//! the secret seed, proves crash atomicity, or establishes physical
+//! obliviousness. A higher-layer authenticated public projection manifest does
+//! not change those properties or make either table resumable after restart.
 
 use std::{fmt, num::NonZeroU64};
 
@@ -16,8 +19,22 @@ use blake2::{
 };
 
 use crate::records::{
-    AddressDirectory, AddressEventPage, AddressKey, PersistentAddressDirectory,
-    PersistentAddressEventPage, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
+    finalized_live_utxo_at, AddressDirectory, AddressEventPage, AddressKey,
+    FinalizedEventHistoryError, PersistentAddressDirectory, PersistentAddressEventPage,
+    TransparentUtxo, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
+};
+
+mod atomic_store;
+
+#[cfg(feature = "corpus-zaino")]
+pub(super) use atomic_store::{
+    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
+    AtomicQualificationAppendResult, AtomicQualificationCommandError, AtomicQualificationSnapshot,
+    AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+};
+#[cfg(all(test, feature = "corpus-zaino"))]
+pub(super) use atomic_store::{
+    spawn_atomic_worker_for_tests, BackendFailure, QualificationMemoryTable, UniqueTable,
 };
 
 const LAYOUT_FORMAT_VERSION: u8 = 1;
@@ -30,7 +47,7 @@ const MAXIMUM_PROBE_COUNT: usize = 64;
 
 /// Network domain included in canonical address keys and probe plans.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LayoutNetwork {
+pub(super) enum LayoutNetwork {
     Mainnet,
     Testnet,
     Regtest,
@@ -48,13 +65,13 @@ impl LayoutNetwork {
 
 /// Standard transparent address identity before canonical key derivation.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct StandardAddress {
+pub(super) struct StandardAddress {
     kind: StandardScriptKind,
     hash: [u8; 20],
 }
 
 impl StandardAddress {
-    const fn new(kind: StandardScriptKind, hash: [u8; 20]) -> Self {
+    pub(super) const fn new(kind: StandardScriptKind, hash: [u8; 20]) -> Self {
         Self { kind, hash }
     }
 
@@ -76,7 +93,7 @@ impl fmt::Debug for StandardAddress {
 
 /// Supported standard transparent locking-script class.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum StandardScriptKind {
+pub(super) enum StandardScriptKind {
     PayToPublicKeyHash,
     PayToScriptHash,
 }
@@ -88,6 +105,25 @@ impl StandardScriptKind {
             Self::PayToScriptHash => 2,
         }
     }
+}
+
+/// Derives the canonical layout key for one standard transparent address.
+pub(super) fn derive_standard_address_key(
+    network: LayoutNetwork,
+    schema_version: u32,
+    address: StandardAddress,
+) -> AddressKey {
+    let mut hasher = Blake2s256::new();
+    Digest::update(&mut hasher, ADDRESS_KEY_DOMAIN);
+    Digest::update(&mut hasher, [LAYOUT_FORMAT_VERSION]);
+    Digest::update(&mut hasher, [network.tag()]);
+    Digest::update(&mut hasher, schema_version.to_le_bytes());
+    Digest::update(&mut hasher, [address.kind.tag()]);
+    Digest::update(&mut hasher, address.hash);
+    let digest = Digest::finalize(hasher);
+    let mut bytes = [0; ADDRESS_KEY_BYTES];
+    bytes.copy_from_slice(&digest);
+    AddressKey::new(bytes)
 }
 
 /// Secret probe seed injected by a future lifecycle owner.
@@ -114,7 +150,7 @@ impl fmt::Debug for ProbeSeed {
 }
 
 /// Immutable identity shared by both protected tables in one generation.
-struct LayoutIdentity {
+pub(super) struct LayoutIdentity {
     network: LayoutNetwork,
     schema_version: u32,
     key_epoch: NonZeroU64,
@@ -123,7 +159,7 @@ struct LayoutIdentity {
 }
 
 impl LayoutIdentity {
-    fn new(
+    pub(super) fn new(
         network: LayoutNetwork,
         schema_version: u32,
         key_epoch: u64,
@@ -152,7 +188,7 @@ impl fmt::Debug for LayoutIdentity {
 
 /// Protected table kind. This is public profile information, not an identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TableKind {
+pub(super) enum TableKind {
     Directory,
     Event,
 }
@@ -163,6 +199,129 @@ impl TableKind {
             Self::Directory => 1,
             Self::Event => 2,
         }
+    }
+}
+
+/// Validated fixed allocation and admission boundary shared with sizing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct TableAllocation {
+    capacity: u32,
+    admission_limit: u32,
+}
+
+impl TableAllocation {
+    fn new(
+        kind: TableKind,
+        capacity: u64,
+        admission_limit: u64,
+    ) -> Result<Self, LayoutConfigError> {
+        let capacity = validate_table_capacity(kind, capacity)?;
+        let admission_limit = validate_admission_limit(kind, capacity, admission_limit)?;
+        Ok(Self {
+            capacity,
+            admission_limit,
+        })
+    }
+
+    pub(super) const fn capacity(self) -> u32 {
+        self.capacity
+    }
+
+    pub(super) const fn admission_limit(self) -> u32 {
+        self.admission_limit
+    }
+}
+
+fn validate_table_capacity(kind: TableKind, capacity: u64) -> Result<u32, LayoutConfigError> {
+    if capacity < MINIMUM_TABLE_CAPACITY {
+        return Err(LayoutConfigError::CapacityBelowMinimum { table: kind });
+    }
+    if capacity > MAXIMUM_TABLE_CAPACITY {
+        return Err(LayoutConfigError::CapacityOutsideSlotDomain { table: kind });
+    }
+    if !capacity.is_power_of_two() {
+        return Err(LayoutConfigError::CapacityNotPowerOfTwo { table: kind });
+    }
+    u32::try_from(capacity)
+        .map_err(|_| LayoutConfigError::CapacityOutsideSlotDomain { table: kind })
+}
+
+fn validate_admission_limit(
+    kind: TableKind,
+    capacity: u32,
+    admission_limit: u64,
+) -> Result<u32, LayoutConfigError> {
+    if admission_limit == 0 {
+        return Err(LayoutConfigError::ZeroAdmissionLimit { table: kind });
+    }
+    if admission_limit >= u64::from(capacity) {
+        return Err(LayoutConfigError::AdmissionLimitOutsideTable { table: kind });
+    }
+    u32::try_from(admission_limit)
+        .map_err(|_| LayoutConfigError::AdmissionLimitOutsideTable { table: kind })
+}
+
+impl fmt::Debug for TableAllocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TableAllocation { public_shape: true, .. }")
+    }
+}
+
+/// Validated allocation shared by the pure planner and capacity model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct FixedLayoutAllocation {
+    directory: TableAllocation,
+    event: TableAllocation,
+    max_events_per_address: u32,
+}
+
+impl FixedLayoutAllocation {
+    pub(super) fn new(
+        directory_capacity: u64,
+        directory_admission_limit: u64,
+        event_capacity: u64,
+        event_admission_limit: u64,
+        max_events_per_address: u64,
+    ) -> Result<Self, LayoutConfigError> {
+        let directory = TableAllocation::new(
+            TableKind::Directory,
+            directory_capacity,
+            directory_admission_limit,
+        )?;
+        let event = TableAllocation::new(TableKind::Event, event_capacity, event_admission_limit)?;
+        Self::from_allocations(directory, event, max_events_per_address)
+    }
+
+    fn from_allocations(
+        directory: TableAllocation,
+        event: TableAllocation,
+        max_events_per_address: u64,
+    ) -> Result<Self, LayoutConfigError> {
+        let max_events_per_address =
+            validate_max_events_per_address(event.admission_limit(), max_events_per_address)?;
+        Ok(Self {
+            directory,
+            event,
+            max_events_per_address,
+        })
+    }
+
+    pub(super) const fn directory(self) -> TableAllocation {
+        self.directory
+    }
+
+    pub(super) const fn event(self) -> TableAllocation {
+        self.event
+    }
+
+    pub(super) const fn max_events_per_address(self) -> u32 {
+        self.max_events_per_address
+    }
+}
+
+impl fmt::Debug for FixedLayoutAllocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FixedLayoutAllocation { public_shape: true, .. }")
     }
 }
 
@@ -187,28 +346,11 @@ impl TableShape {
         if probe_count > MAXIMUM_PROBE_COUNT {
             return Err(LayoutConfigError::ProbeCountAboveResearchLimit { table: kind });
         }
-        if capacity < MINIMUM_TABLE_CAPACITY {
-            return Err(LayoutConfigError::CapacityBelowMinimum { table: kind });
-        }
-        if capacity > MAXIMUM_TABLE_CAPACITY {
-            return Err(LayoutConfigError::CapacityOutsideSlotDomain { table: kind });
-        }
-        if !capacity.is_power_of_two() {
-            return Err(LayoutConfigError::CapacityNotPowerOfTwo { table: kind });
-        }
-        if u64::try_from(probe_count).map_or(true, |count| count > capacity) {
+        let capacity = validate_table_capacity(kind, capacity)?;
+        if u64::try_from(probe_count).map_or(true, |count| count > u64::from(capacity)) {
             return Err(LayoutConfigError::ProbeCountExceedsCapacity { table: kind });
         }
-        if admission_limit == 0 {
-            return Err(LayoutConfigError::ZeroAdmissionLimit { table: kind });
-        }
-        if admission_limit >= capacity {
-            return Err(LayoutConfigError::AdmissionLimitOutsideTable { table: kind });
-        }
-        let capacity = u32::try_from(capacity)
-            .map_err(|_| LayoutConfigError::CapacityOutsideSlotDomain { table: kind })?;
-        let admission_limit = u32::try_from(admission_limit)
-            .map_err(|_| LayoutConfigError::AdmissionLimitOutsideTable { table: kind })?;
+        let admission_limit = validate_admission_limit(kind, capacity, admission_limit)?;
         let probe_count = u32::try_from(probe_count)
             .map_err(|_| LayoutConfigError::ProbeCountAboveResearchLimit { table: kind })?;
         Ok(Self {
@@ -221,6 +363,13 @@ impl TableShape {
     const fn mask(self) -> u32 {
         self.capacity - 1
     }
+
+    const fn allocation(self) -> TableAllocation {
+        TableAllocation {
+            capacity: self.capacity,
+            admission_limit: self.admission_limit,
+        }
+    }
 }
 
 impl fmt::Debug for TableShape {
@@ -231,10 +380,10 @@ impl fmt::Debug for TableShape {
 
 /// Directory-table configuration that cannot be swapped with the event table.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct DirectoryTableConfiguration<const PROBES: usize>(TableShape);
+pub(super) struct DirectoryTableConfiguration<const PROBES: usize>(TableShape);
 
 impl<const PROBES: usize> DirectoryTableConfiguration<PROBES> {
-    fn new(capacity: u64, admission_limit: u64) -> Result<Self, LayoutConfigError> {
+    pub(super) fn new(capacity: u64, admission_limit: u64) -> Result<Self, LayoutConfigError> {
         TableShape::new(TableKind::Directory, capacity, admission_limit, PROBES).map(Self)
     }
 }
@@ -247,10 +396,10 @@ impl<const PROBES: usize> fmt::Debug for DirectoryTableConfiguration<PROBES> {
 
 /// Event-table configuration that cannot be swapped with the directory table.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct EventTableConfiguration<const PROBES: usize>(TableShape);
+pub(super) struct EventTableConfiguration<const PROBES: usize>(TableShape);
 
 impl<const PROBES: usize> EventTableConfiguration<PROBES> {
-    fn new(capacity: u64, admission_limit: u64) -> Result<Self, LayoutConfigError> {
+    pub(super) fn new(capacity: u64, admission_limit: u64) -> Result<Self, LayoutConfigError> {
         TableShape::new(TableKind::Event, capacity, admission_limit, PROBES).map(Self)
     }
 }
@@ -263,7 +412,7 @@ impl<const PROBES: usize> fmt::Debug for EventTableConfiguration<PROBES> {
 
 /// Invalid public layout configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayoutConfigError {
+pub(super) enum LayoutConfigError {
     ZeroSchemaVersion,
     ZeroKeyEpoch,
     ZeroLayoutGeneration,
@@ -328,11 +477,27 @@ impl fmt::Display for LayoutConfigError {
 
 impl std::error::Error for LayoutConfigError {}
 
+fn validate_max_events_per_address(
+    event_admission_limit: u32,
+    max_events_per_address: u64,
+) -> Result<u32, LayoutConfigError> {
+    if max_events_per_address == 0 {
+        return Err(LayoutConfigError::ZeroEventsPerAddress);
+    }
+    let max_events_per_address = u32::try_from(max_events_per_address)
+        .map_err(|_| LayoutConfigError::EventsPerAddressOutsideDomain)?;
+    if max_events_per_address > event_admission_limit {
+        return Err(LayoutConfigError::EventsPerAddressExceedsAdmission);
+    }
+    Ok(max_events_per_address)
+}
+
 /// Identifier-free failure to prepare a logical probe plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutPlanError {
     EventOrdinalOutOfRange,
     DirectoryProfileMismatch,
+    ProbePlanProfileMismatch,
     BackendIndexOutsideHostDomain,
 }
 
@@ -343,7 +508,10 @@ impl fmt::Display for LayoutPlanError {
                 f.write_str("event ordinal is outside the compiled layout profile")
             }
             Self::DirectoryProfileMismatch => {
-                f.write_str("bound directory belongs to a different layout profile")
+                f.write_str("directory witness belongs to a different layout profile")
+            }
+            Self::ProbePlanProfileMismatch => {
+                f.write_str("probe plan belongs to a different layout profile")
             }
             Self::BackendIndexOutsideHostDomain => {
                 f.write_str("logical table slot is outside the host index domain")
@@ -544,6 +712,20 @@ impl fmt::Debug for BoundDirectory {
     }
 }
 
+/// A clean directory vacancy retained only while one append is preflighted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProspectiveDirectory {
+    profile_binding: [u8; 32],
+    slot: DirectorySlot,
+    address_key: AddressKey,
+}
+
+impl fmt::Debug for ProspectiveDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProspectiveDirectory { ..REDACTED.. }")
+    }
+}
+
 /// Fixed event probe plan for one bound directory and append ordinal.
 struct EventProbePlan<const PROBES: usize> {
     profile_binding: [u8; 32],
@@ -669,7 +851,7 @@ struct ScanOutcome<T> {
 }
 
 /// Pure keyed planner for a two-table immutable layout generation.
-struct FixedProbeLayout<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize> {
+pub(super) struct FixedProbeLayout<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize> {
     identity: LayoutIdentity,
     directory: DirectoryTableConfiguration<DIRECTORY_PROBES>,
     event: EventTableConfiguration<EVENT_PROBES>,
@@ -680,20 +862,18 @@ struct FixedProbeLayout<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize
 impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
     FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>
 {
-    fn new(
+    pub(super) fn new(
         identity: LayoutIdentity,
         directory: DirectoryTableConfiguration<DIRECTORY_PROBES>,
         event: EventTableConfiguration<EVENT_PROBES>,
         max_events_per_address: u64,
     ) -> Result<Self, LayoutConfigError> {
-        if max_events_per_address == 0 {
-            return Err(LayoutConfigError::ZeroEventsPerAddress);
-        }
-        let max_events_per_address = u32::try_from(max_events_per_address)
-            .map_err(|_| LayoutConfigError::EventsPerAddressOutsideDomain)?;
-        if max_events_per_address > event.0.admission_limit {
-            return Err(LayoutConfigError::EventsPerAddressExceedsAdmission);
-        }
+        let allocation = FixedLayoutAllocation::from_allocations(
+            directory.0.allocation(),
+            event.0.allocation(),
+            max_events_per_address,
+        )?;
+        let max_events_per_address = allocation.max_events_per_address();
         let mut layout = Self {
             identity,
             directory,
@@ -705,30 +885,101 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
         Ok(layout)
     }
 
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn network(&self) -> LayoutNetwork {
+        self.identity.network
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn schema_version(&self) -> u32 {
+        self.identity.schema_version
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn key_epoch(&self) -> u64 {
+        self.identity.key_epoch.get()
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn directory_admission_limit(&self) -> u32 {
+        self.directory.0.admission_limit
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn event_admission_limit(&self) -> u32 {
+        self.event.0.admission_limit
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) const fn max_events_per_address(&self) -> u32 {
+        self.max_events_per_address
+    }
+
     fn address_key(&self, address: StandardAddress) -> AddressKey {
-        let mut hasher = Blake2s256::new();
-        Digest::update(&mut hasher, ADDRESS_KEY_DOMAIN);
-        Digest::update(&mut hasher, [LAYOUT_FORMAT_VERSION]);
-        Digest::update(&mut hasher, [self.identity.network.tag()]);
-        Digest::update(&mut hasher, self.identity.schema_version.to_le_bytes());
-        Digest::update(&mut hasher, [address.kind.tag()]);
-        Digest::update(&mut hasher, address.hash);
-        let digest = Digest::finalize(hasher);
-        let mut bytes = [0; ADDRESS_KEY_BYTES];
-        bytes.copy_from_slice(&digest);
-        AddressKey::new(bytes)
+        derive_standard_address_key(self.identity.network, self.identity.schema_version, address)
     }
 
     fn directory_plan(&self, address: StandardAddress) -> DirectoryProbePlan<DIRECTORY_PROBES> {
         let address_key = self.address_key(address);
+        self.directory_plan_for_key(&address_key)
+    }
+
+    fn directory_plan_for_key(
+        &self,
+        address_key: &AddressKey,
+    ) -> DirectoryProbePlan<DIRECTORY_PROBES> {
         let slots = self
             .probe_slots::<DIRECTORY_PROBES>(TableKind::Directory, address_key.as_bytes())
             .map(DirectorySlot);
         DirectoryProbePlan {
             profile_binding: self.profile_binding,
-            address_key,
+            address_key: *address_key,
             slots,
         }
+    }
+
+    fn directory_backend_indices(
+        &self,
+        plan: &DirectoryProbePlan<DIRECTORY_PROBES>,
+    ) -> Result<[usize; DIRECTORY_PROBES], LayoutPlanError> {
+        if !fixed_bytes_equal(&plan.profile_binding, &self.profile_binding) {
+            return Err(LayoutPlanError::ProbePlanProfileMismatch);
+        }
+        let mut indices = [0; DIRECTORY_PROBES];
+        for (destination, slot) in indices.iter_mut().zip(plan.slots) {
+            *destination = slot.backend_index()?;
+        }
+        Ok(indices)
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) fn qualification_directory_probe_indices(
+        &self,
+        address: StandardAddress,
+    ) -> Result<[usize; DIRECTORY_PROBES], ()> {
+        self.directory_backend_indices(&self.directory_plan(address))
+            .map_err(|_| ())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    pub(super) fn qualification_event_probe_indices(
+        &self,
+        address: StandardAddress,
+        directory_index: usize,
+        ordinal: u64,
+    ) -> Result<[usize; EVENT_PROBES], ()> {
+        let directory_slot = DirectorySlot(u32::try_from(directory_index).map_err(|_| ())?);
+        let directory_plan = self.directory_plan(address);
+        if !directory_plan.slots.contains(&directory_slot) {
+            return Err(());
+        }
+        let directory = BoundDirectory {
+            profile_binding: directory_plan.profile_binding,
+            slot: directory_slot,
+            address_key: directory_plan.address_key,
+        };
+        let event_plan = self.event_plan(&directory, ordinal).map_err(|_| ())?;
+        self.event_backend_indices(&event_plan).map_err(|_| ())
     }
 
     fn event_plan(
@@ -739,33 +990,89 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
         if !fixed_bytes_equal(&directory.profile_binding, &self.profile_binding) {
             return Err(LayoutPlanError::DirectoryProfileMismatch);
         }
-        let ordinal = self.event_ordinal(ordinal)?;
-        let directory_identity = directory.slot.0;
-        Ok(EventProbePlan {
-            profile_binding: directory.profile_binding,
-            directory_identity,
+        self.event_plan_for_identity(
+            directory.profile_binding,
+            directory.slot,
+            directory.address_key,
             ordinal,
-            expected_address_key: directory.address_key,
-            accept_match: true,
-            slots: self
-                .event_probe_slots(directory_identity, ordinal)
-                .map(EventTableSlot),
+            true,
+        )
+    }
+
+    fn prospective_directory(
+        &self,
+        vacancy: &DirectoryVacancy,
+    ) -> Result<ProspectiveDirectory, LayoutPlanError> {
+        if !fixed_bytes_equal(&vacancy.profile_binding, &self.profile_binding) {
+            return Err(LayoutPlanError::DirectoryProfileMismatch);
+        }
+        Ok(ProspectiveDirectory {
+            profile_binding: vacancy.profile_binding,
+            slot: vacancy.slot,
+            address_key: vacancy.address_key,
         })
+    }
+
+    fn prospective_event_plan(
+        &self,
+        directory: &ProspectiveDirectory,
+        ordinal: u64,
+    ) -> Result<EventProbePlan<EVENT_PROBES>, LayoutPlanError> {
+        if !fixed_bytes_equal(&directory.profile_binding, &self.profile_binding) {
+            return Err(LayoutPlanError::DirectoryProfileMismatch);
+        }
+        self.event_plan_for_identity(
+            directory.profile_binding,
+            directory.slot,
+            directory.address_key,
+            ordinal,
+            true,
+        )
     }
 
     fn cover_event_plan(
         &self,
         ordinal: u64,
     ) -> Result<EventProbePlan<EVENT_PROBES>, LayoutPlanError> {
+        self.event_plan_for_identity(
+            self.profile_binding,
+            DirectorySlot(self.directory.0.capacity),
+            self.synthetic_address_key(),
+            ordinal,
+            false,
+        )
+    }
+
+    fn event_backend_indices(
+        &self,
+        plan: &EventProbePlan<EVENT_PROBES>,
+    ) -> Result<[usize; EVENT_PROBES], LayoutPlanError> {
+        if !fixed_bytes_equal(&plan.profile_binding, &self.profile_binding) {
+            return Err(LayoutPlanError::ProbePlanProfileMismatch);
+        }
+        let mut indices = [0; EVENT_PROBES];
+        for (destination, slot) in indices.iter_mut().zip(plan.slots) {
+            *destination = slot.backend_index()?;
+        }
+        Ok(indices)
+    }
+
+    fn event_plan_for_identity(
+        &self,
+        profile_binding: [u8; 32],
+        directory_slot: DirectorySlot,
+        expected_address_key: AddressKey,
+        ordinal: u64,
+        accept_match: bool,
+    ) -> Result<EventProbePlan<EVENT_PROBES>, LayoutPlanError> {
         let ordinal = self.event_ordinal(ordinal)?;
-        let directory_identity = self.directory.0.capacity;
-        let synthetic = self.synthetic_address_key();
+        let directory_identity = directory_slot.0;
         Ok(EventProbePlan {
-            profile_binding: self.profile_binding,
+            profile_binding,
             directory_identity,
             ordinal,
-            expected_address_key: synthetic,
-            accept_match: false,
+            expected_address_key,
+            accept_match,
             slots: self
                 .event_probe_slots(directory_identity, ordinal)
                 .map(EventTableSlot),
@@ -1293,6 +1600,32 @@ mod tests {
         )
     }
 
+    #[test]
+    fn planner_and_sizing_share_one_validated_allocation_shape() -> Result<(), LayoutConfigError> {
+        let allocation = FixedLayoutAllocation::new(8, 6, 16, 12, 8)?;
+        let layout = layout()?;
+
+        assert_eq!(allocation.directory(), layout.directory.0.allocation());
+        assert_eq!(allocation.event(), layout.event.0.allocation());
+        assert_eq!(allocation.max_events_per_address(), 8);
+        assert_eq!(layout.max_events_per_address, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn key_addressed_directory_plan_matches_the_standard_address_plan(
+    ) -> Result<(), LayoutConfigError> {
+        let layout = layout()?;
+        let address = p2sh(0x2a);
+        let address_plan = layout.directory_plan(address);
+        let key_plan = layout.directory_plan_for_key(&address_plan.address_key);
+
+        assert_eq!(key_plan.profile_binding, address_plan.profile_binding);
+        assert_eq!(key_plan.address_key, address_plan.address_key);
+        assert_eq!(key_plan.slots, address_plan.slots);
+        Ok(())
+    }
+
     const fn p2pkh(byte: u8) -> StandardAddress {
         StandardAddress::new(StandardScriptKind::PayToPublicKeyHash, [byte; 20])
     }
@@ -1743,11 +2076,26 @@ mod tests {
         let replacement = layout_with(LayoutNetwork::Mainnet, 1, 7, 12, [0x5a; 32], 8, 6, 16, 12)?;
         let plan = original.directory_plan(p2pkh(0x1b));
         assert!(matches!(
+            replacement.directory_backend_indices(&plan),
+            Err(LayoutPlanError::ProbePlanProfileMismatch)
+        ));
+        assert!(matches!(
             replacement.scan_directory(&plan, [ProbeRead::Miss; DIRECTORY_PROBES]),
             Err(LayoutCorruption::ProbePlanProfileMismatch)
         ));
 
         let vacancy = original.scan_directory(&plan, [ProbeRead::Miss; DIRECTORY_PROBES])?;
+        let prospective = match &vacancy {
+            DirectoryScan::Vacant(vacancy) => original.prospective_directory(vacancy)?,
+            DirectoryScan::Found(_) | DirectoryScan::Full => {
+                panic!("all-miss directory scan must produce a vacancy")
+            }
+        };
+        let event_plan = original.prospective_event_plan(&prospective, 0)?;
+        assert!(matches!(
+            replacement.event_backend_indices(&event_plan),
+            Err(LayoutPlanError::ProbePlanProfileMismatch)
+        ));
         assert!(matches!(
             replacement.prepare_directory_insert(vacancy, 0),
             Err(MutationPlanError::VacancyProfileMismatch {
