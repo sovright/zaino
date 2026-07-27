@@ -87,3 +87,20 @@ jobs:
         run: >-
           cargo nextest run -p zainod-oram --all-features --locked
           --no-tests fail --status-level fail
+
+      # Phase 0 kill-gate 2: the ORAM insertion access path must stay
+      # branchless. Inspects the release binary that actually ships, so a
+      # secret-dependent jump cannot reappear unnoticed.
+      - name: Build the typed-qualification runner for codegen inspection
+        run: cargo build -p zainod-oram --all-features --locked --release
+
+      - name: Verify binutils are available
+        run: |
+          nm --version | head -1
+          objdump --version | head -1
+
+      - name: Check the ORAM access path compiles branchless
+        run: >-
+          cargo run --locked --release
+          --manifest-path tools/workbench/Cargo.toml
+          --bin check-oram-codegen -- target/release/zainod-oram
