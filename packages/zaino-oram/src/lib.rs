@@ -51,6 +51,7 @@ mod store;
 mod stress_qualification;
 #[cfg(feature = "corpus-zaino")]
 mod target_load;
+mod timing_equivalence;
 mod trace;
 mod xchacha20;
 #[cfg(feature = "corpus-zaino")]
@@ -82,6 +83,10 @@ pub use stress_qualification::{
 pub use target_load::{
     run_typed_worker_target_load, TypedWorkerTargetLoadError, TypedWorkerTargetLoadProfile,
     TypedWorkerTargetLoadReport,
+};
+pub use timing_equivalence::{
+    evaluate as evaluate_timing_equivalence, EquivalenceBound, EquivalenceReport, Pair,
+    Seed as TimingSeed, MINIMUM_PAIRS,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use zaino_corpus::{
