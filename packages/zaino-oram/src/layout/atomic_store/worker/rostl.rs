@@ -3,8 +3,8 @@
 //! This remains a volatile, Linux-x86_64-only research backend. The portable
 //! insertion core is kept here so its missing/duplicate schedule can be tested
 //! on every host that enables `rostl-experimental`.
-//! The Linux-only worker constructor is offline construction evidence; no
-//! projection or service owner calls it yet.
+//! The Linux-only worker constructor is consumed only by the crate-internal
+//! offline projection owner.
 
 use std::{fmt, marker::PhantomData};
 
@@ -14,6 +14,8 @@ use rostl_primitives::traits::Cmov;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::super::{AtomicStoreError, ExclusiveTwoTableExecutor};
 use super::super::{BackendFailure, UniqueTable};
+#[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+use super::AtomicWorkerBuildError;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::{AtomicQueueCapacity, AtomicWorker, AtomicWorkerError};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -351,10 +353,18 @@ impl std::error::Error for RostlWorkerBuildError {
     }
 }
 
+#[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+/// Builds the exact typed worker while erasing backend-specific failures.
+pub(super) fn spawn_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
+    layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
+    queue_capacity: AtomicQueueCapacity,
+) -> Result<AtomicWorker, AtomicWorkerBuildError> {
+    build_rostl_worker(layout, queue_capacity)
+        .map_err(|_| AtomicWorkerBuildError::ConstructionFailed)
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-/// Builds the exact typed worker for offline native tests and future owner
-/// integration. It intentionally remains private until an owner needs it.
-fn spawn_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
+fn build_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
     layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
     queue_capacity: AtomicQueueCapacity,
 ) -> Result<AtomicWorker, RostlWorkerBuildError> {
@@ -600,7 +610,7 @@ mod tests {
     #[test]
     fn exact_typed_executor_runs_behind_the_business_worker(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let worker = spawn_rostl_worker(test_layout()?, AtomicQueueCapacity::try_new(2)?)?;
+        let worker = build_rostl_worker(test_layout()?, AtomicQueueCapacity::try_new(2)?)?;
         let handle = worker.handle();
         let address = StandardAddress::new(StandardScriptKind::PayToPublicKeyHash, [0x61; 20]);
         let event = UtxoEvent::created(
