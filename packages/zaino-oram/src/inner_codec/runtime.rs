@@ -4,9 +4,11 @@
 //! This module proves only a deterministic source-level logical schedule for
 //! the injected research fixtures and withholds a completed envelope unless
 //! its pinned serving epoch is still current after response encoding. It does
-//! not provide a production nonce source, trusted clock, replay database,
-//! AEAD, listener, transport-write guard, physical ORAM trace, timing result,
-//! or TDX claim.
+//! not provide a production key/session owner, nonce source, trusted clock,
+//! replay database, listener, transport-write guard, physical ORAM trace,
+//! timing result, or TDX claim. The round's Unix-seconds value is only observed
+//! host/fixture input used by token issue and validation; it does not authorize
+//! replay-journal maintenance or claim retirement.
 
 use crate::{
     continuation_token::{
@@ -23,6 +25,7 @@ use crate::{
         ServingEpochLease, ServingEpochStore,
     },
     records::{QueryOutcome, UtxoResultPage},
+    runtime_security::{ReplayCommitAuthority, RoundReservationAuthority, SecurityRoundCapture},
     store::ObliviousStore,
     trace::{AccessTrace, CompletionShape, RuntimePhase, TraceRecorder},
 };
@@ -30,6 +33,7 @@ use crate::{
 #[cfg(feature = "corpus-zaino")]
 use crate::{
     canonical_chain::CanonicalNetwork,
+    private_runtime::{FixedEnvelopeRuntime, PendingFixedEnvelope, PrivateQueryUnavailable},
     projection_owner::FinalizedProjectionServingStore,
     recent_snapshot::{
         CanonicalServingEpochCurrentness, RecentSnapshotRefreshController,
@@ -56,50 +60,42 @@ use crate::{
 };
 
 use super::{
+    security_owner::{ActiveSecurityLease, RoundMaterialSource},
     EnvelopeProtector, InnerCodecError, PrivateQueryCheckpoint, PrivateQueryCodec,
     PrivateQueryResponse, UniformExternalFailure, ENVELOPE_NONCE_BYTES,
 };
 
 #[cfg(feature = "corpus-zaino")]
-use super::{PrivateNetwork, SESSION_BINDING_BYTES};
+use super::{security_owner::SecurityEpochReleaseWitness, PrivateNetwork};
 
-/// Server-owned material acquired once before any real continuation claim.
-#[derive(Clone, Copy)]
-struct RoundMaterial {
+#[cfg(test)]
+use super::security_owner::{
+    xchacha20_fixture_security_lease, FixtureSecurityLeaseIdentity, RoundMaterial,
+    RoundMaterialUnavailable,
+};
+
+/// One encoded response retaining both fixture-contract authorities.
+struct EncodedRuntimeRound<const ENVELOPE_BYTES: usize> {
+    envelope: FixedEnvelope<ENVELOPE_BYTES>,
+    trace: AccessTrace,
     now_unix_seconds: u64,
     response_nonce: [u8; ENVELOPE_NONCE_BYTES],
     token_nonce: [u8; ENVELOPE_NONCE_BYTES],
+    security_round: SecurityRoundCapture,
+    reservation_authority: RoundReservationAuthority,
+    replay_commit_authority: ReplayCommitAuthority,
 }
 
-impl RoundMaterial {
-    const fn new(
-        now_unix_seconds: u64,
-        response_nonce: [u8; ENVELOPE_NONCE_BYTES],
-        token_nonce: [u8; ENVELOPE_NONCE_BYTES],
-    ) -> Self {
-        Self {
-            now_unix_seconds,
-            response_nonce,
-            token_nonce,
+impl<const ENVELOPE_BYTES: usize> EncodedRuntimeRound<ENVELOPE_BYTES> {
+    fn into_released(self) -> RuntimeRound<ENVELOPE_BYTES> {
+        RuntimeRound {
+            envelope: self.envelope,
+            trace: self.trace,
         }
     }
 }
 
-impl std::fmt::Debug for RoundMaterial {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RoundMaterial { ..REDACTED.. }")
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RoundMaterialUnavailable;
-
-/// Injected trusted-clock and domain-separated nonce owner.
-trait RoundMaterialSource {
-    fn next_round_material(&mut self) -> Result<RoundMaterial, RoundMaterialUnavailable>;
-}
-
-/// One completed protected envelope and its key-free logical trace.
+/// One completed protected envelope authorized for caller release.
 struct RuntimeRound<const ENVELOPE_BYTES: usize> {
     envelope: FixedEnvelope<ENVELOPE_BYTES>,
     trace: AccessTrace,
@@ -290,8 +286,9 @@ impl std::fmt::Debug for ResponseReleasePermit {
 /// One completed runtime round whose release permit remains outstanding.
 #[cfg(feature = "corpus-zaino")]
 struct PendingRuntimeRound<B, C, const ENVELOPE_BYTES: usize> {
-    round: RuntimeRound<ENVELOPE_BYTES>,
-    release_witness: ServingEpochReleaseWitness<B, C>,
+    round: EncodedRuntimeRound<ENVELOPE_BYTES>,
+    serving_release_witness: ServingEpochReleaseWitness<B, C>,
+    security_release_witness: SecurityEpochReleaseWitness,
     release_decision: OnceLock<Result<(), UniformExternalFailure>>,
     release_permit: ResponseReleasePermit,
 }
@@ -305,14 +302,27 @@ where
     fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], UniformExternalFailure> {
         let decision = self.release_decision.get_or_init(|| {
             if !self.release_permit.begin_response_release() {
+                self.fail_closed();
                 return Err(UniformExternalFailure);
             }
-            if self.release_witness.observe_and_match().is_err() {
-                self.release_permit.fail_closed();
+            if self.serving_release_witness.observe_and_match().is_err()
+                || self
+                    .security_release_witness
+                    .observe_and_match(
+                        &self.round.security_round,
+                        &self.round.reservation_authority,
+                        &self.round.replay_commit_authority,
+                        self.round.now_unix_seconds,
+                        &self.round.response_nonce,
+                        &self.round.token_nonce,
+                    )
+                    .is_err()
+            {
+                self.fail_closed();
                 return Err(UniformExternalFailure);
             }
             if !self.release_permit.authorize_response_release() {
-                self.release_permit.fail_closed();
+                self.fail_closed();
                 return Err(UniformExternalFailure);
             }
             Ok(())
@@ -322,12 +332,29 @@ where
             Err(_) => Err(UniformExternalFailure),
         }
     }
+
+    fn fail_closed(&self) {
+        self.security_release_witness.retire();
+        self.release_permit.fail_closed();
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<B, C, const ENVELOPE_BYTES: usize> PendingFixedEnvelope<ENVELOPE_BYTES>
+    for PendingRuntimeRound<B, C, ENVELOPE_BYTES>
+where
+    B: ServingEpochBoundary,
+    C: ServingEpochCurrentness<B>,
+{
+    fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], PrivateQueryUnavailable> {
+        PendingRuntimeRound::try_release_bytes(self).map_err(|_| PrivateQueryUnavailable)
+    }
 }
 
 #[cfg(all(feature = "corpus-zaino", test))]
 impl<B, C, const ENVELOPE_BYTES: usize> PendingRuntimeRound<B, C, ENVELOPE_BYTES> {
     const fn trace(&self) -> &AccessTrace {
-        self.round.trace()
+        &self.round.trace
     }
 }
 
@@ -337,30 +364,6 @@ impl<B, C, const ENVELOPE_BYTES: usize> std::fmt::Debug
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PendingRuntimeRound { ..REDACTED.. }")
-    }
-}
-
-/// Injected protection, replay, clock, and nonce dependencies.
-struct RuntimeDependencies<E, T, R, N> {
-    envelope_protector: E,
-    token_protector: T,
-    replay_guard: R,
-    material_source: N,
-}
-
-impl<E, T, R, N> RuntimeDependencies<E, T, R, N> {
-    const fn new(
-        envelope_protector: E,
-        token_protector: T,
-        replay_guard: R,
-        material_source: N,
-    ) -> Self {
-        Self {
-            envelope_protector,
-            token_protector,
-            replay_guard,
-            material_source,
-        }
     }
 }
 
@@ -433,10 +436,7 @@ struct PrivateQueryRuntime<
 > {
     shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
     codec: PrivateQueryCodec<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-    envelope_protector: E,
-    token_protector: T,
-    replay_guard: R,
-    material_source: N,
+    security: ActiveSecurityLease<E, T, R, N>,
     epoch: Option<
         PrivateQueryRuntimeEpoch<S, C, B, RESPONSE_SLOTS, ENVELOPE_BYTES, RECENT_SNAPSHOT_SLOTS>,
     >,
@@ -467,8 +467,7 @@ where
 {
     fn without_epoch(
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-        session_binding: [u8; 32],
-        dependencies: RuntimeDependencies<E, T, R, N>,
+        security: ActiveSecurityLease<E, T, R, N>,
     ) -> Result<Self, UniformExternalFailure> {
         shape
             .profile()
@@ -479,15 +478,15 @@ where
             .combined_scan_slots()
             .map_err(|_| UniformExternalFailure)?;
         u64::try_from(combined_scan_slots).map_err(|_| UniformExternalFailure)?;
-        let codec = PrivateQueryCodec::new(&shape, session_binding)
+        if security.profile_id() != shape.profile().profile_id() {
+            return Err(UniformExternalFailure);
+        }
+        let codec = PrivateQueryCodec::new(&shape, security.session_binding())
             .map_err(InnerCodecError::into_uniform_external_failure)?;
         Ok(Self {
             shape,
             codec,
-            envelope_protector: dependencies.envelope_protector,
-            token_protector: dependencies.token_protector,
-            replay_guard: dependencies.replay_guard,
-            material_source: dependencies.material_source,
+            security,
             epoch: None,
             healthy: true,
         })
@@ -496,11 +495,10 @@ where
     fn new(
         serving_epoch: ServingEpochLease<RECENT_SNAPSHOT_SLOTS, B, S, C>,
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-        session_binding: [u8; 32],
         checkpoint: PrivateQueryCheckpoint,
-        dependencies: RuntimeDependencies<E, T, R, N>,
+        security: ActiveSecurityLease<E, T, R, N>,
     ) -> Result<Self, UniformExternalFailure> {
-        let mut runtime = Self::without_epoch(shape, session_binding, dependencies)?;
+        let mut runtime = Self::without_epoch(shape, security)?;
         runtime.activate_epoch(serving_epoch, checkpoint)?;
         Ok(runtime)
     }
@@ -511,7 +509,7 @@ where
         checkpoint: PrivateQueryCheckpoint,
     ) -> Result<(), UniformExternalFailure> {
         self.epoch = None;
-        if !self.healthy {
+        if !self.healthy || checkpoint.key_epoch != self.security.key_epoch() {
             return Err(UniformExternalFailure);
         }
         let epoch = PrivateQueryRuntimeEpoch::new(serving_epoch, self.shape, checkpoint)?;
@@ -519,8 +517,14 @@ where
         Ok(())
     }
 
+    #[cfg(feature = "corpus-zaino")]
     fn retire_epoch(&mut self) {
         self.epoch = None;
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn retire_security_epoch(&mut self) {
+        self.security.retire();
     }
 
     #[cfg(test)]
@@ -553,6 +557,9 @@ where
         &mut self,
         envelope: &FixedEnvelope<ENVELOPE_BYTES>,
     ) -> Result<RuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
+        if !self.healthy {
+            return Err(UniformExternalFailure);
+        }
         let mut epoch = self.epoch.take().ok_or(UniformExternalFailure)?;
         let result = self.handle_epoch(&mut epoch, envelope);
         self.epoch = Some(epoch);
@@ -579,7 +586,21 @@ where
         if !epoch.serving_epoch.is_current(&observation) {
             return Err(self.latch_failure());
         }
-        Ok(round)
+        let security_release_witness = self.security.release_witness();
+        if security_release_witness
+            .observe_and_match(
+                &round.security_round,
+                &round.reservation_authority,
+                &round.replay_commit_authority,
+                round.now_unix_seconds,
+                &round.response_nonce,
+                &round.token_nonce,
+            )
+            .is_err()
+        {
+            return Err(self.latch_failure());
+        }
+        Ok(round.into_released())
     }
 
     #[cfg(feature = "corpus-zaino")]
@@ -588,15 +609,21 @@ where
         envelope: &FixedEnvelope<ENVELOPE_BYTES>,
     ) -> Result<
         (
-            RuntimeRound<ENVELOPE_BYTES>,
+            EncodedRuntimeRound<ENVELOPE_BYTES>,
             ServingEpochReleaseWitness<B, C>,
+            SecurityEpochReleaseWitness,
         ),
         UniformExternalFailure,
     > {
         let mut epoch = self.epoch.take().ok_or(UniformExternalFailure)?;
-        let result = self
-            .execute_epoch(&mut epoch, envelope)
-            .map(|round| (round, epoch.serving_epoch.release_witness()));
+        let security_release_witness = self.security.release_witness();
+        let result = self.execute_epoch(&mut epoch, envelope).map(|round| {
+            (
+                round,
+                epoch.serving_epoch.release_witness(),
+                security_release_witness,
+            )
+        });
         self.epoch = Some(epoch);
         result
     }
@@ -612,10 +639,10 @@ where
             RECENT_SNAPSHOT_SLOTS,
         >,
         envelope: &FixedEnvelope<ENVELOPE_BYTES>,
-    ) -> Result<RuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
+    ) -> Result<EncodedRuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
         let decoded_request = self
             .codec
-            .decode_request_with_nonce(envelope, &self.envelope_protector);
+            .decode_request_with_nonce(envelope, self.security.envelope_protector());
         let (request, request_nonce) = match decoded_request {
             Ok(request) => request,
             Err(InnerCodecError::ProtectionUnavailable) => return Err(self.latch_failure()),
@@ -632,7 +659,7 @@ where
             .map_err(|_| self.latch_failure())?;
 
         let material = self
-            .material_source
+            .security
             .next_round_material()
             .map_err(|_| self.latch_failure())?;
         trace
@@ -646,8 +673,11 @@ where
                 .map_err(|_| self.latch_failure())?,
         )
         .map_err(|_| self.latch_failure())?;
+        // This observed round value drives token semantics only. Matching it to
+        // the reservation later prevents cross-round mixing, but does not turn
+        // it into a trusted clock or an eviction/maintenance cutoff.
         let initial_expiry = material
-            .now_unix_seconds
+            .now_unix_seconds()
             .checked_add(profile.continuation_ttl_seconds())
             .ok_or_else(|| self.latch_failure())?;
         let token_context = self
@@ -659,24 +689,28 @@ where
             })?;
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             query_digest,
             epoch.checkpoint.projection_epoch,
-            material.now_unix_seconds,
+            material.now_unix_seconds(),
             cursor_limit,
         );
         let inspection = ContinuationToken::inspect_optional(
             request.continuation.as_ref(),
-            &self.token_protector,
+            self.security.token_protector(),
             &token_context,
             &expectation,
+            self.security.replay_namespace(),
             request_nonce,
         );
         trace
             .record_runtime_phase(RuntimePhase::TokenOpen)
             .map_err(|_| self.latch_failure())?;
 
-        let continuation_use = inspection.claim_or_cover(&mut self.replay_guard);
+        let (continuation_use, replay_commit_authority) = self
+            .security
+            .finish_replay(inspection, material.security_round())
+            .into_parts();
         trace
             .record_replay_access()
             .map_err(|_| self.latch_failure())?;
@@ -686,11 +720,12 @@ where
 
         let was_healthy = self.healthy;
         let checkpoint_matches = request.checkpoint == epoch.checkpoint;
+        let replay_unavailable = replay_commit_authority.is_none();
         let (
             cursor,
             continuation_expiry,
             invalid_continuation,
-            replay_unavailable,
+            request_duplicate,
             mut token_protection_unavailable,
         ) = match continuation_use {
             ContinuationUse::Initial => (0, initial_expiry, false, false, false),
@@ -764,6 +799,7 @@ where
             || recent_snapshot_failed
             || !was_healthy
             || !checkpoint_matches
+            || request_duplicate
             || replay_unavailable
             || token_protection_unavailable
         {
@@ -793,17 +829,20 @@ where
             epoch.checkpoint.projection_epoch,
             issue_cursor,
             continuation_expiry,
-            material.token_nonce,
+            material.token_nonce(),
         );
-        let issued =
-            match ContinuationToken::issue(&issue_state, &token_context, &self.token_protector) {
-                Ok(token) => token,
-                Err(_) => {
-                    self.healthy = false;
-                    token_protection_unavailable = true;
-                    ContinuationToken::from_opaque_bytes([0; CONTINUATION_TOKEN_BYTES])
-                }
-            };
+        let issued = match ContinuationToken::issue(
+            &issue_state,
+            &token_context,
+            self.security.token_protector(),
+        ) {
+            Ok(token) => token,
+            Err(_) => {
+                self.healthy = false;
+                token_protection_unavailable = true;
+                ContinuationToken::from_opaque_bytes([0; CONTINUATION_TOKEN_BYTES])
+            }
+        };
         trace
             .record_runtime_phase(RuntimePhase::TokenIssue)
             .map_err(|_| self.latch_failure())?;
@@ -817,7 +856,11 @@ where
             })?;
         let envelope = self
             .codec
-            .encode_response(&response, material.response_nonce, &self.envelope_protector)
+            .encode_response(
+                &response,
+                material.response_nonce(),
+                self.security.envelope_protector(),
+            )
             .map_err(|error| {
                 self.healthy = false;
                 error.into_uniform_external_failure()
@@ -837,10 +880,23 @@ where
         let trace = trace
             .finish(profile.access_budget())
             .map_err(|_| self.latch_failure())?;
-        if token_protection_unavailable {
+        if token_protection_unavailable || replay_unavailable {
             return Err(self.latch_failure());
         }
-        Ok(RuntimeRound { envelope, trace })
+        let replay_commit_authority =
+            replay_commit_authority.ok_or_else(|| self.latch_failure())?;
+        let (now_unix_seconds, response_nonce, token_nonce, security_round, reservation_authority) =
+            material.into_parts();
+        Ok(EncodedRuntimeRound {
+            envelope,
+            trace,
+            now_unix_seconds,
+            response_nonce,
+            token_nonce,
+            security_round,
+            reservation_authority,
+            replay_commit_authority,
+        })
     }
 
     fn latch_failure(&mut self) -> UniformExternalFailure {
@@ -931,11 +987,10 @@ where
             C,
         >,
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-        session_binding: [u8; SESSION_BINDING_BYTES],
-        dependencies: RuntimeDependencies<E, T, R, N>,
+        security: ActiveSecurityLease<E, T, R, N>,
     ) -> Result<Self, FinalizedRuntimeBuildError> {
-        let mut runtime = Self::without_epoch(shape, session_binding, dependencies)
-            .map_err(|_| FinalizedRuntimeBuildError)?;
+        let mut runtime =
+            Self::without_epoch(shape, security).map_err(|_| FinalizedRuntimeBuildError)?;
         runtime.activate_finalized_serving_epoch(serving_epoch)?;
         Ok(runtime)
     }
@@ -1065,10 +1120,12 @@ where
     if !runtime.healthy {
         return Err(UniformExternalFailure);
     }
-    let (round, release_witness) = runtime.handle_with_release_witness(envelope)?;
+    let (round, serving_release_witness, security_release_witness) =
+        runtime.handle_with_release_witness(envelope)?;
     Ok(PendingRuntimeRound {
         round,
-        release_witness,
+        serving_release_witness,
+        security_release_witness,
         release_decision: OnceLock::new(),
         release_permit,
     })
@@ -1113,6 +1170,8 @@ where
     if runtime.healthy || (!protected_response_pending && !response_release.is_idle()) {
         return false;
     }
+    response_release.close();
+    runtime.retire_security_epoch();
     runtime.retire_epoch();
     true
 }
@@ -1151,6 +1210,7 @@ fn stop_finalized_runtime<
     B: ServingEpochBoundary,
 {
     *stopped = true;
+    runtime.retire_security_epoch();
     runtime.retire_epoch();
 }
 
@@ -1280,11 +1340,10 @@ where
         network: CanonicalNetwork,
         schema_version: u32,
         projection_epoch: u64,
-        key_epoch: u64,
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-        session_binding: [u8; SESSION_BINDING_BYTES],
-        dependencies: RuntimeDependencies<E, T, R, N>,
+        security: ActiveSecurityLease<E, T, R, N>,
     ) -> Result<Self, FinalizedRuntimeOwnerError> {
+        let key_epoch = security.key_epoch();
         let controller = RecentSnapshotRefreshController::new(
             network,
             schema_version,
@@ -1292,7 +1351,7 @@ where
             key_epoch,
         )
         .map_err(coarsen_runtime_owner_error)?;
-        let runtime = PrivateQueryRuntime::without_epoch(shape, session_binding, dependencies)
+        let runtime = PrivateQueryRuntime::without_epoch(shape, security)
             .map_err(coarsen_runtime_owner_error)?;
         Ok(Self {
             controller,
@@ -1369,6 +1428,45 @@ impl<
         const RESPONSE_SLOTS: usize,
         const ENVELOPE_BYTES: usize,
         const RECENT_SNAPSHOT_SLOTS: usize,
+    > FixedEnvelopeRuntime<ENVELOPE_BYTES>
+    for FinalizedRuntimeOwner<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        RESPONSE_SLOTS,
+        ENVELOPE_BYTES,
+        RECENT_SNAPSHOT_SLOTS,
+    >
+where
+    Source: BlockchainSource,
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+{
+    type PendingResponse = FinalizedPendingRuntimeRound<Source, ENVELOPE_BYTES>;
+
+    fn query_page(
+        &mut self,
+        request: [u8; ENVELOPE_BYTES],
+    ) -> Result<Self::PendingResponse, PrivateQueryUnavailable> {
+        self.handle(&FixedEnvelope::from_array(request))
+            .map_err(|_| PrivateQueryUnavailable)
+    }
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        const RESPONSE_SLOTS: usize,
+        const ENVELOPE_BYTES: usize,
+        const RECENT_SNAPSHOT_SLOTS: usize,
     > Drop
     for FinalizedRuntimeOwner<
         Source,
@@ -1385,6 +1483,7 @@ where
 {
     fn drop(&mut self) {
         self.response_release.close();
+        self.runtime.security.retire();
     }
 }
 
@@ -1483,13 +1582,18 @@ mod tests {
 
     use super::*;
     use crate::{
-        continuation_token::{ContinuationProtectionContext, ReplayBinding, ReplayGuardError},
+        continuation_token::{ContinuationProtectionContext, ContinuationReplayPlan},
         profile::test_profile_with_recent_snapshot,
         recent_snapshot::{
             serving_epoch_for_tests, FrozenRecentSnapshot, RecentSnapshotLineage,
             RecentSnapshotSlot,
         },
         records::{AddressKey, TransparentUtxo, UtxoQuery, ADDRESS_KEY_BYTES, TXID_BYTES},
+        runtime_security::{
+            ReplayCommitAuthority, ReplayCommitResult, ReplayCommitUnavailable,
+            ReplayDuplicateDecision, RequestReplayKey, RoundReservationAuthority, SecurityEpochTag,
+            SecurityRoundCapture, REPLAY_RECORD_KEY_BYTES,
+        },
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
     };
@@ -1503,10 +1607,19 @@ mod tests {
     const RESPONSE_SLOTS: usize = 2;
     const ENVELOPE_BYTES: usize = 512;
     const SESSION_BINDING: [u8; 32] = [0x22; 32];
+    const SERVICE_NAMESPACE_ID: [u8; 16] = [0x23; 16];
+    const OWNER_GENERATION: u64 = 1;
+    const SECURITY_EPOCH_BINDING: [u8; 32] = [0x24; 32];
     const TOKEN_TTL_SECONDS: u64 = 60;
     const BLOCK_HASH_DISPLAY: [u8; 32] = [0x31; 32];
     const RECENT_TIP_HASH_DISPLAY: [u8; 32] = [0x32; 32];
     const RECENT_SNAPSHOT_SLOTS: usize = 4;
+    const XCHACHA_REQUEST_KEY: [u8; crate::xchacha20::KEY_BYTES] =
+        [0x91; crate::xchacha20::KEY_BYTES];
+    const XCHACHA_RESPONSE_KEY: [u8; crate::xchacha20::KEY_BYTES] =
+        [0x92; crate::xchacha20::KEY_BYTES];
+    const XCHACHA_TOKEN_KEY: [u8; crate::xchacha20::KEY_BYTES] =
+        [0x93; crate::xchacha20::KEY_BYTES];
 
     type TestRecentSnapshot = FrozenRecentSnapshot<RECENT_SNAPSHOT_SLOTS>;
 
@@ -1865,8 +1978,8 @@ mod tests {
     }
 
     struct CountingReplayGuard {
-        claimed: [Option<ReplayBinding>; 16],
-        cover_slot: Option<ReplayBinding>,
+        claimed_requests: [Option<RequestReplayKey>; 16],
+        claimed: [Option<[u8; REPLAY_RECORD_KEY_BYTES]>; 16],
         calls: usize,
         real_claim_attempts: usize,
         logical_reads: usize,
@@ -1877,8 +1990,8 @@ mod tests {
     impl CountingReplayGuard {
         fn available() -> Self {
             Self {
+                claimed_requests: [None; 16],
                 claimed: [None; 16],
-                cover_slot: None,
                 calls: 0,
                 real_claim_attempts: 0,
                 logical_reads: 0,
@@ -1896,48 +2009,73 @@ mod tests {
     }
 
     impl ContinuationReplayGuard for CountingReplayGuard {
-        fn claim_or_cover(
+        fn commit_request_and_continuation(
             &mut self,
-            binding: &ReplayBinding,
-            claim: bool,
-        ) -> Result<(), ReplayGuardError> {
+            security_round: &SecurityRoundCapture,
+            request_key: &RequestReplayKey,
+            continuation_plan: &ContinuationReplayPlan,
+        ) -> Result<ReplayCommitResult, ReplayCommitUnavailable> {
             self.calls += 1;
             self.logical_reads += 1;
-            if claim {
-                self.real_claim_attempts += 1;
-            }
-            let mut already_claimed = false;
-            let mut first_vacant = None;
-            for (index, candidate) in self.claimed.iter().enumerate() {
-                if candidate.as_ref() == Some(binding) {
-                    already_claimed = true;
-                }
-                if candidate.is_none() && first_vacant.is_none() {
-                    first_vacant = Some(index);
-                }
-            }
-            if !self.available {
-                self.cover_slot = Some(*binding);
-                self.logical_writes += 1;
-                return Err(ReplayGuardError::Unavailable);
-            }
-            if claim {
-                if already_claimed {
-                    self.cover_slot = Some(*binding);
-                    self.logical_writes += 1;
-                    return Err(ReplayGuardError::AlreadyClaimed);
-                }
-                let Some(vacant) = first_vacant else {
-                    self.cover_slot = Some(*binding);
-                    self.logical_writes += 1;
-                    return Err(ReplayGuardError::Unavailable);
-                };
-                self.claimed[vacant] = Some(*binding);
-            } else {
-                self.cover_slot = Some(*binding);
-            }
             self.logical_writes += 1;
-            Ok(())
+            if !self.available {
+                return Err(ReplayCommitUnavailable);
+            }
+
+            let request_duplicate = self
+                .claimed_requests
+                .iter()
+                .any(|candidate| candidate.as_ref() == Some(request_key));
+            let (continuation_key, continuation_duplicate) = if request_duplicate {
+                (None, false)
+            } else {
+                match continuation_plan {
+                    ContinuationReplayPlan::Cover => (None, false),
+                    ContinuationReplayPlan::ClaimOrCover(claim) => {
+                        self.real_claim_attempts += 1;
+                        let key = *claim.replay_key_bytes();
+                        let duplicate = self
+                            .claimed
+                            .iter()
+                            .any(|candidate| candidate.as_ref() == Some(&key));
+                        (Some(key), duplicate)
+                    }
+                }
+            };
+            let decision = if request_duplicate {
+                ReplayDuplicateDecision::RequestDuplicate
+            } else if continuation_duplicate {
+                ReplayDuplicateDecision::ContinuationDuplicate
+            } else {
+                ReplayDuplicateDecision::Fresh
+            };
+
+            if !request_duplicate {
+                let request_slot = self
+                    .claimed_requests
+                    .iter()
+                    .position(Option::is_none)
+                    .ok_or(ReplayCommitUnavailable)?;
+                let continuation_slot = if continuation_key.is_some() && !continuation_duplicate {
+                    Some(
+                        self.claimed
+                            .iter()
+                            .position(Option::is_none)
+                            .ok_or(ReplayCommitUnavailable)?,
+                    )
+                } else {
+                    None
+                };
+                self.claimed_requests[request_slot] = Some(*request_key);
+                if let (Some(slot), Some(key)) = (continuation_slot, continuation_key) {
+                    self.claimed[slot] = Some(key);
+                }
+            }
+
+            Ok(ReplayCommitResult::new(
+                ReplayCommitAuthority::new(security_round),
+                decision,
+            ))
         }
     }
 
@@ -1966,17 +2104,31 @@ mod tests {
     }
 
     impl RoundMaterialSource for DeterministicMaterialSource {
-        fn next_round_material(&mut self) -> Result<RoundMaterial, RoundMaterialUnavailable> {
+        fn next_round_material(
+            &mut self,
+            security_epoch: &SecurityEpochTag,
+        ) -> Result<RoundMaterial, RoundMaterialUnavailable> {
             self.calls += 1;
             if self.fail_next {
                 self.fail_next = false;
                 return Err(RoundMaterialUnavailable);
             }
             let ordinal = u8::try_from(self.calls).map_err(|_| RoundMaterialUnavailable)?;
+            let response_nonce = [ordinal.wrapping_add(0x80); ENVELOPE_NONCE_BYTES];
+            let token_nonce = [ordinal.wrapping_add(0x40); ENVELOPE_NONCE_BYTES];
+            let security_round = SecurityRoundCapture::new(security_epoch);
+            let reservation_authority = RoundReservationAuthority::new(
+                &security_round,
+                self.now_unix_seconds,
+                response_nonce,
+                token_nonce,
+            );
             let material = RoundMaterial::new(
                 self.now_unix_seconds,
-                [ordinal.wrapping_add(0x80); ENVELOPE_NONCE_BYTES],
-                [ordinal.wrapping_add(0x40); ENVELOPE_NONCE_BYTES],
+                response_nonce,
+                token_nonce,
+                security_round,
+                reservation_authority,
             );
             self.now_unix_seconds = self
                 .now_unix_seconds
@@ -2042,10 +2194,10 @@ mod tests {
         replay_guard: CountingReplayGuard,
         material_source: DeterministicMaterialSource,
     ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
-        runtime_with_session_components(
+        runtime_with_snapshot_components(
             store,
             store_reads,
-            SESSION_BINDING,
+            empty_recent_snapshot(),
             replay_guard,
             material_source,
         )
@@ -2058,7 +2210,7 @@ mod tests {
         replay_guard: CountingReplayGuard,
         material_source: DeterministicMaterialSource,
     ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
-        runtime_with_snapshot_components(
+        runtime_with_snapshot_and_session_components(
             store,
             store_reads,
             empty_recent_snapshot(),
@@ -2072,18 +2224,49 @@ mod tests {
         store: PlaintextMockStore,
         store_reads: usize,
         recent_snapshot: TestRecentSnapshot,
+        replay_guard: CountingReplayGuard,
+        material_source: DeterministicMaterialSource,
+    ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
+        let shape = runtime_shape(store_reads)?;
+        let security_lease = fixture_security_lease(shape, replay_guard, material_source)?;
+        runtime_with_snapshot_and_security_lease(store, recent_snapshot, shape, security_lease)
+    }
+
+    fn runtime_with_snapshot_and_session_components(
+        store: PlaintextMockStore,
+        store_reads: usize,
+        recent_snapshot: TestRecentSnapshot,
         session_binding: [u8; 32],
         replay_guard: CountingReplayGuard,
         material_source: DeterministicMaterialSource,
     ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
         let shape = runtime_shape(store_reads)?;
+        let security_lease = fixture_security_lease_with_session(
+            shape,
+            session_binding,
+            replay_guard,
+            material_source,
+        )?;
+        runtime_with_snapshot_and_security_lease(store, recent_snapshot, shape, security_lease)
+    }
+
+    fn runtime_with_snapshot_and_security_lease(
+        store: PlaintextMockStore,
+        recent_snapshot: TestRecentSnapshot,
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        security_lease: ActiveSecurityLease<
+            DeterministicEnvelopeProtector,
+            CountingTokenProtector,
+            CountingReplayGuard,
+            DeterministicMaterialSource,
+        >,
+    ) -> Result<TestRuntime, Box<dyn std::error::Error>> {
         let serving_epoch = serving_epoch(recent_snapshot, store);
         Ok(TestRuntime::new(
             serving_epoch,
             shape,
-            session_binding,
             checkpoint(),
-            runtime_dependencies(replay_guard, material_source),
+            security_lease,
         )?)
     }
 
@@ -2111,20 +2294,86 @@ mod tests {
         Ok(CompiledQueryShape::new(profile)?)
     }
 
-    fn runtime_dependencies(
+    fn fixture_security_lease(
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
         replay_guard: CountingReplayGuard,
         material_source: DeterministicMaterialSource,
-    ) -> RuntimeDependencies<
-        DeterministicEnvelopeProtector,
-        CountingTokenProtector,
-        CountingReplayGuard,
-        DeterministicMaterialSource,
+    ) -> Result<
+        ActiveSecurityLease<
+            DeterministicEnvelopeProtector,
+            CountingTokenProtector,
+            CountingReplayGuard,
+            DeterministicMaterialSource,
+        >,
+        UniformExternalFailure,
     > {
-        RuntimeDependencies::new(
+        fixture_security_lease_with_identity(
+            shape,
+            checkpoint().key_epoch,
+            SESSION_BINDING,
+            replay_guard,
+            material_source,
+        )
+    }
+
+    fn fixture_security_lease_with_session(
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        session_binding: [u8; 32],
+        replay_guard: CountingReplayGuard,
+        material_source: DeterministicMaterialSource,
+    ) -> Result<
+        ActiveSecurityLease<
+            DeterministicEnvelopeProtector,
+            CountingTokenProtector,
+            CountingReplayGuard,
+            DeterministicMaterialSource,
+        >,
+        UniformExternalFailure,
+    > {
+        fixture_security_lease_with_identity(
+            shape,
+            checkpoint().key_epoch,
+            session_binding,
+            replay_guard,
+            material_source,
+        )
+    }
+
+    fn fixture_security_lease_with_identity(
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        key_epoch: u64,
+        session_binding: [u8; 32],
+        replay_guard: CountingReplayGuard,
+        material_source: DeterministicMaterialSource,
+    ) -> Result<
+        ActiveSecurityLease<
+            DeterministicEnvelopeProtector,
+            CountingTokenProtector,
+            CountingReplayGuard,
+            DeterministicMaterialSource,
+        >,
+        UniformExternalFailure,
+    > {
+        Ok(ActiveSecurityLease::from_fixture(
+            shape,
+            fixture_security_lease_identity(key_epoch, session_binding)?,
             DeterministicEnvelopeProtector::default(),
             CountingTokenProtector::default(),
             replay_guard,
             material_source,
+        ))
+    }
+
+    fn fixture_security_lease_identity(
+        key_epoch: u64,
+        session_binding: [u8; 32],
+    ) -> Result<FixtureSecurityLeaseIdentity, UniformExternalFailure> {
+        FixtureSecurityLeaseIdentity::new(
+            key_epoch,
+            session_binding,
+            SERVICE_NAMESPACE_ID,
+            OWNER_GENERATION,
+            SECURITY_EPOCH_BINDING,
         )
     }
 
@@ -2195,6 +2444,25 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "corpus-zaino")]
+    fn finalized_runtime_from_epoch(
+        serving_epoch: FinalizedTestEpoch,
+        shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        replay_guard: CountingReplayGuard,
+        material_source: DeterministicMaterialSource,
+    ) -> Result<FinalizedTestRuntime, FinalizedRuntimeBuildError> {
+        let key_epoch = serving_epoch.identity().key_epoch();
+        let security_lease = fixture_security_lease_with_identity(
+            shape,
+            key_epoch,
+            SESSION_BINDING,
+            replay_guard,
+            material_source,
+        )
+        .map_err(|_| FinalizedRuntimeBuildError)?;
+        FinalizedTestRuntime::from_finalized_serving_epoch(serving_epoch, shape, security_lease)
+    }
+
     fn runtime_with_recent(
         store_reads: usize,
         entries: &[(usize, TransparentUtxo)],
@@ -2204,19 +2472,18 @@ mod tests {
             store(store_reads, entries)?,
             store_reads,
             recent_snapshot(recent_slots),
-            SESSION_BINDING,
             CountingReplayGuard::available(),
             DeterministicMaterialSource::at(100),
         )
     }
 
-    fn request_envelope<S, C, B>(
+    fn request_envelope<S, E, T, R, N, C, B>(
         runtime: &PrivateQueryRuntime<
             S,
-            DeterministicEnvelopeProtector,
-            CountingTokenProtector,
-            CountingReplayGuard,
-            DeterministicMaterialSource,
+            E,
+            T,
+            R,
+            N,
             C,
             B,
             RESPONSE_SLOTS,
@@ -2230,13 +2497,14 @@ mod tests {
     ) -> Result<FixedEnvelope<ENVELOPE_BYTES>, InnerCodecError>
     where
         S: ObliviousStore,
+        E: EnvelopeProtector,
         C: ServingEpochCurrentness<B>,
         B: ServingEpochBoundary,
     {
         runtime.codec.encode_request(
             &super::super::PrivateQueryRequest::new(checkpoint, query, continuation),
             [nonce_byte; ENVELOPE_NONCE_BYTES],
-            &runtime.envelope_protector,
+            runtime.security.envelope_protector(),
         )
     }
 
@@ -2248,7 +2516,7 @@ mod tests {
         let round = runtime.handle(request)?;
         Ok(runtime
             .codec
-            .decode_response(round.envelope(), &runtime.envelope_protector)?)
+            .decode_response(round.envelope(), runtime.security.envelope_protector())?)
     }
 
     #[cfg(feature = "corpus-zaino")]
@@ -2256,10 +2524,13 @@ mod tests {
         runtime: &FinalizedTestRuntime,
         pending: &FinalizedTestPendingRound,
     ) -> Result<PrivateQueryResponse<RESPONSE_SLOTS>, Box<dyn std::error::Error>> {
-        let envelope = FixedEnvelope::from_array(*pending.try_release_bytes()?);
+        let envelope =
+            FixedEnvelope::from_array(*<FinalizedTestPendingRound as PendingFixedEnvelope<
+                ENVELOPE_BYTES,
+            >>::try_release_bytes(pending)?);
         Ok(runtime
             .codec
-            .decode_response(&envelope, &runtime.envelope_protector)?)
+            .decode_response(&envelope, runtime.security.envelope_protector())?)
     }
 
     #[cfg(feature = "corpus-zaino")]
@@ -2273,14 +2544,11 @@ mod tests {
     > {
         let (serving_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let runtime = finalized_runtime_from_epoch(
             serving_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
         let request = request_envelope(
             &runtime,
@@ -2290,6 +2558,73 @@ mod tests {
             1,
         )?;
         Ok((runtime, request, ResponseReleaseGate::new()))
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn finalized_pending_round_fixture() -> Result<
+        (
+            FinalizedTestRuntime,
+            ResponseReleaseGate,
+            FinalizedTestPendingRound,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (mut runtime, request, response_release) = finalized_pending_fixture()?;
+        let pending =
+            handle_finalized_runtime_round(&mut runtime, false, &response_release, &request)?;
+        Ok((runtime, response_release, pending))
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn fixture_security_state(runtime: &FinalizedTestRuntime) -> (bool, bool, usize) {
+        runtime.security.security_state_for_tests()
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn assert_terminal_security_release_failure(
+        runtime: &FinalizedTestRuntime,
+        response_release: &ResponseReleaseGate,
+        pending: &FinalizedTestPendingRound,
+        expected_security_observations: usize,
+    ) {
+        let serving_observations = serving_epoch_observations(runtime);
+        let (active, _, security_observations) = fixture_security_state(runtime);
+        assert!(active);
+
+        assert!(matches!(
+            pending.try_release_bytes(),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(
+            serving_epoch_observations(runtime),
+            serving_observations + 1
+        );
+        assert_eq!(
+            fixture_security_state(runtime),
+            (
+                false,
+                false,
+                security_observations + expected_security_observations,
+            )
+        );
+        assert!(response_release.is_closed_for_tests());
+
+        assert!(matches!(
+            pending.try_release_bytes(),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(
+            serving_epoch_observations(runtime),
+            serving_observations + 1
+        );
+        assert_eq!(
+            fixture_security_state(runtime),
+            (
+                false,
+                false,
+                security_observations + expected_security_observations,
+            )
+        );
     }
 
     #[cfg(feature = "corpus-zaino")]
@@ -2348,20 +2683,22 @@ mod tests {
             C: ServingEpochCurrentness<B>,
             B: ServingEpochBoundary,
         {
+            let replay_guard = runtime.security.replay_guard_for_tests();
             Self {
-                envelope_opens: runtime.envelope_protector.opens.get(),
-                envelope_seals: runtime.envelope_protector.seals.get(),
-                token_opens: runtime.token_protector.opens.get(),
-                token_seals: runtime.token_protector.seals.get(),
-                replay_calls: runtime.replay_guard.calls,
-                replay_claims: runtime.replay_guard.real_claim_attempts,
-                replay_reads: runtime.replay_guard.logical_reads,
-                replay_writes: runtime.replay_guard.logical_writes,
-                material_calls: runtime.material_source.calls,
+                envelope_opens: runtime.security.envelope_protector().opens.get(),
+                envelope_seals: runtime.security.envelope_protector().seals.get(),
+                token_opens: runtime.security.token_protector().opens.get(),
+                token_seals: runtime.security.token_protector().seals.get(),
+                replay_calls: replay_guard.calls,
+                replay_claims: replay_guard.real_claim_attempts,
+                replay_reads: replay_guard.logical_reads,
+                replay_writes: replay_guard.logical_writes,
+                material_calls: runtime.security.material_source_for_tests().calls,
             }
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct RuntimeCounters {
         envelope_opens: usize,
         envelope_seals: usize,
@@ -2378,15 +2715,16 @@ mod tests {
 
     impl RuntimeCounters {
         fn capture(runtime: &TestRuntime) -> Self {
+            let replay_guard = runtime.security.replay_guard_for_tests();
             Self {
-                envelope_opens: runtime.envelope_protector.opens.get(),
-                envelope_seals: runtime.envelope_protector.seals.get(),
-                token_opens: runtime.token_protector.opens.get(),
-                token_seals: runtime.token_protector.seals.get(),
-                replay_calls: runtime.replay_guard.calls,
-                replay_reads: runtime.replay_guard.logical_reads,
-                replay_writes: runtime.replay_guard.logical_writes,
-                material_calls: runtime.material_source.calls,
+                envelope_opens: runtime.security.envelope_protector().opens.get(),
+                envelope_seals: runtime.security.envelope_protector().seals.get(),
+                token_opens: runtime.security.token_protector().opens.get(),
+                token_seals: runtime.security.token_protector().seals.get(),
+                replay_calls: replay_guard.calls,
+                replay_reads: replay_guard.logical_reads,
+                replay_writes: replay_guard.logical_writes,
+                material_calls: runtime.security.material_source_for_tests().calls,
                 serving_epoch_observations: serving_epoch_observations(runtime),
                 recent_snapshot_reads: runtime.epoch_for_tests().recent_snapshot.read_calls(),
                 store_reads: finalized_store_reads(runtime),
@@ -2408,19 +2746,29 @@ mod tests {
             expected_currentness_observations: usize,
         ) {
             assert_eq!(
-                runtime.envelope_protector.opens.get() - self.envelope_opens,
+                runtime.security.envelope_protector().opens.get() - self.envelope_opens,
                 1
             );
             assert_eq!(
-                runtime.envelope_protector.seals.get() - self.envelope_seals,
+                runtime.security.envelope_protector().seals.get() - self.envelope_seals,
                 response_seal_attempts
             );
-            assert_eq!(runtime.token_protector.opens.get() - self.token_opens, 1);
-            assert_eq!(runtime.token_protector.seals.get() - self.token_seals, 1);
-            assert_eq!(runtime.replay_guard.calls - self.replay_calls, 1);
-            assert_eq!(runtime.replay_guard.logical_reads - self.replay_reads, 1);
-            assert_eq!(runtime.replay_guard.logical_writes - self.replay_writes, 1);
-            assert_eq!(runtime.material_source.calls - self.material_calls, 1);
+            assert_eq!(
+                runtime.security.token_protector().opens.get() - self.token_opens,
+                1
+            );
+            assert_eq!(
+                runtime.security.token_protector().seals.get() - self.token_seals,
+                1
+            );
+            let replay_guard = runtime.security.replay_guard_for_tests();
+            assert_eq!(replay_guard.calls - self.replay_calls, 1);
+            assert_eq!(replay_guard.logical_reads - self.replay_reads, 1);
+            assert_eq!(replay_guard.logical_writes - self.replay_writes, 1);
+            assert_eq!(
+                runtime.security.material_source_for_tests().calls - self.material_calls,
+                1
+            );
             assert_eq!(
                 serving_epoch_observations(runtime) - self.serving_epoch_observations,
                 expected_currentness_observations
@@ -2444,15 +2792,71 @@ mod tests {
         let counters = RuntimeCounters::capture(runtime);
         let round = runtime.handle(request)?;
         counters.assert_complete_round(runtime);
-        let trace = *round.trace();
-        let response = runtime
-            .codec
-            .decode_response(round.envelope(), &runtime.envelope_protector)?;
-        assert_eq!(trace.runtime_phases(), RuntimePhase::COUNT);
-        assert_eq!(
-            trace.store_reads(),
-            runtime.epoch_for_tests().engine.profile().store_reads()
+        let decoded = decode_runtime_round(
+            &runtime.codec,
+            runtime.security.envelope_protector(),
+            &round,
+        )?;
+        assert_complete_runtime_trace(
+            &decoded.0,
+            runtime.epoch_for_tests().engine.profile().store_reads(),
         );
+        Ok(decoded)
+    }
+
+    fn handle_and_decode_protected<S, E, T, R, N, C, B>(
+        runtime: &mut PrivateQueryRuntime<
+            S,
+            E,
+            T,
+            R,
+            N,
+            C,
+            B,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            RECENT_SNAPSHOT_SLOTS,
+        >,
+        request: &FixedEnvelope<ENVELOPE_BYTES>,
+    ) -> Result<(AccessTrace, PrivateQueryResponse<RESPONSE_SLOTS>), Box<dyn std::error::Error>>
+    where
+        S: ObliviousStore,
+        E: EnvelopeProtector,
+        T: ContinuationTokenProtector,
+        R: ContinuationReplayGuard,
+        N: RoundMaterialSource,
+        C: ServingEpochCurrentness<B>,
+        B: ServingEpochBoundary,
+    {
+        let round = runtime.handle(request)?;
+        let decoded = decode_runtime_round(
+            &runtime.codec,
+            runtime.security.envelope_protector(),
+            &round,
+        )?;
+        assert_complete_runtime_trace(
+            &decoded.0,
+            runtime.epoch_for_tests().engine.profile().store_reads(),
+        );
+        Ok(decoded)
+    }
+
+    fn decode_runtime_round<E>(
+        codec: &PrivateQueryCodec<RESPONSE_SLOTS, ENVELOPE_BYTES>,
+        envelope_protector: &E,
+        round: &RuntimeRound<ENVELOPE_BYTES>,
+    ) -> Result<(AccessTrace, PrivateQueryResponse<RESPONSE_SLOTS>), Box<dyn std::error::Error>>
+    where
+        E: EnvelopeProtector,
+    {
+        let trace = *round.trace();
+        let response = codec.decode_response(round.envelope(), envelope_protector)?;
+        Ok((trace, response))
+    }
+
+    fn assert_complete_runtime_trace(trace: &AccessTrace, expected_store_reads: usize) {
+        assert_eq!(trace.runtime_phases(), RuntimePhase::COUNT);
+        assert_eq!(trace.store_reads(), expected_store_reads);
         assert_eq!(trace.recent_snapshot_reads(), RECENT_SNAPSHOT_SLOTS);
         assert_eq!(trace.replay_reads(), 1);
         assert_eq!(trace.replay_writes(), 1);
@@ -2461,7 +2865,6 @@ mod tests {
         assert_eq!(trace.request_bytes(), ENVELOPE_BYTES);
         assert_eq!(trace.response_bytes(), ENVELOPE_BYTES);
         assert_eq!(trace.completion(), CompletionShape::UnaryFixedEnvelope);
-        Ok((trace, response))
     }
 
     fn assert_late_serving_epoch_failure_completes_fixed_work(
@@ -2505,7 +2908,13 @@ mod tests {
 
         assert_eq!(failure.to_string(), "private query failed");
         counters.assert_fixed_work_before_release_failure(&runtime);
-        assert_eq!(runtime.replay_guard.real_claim_attempts, 0);
+        assert_eq!(
+            runtime
+                .security
+                .replay_guard_for_tests()
+                .real_claim_attempts,
+            0
+        );
         assert!(!runtime.healthy);
         Ok(())
     }
@@ -2520,28 +2929,135 @@ mod tests {
         handle_and_decode(&mut runtime, &request)
     }
 
+    #[test]
+    fn xchacha20_runtime_round_trips_continuations_and_rejects_tampering(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let entries = [(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))];
+        let serving_epoch = serving_epoch(empty_recent_snapshot(), store(4, &entries)?);
+        let shape = runtime_shape(4)?;
+        let security_lease = xchacha20_fixture_security_lease(
+            shape,
+            fixture_security_lease_identity(checkpoint().key_epoch, SESSION_BINDING)?,
+            zeroize::Zeroizing::new(XCHACHA_REQUEST_KEY),
+            zeroize::Zeroizing::new(XCHACHA_RESPONSE_KEY),
+            zeroize::Zeroizing::new(XCHACHA_TOKEN_KEY),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
+        );
+        let mut runtime =
+            PrivateQueryRuntime::new(serving_epoch, shape, checkpoint(), security_lease)?;
+        let query = UtxoQuery::new(address(1), 0);
+
+        let wrong_request_protector = super::super::xchacha20_envelope_protector(
+            zeroize::Zeroizing::new([0xa1; crate::xchacha20::KEY_BYTES]),
+            zeroize::Zeroizing::new(XCHACHA_RESPONSE_KEY),
+        );
+        let wrong_key_request = runtime.codec.encode_request(
+            &super::super::PrivateQueryRequest::new(checkpoint(), query, None),
+            [0x11; ENVELOPE_NONCE_BYTES],
+            &wrong_request_protector,
+        )?;
+        let wrong_key_failure = uniform_failure(runtime.handle(&wrong_key_request));
+        assert_eq!(wrong_key_failure.to_string(), "private query failed");
+        assert_eq!(runtime.security.material_source_for_tests().calls, 0);
+        assert_eq!(runtime.security.replay_guard_for_tests().calls, 0);
+        assert!(runtime.healthy);
+
+        let initial_request = request_envelope(&runtime, checkpoint(), query, None, 0x12)?;
+        let (initial_trace, initial_response) =
+            handle_and_decode_protected(&mut runtime, &initial_request)?;
+        assert_eq!(
+            initial_response.page.outcome(),
+            QueryOutcome::ResultBudgetExceeded
+        );
+        let continuation = initial_response
+            .continuation
+            .clone()
+            .expect("capped XChaCha page carries one protected token");
+
+        let mut tampered_token_bytes = *continuation.opaque_bytes();
+        tampered_token_bytes[0] ^= 1;
+        let tampered_token = ContinuationToken::from_opaque_bytes(tampered_token_bytes);
+        let tampered_request =
+            request_envelope(&runtime, checkpoint(), query, Some(tampered_token), 0x13)?;
+        let (tampered_trace, tampered_response) =
+            handle_and_decode_protected(&mut runtime, &tampered_request)?;
+        assert_eq!(tampered_trace, initial_trace);
+        assert_eq!(
+            tampered_response.page.outcome(),
+            QueryOutcome::InvalidContinuation
+        );
+        assert!(tampered_response.page.is_all_dummy());
+        assert_eq!(
+            runtime
+                .security
+                .replay_guard_for_tests()
+                .real_claim_attempts,
+            0
+        );
+
+        let continued_request = request_envelope(
+            &runtime,
+            checkpoint(),
+            query,
+            Some(continuation.clone()),
+            0x14,
+        )?;
+        let (continued_trace, continued_response) =
+            handle_and_decode_protected(&mut runtime, &continued_request)?;
+        assert_eq!(continued_trace, initial_trace);
+        assert_eq!(continued_response.page.outcome(), QueryOutcome::Complete);
+        assert_eq!(continued_response.page.real_count(), 1);
+        assert_eq!(
+            continued_response.page.slots()[0].padded_utxo().txid(),
+            &[3; TXID_BYTES]
+        );
+
+        let replay_request =
+            request_envelope(&runtime, checkpoint(), query, Some(continuation), 0x15)?;
+        let (replay_trace, replay_response) =
+            handle_and_decode_protected(&mut runtime, &replay_request)?;
+        assert_eq!(replay_trace, initial_trace);
+        assert_eq!(
+            replay_response.page.outcome(),
+            QueryOutcome::InvalidContinuation
+        );
+        assert!(replay_response.page.is_all_dummy());
+        assert_eq!(runtime.security.material_source_for_tests().calls, 4);
+        let replay_guard = runtime.security.replay_guard_for_tests();
+        assert_eq!(replay_guard.calls, 4);
+        assert_eq!(replay_guard.real_claim_attempts, 2);
+        assert_eq!(replay_guard.claimed.iter().flatten().count(), 1);
+        Ok(())
+    }
+
     #[cfg(feature = "corpus-zaino")]
     #[test]
     fn finalized_runtime_owner_is_unready_before_refresh_and_stops_once(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let store_reads = finalized_serving_store_for_runtime_tests()?.slots_per_key();
+        let shape = runtime_shape(store_reads)?;
         let mut owner = FinalizedTestOwner::new(
             CanonicalNetwork::Mainnet,
             1,
             7,
-            9,
-            runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
+            shape,
+            fixture_security_lease_with_identity(
+                shape,
+                9,
+                SESSION_BINDING,
                 CountingReplayGuard::available(),
                 DeterministicMaterialSource::at(100),
-            ),
+            )?,
         )?;
         let request = FixedEnvelope::from_array([0; ENVELOPE_BYTES]);
 
         assert!(matches!(
-            owner.handle(&request),
-            Err(UniformExternalFailure)
+            <FinalizedTestOwner as FixedEnvelopeRuntime<ENVELOPE_BYTES>>::query_page(
+                &mut owner,
+                [0; ENVELOPE_BYTES],
+            ),
+            Err(PrivateQueryUnavailable)
         ));
         assert!(owner.runtime.healthy);
         assert!(owner.runtime.epoch.is_none());
@@ -2576,17 +3092,19 @@ mod tests {
     #[test]
     fn owner_drop_closes_detached_response_permit() -> Result<(), Box<dyn std::error::Error>> {
         let store_reads = finalized_serving_store_for_runtime_tests()?.slots_per_key();
+        let shape = runtime_shape(store_reads)?;
         let owner = FinalizedTestOwner::new(
             CanonicalNetwork::Mainnet,
             1,
             7,
-            9,
-            runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
+            shape,
+            fixture_security_lease_with_identity(
+                shape,
+                9,
+                SESSION_BINDING,
                 CountingReplayGuard::available(),
                 DeterministicMaterialSource::at(100),
-            ),
+            )?,
         )?;
         let release_state = Arc::clone(&owner.response_release.state);
         let permit = owner.response_release.begin_response()?;
@@ -2647,8 +3165,10 @@ mod tests {
         response_release.close();
 
         assert!(matches!(
-            pending.try_release_bytes(),
-            Err(UniformExternalFailure)
+            <FinalizedTestPendingRound as PendingFixedEnvelope<ENVELOPE_BYTES>>::try_release_bytes(
+                &pending,
+            ),
+            Err(PrivateQueryUnavailable)
         ));
         assert_eq!(serving_epoch_observations(&runtime), observations);
         drop(pending);
@@ -2684,6 +3204,57 @@ mod tests {
 
     #[cfg(feature = "corpus-zaino")]
     #[test]
+    fn security_release_unavailability_is_terminal_and_cached(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (runtime, response_release, pending) = finalized_pending_round_fixture()?;
+        runtime.security.make_security_unavailable_for_tests();
+
+        assert_terminal_security_release_failure(&runtime, &response_release, &pending, 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn security_release_rejects_equal_value_epoch_remint() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (runtime, response_release, pending) = finalized_pending_round_fixture()?;
+        runtime
+            .security
+            .remint_security_epoch_for_tests(SECURITY_EPOCH_BINDING);
+
+        assert_terminal_security_release_failure(&runtime, &response_release, &pending, 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn security_release_rejects_each_cross_round_authority(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        {
+            let (runtime, response_release, mut pending) = finalized_pending_round_fixture()?;
+            let other_round =
+                SecurityRoundCapture::new(runtime.security.security_epoch_tag_for_tests());
+            pending.round.replay_commit_authority = ReplayCommitAuthority::new(&other_round);
+
+            assert_terminal_security_release_failure(&runtime, &response_release, &pending, 1);
+        }
+
+        let (runtime, response_release, mut pending) = finalized_pending_round_fixture()?;
+        let other_round =
+            SecurityRoundCapture::new(runtime.security.security_epoch_tag_for_tests());
+        pending.round.reservation_authority = RoundReservationAuthority::new(
+            &other_round,
+            pending.round.now_unix_seconds,
+            pending.round.response_nonce,
+            pending.round.token_nonce,
+        );
+
+        assert_terminal_security_release_failure(&runtime, &response_release, &pending, 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
     fn pending_response_blocks_lifecycle_before_mutation() -> Result<(), Box<dyn std::error::Error>>
     {
         assert_send_and_static::<FinalizedTestPendingRound>();
@@ -2692,14 +3263,11 @@ mod tests {
         >();
         let (first_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             first_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
         let checkpoint = runtime.epoch_for_tests().checkpoint;
         let request = request_envelope(
@@ -2794,14 +3362,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (first_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             first_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
         let checkpoint = runtime.epoch_for_tests().checkpoint;
         let query = UtxoQuery::new(address(0xee), 0);
@@ -2868,19 +3433,22 @@ mod tests {
 
     #[cfg(feature = "corpus-zaino")]
     #[test]
-    fn protected_failure_retires_epoch_while_response_remains_pending(
+    fn protected_failure_retires_security_and_makes_pending_response_unreleasable(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (first_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             first_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::unavailable(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
+        let lineage = runtime.epoch_for_tests().recent_snapshot.lineage();
+        runtime.epoch_mut_for_tests().recent_snapshot = FrozenRecentSnapshot::failing(
+            lineage,
+            [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
+            0,
+        );
         let checkpoint = runtime.epoch_for_tests().checkpoint;
         let request = request_envelope(
             &runtime,
@@ -2901,12 +3469,15 @@ mod tests {
             &response_release,
         ));
         assert!(runtime.epoch.is_none());
-        assert!(!response_release.is_idle());
-        let response = release_finalized_pending_and_decode(&runtime, &pending)?;
-        assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
+        assert!(response_release.is_closed_for_tests());
+        assert!(!runtime.security.security_state_for_tests().0);
+        assert!(matches!(
+            pending.try_release_bytes(),
+            Err(UniformExternalFailure)
+        ));
 
         drop(pending);
-        assert!(response_release.is_idle());
+        assert!(response_release.is_closed_for_tests());
         Ok(())
     }
 
@@ -2916,14 +3487,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (first_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             first_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
         let checkpoint = runtime.epoch_for_tests().checkpoint;
         let request = request_envelope(
@@ -2945,6 +3513,7 @@ mod tests {
             handle_finalized_runtime_round(&mut runtime, false, &response_release, &request)?;
         assert_eq!(serving_epoch_observations(&runtime), observations);
         assert!(runtime.healthy);
+        assert!(runtime.security.security_state_for_tests().0);
         let counters = FinalizedProcessCounters::capture(&runtime);
 
         assert!(matches!(
@@ -2953,6 +3522,7 @@ mod tests {
         ));
         assert_eq!(serving_epoch_observations(&runtime), observations + 1);
         assert!(response_release.is_closed_for_tests());
+        assert!(!runtime.security.security_state_for_tests().0);
         assert!(matches!(
             pending.try_release_bytes(),
             Err(UniformExternalFailure)
@@ -2985,14 +3555,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (first_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             first_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
         let checkpoint = runtime.epoch_for_tests().checkpoint;
         let request = request_envelope(
@@ -3064,14 +3631,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (serving_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             serving_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
         let checkpoint = runtime.epoch_for_tests().checkpoint;
         let request = request_envelope(
@@ -3119,14 +3683,11 @@ mod tests {
     fn finalized_epoch_factory_derives_checkpoint_and_retains_runtime_state(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (serving_epoch, identity, store_reads) = finalized_test_epoch(|identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             serving_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
 
         let checkpoint = runtime.epoch_for_tests().checkpoint;
@@ -3148,15 +3709,15 @@ mod tests {
                     None,
                 ),
                 [nonce_byte; ENVELOPE_NONCE_BYTES],
-                &runtime.envelope_protector,
+                runtime.security.envelope_protector(),
             )?;
             let round = runtime.handle(&request)?;
             let response = runtime
                 .codec
-                .decode_response(round.envelope(), &runtime.envelope_protector)?;
+                .decode_response(round.envelope(), runtime.security.envelope_protector())?;
             assert_eq!(response.page.outcome(), QueryOutcome::Complete);
         }
-        assert_eq!(runtime.material_source.calls, 2);
+        assert_eq!(runtime.security.material_source_for_tests().calls, 2);
         assert!(runtime.healthy);
         Ok(())
     }
@@ -3167,14 +3728,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (first_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             first_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
         let checkpoint = runtime.epoch_for_tests().checkpoint;
         let request = request_envelope(
@@ -3221,13 +3779,17 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (first_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
+        let key_epoch = first_epoch.identity().key_epoch();
+        let shape = runtime_shape(store_reads)?;
         let mut runtime = FinalizedTestRuntime::without_epoch(
-            runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
+            shape,
+            fixture_security_lease_with_identity(
+                shape,
+                key_epoch,
+                SESSION_BINDING,
                 CountingReplayGuard::available(),
                 DeterministicMaterialSource::at(100),
-            ),
+            )?,
         )?;
         runtime.activate_finalized_serving_epoch(first_epoch)?;
         let checkpoint = runtime.epoch_for_tests().checkpoint;
@@ -3245,8 +3807,8 @@ mod tests {
         let first_request = request_envelope(&runtime, checkpoint, query, None, 1)?;
         let first_response = finalized_handle_and_decode(&mut runtime, &first_request)?;
         assert_eq!(first_response.page.outcome(), QueryOutcome::Complete);
-        assert_eq!(runtime.replay_guard.calls, 1);
-        assert_eq!(runtime.material_source.calls, 1);
+        assert_eq!(runtime.security.replay_guard_for_tests().calls, 1);
+        assert_eq!(runtime.security.material_source_for_tests().calls, 1);
 
         let profile = *runtime.epoch_for_tests().engine.profile();
         let token_context = runtime.codec.continuation_protection_context(&checkpoint)?;
@@ -3261,7 +3823,7 @@ mod tests {
                 [0x41; ENVELOPE_NONCE_BYTES],
             ),
             &token_context,
-            &runtime.token_protector,
+            runtime.security.token_protector(),
         )?;
         let counters_before_replacement = FinalizedProcessCounters::capture(&runtime);
 
@@ -3305,8 +3867,8 @@ mod tests {
         let replacement_request = request_envelope(&runtime, checkpoint, query, None, 3)?;
         let replacement_response = finalized_handle_and_decode(&mut runtime, &replacement_request)?;
         assert_eq!(replacement_response.page.outcome(), QueryOutcome::Complete);
-        assert_eq!(runtime.replay_guard.calls, 3);
-        assert_eq!(runtime.material_source.calls, 3);
+        assert_eq!(runtime.security.replay_guard_for_tests().calls, 3);
+        assert_eq!(runtime.security.material_source_for_tests().calls, 3);
         assert!(runtime.healthy);
 
         runtime
@@ -3320,8 +3882,8 @@ mod tests {
             Err(UniformExternalFailure)
         ));
         assert!(!runtime.healthy);
-        assert_eq!(runtime.replay_guard.calls, 4);
-        assert_eq!(runtime.material_source.calls, 4);
+        assert_eq!(runtime.security.replay_guard_for_tests().calls, 4);
+        assert_eq!(runtime.security.material_source_for_tests().calls, 4);
 
         let (recovery_epoch, _, _) = finalized_test_epoch_at_generation(3, |identity| identity)?;
         assert_eq!(
@@ -3338,8 +3900,8 @@ mod tests {
             runtime.handle(&unavailable_request),
             Err(UniformExternalFailure)
         ));
-        assert_eq!(runtime.replay_guard.calls, 4);
-        assert_eq!(runtime.material_source.calls, 4);
+        assert_eq!(runtime.security.replay_guard_for_tests().calls, 4);
+        assert_eq!(runtime.security.material_source_for_tests().calls, 4);
         Ok(())
     }
 
@@ -3349,14 +3911,11 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (first_epoch, _, store_reads) =
             finalized_test_epoch_at_generation(1, |identity| identity)?;
-        let mut runtime = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let mut runtime = finalized_runtime_from_epoch(
             first_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         )?;
         let checkpoint = runtime.epoch_for_tests().checkpoint;
         let request = request_envelope(
@@ -3434,8 +3993,8 @@ mod tests {
         let response = finalized_handle_and_decode(&mut runtime, &request)?;
         assert_eq!(response.page.outcome(), QueryOutcome::Complete);
         assert!(runtime.healthy);
-        assert_eq!(runtime.replay_guard.calls, 1);
-        assert_eq!(runtime.material_source.calls, 1);
+        assert_eq!(runtime.security.replay_guard_for_tests().calls, 1);
+        assert_eq!(runtime.security.material_source_for_tests().calls, 1);
         Ok(())
     }
 
@@ -3453,14 +4012,11 @@ mod tests {
                 identity.key_epoch(),
             )
         })?;
-        let result = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let result = finalized_runtime_from_epoch(
             serving_epoch,
             runtime_shape(store_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         );
         let Err(error) = result else {
             return Err("unknown internal network tag must reject runtime construction".into());
@@ -3485,14 +4041,11 @@ mod tests {
         let mismatched_reads = store_reads
             .checked_sub(1)
             .ok_or("finalized store fixture must expose at least one slot")?;
-        let result = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let result = finalized_runtime_from_epoch(
             serving_epoch,
             runtime_shape(mismatched_reads)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         );
         let Err(error) = result else {
             return Err("store/profile mismatch must reject runtime construction".into());
@@ -3509,14 +4062,11 @@ mod tests {
         let mismatched_slots = RECENT_SNAPSHOT_SLOTS
             .checked_sub(1)
             .ok_or("recent-snapshot fixture must expose at least one slot")?;
-        let result = FinalizedTestRuntime::from_finalized_serving_epoch(
+        let result = finalized_runtime_from_epoch(
             serving_epoch,
             runtime_shape_with_recent_snapshot_slots(store_reads, mismatched_slots)?,
-            SESSION_BINDING,
-            runtime_dependencies(
-                CountingReplayGuard::available(),
-                DeterministicMaterialSource::at(100),
-            ),
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
         );
         let Err(error) = result else {
             return Err("recent-snapshot shape mismatch must reject runtime construction".into());
@@ -3674,7 +4224,7 @@ mod tests {
         let profile = *runtime.epoch_for_tests().engine.profile();
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             102,
@@ -3685,10 +4235,23 @@ mod tests {
             &CountingTokenProtector::default(),
             &token_context,
             &expectation,
+            runtime.security.replay_namespace(),
             [0; ENVELOPE_NONCE_BYTES],
         );
+        let security_round =
+            SecurityRoundCapture::new(runtime.security.security_epoch_tag_for_tests());
+        let mut replay_guard = CountingReplayGuard::available();
+        let (continuation_use, replay_commit_authority) = inspection
+            .finish_replay(&security_round, &mut replay_guard)
+            .into_parts();
+        let replay_commit_authority =
+            replay_commit_authority.ok_or("fixture replay commit must return an authority")?;
+        assert!(replay_commit_authority.matches(
+            runtime.security.security_epoch_tag_for_tests(),
+            &security_round
+        ));
         assert_eq!(
-            inspection.claim_or_cover(&mut CountingReplayGuard::available()),
+            continuation_use,
             ContinuationUse::Continue {
                 cursor: 5,
                 expires_at_unix_seconds: 160,
@@ -3917,7 +4480,6 @@ mod tests {
                 [RecentSnapshotSlot::dummy(); RECENT_SNAPSHOT_SLOTS],
                 next_lineage,
             ),
-            SESSION_BINDING,
             CountingReplayGuard::available(),
             DeterministicMaterialSource::at(101),
         )?;
@@ -3968,7 +4530,7 @@ mod tests {
         let profile = *runtime.epoch_for_tests().engine.profile();
         let expectation = ContinuationExpectation::new(
             CONTINUATION_VERSION,
-            *profile.profile_id(),
+            &profile,
             runtime.continuation_query_digest_for_tests(&query),
             checkpoint().projection_epoch,
             102,
@@ -3979,10 +4541,23 @@ mod tests {
             &CountingTokenProtector::default(),
             &token_context,
             &expectation,
+            runtime.security.replay_namespace(),
             [0; ENVELOPE_NONCE_BYTES],
         );
+        let security_round =
+            SecurityRoundCapture::new(runtime.security.security_epoch_tag_for_tests());
+        let mut replay_guard = CountingReplayGuard::available();
+        let (continuation_use, replay_commit_authority) = inspection
+            .finish_replay(&security_round, &mut replay_guard)
+            .into_parts();
+        let replay_commit_authority =
+            replay_commit_authority.ok_or("fixture replay commit must return an authority")?;
+        assert!(replay_commit_authority.matches(
+            runtime.security.security_epoch_tag_for_tests(),
+            &security_round
+        ));
         assert_eq!(
-            inspection.claim_or_cover(&mut CountingReplayGuard::available()),
+            continuation_use,
             ContinuationUse::Continue {
                 cursor: 9,
                 expires_at_unix_seconds: 160,
@@ -4015,7 +4590,13 @@ mod tests {
                 [5; TXID_BYTES]
             ]
         );
-        assert_eq!(runtime.replay_guard.real_claim_attempts, 2);
+        assert_eq!(
+            runtime
+                .security
+                .replay_guard_for_tests()
+                .real_claim_attempts,
+            2
+        );
         Ok(())
     }
 
@@ -4099,7 +4680,7 @@ mod tests {
             &cursor_runtime
                 .codec
                 .continuation_protection_context(&checkpoint())?,
-            &cursor_runtime.token_protector,
+            cursor_runtime.security.token_protector(),
         )?;
         let cursor_request =
             request_envelope(&cursor_runtime, checkpoint(), query, Some(cursor_token), 7)?;
@@ -4130,7 +4711,7 @@ mod tests {
                 &binding_runtime
                     .codec
                     .continuation_protection_context(&checkpoint())?,
-                &binding_runtime.token_protector,
+                binding_runtime.security.token_protector(),
             )?;
             let binding_request = request_envelope(
                 &binding_runtime,
@@ -4178,7 +4759,65 @@ mod tests {
 
         assert_eq!(trace, baseline);
         assert_invalid_continuation(&response);
-        assert_eq!(other_session.replay_guard.real_claim_attempts, 0);
+        assert_eq!(
+            other_session
+                .security
+                .replay_guard_for_tests()
+                .real_claim_attempts,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_request_nonce_ignores_query_and_does_not_consume_continuation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let entries = [(0, utxo(1, 10)), (2, utxo(2, 11)), (3, utxo(3, 12))];
+        let continuation_query = UtxoQuery::new(address(1), 0);
+        let different_query = UtxoQuery::new(address(2), 0);
+        let mut runtime = runtime(4, &entries)?;
+
+        let initial_request =
+            request_envelope(&runtime, checkpoint(), continuation_query, None, 1)?;
+        let (_, initial_response) = handle_and_decode(&mut runtime, &initial_request)?;
+        let continuation = initial_response
+            .continuation
+            .expect("capped initial page carries a continuation");
+
+        let marker_request = request_envelope(&runtime, checkpoint(), different_query, None, 2)?;
+        let (_, marker_response) = handle_and_decode(&mut runtime, &marker_request)?;
+        assert_eq!(marker_response.page.outcome(), QueryOutcome::Complete);
+
+        let duplicate_request = request_envelope(
+            &runtime,
+            checkpoint(),
+            continuation_query,
+            Some(continuation.clone()),
+            2,
+        )?;
+        let (_, duplicate_response) = handle_and_decode(&mut runtime, &duplicate_request)?;
+        assert_eq!(
+            duplicate_response.page.outcome(),
+            QueryOutcome::ProjectionNotReady
+        );
+        assert!(runtime.healthy);
+        let replay_guard = runtime.security.replay_guard_for_tests();
+        assert_eq!(replay_guard.real_claim_attempts, 0);
+        assert!(replay_guard.claimed.iter().all(Option::is_none));
+
+        let fresh_request = request_envelope(
+            &runtime,
+            checkpoint(),
+            continuation_query,
+            Some(continuation),
+            3,
+        )?;
+        let (_, fresh_response) = handle_and_decode(&mut runtime, &fresh_request)?;
+        assert_eq!(fresh_response.page.outcome(), QueryOutcome::Complete);
+        let replay_guard = runtime.security.replay_guard_for_tests();
+        assert_eq!(replay_guard.real_claim_attempts, 1);
+        assert_eq!(replay_guard.claimed.iter().flatten().count(), 1);
+        assert_eq!(replay_guard.claimed_requests.iter().flatten().count(), 3);
         Ok(())
     }
 
@@ -4274,15 +4913,30 @@ mod tests {
             Some(retryable_token),
             8,
         )?;
-        let (unavailable_trace, unavailable_response) =
-            handle_and_decode(&mut unavailable_runtime, &unavailable_request)?;
-        assert_eq!(unavailable_trace, baseline);
-        assert_eq!(
-            unavailable_response.page.outcome(),
-            QueryOutcome::ProjectionNotReady
-        );
-        assert_eq!(unavailable_runtime.replay_guard.real_claim_attempts, 1);
+        let unavailable_counters = RuntimeCounters::capture(&unavailable_runtime);
+        assert!(matches!(
+            unavailable_runtime.handle(&unavailable_request),
+            Err(UniformExternalFailure)
+        ));
+        unavailable_counters.assert_fixed_work_before_release_failure(&unavailable_runtime);
+        let replay_guard = unavailable_runtime.security.replay_guard_for_tests();
+        assert_eq!(replay_guard.real_claim_attempts, 0);
+        assert!(replay_guard.claimed_requests.iter().all(Option::is_none));
+        assert!(replay_guard.claimed.iter().all(Option::is_none));
         assert!(!unavailable_runtime.healthy);
+        let unavailable_after_failure = RuntimeCounters::capture(&unavailable_runtime);
+        unavailable_runtime
+            .security
+            .replay_guard_mut_for_tests()
+            .available = true;
+        assert!(matches!(
+            unavailable_runtime.handle(&unavailable_request),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(
+            RuntimeCounters::capture(&unavailable_runtime),
+            unavailable_after_failure
+        );
 
         for failing_ordinal in 1..=4 {
             let failing_store = store(4, &entries)?.with_failure_on_read(failing_ordinal);
@@ -4325,24 +4979,29 @@ mod tests {
                 store(4, &entries)?,
                 4,
                 recent_snapshot,
-                SESSION_BINDING,
                 CountingReplayGuard::available(),
                 DeterministicMaterialSource::at(100),
             )?;
 
-            for nonce in [1_u8, 2_u8] {
-                let request = request_envelope(&runtime, checkpoint(), query, None, nonce)?;
-                let (trace, response) = handle_and_decode(&mut runtime, &request)?;
-                assert_eq!(trace, baseline);
-                assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
-                assert!(response.page.is_all_dummy());
-                assert!(!runtime.healthy);
-            }
+            let request = request_envelope(&runtime, checkpoint(), query, None, 1)?;
+            let (trace, response) = handle_and_decode(&mut runtime, &request)?;
+            assert_eq!(trace, baseline);
+            assert_eq!(response.page.outcome(), QueryOutcome::ProjectionNotReady);
+            assert!(response.page.is_all_dummy());
+            assert!(!runtime.healthy);
+
+            let rejected = request_envelope(&runtime, checkpoint(), query, None, 2)?;
+            let counters = RuntimeCounters::capture(&runtime);
+            assert!(matches!(
+                runtime.handle(&rejected),
+                Err(UniformExternalFailure)
+            ));
+            assert_eq!(RuntimeCounters::capture(&runtime), counters);
             assert_eq!(
                 runtime.epoch_for_tests().recent_snapshot.read_calls(),
-                2 * RECENT_SNAPSHOT_SLOTS
+                RECENT_SNAPSHOT_SLOTS
             );
-            assert_eq!(finalized_store_reads(&runtime), 8);
+            assert_eq!(finalized_store_reads(&runtime), 4);
         }
 
         let recent_snapshot = FrozenRecentSnapshot::failing(
@@ -4354,7 +5013,6 @@ mod tests {
             store(4, &entries)?.with_failure_on_read(1),
             4,
             recent_snapshot,
-            SESSION_BINDING,
             CountingReplayGuard::available(),
             DeterministicMaterialSource::at(100),
         )?;
@@ -4363,6 +5021,61 @@ mod tests {
         assert_eq!(trace, baseline);
         assert_eq!(response.page.outcome(), QueryOutcome::StoreFailure);
         assert!(response.page.is_all_dummy());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_rejects_lease_bound_to_different_replay_policy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let profile_a = test_profile_with_recent_snapshot(
+            "runtime-replay-policy",
+            4,
+            RECENT_SNAPSHOT_SLOTS,
+            RESPONSE_SLOTS,
+            ENVELOPE_BYTES,
+            3,
+            TOKEN_TTL_SECONDS,
+        )?;
+        let replay_policy_a = profile_a.replay_policy();
+        let profile_b = profile_a.with_test_replay_policy(
+            replay_policy_a
+                .transaction_capacity()
+                .checked_add(1)
+                .expect("fixture replay capacity leaves increment headroom"),
+            replay_policy_a.expiry_bucket_width_seconds(),
+            replay_policy_a.garbage_collection_interval_seconds(),
+        )?;
+        assert_ne!(
+            profile_a.replay_policy().transaction_capacity(),
+            profile_b.replay_policy().transaction_capacity()
+        );
+        assert_eq!(
+            profile_a.replay_policy().expiry_bucket_width_seconds(),
+            profile_b.replay_policy().expiry_bucket_width_seconds()
+        );
+        assert_eq!(
+            profile_a
+                .replay_policy()
+                .garbage_collection_interval_seconds(),
+            profile_b
+                .replay_policy()
+                .garbage_collection_interval_seconds()
+        );
+        let shape_a = CompiledQueryShape::new(profile_a)?;
+        let shape_b = CompiledQueryShape::new(profile_b)?;
+        assert_ne!(
+            shape_a.profile().profile_id(),
+            shape_b.profile().profile_id()
+        );
+        let security_lease = fixture_security_lease(
+            shape_a,
+            CountingReplayGuard::available(),
+            DeterministicMaterialSource::at(100),
+        )?;
+
+        let runtime = TestRuntime::without_epoch(shape_b, security_lease);
+
+        assert!(matches!(runtime, Err(UniformExternalFailure)));
         Ok(())
     }
 
@@ -4402,14 +5115,12 @@ mod tests {
         let shape_mismatch = ThreeSlotRuntime::new(
             shape_mismatch_epoch,
             shape,
-            SESSION_BINDING,
             checkpoint(),
-            RuntimeDependencies::new(
-                DeterministicEnvelopeProtector::default(),
-                CountingTokenProtector::default(),
+            fixture_security_lease(
+                shape,
                 CountingReplayGuard::available(),
                 DeterministicMaterialSource::at(100),
-            ),
+            )?,
         );
         assert!(matches!(shape_mismatch, Err(UniformExternalFailure)));
 
@@ -4481,17 +5192,16 @@ mod tests {
                 ),
                 store(4, &[])?,
             );
+            let shape = CompiledQueryShape::new(profile)?;
             let identity_mismatch = TestRuntime::new(
                 identity_mismatch_epoch,
-                CompiledQueryShape::new(profile)?,
-                SESSION_BINDING,
+                shape,
                 current,
-                RuntimeDependencies::new(
-                    DeterministicEnvelopeProtector::default(),
-                    CountingTokenProtector::default(),
+                fixture_security_lease(
+                    shape,
                     CountingReplayGuard::available(),
                     DeterministicMaterialSource::at(100),
-                ),
+                )?,
             );
             assert!(matches!(identity_mismatch, Err(UniformExternalFailure)));
         }
@@ -4499,7 +5209,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_precedence_and_claim_consumption_survive_downstream_failure(
+    fn readiness_precedence_and_claim_commit_survive_downstream_failure_and_latch(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let entries = [(0, utxo(1, 10)), (2, utxo(2, 11)), (3, utxo(3, 12))];
         let query = UtxoQuery::new(address(1), 0);
@@ -4543,31 +5253,41 @@ mod tests {
             CountingReplayGuard::available(),
             DeterministicMaterialSource::at(101),
         )?;
-        for (nonce, expected_outcome) in [
-            (4_u8, QueryOutcome::StoreFailure),
-            (5_u8, QueryOutcome::ProjectionNotReady),
-        ] {
-            let request = request_envelope(
-                &claimed_then_failed,
-                checkpoint(),
-                query,
-                Some(token.clone()),
-                nonce,
-            )?;
-            let (trace, response) = handle_and_decode(&mut claimed_then_failed, &request)?;
-            assert_eq!(trace, baseline);
-            assert_eq!(response.page.outcome(), expected_outcome);
-        }
-        assert_eq!(claimed_then_failed.replay_guard.real_claim_attempts, 2);
+        let request = request_envelope(
+            &claimed_then_failed,
+            checkpoint(),
+            query,
+            Some(token.clone()),
+            4,
+        )?;
+        let (trace, response) = handle_and_decode(&mut claimed_then_failed, &request)?;
+        assert_eq!(trace, baseline);
+        assert_eq!(response.page.outcome(), QueryOutcome::StoreFailure);
         assert_eq!(
             claimed_then_failed
-                .replay_guard
+                .security
+                .replay_guard_for_tests()
+                .real_claim_attempts,
+            1
+        );
+        assert_eq!(
+            claimed_then_failed
+                .security
+                .replay_guard_for_tests()
                 .claimed
                 .iter()
                 .flatten()
                 .count(),
             1
         );
+
+        let rejected = request_envelope(&claimed_then_failed, checkpoint(), query, Some(token), 5)?;
+        let counters = RuntimeCounters::capture(&claimed_then_failed);
+        assert!(matches!(
+            claimed_then_failed.handle(&rejected),
+            Err(UniformExternalFailure)
+        ));
+        assert_eq!(RuntimeCounters::capture(&claimed_then_failed), counters);
         Ok(())
     }
 
@@ -4583,29 +5303,38 @@ mod tests {
             1,
         )?;
         let counters = RuntimeCounters::capture(&runtime);
-        runtime.envelope_protector.make_open_unavailable();
+        runtime
+            .security
+            .envelope_protector()
+            .make_open_unavailable();
 
         let failure = uniform_failure(runtime.handle(&request));
 
         assert_eq!(failure.to_string(), "private query failed");
         assert_eq!(
-            runtime.envelope_protector.opens.get() - counters.envelope_opens,
+            runtime.security.envelope_protector().opens.get() - counters.envelope_opens,
             1
         );
         assert_eq!(
-            runtime.envelope_protector.seals.get() - counters.envelope_seals,
+            runtime.security.envelope_protector().seals.get() - counters.envelope_seals,
             0
         );
         assert_eq!(
-            runtime.token_protector.opens.get() - counters.token_opens,
+            runtime.security.token_protector().opens.get() - counters.token_opens,
             0
         );
         assert_eq!(
-            runtime.token_protector.seals.get() - counters.token_seals,
+            runtime.security.token_protector().seals.get() - counters.token_seals,
             0
         );
-        assert_eq!(runtime.replay_guard.calls - counters.replay_calls, 0);
-        assert_eq!(runtime.material_source.calls - counters.material_calls, 0);
+        assert_eq!(
+            runtime.security.replay_guard_for_tests().calls - counters.replay_calls,
+            0
+        );
+        assert_eq!(
+            runtime.security.material_source_for_tests().calls - counters.material_calls,
+            0
+        );
         assert_eq!(
             runtime.epoch_for_tests().recent_snapshot.read_calls() - counters.recent_snapshot_reads,
             0
@@ -4623,7 +5352,7 @@ mod tests {
     fn token_open_unavailability_completes_fixed_work_and_withholds_round(
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert_protection_failure_completes_fixed_work(&[(0, utxo(1, 10))], |runtime| {
-            runtime.token_protector.make_open_unavailable()
+            runtime.security.token_protector().make_open_unavailable()
         })
     }
 
@@ -4632,7 +5361,7 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert_protection_failure_completes_fixed_work(
             &[(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))],
-            |runtime| runtime.token_protector.make_seal_unavailable(),
+            |runtime| runtime.security.token_protector().make_seal_unavailable(),
         )
     }
 
@@ -4640,7 +5369,10 @@ mod tests {
     fn envelope_seal_unavailability_completes_fixed_work_and_withholds_round(
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert_protection_failure_completes_fixed_work(&[(0, utxo(1, 10))], |runtime| {
-            runtime.envelope_protector.make_seal_unavailable()
+            runtime
+                .security
+                .envelope_protector()
+                .make_seal_unavailable()
         })
     }
 
@@ -4674,13 +5406,17 @@ mod tests {
             Err(failure) => failure,
         };
         assert_eq!(failure.to_string(), "private query failed");
-        assert_eq!(failing_runtime.material_source.calls, 1);
-        assert_eq!(failing_runtime.replay_guard.calls, 0);
-        assert_eq!(failing_runtime.replay_guard.real_claim_attempts, 0);
-        assert_eq!(failing_runtime.replay_guard.logical_reads, 0);
-        assert_eq!(failing_runtime.replay_guard.logical_writes, 0);
-        assert_eq!(failing_runtime.token_protector.opens.get(), 0);
-        assert_eq!(failing_runtime.token_protector.seals.get(), 0);
+        assert_eq!(
+            failing_runtime.security.material_source_for_tests().calls,
+            1
+        );
+        let replay_guard = failing_runtime.security.replay_guard_for_tests();
+        assert_eq!(replay_guard.calls, 0);
+        assert_eq!(replay_guard.real_claim_attempts, 0);
+        assert_eq!(replay_guard.logical_reads, 0);
+        assert_eq!(replay_guard.logical_writes, 0);
+        assert_eq!(failing_runtime.security.token_protector().opens.get(), 0);
+        assert_eq!(failing_runtime.security.token_protector().seals.get(), 0);
         assert!(!failing_runtime.healthy);
 
         let mut malformed_runtime = runtime(4, &[])?;
@@ -4698,8 +5434,11 @@ mod tests {
             Err(failure) => failure,
         };
         assert_eq!(failure.to_string(), "private query failed");
-        assert_eq!(malformed_runtime.material_source.calls, 0);
-        assert_eq!(malformed_runtime.replay_guard.calls, 0);
+        assert_eq!(
+            malformed_runtime.security.material_source_for_tests().calls,
+            0
+        );
+        assert_eq!(malformed_runtime.security.replay_guard_for_tests().calls, 0);
         assert!(malformed_runtime.healthy);
 
         let mut noncanonical_runtime = runtime(4, &[])?;
@@ -4713,7 +5452,7 @@ mod tests {
         let mut bytes = *canonical.as_bytes();
         let (nonce, body, authentication) = super::super::split_envelope_mut(&mut bytes)?;
         body[super::super::REQUEST_FLAGS_START] = 0x80;
-        *authentication = noncanonical_runtime.envelope_protector.seal(
+        *authentication = noncanonical_runtime.security.envelope_protector().seal(
             &noncanonical_runtime
                 .codec
                 .protection_context(super::super::EnvelopeDirection::Request),
@@ -4725,15 +5464,36 @@ mod tests {
             Err(failure) => failure,
         };
         assert_eq!(failure.to_string(), "private query failed");
-        assert_eq!(noncanonical_runtime.material_source.calls, 0);
-        assert_eq!(noncanonical_runtime.replay_guard.calls, 0);
+        assert_eq!(
+            noncanonical_runtime
+                .security
+                .material_source_for_tests()
+                .calls,
+            0
+        );
+        assert_eq!(
+            noncanonical_runtime.security.replay_guard_for_tests().calls,
+            0
+        );
         assert!(noncanonical_runtime.healthy);
         Ok(())
     }
 
     #[test]
     fn runtime_debug_surfaces_redact_private_material() {
-        let material = RoundMaterial::new(123_456, [0x44; 24], [0x55; 24]);
+        let security_epoch = SecurityEpochTag::new(SECURITY_EPOCH_BINDING);
+        let security_round = SecurityRoundCapture::new(&security_epoch);
+        let response_nonce = [0x44; ENVELOPE_NONCE_BYTES];
+        let token_nonce = [0x55; ENVELOPE_NONCE_BYTES];
+        let reservation_authority =
+            RoundReservationAuthority::new(&security_round, 123_456, response_nonce, token_nonce);
+        let material = RoundMaterial::new(
+            123_456,
+            response_nonce,
+            token_nonce,
+            security_round,
+            reservation_authority,
+        );
         let context = runtime(4, &[])
             .expect("test runtime profile is valid")
             .codec

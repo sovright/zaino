@@ -31,7 +31,12 @@ use crate::{
     },
 };
 
+mod replay_journal;
 mod runtime;
+mod security_owner;
+mod security_state_binding;
+mod security_state_store;
+mod xchacha20;
 
 const FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
@@ -215,11 +220,12 @@ impl<const RESPONSE_SLOTS: usize> fmt::Debug for PrivateQueryResponse<RESPONSE_S
 
 /// Protection injected around the complete fixed envelope body.
 ///
-/// No production implementation is supplied. A later runtime must own nonce
-/// generation and provide reviewed AEAD protection. It must bind the complete
-/// [`EnvelopeProtectionContext`] as associated data or through domain-separated
-/// key derivation before releasing plaintext. The codec never treats the
-/// deterministic test implementation as cryptographic evidence.
+/// A crate-internal XChaCha20-Poly1305 primitive is available, but no service
+/// yet owns its keys, session establishment, or nonce lifecycle. Any selected
+/// implementation must bind the complete [`EnvelopeProtectionContext`] as
+/// associated data or through domain-separated key derivation before releasing
+/// plaintext. The codec never treats the deterministic test implementation as
+/// cryptographic evidence.
 trait EnvelopeProtector {
     /// Protects `body`, or reports that no protected output can be produced.
     fn seal(
@@ -237,6 +243,13 @@ trait EnvelopeProtector {
         body: &mut [u8],
         authentication: &[u8; ENVELOPE_AUTHENTICATION_BYTES],
     ) -> Result<AuthenticationDecision, ProtectionUnavailable>;
+}
+
+fn xchacha20_envelope_protector(
+    request_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+    response_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
+) -> impl EnvelopeProtector {
+    xchacha20::envelope_protector(request_key, response_key)
 }
 
 fn require_authentication(
@@ -1267,8 +1280,8 @@ mod tests {
         assert_eq!(
             digest(&envelope),
             [
-                40, 33, 40, 241, 165, 121, 243, 36, 5, 16, 109, 11, 129, 147, 59, 254, 199, 235,
-                173, 184, 193, 187, 20, 0, 98, 88, 215, 186, 110, 57, 211, 6,
+                243, 46, 130, 99, 165, 69, 13, 41, 40, 29, 36, 43, 205, 154, 18, 53, 68, 47, 238,
+                84, 46, 168, 177, 140, 156, 222, 9, 94, 193, 53, 204, 33,
             ]
         );
         Ok(())
@@ -1394,8 +1407,8 @@ mod tests {
         assert_eq!(
             digest(&envelope),
             [
-                107, 201, 81, 162, 168, 81, 155, 208, 251, 123, 55, 162, 165, 105, 47, 232, 199,
-                212, 168, 64, 90, 195, 129, 214, 126, 208, 177, 70, 29, 43, 86, 200,
+                140, 143, 245, 55, 145, 47, 35, 181, 122, 31, 132, 46, 182, 64, 252, 110, 207, 29,
+                112, 253, 15, 193, 124, 118, 31, 85, 167, 49, 138, 55, 37, 107,
             ]
         );
         Ok(())
