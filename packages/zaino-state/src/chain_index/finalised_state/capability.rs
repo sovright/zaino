@@ -465,10 +465,10 @@ impl DbVersion {
     /// If a schema version is unknown to this build, this returns [`Capability::empty`], ensuring
     /// the router will reject feature requests rather than serving incorrect data.
     pub(crate) fn capability(&self) -> Capability {
-        match (self.major, self.minor) {
+        match (self.major, self.minor, self.patch) {
             // V1: Adds chainblockv1 and transparent transaction history data.
             #[cfg(feature = "transparent_address_history_experimental")]
-            (1, 0) | (1, 1) => {
+            (1, 0, 0) | (1, 1, 0) => {
                 Capability::READ_CORE
                     | Capability::WRITE_CORE
                     | Capability::BLOCK_CORE_EXT
@@ -480,7 +480,7 @@ impl DbVersion {
             }
 
             #[cfg(not(feature = "transparent_address_history_experimental"))]
-            (1, 0) | (1, 1) => {
+            (1, 0, 0) | (1, 1, 0) => {
                 Capability::READ_CORE
                     | Capability::WRITE_CORE
                     | Capability::BLOCK_CORE_EXT
@@ -490,8 +490,9 @@ impl DbVersion {
                     | Capability::CHAIN_BLOCK_EXT
             }
 
-            // V1.2: Moves Spent indexing out of "transparent_address_history_experimental".
-            (1, 2) => {
+            // V1.2 moves spent indexing out of "transparent_address_history_experimental".
+            // V1.2.1 and V1.3.0 retain that complete capability set.
+            (1, 2, 0) | (1, 2, 1) | (1, 3, 0) => {
                 Capability::READ_CORE
                     | Capability::WRITE_CORE
                     | Capability::BLOCK_CORE_EXT
@@ -1123,4 +1124,44 @@ pub(crate) trait TransparentHistExt: Send + Sync {
     fn get_tx_out_set_info_accumulator(
         &self,
     ) -> impl SendFut<Result<FinalisedTxOutSetInfoAccumulator, FinalisedStateError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Capability, DbVersion};
+    use crate::chain_index::finalised_state::finalised_source::v1::DB_VERSION_V1;
+
+    #[test]
+    fn current_database_version_advertises_latest_capabilities() {
+        assert_eq!(DB_VERSION_V1.capability(), Capability::LATEST);
+    }
+
+    #[test]
+    fn known_exact_versions_have_their_declared_capabilities() {
+        for version in [DbVersion::new(1, 0, 0), DbVersion::new(1, 1, 0)] {
+            assert!(!version.capability().is_empty());
+        }
+
+        for version in [
+            DbVersion::new(1, 2, 0),
+            DbVersion::new(1, 2, 1),
+            DbVersion::new(1, 3, 0),
+        ] {
+            assert_eq!(version.capability(), Capability::LATEST);
+        }
+    }
+
+    #[test]
+    fn unknown_exact_versions_fail_closed() {
+        for version in [
+            DbVersion::new(1, 0, 1),
+            DbVersion::new(1, 1, 1),
+            DbVersion::new(1, 2, 2),
+            DbVersion::new(1, 3, 1),
+            DbVersion::new(1, 4, 0),
+            DbVersion::new(2, 0, 0),
+        ] {
+            assert_eq!(version.capability(), Capability::empty());
+        }
+    }
 }

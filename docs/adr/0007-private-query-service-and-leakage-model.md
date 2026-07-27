@@ -101,8 +101,9 @@ mainnet corpus plus growth horizon fits the intended TDX instance with at least
 30% RSS headroom and no host swapping; capacity, hot-address, stash, and queue
 failures are typed and fail closed; a credible authenticated recovery or
 measured rebuild plan and RTO exist; the pinned compiler/CPU/ORAM trace and
-assembly experiments support the claim; dependency licensing permits the
-intended distribution; and the leakage budget is accepted.
+assembly experiments support the claim; and the leakage budget is accepted.
+Dependency-license evidence remains pre-redistribution due diligence. It does
+not gate Phase 0 technical remediation or backend-fork work.
 
 **Phase 1 — deterministic contract.** The mock engine must demonstrate equal
 configured logical store operations, source calls, allocations, envelopes,
@@ -117,7 +118,7 @@ full-corpus build and at least seven days of mainnet shadowing; target-load soak
 results on intended TDX hardware with the required headroom and recovery time;
 release-binary instruction, memory/page, allocation, timing, frame, log, and
 admin-traffic trace equivalence; fail-closed attestation, rollback, capacity,
-and recovery behavior; resolved dependency licenses; and independent
+and recovery behavior; a recorded dependency-license inventory; and independent
 cryptographic/side-channel, Rust, TEE/deployment, and leakage-claim review with
 all blockers closed.
 
@@ -138,7 +139,8 @@ all blockers closed.
 - **Copy `rostl` or `oblivious_node` directly into the server.** Rejected:
   they are research inputs, not production backends. Any selected engine stays
   pinned behind the abstraction and must pass the same capacity, correctness,
-  recovery, compiler, leakage, audit, and licensing gates.
+  recovery, compiler, leakage, and audit gates. License review remains a
+  separate release-readiness concern.
 
 ## Consequences
 

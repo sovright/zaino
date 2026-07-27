@@ -3,6 +3,58 @@
 `zainod-oram` is a non-published application package for Zaino ORAM research.
 It is not part of the workspace's default members.
 
+## Listener-free private service boundary
+
+The default-off `private-service` feature compiles an independent
+`zaino.private.v1` protobuf contract owned by this package. Its only method is
+`PrivateCompactTxStreamer.QueryPage`; both directions carry one non-empty
+`FixedEnvelope.bytes` field whose decoded length must exactly match the selected
+compile-time profile:
+
+```console
+cargo check -p zainod-oram --features private-service
+```
+
+When `protoc` is available, the build script regenerates and formats a temporary
+copy, then fails if it differs from the committed Rust source. Refreshing after
+an intentional schema change requires the pinned toolchain's `rustfmt` and the
+explicit update mode:
+
+```console
+ZAINO_UPDATE_PRIVATE_PROTO=1 cargo check -p zainod-oram --features private-service
+```
+
+Builds without `protoc` consume the same committed source, so ordinary and
+native-builder checks do not depend on an ambient compiler and never select a
+different generated contract.
+
+The same feature adds a crate-private synchronous, listener-free adapter over
+the small `zaino-oram` `FixedEnvelopeRuntime`, `PendingFixedEnvelope`, and
+`PrivateQueryUnavailable` facade. It validates the protobuf boundary through
+named `try_from_wire` / `to_wire` methods, maps boundary and runtime failures to
+one redacted adapter error, and retains the non-`Clone` pending response without
+extracting detached response bytes.
+
+A crate-private custom Tonic codec and body adapter consumes that pending value
+only when the outbound body is first polled. That poll performs the pending
+value's fallible release-time currentness check before borrowing its fixed
+bytes. A successful check encodes one exact fixed-envelope protobuf DATA frame
+and releases the pending value after encoding. A stale or unavailable response
+emits no DATA and is collapsed to one static `Unavailable` trailer shape. If
+the body is dropped before it is polled, the pending value is released without
+a currentness check or response-byte borrow.
+
+The concrete `zaino-oram` runtime owner remains private, with no public
+constructor or factory, so this package currently exercises the shared facade
+with mock implementations only. The generated Tonic service trait is
+deliberately not implemented; it fixes the response type to the generated
+protobuf message and cannot carry this pending value. A generated route and
+listener, production protector/replay/material providers, durable replay,
+trusted clock and nonce ledger, key management, rollback protection, TLS/TDX,
+package/profile-specific message limits, real-owner integration, and
+transport-write or peer-delivery evidence remain open. Currentness at first
+body poll is not currentness at the later transport-write boundary.
+
 ## Release-bound deterministic-build receipt
 
 From a completely clean checkout at an exact full source revision, the
@@ -241,6 +293,13 @@ earlier checkpoint; the RPC-order hash is verified against the indexed
 canonical block before the scan begins. The scanner then verifies genesis,
 height, parent-hash, and final checkpoint continuity while retaining no blocks
 in the runner.
+
+Block fetching is sequential by default. Operators may explicitly set
+`--fetch-concurrency` from 1 through 32 to keep a bounded number of indexed
+block reads in flight. Fetches may complete out of order, but the runner always
+feeds them to the canonical scanner in ascending height order, so this knob
+does not change the measurement or its digest. The bound limits transient
+full-block memory and validator work-queue pressure.
 
 `--output-dir` must name a new directory. The command builds the artifact in a
 temporary sibling directory and atomically renames it into place only after all

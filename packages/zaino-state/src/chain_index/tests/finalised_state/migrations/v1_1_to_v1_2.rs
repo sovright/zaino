@@ -11,8 +11,9 @@ use crate::chain_index::finalised_state::capability::{
     TransparentHistExt as _,
 };
 use crate::chain_index::finalised_state::entry::{StoredEntryFixed, StoredEntryVar};
-use crate::chain_index::finalised_state::finalised_source::v1::DB_SCHEMA_V1_HASH;
-use crate::chain_index::finalised_state::finalised_source::v1::TX_OUT_SET_INFO_ACCUMULATOR_KEY;
+use crate::chain_index::finalised_state::finalised_source::v1::{
+    canonical_schema_hash_for_test, TX_OUT_SET_INFO_ACCUMULATOR_KEY,
+};
 use crate::chain_index::finalised_state::finalised_source::FinalisedSource;
 use crate::chain_index::finalised_state::FinalisedState;
 use crate::chain_index::source::mockchain_source::MockchainSource;
@@ -167,12 +168,17 @@ fn v1_2_0() -> DbVersion {
     }
 }
 
+fn expected_schema_hash(version: DbVersion) -> [u8; 32] {
+    canonical_schema_hash_for_test(version)
+        .expect("every migration fixture version must have a canonical schema hash")
+}
+
 async fn assert_v1_2_migration_complete(zaino_database: &FinalisedState<MockchainSource>) {
     let metadata = zaino_database.get_metadata().await.unwrap();
 
     assert_eq!(metadata.version, v1_2_0());
     assert_eq!(metadata.migration_status, MigrationStatus::Empty);
-    assert_eq!(metadata.schema_hash, DB_SCHEMA_V1_HASH);
+    assert_eq!(metadata.schema_hash, expected_schema_hash(v1_2_0()));
 
     assert!(
         zaino_database
@@ -288,7 +294,7 @@ async fn simulate_interrupted_v1_1_to_v1_2_spent_index_migration(
 
     let mut metadata = database_backend.get_metadata().await.unwrap();
     metadata.version = v1_1_0();
-    metadata.schema_hash = [0u8; 32];
+    metadata.schema_hash = expected_schema_hash(v1_1_0());
     metadata.migration_status = MigrationStatus::PartialBuidInProgress;
 
     {
@@ -441,7 +447,7 @@ async fn v1_1_to_v1_2_spent_index_backfill_from_old_version() {
     let old_metadata = old_database.get_metadata().await.unwrap();
     assert_eq!(old_metadata.version, v1_1_0());
     assert_eq!(old_metadata.migration_status, MigrationStatus::Empty);
-    assert_eq!(old_metadata.schema_hash, DB_SCHEMA_V1_HASH);
+    assert_eq!(old_metadata.schema_hash, expected_schema_hash(v1_1_0()));
 
     let old_database_height = old_database.db_height().await.unwrap().unwrap();
     assert_eq!(old_database_height, initial_active_height);
@@ -513,7 +519,7 @@ async fn v1_1_to_v1_2_spent_index_migration_resumes_after_crash() {
     let old_metadata = old_database.get_metadata().await.unwrap();
     assert_eq!(old_metadata.version, v1_1_0());
     assert_eq!(old_metadata.migration_status, MigrationStatus::Empty);
-    assert_eq!(old_metadata.schema_hash, DB_SCHEMA_V1_HASH);
+    assert_eq!(old_metadata.schema_hash, expected_schema_hash(v1_1_0()));
 
     old_database.shutdown().await.unwrap();
     drop(old_database);
