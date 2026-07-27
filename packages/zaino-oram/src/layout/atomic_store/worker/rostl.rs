@@ -38,10 +38,40 @@ enum UniqueInsertDisposition {
     Duplicate,
 }
 
+/// The raw outcome of one fixed two-access insertion.
+///
+/// This is deliberately a dumb record. It carries the secret-derived flags out
+/// of the access path without interpreting them, so the access path itself
+/// needs no control flow at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UniqueInsertCommit {
-    disposition: UniqueInsertDisposition,
+    found_before: bool,
+    found_after: bool,
+    occupied_before: u64,
     occupied_records: u64,
+}
+
+impl UniqueInsertCommit {
+    /// Classifies a completed commit.
+    ///
+    /// Every branch here runs after both ORAM accesses have already been
+    /// performed, so none of them can change the schedule a host observer sees.
+    fn classify(self) -> Result<UniqueInsertDisposition, RostlStoreError> {
+        if self.found_after != self.found_before {
+            return Err(RostlStoreError::FoundMismatch);
+        }
+        // A hit on an empty table is corruption rather than a duplicate. It is
+        // rejected here, not before the second access, so that the corrupt and
+        // healthy cases keep the same two-access schedule.
+        if self.found_before && self.occupied_before == 0 {
+            return Err(RostlStoreError::OccupancyInvariant);
+        }
+        if self.found_before {
+            Ok(UniqueInsertDisposition::Duplicate)
+        } else {
+            Ok(UniqueInsertDisposition::Inserted)
+        }
+    }
 }
 
 trait FixedUniqueInsertAccess<T> {
@@ -50,13 +80,35 @@ trait FixedUniqueInsertAccess<T> {
     fn write_or_insert_and_remap(&mut self, key: usize, value: T) -> bool;
 }
 
+/// Decides from public state alone whether an insertion may be attempted.
+///
+/// This runs before the first access and deliberately cannot observe the
+/// record. A full table therefore refuses every insertion with zero accesses
+/// and a non-full table always performs exactly two, so occupancy — which is
+/// public — is the only thing that selects between those two schedules.
+fn admit_insert(occupied_records: u64, capacity: u64) -> Result<(), RostlStoreError> {
+    if occupied_records > capacity {
+        return Err(RostlStoreError::OccupancyInvariant);
+    }
+    if occupied_records == capacity {
+        return Err(RostlStoreError::TableFull);
+    }
+    Ok(())
+}
+
+/// Performs the fixed two-access insertion.
+///
+/// The body contains no control flow: the secret hit/miss result reaches only
+/// `Cmov` and integer arithmetic. Callers must first admit the insertion via
+/// [`admit_insert`], which establishes `occupied_records < capacity`, and
+/// [`RostlTable::new`] caps capacity at `u32::MAX`, so the increment cannot
+/// overflow and needs no checked-arithmetic branch.
 fn fixed_unique_insert<T, A>(
     access: &mut A,
     key: usize,
     candidate: T,
     occupied_records: u64,
-    capacity: u64,
-) -> Result<UniqueInsertCommit, RostlStoreError>
+) -> UniqueInsertCommit
 where
     T: Cmov + Copy + Default,
     A: FixedUniqueInsertAccess<T>,
@@ -64,34 +116,16 @@ where
     let mut prior = T::default();
     let found_before = access.read_and_remap(key, &mut prior);
 
-    // A healthy accepted-domain miss and duplicate both continue to the second
-    // access. These early exits are only for already-inconsistent occupancy,
-    // where attempting a missing-key insertion could exceed physical capacity.
-    if occupied_records > capacity
-        || (found_before && occupied_records == 0)
-        || (!found_before && occupied_records == capacity)
-    {
-        return Err(RostlStoreError::OccupancyInvariant);
-    }
-    let next_occupied = occupied_records
-        .checked_add(u64::from(!found_before))
-        .ok_or(RostlStoreError::OccupancyInvariant)?;
-
     let mut selected = candidate;
     selected.cmov(&prior, found_before);
     let found_after = access.write_or_insert_and_remap(key, selected);
-    if found_after != found_before {
-        return Err(RostlStoreError::FoundMismatch);
-    }
 
-    Ok(UniqueInsertCommit {
-        disposition: if found_before {
-            UniqueInsertDisposition::Duplicate
-        } else {
-            UniqueInsertDisposition::Inserted
-        },
-        occupied_records: next_occupied,
-    })
+    UniqueInsertCommit {
+        found_before,
+        found_after,
+        occupied_before: occupied_records,
+        occupied_records: occupied_records + u64::from(!found_before),
+    }
 }
 
 struct RostlTable<T>
@@ -169,18 +203,18 @@ where
                 RostlStoreError::OccupancyInvariant
             })?;
             let occupied_records = self.occupied_records;
-            let result = catch_upstream(|| {
-                fixed_unique_insert(self, key, value, occupied_records, capacity)
-            });
-            let commit = match self.finish_upstream(result)? {
-                Ok(commit) => commit,
-                Err(error) => {
-                    self.failed_closed = true;
-                    return Err(error);
-                }
-            };
+            // Admitted from public occupancy before the access path runs, so a
+            // refusal never depends on whether the key is present.
+            admit_insert(occupied_records, capacity).inspect_err(|_| {
+                self.failed_closed = true;
+            })?;
+            let result = catch_upstream(|| fixed_unique_insert(self, key, value, occupied_records));
+            let commit = self.finish_upstream(result)?;
+            let disposition = commit.classify().inspect_err(|_| {
+                self.failed_closed = true;
+            })?;
             self.occupied_records = commit.occupied_records;
-            match commit.disposition {
+            match disposition {
                 UniqueInsertDisposition::Inserted => Ok(()),
                 UniqueInsertDisposition::Duplicate => Err(RostlStoreError::DuplicateKey),
             }
@@ -291,6 +325,7 @@ enum RostlStoreError {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     DuplicateKey,
     OccupancyInvariant,
+    TableFull,
     FoundMismatch,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     UpstreamPanic,
@@ -307,6 +342,7 @@ impl fmt::Display for RostlStoreError {
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Self::DuplicateKey => f.write_str("typed rostl store rejected a duplicate key"),
             Self::OccupancyInvariant => f.write_str("typed rostl store occupancy is inconsistent"),
+            Self::TableFull => f.write_str("typed rostl store is at capacity"),
             Self::FoundMismatch => f.write_str("typed rostl store access results are inconsistent"),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Self::UpstreamPanic => f.write_str("typed rostl store failed closed"),
@@ -434,29 +470,75 @@ mod tests {
         }
     }
 
-    #[test]
-    fn healthy_missing_and_duplicate_use_the_same_two_access_schedule(
-    ) -> Result<(), RostlStoreError> {
-        let mut missing = FakeAccess::default();
-        let inserted = fixed_unique_insert(&mut missing, 3, 7, 0, 8)?;
-        assert_eq!(inserted.disposition, UniqueInsertDisposition::Inserted);
-        assert_eq!(inserted.occupied_records, 1);
-        assert_eq!(missing.record, Some(7));
-
-        let mut duplicate = FakeAccess {
-            record: Some(11),
+    /// Runs the whole insertion path against a fake backend and reports both the
+    /// classified result and the exact access schedule it produced.
+    fn run_insert(
+        record: Option<u64>,
+        occupied_records: u64,
+        capacity: u64,
+    ) -> (
+        Result<UniqueInsertDisposition, RostlStoreError>,
+        Vec<AccessKind>,
+        Option<u64>,
+    ) {
+        let mut access = FakeAccess {
+            record,
             ..FakeAccess::default()
         };
-        let rejected = fixed_unique_insert(&mut duplicate, 3, 99, 1, 8)?;
-        assert_eq!(rejected.disposition, UniqueInsertDisposition::Duplicate);
-        assert_eq!(rejected.occupied_records, 1);
-        assert_eq!(duplicate.record, Some(11));
-        assert_eq!(missing.trace, duplicate.trace);
+        let result = admit_insert(occupied_records, capacity)
+            .and_then(|()| fixed_unique_insert(&mut access, 3, 7, occupied_records).classify());
+        (result, access.trace, access.record)
+    }
+
+    /// The Gate 2 property: at every public occupancy a present record and an
+    /// absent record must produce identical access schedules.
+    #[test]
+    fn hit_and_miss_share_an_access_schedule_at_every_public_occupancy() {
+        const CAPACITY: u64 = 8;
+        for occupied in [0, 1, 7, CAPACITY] {
+            let (_, hit, _) = run_insert(Some(11), occupied, CAPACITY);
+            let (_, miss, _) = run_insert(None, occupied, CAPACITY);
+            assert_eq!(hit, miss, "schedules diverged at occupied={occupied}");
+        }
+    }
+
+    /// Pins the two schedules the property test compares so it cannot pass
+    /// vacuously by refusing, or accessing, in every state alike.
+    #[test]
+    fn admitted_insertions_access_twice_and_refused_insertions_never_access() {
+        const CAPACITY: u64 = 8;
+        let (_, admitted, _) = run_insert(None, 1, CAPACITY);
+        assert_eq!(admitted, vec![AccessKind::Read, AccessKind::WriteOrInsert]);
+
+        let (refused, refused_trace, _) = run_insert(None, CAPACITY, CAPACITY);
+        assert_eq!(refused, Err(RostlStoreError::TableFull));
+        assert_eq!(refused_trace, Vec::new());
+    }
+
+    #[test]
+    fn healthy_missing_and_duplicate_use_the_same_two_access_schedule() {
+        let (inserted, inserted_trace, stored) = run_insert(None, 0, 8);
+        assert_eq!(inserted, Ok(UniqueInsertDisposition::Inserted));
+        assert_eq!(stored, Some(7));
+
+        let (duplicate, duplicate_trace, preserved) = run_insert(Some(11), 1, 8);
+        assert_eq!(duplicate, Ok(UniqueInsertDisposition::Duplicate));
+        assert_eq!(preserved, Some(11));
+
+        assert_eq!(inserted_trace, duplicate_trace);
         assert_eq!(
-            missing.trace,
+            inserted_trace,
             vec![AccessKind::Read, AccessKind::WriteOrInsert]
         );
-        Ok(())
+    }
+
+    /// This case formerly short-circuited after a single access. A hit on an
+    /// empty table now costs the full schedule and is rejected only afterwards.
+    #[test]
+    fn hit_on_an_empty_table_is_rejected_after_both_accesses() {
+        let (result, trace, _) = run_insert(Some(11), 0, 8);
+        assert_eq!(result, Err(RostlStoreError::OccupancyInvariant));
+        assert_eq!(trace, vec![AccessKind::Read, AccessKind::WriteOrInsert]);
     }
 
     #[test]
@@ -467,7 +549,7 @@ mod tests {
             ..FakeAccess::default()
         };
         assert_eq!(
-            fixed_unique_insert(&mut access, 3, 99, 1, 8),
+            fixed_unique_insert(&mut access, 3, 99, 1).classify(),
             Err(RostlStoreError::FoundMismatch)
         );
         assert_eq!(
@@ -478,13 +560,10 @@ mod tests {
     }
 
     #[test]
-    fn impossible_occupancy_fails_before_a_risky_second_access() {
-        let mut access = FakeAccess::default();
-        assert_eq!(
-            fixed_unique_insert(&mut access, 3, 99, 8, 8),
-            Err(RostlStoreError::OccupancyInvariant)
-        );
-        assert_eq!(access.trace, vec![AccessKind::Read]);
+    fn inconsistent_occupancy_is_refused_before_any_access() {
+        let (result, trace, _) = run_insert(None, 9, 8);
+        assert_eq!(result, Err(RostlStoreError::OccupancyInvariant));
+        assert_eq!(trace, Vec::new());
     }
 
     #[test]
@@ -576,21 +655,23 @@ mod tests {
         Ok(())
     }
 
+    /// A full table is refused from public occupancy alone, before any access,
+    /// so no insertion into it can reveal whether the key was present.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn full_store_duplicate_still_completes_both_accesses() -> Result<(), RostlStoreError> {
+    fn full_store_refuses_every_insertion_without_accessing() -> Result<(), RostlStoreError> {
         let mut store = RostlTable::<PersistentAddressDirectory>::new(8)?;
         for key in 0..8 {
             store.insert_record_unique(key, directory_record(key as u8 + 1, key as u32))?;
         }
         assert_eq!(store.occupied_record_count()?, 8);
+
         let before = store.oram.evict_counter;
         assert_eq!(
             store.insert_record_unique(3, directory_record(0xf0, 7)),
-            Err(RostlStoreError::DuplicateKey)
+            Err(RostlStoreError::TableFull)
         );
-        let after = store.oram.evict_counter;
-        assert_eq!((after + 8 - before) % 8, 4);
+        assert_eq!(store.oram.evict_counter, before);
         assert_eq!(store.occupied_record_count()?, 8);
         assert_eq!(store.read_record(3)?, Some(directory_record(4, 3)));
         Ok(())
