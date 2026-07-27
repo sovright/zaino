@@ -27,6 +27,10 @@ pub(crate) use publication::serving_epoch_for_tests;
 pub(super) use publication::FinalizedServingStore;
 #[cfg(test)]
 use publication::RecentSnapshotLineageError;
+#[cfg(feature = "corpus-zaino")]
+pub(super) use publication::ServingEpochReleaseWitness;
+#[cfg(feature = "corpus-zaino")]
+pub(crate) use publication::{CanonicalServingEpochCurrentness, RecentSnapshotRefreshController};
 pub(super) use publication::{FrozenRecentSnapshot, RecentSnapshotLineage};
 pub(super) use publication::{
     ServingEpochBoundary, ServingEpochCurrentness, ServingEpochLease, ServingEpochStore,

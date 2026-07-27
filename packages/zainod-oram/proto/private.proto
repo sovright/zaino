@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package zaino.private.v1;
+
+// One fixed-size protected application envelope.
+message FixedEnvelope {
+  bytes envelope = 1;
+}
+
+// Independent private-query surface. This is not the legacy lightwallet API.
+service PrivateCompactTxStreamer {
+  rpc QueryPage(FixedEnvelope) returns (FixedEnvelope);
+}
