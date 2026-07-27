@@ -10,6 +10,8 @@
   remains a tracked distribution-readiness concern, not a Phase 0 blocker.
 - Completed Gate 1 capture operation:
   [2026-07-26 mainnet capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
+- Active Gate 1 insertion-budget slice:
+  [2026-07-27 work log](oram-gate1-insertion-budget-status-2026-07-27.md).
 
 This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
