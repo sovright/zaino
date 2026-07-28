@@ -18,8 +18,9 @@
 //! Concurrent load inflates variance and widens confidence intervals, making an
 //! equivalence result harder to obtain. More importantly, uncontrolled load can
 //! create, erase, or reorder timing effects, so a noisy run is not conservative
-//! evidence in either direction. The platform driver therefore checks an
-//! initial [`Quiescence`] snapshot and records contention throughout the run.
+//! evidence in either direction. The platform driver therefore applies its
+//! [`QuiescencePolicy`] before, between, and after the record-kind experiments
+//! and records scheduler contention around every timed insertion.
 
 use std::fmt;
 
@@ -142,7 +143,7 @@ pub struct QuiescencePolicy {
 }
 
 impl QuiescencePolicy {
-    /// Declares the admissible conditions before the run.
+    /// Declares the admissible conditions at every environment snapshot.
     pub const fn new(max_load_average_1m: f64, max_competing_processes: usize) -> Self {
         Self {
             max_load_average_1m,

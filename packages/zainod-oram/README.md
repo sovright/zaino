@@ -105,6 +105,7 @@ policy admits the initial host state:
 cargo build -p zainod-oram --features typed-qualification \
   --bin zainod-oram-timing --release
 taskset -c 3 target/release/zainod-oram-timing \
+  --mode hit-miss \
   --directory-capacity <POWER_OF_TWO> \
   --directory-occupancy <RECORDS_BELOW_CAPACITY> \
   --event-capacity <POWER_OF_TWO> \
@@ -117,6 +118,47 @@ taskset -c 3 target/release/zainod-oram-timing \
   --seed <SEED> \
   --output <NEW_JSON_FILE>
 ```
+
+`--mode hit-miss` is the default and measures the actual existing-key versus
+absent-key insertion paths. The same supported driver also runs the two null
+controls; use a distinct new output path for every invocation:
+
+```console
+taskset -c 3 target/release/zainod-oram-timing \
+  --mode forced-hit \
+  --directory-capacity <POWER_OF_TWO> \
+  --directory-occupancy <RECORDS_BELOW_CAPACITY> \
+  --event-capacity <POWER_OF_TWO> \
+  --event-occupancy <RECORDS_BELOW_CAPACITY> \
+  --mean-bound-nanos <PREDECLARED_NANOSECONDS> \
+  --cdf-distance-bound <PREDECLARED_0_TO_1_BOUND> \
+  --max-load-average-1m <LOAD> \
+  --max-competing-processes <COUNT> \
+  --max-runqueue-wait-ratio <PREDECLARED_0_TO_1_RATIO> \
+  --seed <SEED> \
+  --output <NEW_FORCED_HIT_JSON_FILE>
+taskset -c 3 target/release/zainod-oram-timing \
+  --mode forced-miss \
+  --directory-capacity <POWER_OF_TWO> \
+  --directory-occupancy <RECORDS_BELOW_CAPACITY> \
+  --event-capacity <POWER_OF_TWO> \
+  --event-occupancy <RECORDS_BELOW_CAPACITY> \
+  --mean-bound-nanos <PREDECLARED_NANOSECONDS> \
+  --cdf-distance-bound <PREDECLARED_0_TO_1_BOUND> \
+  --max-load-average-1m <LOAD> \
+  --max-competing-processes <COUNT> \
+  --max-runqueue-wait-ratio <PREDECLARED_0_TO_1_RATIO> \
+  --seed <SEED> \
+  --output <NEW_FORCED_MISS_JSON_FILE>
+```
+
+`forced-hit` executes the existing-key insertion for both schedule labels;
+`forced-miss` executes the absent-key insertion for both labels. They retain the
+same balanced AB/BA schedule, fresh equal-occupancy tables, warm-up, scheduler
+admission, statistics, and atomic artifact publication as `hit-miss`. Their
+reported hit/miss-named statistics compare the two schedule labels, not two
+different operations. One invocation always measures both the directory and
+event record kinds in its selected mode.
 
 Set `kernel.sched_schedstats=1` before the run if the host has disabled that
 accounting. The driver reads the control before, between, and after the two
@@ -133,19 +175,27 @@ limits. The statistical gate evaluates the pooled sample, both AB/BA order
 strata, and both first/second measurement positions, preventing order or
 cache-period effects from cancelling into a pass. The file also records CPU
 and quiescence observations before, between, and after the two experiments.
+The `zaino-oram-insert-timing-v2` artifact records the selected mode and
+separate booleans for all three quiescence decisions, affinity stability,
+scheduler-stat continuity, both per-record scheduler decisions, and the
+combined environment decision. Its `mode` value is `hit_miss`, `forced_hit`,
+or `forced_miss`.
 Scheduler counters bracket every timed insertion. Run-queue wait is divided by
 the narrower measured wall-clock interval, so scheduler work at either procfs
 bracket can only make admission more conservative; both aggregate and
 worst-measurement ratios must meet the declared bound.
-CPU-affinity drift, disabled scheduler accounting, or excess run-queue waiting
-makes `declared_criteria_satisfied` false after preserving the negative result.
-The initial load policy is not reused as a post-run gate because the CPU-bound
-driver contributes to Linux's one-minute load average.
+The declared quiescence policy must admit all three snapshots. The caller must
+therefore choose its predeclared load-average bound with the CPU-bound driver's
+own contribution in mind. A post-start quiescence failure, CPU-affinity drift,
+disabled scheduler accounting, or excess run-queue waiting makes
+`declared_criteria_satisfied` false after preserving the negative artifact.
 
-The CDF gate detects threshold-visible distribution shapes that mean and AUC
-can miss, but it is not evidence against arbitrary nonlinear classifiers,
-memory/page traces, PMU traces, allocator behavior, or other host side
-channels. Bounds and host thresholds are caller-selected, so
+The CDF gate detects threshold-visible distribution shapes that the mean can
+miss. AUC remains a diagnostic with no universal pass threshold; the
+predeclared paired-mean and CDF bounds remain the gate. Neither result is
+evidence against arbitrary nonlinear classifiers, memory/page traces, PMU
+traces, allocator behavior, or other host side channels. Bounds and host
+thresholds are caller-selected, so
 `declared_criteria_satisfied` means exactly that and is not by itself a Gate 2
 qualification. The output is self-reported and is not signed, source-bound, or
 execution-attested.

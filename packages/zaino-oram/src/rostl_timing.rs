@@ -19,6 +19,22 @@ pub enum RostlTimingRecordKind {
     Event,
 }
 
+/// Which insertion operation each scheduled timing label executes.
+///
+/// [`Self::HitMiss`] measures the real hit/miss distinction. The forced modes
+/// are null controls: the scheduler still emits balanced hit and miss labels,
+/// but both labels execute the same insertion outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RostlTimingMode {
+    /// Execute the operation named by each scheduled label.
+    HitMiss,
+    /// Execute a duplicate-key insertion for both scheduled labels.
+    ForcedHit,
+    /// Execute a missing-key insertion for both scheduled labels.
+    ForcedMiss,
+}
+
 /// Why the native insertion timing probe could not run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RostlTimingError {
@@ -102,9 +118,27 @@ pub fn run_rostl_insert_timing(
     occupancy: usize,
     plan: &ExperimentPlan,
 ) -> Result<RostlTimingRun, RostlTimingError> {
+    run_rostl_insert_timing_mode(kind, RostlTimingMode::HitMiss, capacity, occupancy, plan)
+}
+
+/// Runs one record kind in a selected real or null-control timing mode.
+///
+/// Pair fields retain their scheduled hit/miss labels in every mode. In a
+/// forced mode those labels do not describe the executed insertion outcome;
+/// both labels execute the operation selected by `mode`.
+///
+/// The caller owns platform controls: it must check CPU affinity and machine
+/// quiescence immediately before and after this call.
+pub fn run_rostl_insert_timing_mode(
+    kind: RostlTimingRecordKind,
+    mode: RostlTimingMode,
+    capacity: usize,
+    occupancy: usize,
+    plan: &ExperimentPlan,
+) -> Result<RostlTimingRun, RostlTimingError> {
     #[cfg(feature = "rostl-experimental")]
     {
-        let mut probe = crate::layout::rostl_insert_timing_probe(kind, capacity, occupancy)?;
+        let mut probe = crate::layout::rostl_insert_timing_probe(kind, mode, capacity, occupancy)?;
         let pairs = crate::timing_experiment::run(plan, &mut probe)?;
         let scheduler = summarize_scheduler(&pairs)?;
         Ok(RostlTimingRun { pairs, scheduler })
@@ -112,7 +146,7 @@ pub fn run_rostl_insert_timing(
 
     #[cfg(not(feature = "rostl-experimental"))]
     {
-        let _ = (kind, capacity, occupancy, plan);
+        let _ = (kind, mode, capacity, occupancy, plan);
         Err(RostlTimingError::UnsupportedPlatform)
     }
 }
@@ -176,7 +210,13 @@ pub fn validate_rostl_timing_shape(
 ) -> Result<(), RostlTimingError> {
     #[cfg(feature = "rostl-experimental")]
     {
-        crate::layout::rostl_insert_timing_probe(kind, capacity, occupancy).map(|_| ())
+        crate::layout::rostl_insert_timing_probe(
+            kind,
+            RostlTimingMode::HitMiss,
+            capacity,
+            occupancy,
+        )
+        .map(|_| ())
     }
 
     #[cfg(not(feature = "rostl-experimental"))]
@@ -190,6 +230,62 @@ pub fn validate_rostl_timing_shape(
 mod tests {
     use super::*;
     use crate::timing_equivalence::{ArmMeasurement, PairOrder, TimedSchedulerDelta};
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use crate::{TimingSeed, MINIMUM_PAIRS};
+
+    #[test]
+    fn timing_modes_use_stable_snake_case_names() -> Result<(), serde_json::Error> {
+        for (mode, encoded) in [
+            (RostlTimingMode::HitMiss, "\"hit_miss\""),
+            (RostlTimingMode::ForcedHit, "\"forced_hit\""),
+            (RostlTimingMode::ForcedMiss, "\"forced_miss\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode)?, encoded);
+            assert_eq!(serde_json::from_str::<RostlTimingMode>(encoded)?, mode);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn forced_modes_emit_complete_labelled_pairs_for_both_record_kinds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let plan = ExperimentPlan::new(MINIMUM_PAIRS, 1, TimingSeed::new(0xfeed_cafe))?;
+
+        for kind in [
+            RostlTimingRecordKind::Directory,
+            RostlTimingRecordKind::Event,
+        ] {
+            for mode in [RostlTimingMode::ForcedHit, RostlTimingMode::ForcedMiss] {
+                let run = run_rostl_insert_timing_mode(kind, mode, 8, 7, &plan)?;
+                let (pairs, _) = run.into_parts();
+                assert_eq!(pairs.len(), MINIMUM_PAIRS);
+
+                let encoded = serde_json::to_value(&pairs)?;
+                let Some(encoded_pairs) = encoded.as_array() else {
+                    panic!("timing pairs must serialize as an array");
+                };
+                let hit_first = encoded_pairs
+                    .iter()
+                    .filter(|pair| pair["order"] == "hit_first")
+                    .count();
+                let miss_first = encoded_pairs
+                    .iter()
+                    .filter(|pair| pair["order"] == "miss_first")
+                    .count();
+
+                assert_eq!(hit_first, MINIMUM_PAIRS / 2);
+                assert_eq!(miss_first, MINIMUM_PAIRS / 2);
+                assert!(encoded_pairs.iter().all(|pair| {
+                    pair["hit_nanos"].as_u64().is_some()
+                        && pair["miss_nanos"].as_u64().is_some()
+                        && pair["hit_scheduler"].is_object()
+                        && pair["miss_scheduler"].is_object()
+                }));
+            }
+        }
+        Ok(())
+    }
 
     fn measured_pair(
         order: PairOrder,

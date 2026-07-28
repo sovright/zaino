@@ -33,7 +33,7 @@ use crate::timing_equivalence::ArmMeasurement;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::timing_equivalence::TimedSchedulerDelta;
 use crate::timing_experiment::{Arm, PairedProbe};
-use crate::{RostlTimingError, RostlTimingRecordKind};
+use crate::{RostlTimingError, RostlTimingMode, RostlTimingRecordKind};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use rand::Rng as _;
@@ -454,6 +454,7 @@ fn build_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) struct RostlInsertTimingProbe {
     inner: RostlInsertTimingProbeKind,
+    mode: RostlTimingMode,
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -467,6 +468,7 @@ enum RostlInsertTimingProbeKind {
 
 pub(crate) fn rostl_insert_timing_probe(
     kind: RostlTimingRecordKind,
+    mode: RostlTimingMode,
     capacity: usize,
     occupancy: usize,
 ) -> Result<RostlInsertTimingProbe, RostlTimingError> {
@@ -476,11 +478,13 @@ pub(crate) fn rostl_insert_timing_probe(
             RostlTimingRecordKind::Directory => {
                 InsertProbe::new(capacity, occupancy).map(|probe| RostlInsertTimingProbe {
                     inner: RostlInsertTimingProbeKind::Directory(probe),
+                    mode,
                 })
             }
             RostlTimingRecordKind::Event => {
                 InsertProbe::new(capacity, occupancy).map(|probe| RostlInsertTimingProbe {
                     inner: RostlInsertTimingProbeKind::Event(probe),
+                    mode,
                 })
             }
         }
@@ -488,8 +492,19 @@ pub(crate) fn rostl_insert_timing_probe(
 
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        let _ = (kind, capacity, occupancy);
+        let _ = (kind, mode, capacity, occupancy);
         Err(RostlTimingError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl RostlInsertTimingProbe {
+    fn executed_arm(&self, scheduled: Arm) -> Arm {
+        match self.mode {
+            RostlTimingMode::HitMiss => scheduled,
+            RostlTimingMode::ForcedHit => Arm::Hit,
+            RostlTimingMode::ForcedMiss => Arm::Miss,
+        }
     }
 }
 
@@ -497,10 +512,11 @@ pub(crate) fn rostl_insert_timing_probe(
 impl PairedProbe for RostlInsertTimingProbe {
     type Error = RostlTimingError;
 
-    fn measure(&mut self, arm: Arm) -> Result<ArmMeasurement, Self::Error> {
+    fn measure(&mut self, scheduled: Arm) -> Result<ArmMeasurement, Self::Error> {
+        let executed = self.executed_arm(scheduled);
         match &mut self.inner {
-            RostlInsertTimingProbeKind::Directory(probe) => probe.measure(arm),
-            RostlInsertTimingProbeKind::Event(probe) => probe.measure(arm),
+            RostlInsertTimingProbeKind::Directory(probe) => probe.measure(executed),
+            RostlInsertTimingProbeKind::Event(probe) => probe.measure(executed),
         }
     }
 }
@@ -1012,14 +1028,29 @@ mod tests {
     /// the arm required.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn probes_measure_both_records_and_accept_near_full_tables() -> Result<(), RostlTimingError> {
+    fn probes_measure_every_mode_for_both_records_and_accept_near_full_tables(
+    ) -> Result<(), RostlTimingError> {
         for kind in [
             RostlTimingRecordKind::Directory,
             RostlTimingRecordKind::Event,
         ] {
-            let mut probe = rostl_insert_timing_probe(kind, 8, 7)?;
-            probe.measure(Arm::Hit)?;
-            probe.measure(Arm::Miss)?;
+            for mode in [
+                RostlTimingMode::HitMiss,
+                RostlTimingMode::ForcedHit,
+                RostlTimingMode::ForcedMiss,
+            ] {
+                let mut probe = rostl_insert_timing_probe(kind, mode, 8, 7)?;
+                let expected = match mode {
+                    RostlTimingMode::HitMiss => (Arm::Hit, Arm::Miss),
+                    RostlTimingMode::ForcedHit => (Arm::Hit, Arm::Hit),
+                    RostlTimingMode::ForcedMiss => (Arm::Miss, Arm::Miss),
+                };
+
+                assert_eq!(probe.executed_arm(Arm::Hit), expected.0);
+                assert_eq!(probe.executed_arm(Arm::Miss), expected.1);
+                probe.measure(Arm::Hit)?;
+                probe.measure(Arm::Miss)?;
+            }
         }
 
         assert_eq!(

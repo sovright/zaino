@@ -77,8 +77,9 @@ pub use qualification::{
     run_typed_worker_qualification, TypedWorkerQualificationError, TypedWorkerQualificationReport,
 };
 pub use rostl_timing::{
-    run_rostl_insert_timing, validate_rostl_timing_shape, RostlTimingError, RostlTimingRecordKind,
-    RostlTimingRun, RostlTimingSchedulerSummary,
+    run_rostl_insert_timing, run_rostl_insert_timing_mode, validate_rostl_timing_shape,
+    RostlTimingError, RostlTimingMode, RostlTimingRecordKind, RostlTimingRun,
+    RostlTimingSchedulerSummary,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use stress_qualification::{

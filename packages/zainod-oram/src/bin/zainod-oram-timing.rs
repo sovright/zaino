@@ -11,20 +11,20 @@ use std::{
     process::ExitCode,
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rustix::fs::{renameat_with, RenameFlags, CWD};
 use serde::Serialize;
 use tempfile::NamedTempFile;
 use zaino_oram::{
-    evaluate_timing_equivalence, run_rostl_insert_timing, single_allowed_cpu,
+    evaluate_timing_equivalence, run_rostl_insert_timing_mode, single_allowed_cpu,
     validate_rostl_timing_shape, EquivalenceBounds, EquivalenceReport, ExperimentPlan, Pair,
-    Quiescence, QuiescencePolicy, RostlTimingRecordKind, RostlTimingSchedulerSummary, TimingSeed,
-    MINIMUM_PAIRS,
+    Quiescence, QuiescencePolicy, RostlTimingMode, RostlTimingRecordKind,
+    RostlTimingSchedulerSummary, TimingSeed, MINIMUM_PAIRS,
 };
 
 type DriverResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const SCHEMA: &str = "zaino-oram-insert-timing-v1";
+const SCHEMA: &str = "zaino-oram-insert-timing-v2";
 const WARMUP_PAIRS: usize = 50;
 const EVENT_SEED_DOMAIN: u64 = 0xe7e1_82a5_7b9c_4d31;
 
@@ -35,6 +35,10 @@ const EVENT_SEED_DOMAIN: u64 = 0xe7e1_82a5_7b9c_4d31;
     about = "Run the synchronous Gate 2 insertion timing experiment"
 )]
 struct Cli {
+    /// Comparison mode: real hit/miss arms or an equal-operation null control.
+    #[arg(long, value_enum, default_value = "hit-miss")]
+    mode: TimingModeArgument,
+
     /// Allocated address-directory table slots.
     #[arg(long)]
     directory_capacity: usize,
@@ -51,11 +55,11 @@ struct Cli {
     #[arg(long)]
     event_occupancy: usize,
 
-    /// Predeclared maximum absolute mean hit/miss difference in nanoseconds.
+    /// Predeclared maximum absolute scheduled-label mean difference in nanoseconds.
     #[arg(long)]
     mean_bound_nanos: f64,
 
-    /// Predeclared maximum true hit/miss CDF distance.
+    /// Predeclared maximum true scheduled-label CDF distance.
     #[arg(long)]
     cdf_distance_bound: f64,
 
@@ -80,6 +84,23 @@ struct Cli {
     output: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TimingModeArgument {
+    HitMiss,
+    ForcedHit,
+    ForcedMiss,
+}
+
+impl TimingModeArgument {
+    const fn rostl_mode(self) -> RostlTimingMode {
+        match self {
+            Self::HitMiss => RostlTimingMode::HitMiss,
+            Self::ForcedHit => RostlTimingMode::ForcedHit,
+            Self::ForcedMiss => RostlTimingMode::ForcedMiss,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct EnvironmentSnapshot {
     cpus_allowed_list: String,
@@ -101,17 +122,37 @@ struct RecordEvidence {
 }
 
 #[derive(Debug, Serialize)]
-struct TimingEvidence {
+struct EnvironmentAdmission {
+    before_quiescence_admitted: bool,
+    between_records_quiescence_admitted: bool,
+    after_quiescence_admitted: bool,
+    affinity_stable: bool,
+    scheduler_stats_stayed_enabled: bool,
+    directory_scheduler_admitted: bool,
+    event_scheduler_admitted: bool,
+    environment_admitted: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TimingEvidenceMetadata {
     schema: &'static str,
     runner_version: &'static str,
     platform_os: &'static str,
     platform_arch: &'static str,
+    mode: RostlTimingMode,
     policy: QuiescencePolicy,
     before: EnvironmentSnapshot,
     between_records: EnvironmentSnapshot,
     after: EnvironmentSnapshot,
     max_runqueue_wait_ratio: f64,
-    environment_admitted: bool,
+    #[serde(flatten)]
+    admission: EnvironmentAdmission,
+}
+
+#[derive(Debug, Serialize)]
+struct TimingEvidence {
+    #[serde(flatten)]
+    metadata: TimingEvidenceMetadata,
     directory: RecordEvidence,
     event: RecordEvidence,
     declared_criteria_satisfied: bool,
@@ -239,16 +280,19 @@ fn run(cli: Cli) -> DriverResult<bool> {
     let event_seed = cli.seed ^ EVENT_SEED_DOMAIN;
     let event_plan = ExperimentPlan::new(MINIMUM_PAIRS, WARMUP_PAIRS, TimingSeed::new(event_seed))?;
 
-    let directory_run = run_rostl_insert_timing(
+    let mode = cli.mode.rostl_mode();
+    let directory_run = run_rostl_insert_timing_mode(
         RostlTimingRecordKind::Directory,
+        mode,
         cli.directory_capacity,
         cli.directory_occupancy,
         &directory_plan,
     )?;
     let (directory_pairs, directory_scheduler) = directory_run.into_parts();
     let between_records = read_environment()?;
-    let event_run = run_rostl_insert_timing(
+    let event_run = run_rostl_insert_timing_mode(
         RostlTimingRecordKind::Event,
+        mode,
         cli.event_capacity,
         cli.event_occupancy,
         &event_plan,
@@ -260,31 +304,35 @@ fn run(cli: Cli) -> DriverResult<bool> {
         evaluate_timing_equivalence(&directory_pairs, bounds, TimingSeed::new(cli.seed));
     let event_report =
         evaluate_timing_equivalence(&event_pairs, bounds, TimingSeed::new(event_seed));
-    let affinity_stable =
-        between_records.allowed_cpu == Some(pinned_cpu) && after.allowed_cpu == Some(pinned_cpu);
-    let scheduler_stats_stayed_enabled =
-        between_records.scheduler_stats_enabled && after.scheduler_stats_enabled;
     let directory_scheduler_admitted = directory_scheduler.admits(cli.max_runqueue_wait_ratio);
     let event_scheduler_admitted = event_scheduler.admits(cli.max_runqueue_wait_ratio);
-    let environment_admitted = affinity_stable
-        && scheduler_stats_stayed_enabled
-        && directory_scheduler_admitted
-        && event_scheduler_admitted;
-    let declared_criteria_satisfied = environment_admitted
+    let admission = evaluate_environment_admission(
+        &policy,
+        pinned_cpu,
+        &before,
+        &between_records,
+        &after,
+        directory_scheduler_admitted,
+        event_scheduler_admitted,
+    );
+    let declared_criteria_satisfied = admission.environment_admitted
         && directory_report.bounds_satisfied()
         && event_report.bounds_satisfied();
 
     let evidence = TimingEvidence {
-        schema: SCHEMA,
-        runner_version: env!("CARGO_PKG_VERSION"),
-        platform_os: std::env::consts::OS,
-        platform_arch: std::env::consts::ARCH,
-        policy,
-        before,
-        between_records,
-        after,
-        max_runqueue_wait_ratio: cli.max_runqueue_wait_ratio,
-        environment_admitted,
+        metadata: TimingEvidenceMetadata {
+            schema: SCHEMA,
+            runner_version: env!("CARGO_PKG_VERSION"),
+            platform_os: std::env::consts::OS,
+            platform_arch: std::env::consts::ARCH,
+            mode,
+            policy,
+            before,
+            between_records,
+            after,
+            max_runqueue_wait_ratio: cli.max_runqueue_wait_ratio,
+            admission,
+        },
         directory: RecordEvidence {
             kind: RostlTimingRecordKind::Directory,
             capacity: cli.directory_capacity,
@@ -310,6 +358,43 @@ fn run(cli: Cli) -> DriverResult<bool> {
     publish_json(&cli.output, &evidence)?;
     println!("timing_evidence={}", cli.output.display());
     Ok(declared_criteria_satisfied)
+}
+
+fn evaluate_environment_admission(
+    policy: &QuiescencePolicy,
+    pinned_cpu: u32,
+    before: &EnvironmentSnapshot,
+    between_records: &EnvironmentSnapshot,
+    after: &EnvironmentSnapshot,
+    directory_scheduler_admitted: bool,
+    event_scheduler_admitted: bool,
+) -> EnvironmentAdmission {
+    let before_quiescence_admitted = policy.admits(&before.quiescence);
+    let between_records_quiescence_admitted = policy.admits(&between_records.quiescence);
+    let after_quiescence_admitted = policy.admits(&after.quiescence);
+    let affinity_stable = [before, between_records, after]
+        .iter()
+        .all(|snapshot| snapshot.allowed_cpu == Some(pinned_cpu));
+    let scheduler_stats_stayed_enabled = [before, between_records, after]
+        .iter()
+        .all(|snapshot| snapshot.scheduler_stats_enabled);
+    let environment_admitted = before_quiescence_admitted
+        && between_records_quiescence_admitted
+        && after_quiescence_admitted
+        && affinity_stable
+        && scheduler_stats_stayed_enabled
+        && directory_scheduler_admitted
+        && event_scheduler_admitted;
+    EnvironmentAdmission {
+        before_quiescence_admitted,
+        between_records_quiescence_admitted,
+        after_quiescence_admitted,
+        affinity_stable,
+        scheduler_stats_stayed_enabled,
+        directory_scheduler_admitted,
+        event_scheduler_admitted,
+        environment_admitted,
+    }
 }
 
 fn read_environment() -> DriverResult<EnvironmentSnapshot> {
@@ -410,6 +495,37 @@ fn sync_parent(parent: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn snapshot(
+        load_average_1m: f64,
+        allowed_cpu: Option<u32>,
+        scheduler_stats_enabled: bool,
+    ) -> EnvironmentSnapshot {
+        EnvironmentSnapshot {
+            cpus_allowed_list: allowed_cpu.map_or_else(|| "0-3".to_owned(), |cpu| cpu.to_string()),
+            allowed_cpu,
+            quiescence: Quiescence::new(load_average_1m, 0),
+            scheduler_stats_enabled,
+        }
+    }
+
+    fn admission(
+        before: &EnvironmentSnapshot,
+        between_records: &EnvironmentSnapshot,
+        after: &EnvironmentSnapshot,
+        directory_scheduler_admitted: bool,
+        event_scheduler_admitted: bool,
+    ) -> EnvironmentAdmission {
+        evaluate_environment_admission(
+            &QuiescencePolicy::new(1.0, 0),
+            3,
+            before,
+            between_records,
+            after,
+            directory_scheduler_admitted,
+            event_scheduler_admitted,
+        )
+    }
+
     #[test]
     fn parses_linux_environment_fields() -> Result<(), Box<dyn Error>> {
         let status = "Name:\tzainod\nCpus_allowed_list:\t7\n";
@@ -447,6 +563,141 @@ mod tests {
             parse_scheduler_stats_control("enabled"),
             Err(DriverError::InvalidSchedulerStatsControl)
         ));
+    }
+
+    #[test]
+    fn before_quiescence_failure_rejects_environment() {
+        let before = snapshot(1.01, Some(3), true);
+        let between_records = snapshot(0.5, Some(3), true);
+        let after = snapshot(0.5, Some(3), true);
+
+        let result = admission(&before, &between_records, &after, true, true);
+
+        assert!(!result.before_quiescence_admitted);
+        assert!(result.between_records_quiescence_admitted);
+        assert!(result.after_quiescence_admitted);
+        assert!(!result.environment_admitted);
+    }
+
+    #[test]
+    fn between_records_quiescence_failure_rejects_environment() {
+        let before = snapshot(0.5, Some(3), true);
+        let between_records = snapshot(1.01, Some(3), true);
+        let after = snapshot(0.5, Some(3), true);
+
+        let result = admission(&before, &between_records, &after, true, true);
+
+        assert!(result.before_quiescence_admitted);
+        assert!(!result.between_records_quiescence_admitted);
+        assert!(result.after_quiescence_admitted);
+        assert!(!result.environment_admitted);
+    }
+
+    #[test]
+    fn after_quiescence_failure_rejects_environment() {
+        let before = snapshot(0.5, Some(3), true);
+        let between_records = snapshot(0.5, Some(3), true);
+        let after = snapshot(1.01, Some(3), true);
+
+        let result = admission(&before, &between_records, &after, true, true);
+
+        assert!(result.before_quiescence_admitted);
+        assert!(result.between_records_quiescence_admitted);
+        assert!(!result.after_quiescence_admitted);
+        assert!(!result.environment_admitted);
+    }
+
+    #[test]
+    fn affinity_drift_rejects_environment() {
+        let before = snapshot(0.5, Some(3), true);
+        let between_records = snapshot(0.5, Some(4), true);
+        let after = snapshot(0.5, Some(3), true);
+
+        let result = admission(&before, &between_records, &after, true, true);
+
+        assert!(!result.affinity_stable);
+        assert!(!result.environment_admitted);
+    }
+
+    #[test]
+    fn scheduler_stats_loss_rejects_environment() {
+        let before = snapshot(0.5, Some(3), true);
+        let between_records = snapshot(0.5, Some(3), true);
+        let after = snapshot(0.5, Some(3), false);
+
+        let result = admission(&before, &between_records, &after, true, true);
+
+        assert!(!result.scheduler_stats_stayed_enabled);
+        assert!(!result.environment_admitted);
+    }
+
+    #[test]
+    fn either_scheduler_summary_failure_rejects_environment() {
+        let before = snapshot(0.5, Some(3), true);
+        let between_records = snapshot(0.5, Some(3), true);
+        let after = snapshot(0.5, Some(3), true);
+
+        let directory_failure = admission(&before, &between_records, &after, false, true);
+        let event_failure = admission(&before, &between_records, &after, true, false);
+
+        assert!(!directory_failure.directory_scheduler_admitted);
+        assert!(!directory_failure.environment_admitted);
+        assert!(!event_failure.event_scheduler_admitted);
+        assert!(!event_failure.environment_admitted);
+    }
+
+    #[test]
+    fn v2_metadata_records_mode_and_all_admission_fields() -> Result<(), serde_json::Error> {
+        let before = snapshot(0.5, Some(3), true);
+        let between_records = snapshot(0.5, Some(3), true);
+        let after = snapshot(0.5, Some(3), true);
+        let admission = admission(&before, &between_records, &after, true, true);
+        let metadata = TimingEvidenceMetadata {
+            schema: SCHEMA,
+            runner_version: env!("CARGO_PKG_VERSION"),
+            platform_os: "linux",
+            platform_arch: "x86_64",
+            mode: RostlTimingMode::ForcedHit,
+            policy: QuiescencePolicy::new(1.0, 0),
+            before,
+            between_records,
+            after,
+            max_runqueue_wait_ratio: 0.01,
+            admission,
+        };
+
+        let json = serde_json::to_value(metadata)?;
+
+        assert_eq!(json["schema"], SCHEMA);
+        assert_eq!(json["mode"], "forced_hit");
+        for field in [
+            "before_quiescence_admitted",
+            "between_records_quiescence_admitted",
+            "after_quiescence_admitted",
+            "affinity_stable",
+            "scheduler_stats_stayed_enabled",
+            "directory_scheduler_admitted",
+            "event_scheduler_admitted",
+            "environment_admitted",
+        ] {
+            assert_eq!(json[field], true, "{field} must be an admitted boolean");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cli_modes_map_to_library_modes() {
+        let cases = [
+            ("hit-miss", RostlTimingMode::HitMiss),
+            ("forced-hit", RostlTimingMode::ForcedHit),
+            ("forced-miss", RostlTimingMode::ForcedMiss),
+        ];
+
+        for (argument, expected) in cases {
+            let parsed = TimingModeArgument::from_str(argument, true)
+                .expect("documented timing mode must parse");
+            assert_eq!(parsed.rostl_mode(), expected);
+        }
     }
 
     #[test]
