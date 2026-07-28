@@ -30,7 +30,7 @@ use crate::projection::ProjectionEventSink;
 #[cfg(feature = "rostl-experimental")]
 mod rostl;
 #[cfg(feature = "rostl-experimental")]
-pub(crate) use rostl::rostl_insert_timing_probe;
+pub(crate) use rostl::{rostl_insert_timing_probe, validate_rostl_insert_timing_shape};
 
 const REPLY_CHANNEL_CAPACITY: usize = 1;
 // Allocation guard for the offline experiment, not an approved service profile.

@@ -4,7 +4,8 @@
 //! order*. It never measures the host environment itself: the synchronous
 //! platform driver must enforce CPU affinity and quiescence immediately before
 //! and after calling [`run`]. The caller supplies a [`PairedProbe`] that performs
-//! one timed insertion against a fresh, equal-occupancy table.
+//! two timed insertions against matched equal-occupancy state and then advances
+//! that state at the explicit pair boundary.
 //!
 //! # Why quiescence is a precondition, not a caveat
 //!
@@ -24,7 +25,7 @@
 
 use std::fmt;
 
-use crate::timing_equivalence::{ArmMeasurement, Pair, PairOrder, Rng, Seed, MINIMUM_PAIRS};
+use crate::timing_equivalence::{ArmMeasurement, Pair, PairOrder, Rng, Seed};
 use serde::Serialize;
 
 /// Which side of the pair is being measured.
@@ -36,27 +37,28 @@ pub(crate) enum Arm {
     Miss,
 }
 
-/// One timed insertion against a fresh, equal-occupancy table.
+/// Two timed insertions against matched, equal-occupancy state.
 ///
-/// Implementations must rebuild state between calls so that occupancy is
-/// identical for both arms; otherwise the experiment measures table growth
-/// rather than the hit/miss distinction.
+/// Implementations must present identical public occupancy to both arms in a
+/// pair. [`Self::finish_pair`] is called exactly once after both arms succeed so
+/// a long-lived probe can restore its matched-state invariant before the next
+/// pair. Warm-up pairs use the same lifecycle as retained pairs.
 pub(crate) trait PairedProbe {
     /// Why a measurement could not be taken.
     type Error;
 
     /// Performs one insertion on `arm`.
     fn measure(&mut self, arm: Arm) -> Result<ArmMeasurement, Self::Error>;
+
+    /// Restores the probe's pair-boundary invariant after both arms succeed.
+    fn finish_pair(&mut self) -> Result<(), Self::Error>;
 }
 
 /// Why an experiment plan was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanError {
-    /// Fewer pairs than the kill-gate report's floor of [`MINIMUM_PAIRS`].
-    Underpowered {
-        /// The requested pair count.
-        requested: usize,
-    },
+    /// A plan must retain at least one measured pair.
+    NoMeasuredPairs,
     /// A run with no warm-up measures cold caches, not steady state.
     NoWarmup,
     /// The warm-up and measured pair counts cannot be added safely.
@@ -66,10 +68,9 @@ pub enum PlanError {
 impl fmt::Display for PlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Underpowered { requested } => write!(
-                formatter,
-                "timing plan requested {requested} pairs; at least {MINIMUM_PAIRS} are required"
-            ),
+            Self::NoMeasuredPairs => {
+                formatter.write_str("timing plan requires at least one measured pair")
+            }
             Self::NoWarmup => formatter.write_str("timing plan requires at least one warm-up pair"),
             Self::IterationCountOverflow => {
                 formatter.write_str("timing plan pair count overflows usize")
@@ -85,24 +86,30 @@ impl std::error::Error for PlanError {}
 pub struct ExperimentPlan {
     pairs: usize,
     warmup_pairs: usize,
+    total_pairs: usize,
     seed: Seed,
 }
 
 impl ExperimentPlan {
-    /// Validates a plan, refusing one that could not qualify anything.
+    /// Validates the scheduler mechanics for a timing plan.
+    ///
+    /// Qualification sample-size policy belongs to the evidence driver, which
+    /// can distinguish a deliberately small pilot from a qualification
+    /// candidate. This layer only refuses plans it cannot execute safely.
     pub fn new(pairs: usize, warmup_pairs: usize, seed: Seed) -> Result<Self, PlanError> {
-        if pairs < MINIMUM_PAIRS {
-            return Err(PlanError::Underpowered { requested: pairs });
+        if pairs == 0 {
+            return Err(PlanError::NoMeasuredPairs);
         }
         if warmup_pairs == 0 {
             return Err(PlanError::NoWarmup);
         }
-        warmup_pairs
+        let total_pairs = warmup_pairs
             .checked_add(pairs)
             .ok_or(PlanError::IterationCountOverflow)?;
         Ok(Self {
             pairs,
             warmup_pairs,
+            total_pairs,
             seed,
         })
     }
@@ -115,6 +122,11 @@ impl ExperimentPlan {
     /// How many discarded pairs precede them.
     pub const fn warmup_pairs(&self) -> usize {
         self.warmup_pairs
+    }
+
+    /// Total pair-boundary transitions, including discarded warm-up pairs.
+    pub const fn total_pairs(&self) -> usize {
+        self.total_pairs
     }
 }
 
@@ -198,24 +210,39 @@ where
 }
 
 fn balanced_orders(count: usize, rng: &mut Rng) -> Vec<bool> {
-    let mut orders: Vec<bool> = (0..count).map(|index| index.is_multiple_of(2)).collect();
-    for index in (1..orders.len()).rev() {
-        let other = rng.below(index + 1);
-        orders.swap(index, other);
+    let mut orders = vec![false; count];
+    // The long-lived probe alternates physical hit/miss roles every pair.
+    // Balance AB/BA independently inside each parity stratum so table identity
+    // cannot become correlated with which timed label executes first.
+    for parity in 0..2 {
+        let stratum_len = (parity..count).step_by(2).count();
+        let mut stratum: Vec<bool> = (0..stratum_len)
+            // Opposite extras keep the two odd-length strata globally balanced.
+            .map(|index| (index + parity).is_multiple_of(2))
+            .collect();
+        for index in (1..stratum.len()).rev() {
+            let other = rng.below(index + 1);
+            stratum.swap(index, other);
+        }
+        for (index, miss_first) in (parity..count).step_by(2).zip(stratum) {
+            orders[index] = miss_first;
+        }
     }
     orders
 }
 
 fn measure_pair<P: PairedProbe>(probe: &mut P, miss_first: bool) -> Result<Pair, P::Error> {
-    if miss_first {
+    let pair = if miss_first {
         let miss = probe.measure(Arm::Miss)?;
         let hit = probe.measure(Arm::Hit)?;
-        Ok(Pair::from_measurements(hit, miss, PairOrder::MissFirst))
+        Pair::from_measurements(hit, miss, PairOrder::MissFirst)
     } else {
         let hit = probe.measure(Arm::Hit)?;
         let miss = probe.measure(Arm::Miss)?;
-        Ok(Pair::from_measurements(hit, miss, PairOrder::HitFirst))
-    }
+        Pair::from_measurements(hit, miss, PairOrder::HitFirst)
+    };
+    probe.finish_pair()?;
+    Ok(pair)
 }
 
 /// Whether `Cpus_allowed_list` names exactly one CPU.
@@ -235,11 +262,14 @@ pub fn single_allowed_cpu(cpus_allowed_list: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MINIMUM_PAIRS;
 
     #[derive(Default)]
     struct FakeProbe {
         order: Vec<Arm>,
         calls: usize,
+        finished_pairs: usize,
+        fail_finish: bool,
     }
 
     impl PairedProbe for FakeProbe {
@@ -254,17 +284,23 @@ mod tests {
             };
             Ok(ArmMeasurement::duration_only(nanos))
         }
+
+        fn finish_pair(&mut self) -> Result<(), ()> {
+            if self.fail_finish {
+                return Err(());
+            }
+            self.finished_pairs += 1;
+            Ok(())
+        }
     }
 
     #[test]
-    fn a_plan_below_the_power_floor_is_refused() {
+    fn plan_accepts_small_pilots_but_not_zero_measured_pairs() {
+        assert!(ExperimentPlan::new(1, 1, Seed::new(1)).is_ok());
         assert_eq!(
-            ExperimentPlan::new(MINIMUM_PAIRS - 1, 10, Seed::new(1)),
-            Err(PlanError::Underpowered {
-                requested: MINIMUM_PAIRS - 1
-            })
+            ExperimentPlan::new(0, 1, Seed::new(1)),
+            Err(PlanError::NoMeasuredPairs)
         );
-        assert!(ExperimentPlan::new(MINIMUM_PAIRS, 10, Seed::new(1)).is_ok());
     }
 
     #[test]
@@ -306,6 +342,21 @@ mod tests {
         assert_eq!(pairs.len(), MINIMUM_PAIRS);
         // Every pair, warm-up included, costs two measurements.
         assert_eq!(probe.calls, (MINIMUM_PAIRS + 7) * 2);
+        assert_eq!(probe.finished_pairs, MINIMUM_PAIRS + 7);
+        assert_eq!(plan.total_pairs(), MINIMUM_PAIRS + 7);
+    }
+
+    #[test]
+    fn pair_finalization_failure_prevents_retention() {
+        let plan = ExperimentPlan::new(1, 1, Seed::new(9)).expect("valid pilot plan");
+        let mut probe = FakeProbe {
+            fail_finish: true,
+            ..FakeProbe::default()
+        };
+
+        assert_eq!(run(&plan, &mut probe), Err(()));
+        assert_eq!(probe.calls, 2);
+        assert_eq!(probe.finished_pairs, 0);
     }
 
     #[test]
@@ -339,6 +390,32 @@ mod tests {
             hit_first.abs_diff(miss_first) <= 1,
             "ordering was not exactly balanced: hit-first={hit_first}, miss-first={miss_first}"
         );
+    }
+
+    #[test]
+    fn arm_ordering_is_balanced_within_each_physical_role() {
+        let plan = ExperimentPlan::new(500, 2, Seed::new(11)).expect("valid plan");
+        let mut probe = FakeProbe::default();
+        run(&plan, &mut probe).expect("probe succeeds");
+
+        let measured_order = &probe.order[plan.warmup_pairs() * 2..];
+        for parity in 0..2 {
+            let mut hit_first = 0usize;
+            let mut miss_first = 0usize;
+            for (pair_index, pair) in measured_order.chunks_exact(2).enumerate() {
+                if pair_index % 2 == parity {
+                    if pair[0] == Arm::Hit {
+                        hit_first += 1;
+                    } else {
+                        miss_first += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                hit_first, miss_first,
+                "physical-role stratum {parity} was not balanced"
+            );
+        }
     }
 
     #[test]

@@ -18,15 +18,25 @@ use tempfile::NamedTempFile;
 use zaino_oram::{
     evaluate_timing_equivalence, run_rostl_insert_timing_mode, single_allowed_cpu,
     validate_rostl_timing_shape, EquivalenceBounds, EquivalenceReport, ExperimentPlan, Pair,
-    Quiescence, QuiescencePolicy, RostlTimingMode, RostlTimingRecordKind,
+    Quiescence, QuiescencePolicy, RostlTimingError, RostlTimingMode, RostlTimingRecordKind,
     RostlTimingSchedulerSummary, TimingSeed, MINIMUM_PAIRS,
 };
 
 type DriverResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const SCHEMA: &str = "zaino-oram-insert-timing-v2";
-const WARMUP_PAIRS: usize = 50;
-const EVENT_SEED_DOMAIN: u64 = 0xe7e1_82a5_7b9c_4d31;
+const SCHEMA: &str = "zaino-oram-insert-timing-v3";
+const DEFAULT_WARMUP_PAIRS: usize = 50;
+const DIRECTORY_SCHEDULE_SEED_DOMAIN: u64 = 0x5e12_33a1_a341_71d1;
+const DIRECTORY_REPORT_SEED_DOMAIN: u64 = 0x6127_0c6f_3475_8a0b;
+const EVENT_SCHEDULE_SEED_DOMAIN: u64 = 0xe7e1_82a5_7b9c_4d31;
+const EVENT_REPORT_SEED_DOMAIN: u64 = 0x7b91_ed09_451f_83c7;
+const STATE_CONTROL: &str = "matched_long_lived_logical_twin_tables_v1";
+const LABEL_ASSIGNMENT: &str = "alternating_physical_tables";
+const ORDER_BLOCKING: &str = "physical_table_role_parity_v1";
+const DIRECTORY_RECORD_MODEL: &str = "directory_single_cell_v1";
+const EVENT_RECORD_MODEL: &str = "event_single_immutable_cell_v1";
+const TARGET_PROJECTION_MODEL: &str = "chunked_generational_events";
+const STATISTICAL_SCOPE: &str = "nominal_iid_bounds_on_serially_dependent_rounds";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,21 +49,33 @@ struct Cli {
     #[arg(long, value_enum, default_value = "hit-miss")]
     mode: TimingModeArgument,
 
+    /// Whether this is a small apparatus pilot or a qualification candidate.
+    #[arg(long, value_enum, default_value = "qualification-candidate")]
+    evidence_intent: EvidenceIntent,
+
+    /// Number of retained AB/BA pairs.
+    #[arg(long, default_value_t = MINIMUM_PAIRS)]
+    pairs: usize,
+
+    /// Number of discarded pairs that warm the same long-lived state machine.
+    #[arg(long, default_value_t = DEFAULT_WARMUP_PAIRS)]
+    warmup_pairs: usize,
+
     /// Allocated address-directory table slots.
     #[arg(long)]
     directory_capacity: usize,
 
-    /// Address-directory records present before every timed insertion.
+    /// Address-directory records present before warm-up growth begins.
     #[arg(long)]
-    directory_occupancy: usize,
+    directory_initial_occupancy: usize,
 
     /// Allocated address-event table slots.
     #[arg(long)]
     event_capacity: usize,
 
-    /// Address-event records present before every timed insertion.
+    /// Address-event records present before warm-up growth begins.
     #[arg(long)]
-    event_occupancy: usize,
+    event_initial_occupancy: usize,
 
     /// Predeclared maximum absolute scheduled-label mean difference in nanoseconds.
     #[arg(long)]
@@ -75,7 +97,7 @@ struct Cli {
     #[arg(long)]
     max_runqueue_wait_ratio: f64,
 
-    /// Seed that fixes the directory AB/BA schedule and statistical resampling.
+    /// Root seed domain-separated into both record schedules and reports.
     #[arg(long)]
     seed: u64,
 
@@ -89,6 +111,13 @@ enum TimingModeArgument {
     HitMiss,
     ForcedHit,
     ForcedMiss,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceIntent {
+    Pilot,
+    QualificationCandidate,
 }
 
 impl TimingModeArgument {
@@ -113,8 +142,18 @@ struct EnvironmentSnapshot {
 struct RecordEvidence {
     kind: RostlTimingRecordKind,
     capacity: usize,
-    occupancy: usize,
+    initial_occupancy: usize,
+    measured_start_occupancy: usize,
+    measured_last_pre_occupancy: usize,
+    final_occupancy: usize,
+    growth_per_pair: usize,
+    table_count: usize,
+    state_control: &'static str,
+    label_assignment: &'static str,
+    order_blocking: &'static str,
+    record_model: &'static str,
     plan: ExperimentPlan,
+    report_seed: TimingSeed,
     raw_pairs: Vec<Pair>,
     report: EquivalenceReport,
     timed_scheduler: RostlTimingSchedulerSummary,
@@ -140,6 +179,20 @@ struct TimingEvidenceMetadata {
     platform_os: &'static str,
     platform_arch: &'static str,
     mode: RostlTimingMode,
+    evidence_intent: EvidenceIntent,
+    minimum_qualification_pairs: usize,
+    wall_clock_only: bool,
+    physical_trace_complete: bool,
+    oram_state_seed_bound: bool,
+    serial_independence_established: bool,
+    statistical_scope: &'static str,
+    target_projection_model: &'static str,
+    target_projection_model_implemented: bool,
+    timed_operation_model: &'static str,
+    cover_insertions_per_table_per_pair: usize,
+    cover_physical_order: [usize; 2],
+    table_set_relation: &'static str,
+    can_clear_gate2: bool,
     policy: QuiescencePolicy,
     before: EnvironmentSnapshot,
     between_records: EnvironmentSnapshot,
@@ -155,7 +208,31 @@ struct TimingEvidence {
     metadata: TimingEvidenceMetadata,
     directory: RecordEvidence,
     event: RecordEvidence,
-    declared_criteria_satisfied: bool,
+    declared_wall_clock_criteria_satisfied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OccupancyWindow {
+    initial: usize,
+    measured_start: usize,
+    measured_last_pre: usize,
+    final_occupancy: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunOutcome {
+    evidence_intent: EvidenceIntent,
+    environment_admitted: bool,
+    declared_wall_clock_criteria_satisfied: bool,
+}
+
+impl RunOutcome {
+    const fn exit_success(self) -> bool {
+        match self.evidence_intent {
+            EvidenceIntent::Pilot => self.environment_admitted,
+            EvidenceIntent::QualificationCandidate => self.declared_wall_clock_criteria_satisfied,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -168,6 +245,8 @@ enum DriverError {
     CpuNotPinned,
     InvalidQuiescencePolicy,
     InvalidRunqueueWaitPolicy,
+    UnderpoweredQualificationCandidate { requested: usize },
+    UnbalancedQualificationCandidate,
     InitiallyNotQuiescent,
     InvalidSchedulerStatsControl,
     SchedulerStatsDisabled,
@@ -197,6 +276,13 @@ impl fmt::Display for DriverError {
             Self::InvalidRunqueueWaitPolicy => {
                 formatter.write_str("maximum run-queue wait ratio must be finite and within [0, 1]")
             }
+            Self::UnderpoweredQualificationCandidate { requested } => write!(
+                formatter,
+                "qualification candidate requested {requested} measured pairs; at least {MINIMUM_PAIRS} are required"
+            ),
+            Self::UnbalancedQualificationCandidate => formatter.write_str(
+                "qualification candidate requires measured pairs divisible by four and an even warm-up pair count",
+            ),
             Self::InitiallyNotQuiescent => {
                 formatter.write_str("host is not quiescent enough to start timing")
             }
@@ -223,9 +309,9 @@ impl Error for DriverError {
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => {
-            eprintln!("timing experiment did not satisfy its predeclared criteria");
+        Ok(outcome) if outcome.exit_success() => ExitCode::SUCCESS,
+        Ok(_) => {
+            eprintln!("timing experiment was not admitted for its declared evidence intent");
             ExitCode::FAILURE
         }
         Err(error) => {
@@ -235,7 +321,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> DriverResult<bool> {
+fn run(cli: Cli) -> DriverResult<RunOutcome> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err(DriverError::UnsupportedPlatform.into());
     }
@@ -250,16 +336,34 @@ fn run(cli: Cli) -> DriverResult<bool> {
     {
         return Err(DriverError::InvalidRunqueueWaitPolicy.into());
     }
+    validate_evidence_intent(cli.evidence_intent, cli.pairs, cli.warmup_pairs)?;
+
+    let directory_schedule_seed = derive_seed(cli.seed, DIRECTORY_SCHEDULE_SEED_DOMAIN);
+    let directory_report_seed = derive_seed(cli.seed, DIRECTORY_REPORT_SEED_DOMAIN);
+    let event_schedule_seed = derive_seed(cli.seed, EVENT_SCHEDULE_SEED_DOMAIN);
+    let event_report_seed = derive_seed(cli.seed, EVENT_REPORT_SEED_DOMAIN);
+    let directory_plan = ExperimentPlan::new(
+        cli.pairs,
+        cli.warmup_pairs,
+        TimingSeed::new(directory_schedule_seed),
+    )?;
+    let event_plan = ExperimentPlan::new(
+        cli.pairs,
+        cli.warmup_pairs,
+        TimingSeed::new(event_schedule_seed),
+    )?;
 
     validate_rostl_timing_shape(
         RostlTimingRecordKind::Directory,
         cli.directory_capacity,
-        cli.directory_occupancy,
+        cli.directory_initial_occupancy,
+        &directory_plan,
     )?;
     validate_rostl_timing_shape(
         RostlTimingRecordKind::Event,
         cli.event_capacity,
-        cli.event_occupancy,
+        cli.event_initial_occupancy,
+        &event_plan,
     )?;
 
     let bounds = EquivalenceBounds::new(cli.mean_bound_nanos, cli.cdf_distance_bound)?;
@@ -275,17 +379,12 @@ fn run(cli: Cli) -> DriverResult<bool> {
         return Err(DriverError::InitiallyNotQuiescent.into());
     }
 
-    let directory_plan =
-        ExperimentPlan::new(MINIMUM_PAIRS, WARMUP_PAIRS, TimingSeed::new(cli.seed))?;
-    let event_seed = cli.seed ^ EVENT_SEED_DOMAIN;
-    let event_plan = ExperimentPlan::new(MINIMUM_PAIRS, WARMUP_PAIRS, TimingSeed::new(event_seed))?;
-
     let mode = cli.mode.rostl_mode();
     let directory_run = run_rostl_insert_timing_mode(
         RostlTimingRecordKind::Directory,
         mode,
         cli.directory_capacity,
-        cli.directory_occupancy,
+        cli.directory_initial_occupancy,
         &directory_plan,
     )?;
     let (directory_pairs, directory_scheduler) = directory_run.into_parts();
@@ -294,16 +393,19 @@ fn run(cli: Cli) -> DriverResult<bool> {
         RostlTimingRecordKind::Event,
         mode,
         cli.event_capacity,
-        cli.event_occupancy,
+        cli.event_initial_occupancy,
         &event_plan,
     )?;
     let (event_pairs, event_scheduler) = event_run.into_parts();
     let after = read_environment()?;
 
-    let directory_report =
-        evaluate_timing_equivalence(&directory_pairs, bounds, TimingSeed::new(cli.seed));
+    let directory_report = evaluate_timing_equivalence(
+        &directory_pairs,
+        bounds,
+        TimingSeed::new(directory_report_seed),
+    );
     let event_report =
-        evaluate_timing_equivalence(&event_pairs, bounds, TimingSeed::new(event_seed));
+        evaluate_timing_equivalence(&event_pairs, bounds, TimingSeed::new(event_report_seed));
     let directory_scheduler_admitted = directory_scheduler.admits(cli.max_runqueue_wait_ratio);
     let event_scheduler_admitted = event_scheduler.admits(cli.max_runqueue_wait_ratio);
     let admission = evaluate_environment_admission(
@@ -315,9 +417,14 @@ fn run(cli: Cli) -> DriverResult<bool> {
         directory_scheduler_admitted,
         event_scheduler_admitted,
     );
-    let declared_criteria_satisfied = admission.environment_admitted
+    let declared_wall_clock_criteria_satisfied = cli.evidence_intent
+        == EvidenceIntent::QualificationCandidate
+        && admission.environment_admitted
         && directory_report.bounds_satisfied()
         && event_report.bounds_satisfied();
+    let environment_admitted = admission.environment_admitted;
+    let directory_occupancy = occupancy_window(cli.directory_initial_occupancy, &directory_plan)?;
+    let event_occupancy = occupancy_window(cli.event_initial_occupancy, &event_plan)?;
 
     let evidence = TimingEvidence {
         metadata: TimingEvidenceMetadata {
@@ -326,6 +433,20 @@ fn run(cli: Cli) -> DriverResult<bool> {
             platform_os: std::env::consts::OS,
             platform_arch: std::env::consts::ARCH,
             mode,
+            evidence_intent: cli.evidence_intent,
+            minimum_qualification_pairs: MINIMUM_PAIRS,
+            wall_clock_only: true,
+            physical_trace_complete: false,
+            oram_state_seed_bound: false,
+            serial_independence_established: false,
+            statistical_scope: STATISTICAL_SCOPE,
+            target_projection_model: TARGET_PROJECTION_MODEL,
+            target_projection_model_implemented: false,
+            timed_operation_model: timed_operation_model(mode),
+            cover_insertions_per_table_per_pair: 1,
+            cover_physical_order: [0, 1],
+            table_set_relation: table_set_relation(mode),
+            can_clear_gate2: false,
             policy,
             before,
             between_records,
@@ -336,8 +457,18 @@ fn run(cli: Cli) -> DriverResult<bool> {
         directory: RecordEvidence {
             kind: RostlTimingRecordKind::Directory,
             capacity: cli.directory_capacity,
-            occupancy: cli.directory_occupancy,
+            initial_occupancy: directory_occupancy.initial,
+            measured_start_occupancy: directory_occupancy.measured_start,
+            measured_last_pre_occupancy: directory_occupancy.measured_last_pre,
+            final_occupancy: directory_occupancy.final_occupancy,
+            growth_per_pair: 1,
+            table_count: 2,
+            state_control: STATE_CONTROL,
+            label_assignment: LABEL_ASSIGNMENT,
+            order_blocking: ORDER_BLOCKING,
+            record_model: DIRECTORY_RECORD_MODEL,
             plan: directory_plan,
+            report_seed: TimingSeed::new(directory_report_seed),
             raw_pairs: directory_pairs,
             report: directory_report,
             timed_scheduler: directory_scheduler,
@@ -346,18 +477,97 @@ fn run(cli: Cli) -> DriverResult<bool> {
         event: RecordEvidence {
             kind: RostlTimingRecordKind::Event,
             capacity: cli.event_capacity,
-            occupancy: cli.event_occupancy,
+            initial_occupancy: event_occupancy.initial,
+            measured_start_occupancy: event_occupancy.measured_start,
+            measured_last_pre_occupancy: event_occupancy.measured_last_pre,
+            final_occupancy: event_occupancy.final_occupancy,
+            growth_per_pair: 1,
+            table_count: 2,
+            state_control: STATE_CONTROL,
+            label_assignment: LABEL_ASSIGNMENT,
+            order_blocking: ORDER_BLOCKING,
+            record_model: EVENT_RECORD_MODEL,
             plan: event_plan,
+            report_seed: TimingSeed::new(event_report_seed),
             raw_pairs: event_pairs,
             report: event_report,
             timed_scheduler: event_scheduler,
             scheduler_admitted: event_scheduler_admitted,
         },
-        declared_criteria_satisfied,
+        declared_wall_clock_criteria_satisfied,
     };
     publish_json(&cli.output, &evidence)?;
     println!("timing_evidence={}", cli.output.display());
-    Ok(declared_criteria_satisfied)
+    Ok(RunOutcome {
+        evidence_intent: cli.evidence_intent,
+        environment_admitted,
+        declared_wall_clock_criteria_satisfied,
+    })
+}
+
+fn validate_evidence_intent(
+    intent: EvidenceIntent,
+    pairs: usize,
+    warmup_pairs: usize,
+) -> Result<(), DriverError> {
+    if intent == EvidenceIntent::QualificationCandidate && pairs < MINIMUM_PAIRS {
+        return Err(DriverError::UnderpoweredQualificationCandidate { requested: pairs });
+    }
+    if intent == EvidenceIntent::QualificationCandidate
+        && (!pairs.is_multiple_of(4) || !warmup_pairs.is_multiple_of(2))
+    {
+        return Err(DriverError::UnbalancedQualificationCandidate);
+    }
+    Ok(())
+}
+
+const fn timed_operation_model(mode: RostlTimingMode) -> &'static str {
+    match mode {
+        RostlTimingMode::HitMiss => {
+            "mixed_duplicate_and_unique_insert_current_single_cell_baseline_v1"
+        }
+        RostlTimingMode::ForcedHit => "duplicate_insert_current_single_cell_control_v1",
+        RostlTimingMode::ForcedMiss => "unique_insert_current_single_cell_control_v1",
+    }
+}
+
+const fn table_set_relation(mode: RostlTimingMode) -> &'static str {
+    match mode {
+        RostlTimingMode::HitMiss => "one_record_substitution_equal_cardinality",
+        RostlTimingMode::ForcedHit | RostlTimingMode::ForcedMiss => "identical_key_sets",
+    }
+}
+
+fn occupancy_window(
+    initial: usize,
+    plan: &ExperimentPlan,
+) -> Result<OccupancyWindow, RostlTimingError> {
+    let measured_start = initial
+        .checked_add(plan.warmup_pairs())
+        .ok_or(RostlTimingError::InvalidShape)?;
+    let measured_last_pre = measured_start
+        .checked_add(
+            plan.pairs()
+                .checked_sub(1)
+                .ok_or(RostlTimingError::InvalidShape)?,
+        )
+        .ok_or(RostlTimingError::InvalidShape)?;
+    let final_occupancy = initial
+        .checked_add(plan.total_pairs())
+        .ok_or(RostlTimingError::InvalidShape)?;
+    Ok(OccupancyWindow {
+        initial,
+        measured_start,
+        measured_last_pre,
+        final_occupancy,
+    })
+}
+
+fn derive_seed(root: u64, domain: u64) -> u64 {
+    let mut value = root ^ domain;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn evaluate_environment_admission(
@@ -647,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_metadata_records_mode_and_all_admission_fields() -> Result<(), serde_json::Error> {
+    fn v3_metadata_records_scope_mode_and_all_admission_fields() -> Result<(), serde_json::Error> {
         let before = snapshot(0.5, Some(3), true);
         let between_records = snapshot(0.5, Some(3), true);
         let after = snapshot(0.5, Some(3), true);
@@ -658,6 +868,20 @@ mod tests {
             platform_os: "linux",
             platform_arch: "x86_64",
             mode: RostlTimingMode::ForcedHit,
+            evidence_intent: EvidenceIntent::Pilot,
+            minimum_qualification_pairs: MINIMUM_PAIRS,
+            wall_clock_only: true,
+            physical_trace_complete: false,
+            oram_state_seed_bound: false,
+            serial_independence_established: false,
+            statistical_scope: STATISTICAL_SCOPE,
+            target_projection_model: TARGET_PROJECTION_MODEL,
+            target_projection_model_implemented: false,
+            timed_operation_model: timed_operation_model(RostlTimingMode::ForcedHit),
+            cover_insertions_per_table_per_pair: 1,
+            cover_physical_order: [0, 1],
+            table_set_relation: table_set_relation(RostlTimingMode::ForcedHit),
+            can_clear_gate2: false,
             policy: QuiescencePolicy::new(1.0, 0),
             before,
             between_records,
@@ -670,6 +894,26 @@ mod tests {
 
         assert_eq!(json["schema"], SCHEMA);
         assert_eq!(json["mode"], "forced_hit");
+        assert_eq!(json["evidence_intent"], "pilot");
+        assert_eq!(json["minimum_qualification_pairs"], MINIMUM_PAIRS);
+        assert_eq!(json["wall_clock_only"], true);
+        assert_eq!(json["physical_trace_complete"], false);
+        assert_eq!(json["oram_state_seed_bound"], false);
+        assert_eq!(json["serial_independence_established"], false);
+        assert_eq!(json["statistical_scope"], STATISTICAL_SCOPE);
+        assert_eq!(json["target_projection_model"], TARGET_PROJECTION_MODEL);
+        assert_eq!(json["target_projection_model_implemented"], false);
+        assert_eq!(
+            json["timed_operation_model"],
+            timed_operation_model(RostlTimingMode::ForcedHit)
+        );
+        assert_eq!(json["cover_insertions_per_table_per_pair"], 1);
+        assert_eq!(json["cover_physical_order"], serde_json::json!([0, 1]));
+        assert_eq!(
+            json["table_set_relation"],
+            table_set_relation(RostlTimingMode::ForcedHit)
+        );
+        assert_eq!(json["can_clear_gate2"], false);
         for field in [
             "before_quiescence_admitted",
             "between_records_quiescence_admitted",
@@ -686,6 +930,149 @@ mod tests {
     }
 
     #[test]
+    fn qualification_intent_requires_power_and_balanced_counts() {
+        assert!(matches!(
+            validate_evidence_intent(
+                EvidenceIntent::QualificationCandidate,
+                MINIMUM_PAIRS - 1,
+                DEFAULT_WARMUP_PAIRS
+            ),
+            Err(DriverError::UnderpoweredQualificationCandidate { .. })
+        ));
+        assert!(matches!(
+            validate_evidence_intent(
+                EvidenceIntent::QualificationCandidate,
+                MINIMUM_PAIRS + 1,
+                DEFAULT_WARMUP_PAIRS
+            ),
+            Err(DriverError::UnbalancedQualificationCandidate)
+        ));
+        assert!(matches!(
+            validate_evidence_intent(
+                EvidenceIntent::QualificationCandidate,
+                MINIMUM_PAIRS + 2,
+                DEFAULT_WARMUP_PAIRS
+            ),
+            Err(DriverError::UnbalancedQualificationCandidate)
+        ));
+        assert!(matches!(
+            validate_evidence_intent(
+                EvidenceIntent::QualificationCandidate,
+                MINIMUM_PAIRS,
+                DEFAULT_WARMUP_PAIRS + 1
+            ),
+            Err(DriverError::UnbalancedQualificationCandidate)
+        ));
+        assert!(validate_evidence_intent(
+            EvidenceIntent::QualificationCandidate,
+            MINIMUM_PAIRS,
+            DEFAULT_WARMUP_PAIRS
+        )
+        .is_ok());
+        assert!(validate_evidence_intent(EvidenceIntent::Pilot, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn occupancy_window_records_warmup_and_measured_growth() -> Result<(), Box<dyn Error>> {
+        let plan = ExperimentPlan::new(6, 4, TimingSeed::new(3))?;
+
+        assert_eq!(
+            occupancy_window(20, &plan)?,
+            OccupancyWindow {
+                initial: 20,
+                measured_start: 24,
+                measured_last_pre: 29,
+                final_occupancy: 30,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn seed_roles_are_domain_separated_and_reproducible() {
+        let domains = [
+            DIRECTORY_SCHEDULE_SEED_DOMAIN,
+            DIRECTORY_REPORT_SEED_DOMAIN,
+            EVENT_SCHEDULE_SEED_DOMAIN,
+            EVENT_REPORT_SEED_DOMAIN,
+        ];
+        let derived: Vec<_> = domains
+            .into_iter()
+            .map(|domain| derive_seed(17, domain))
+            .collect();
+
+        assert_eq!(
+            derived,
+            domains
+                .into_iter()
+                .map(|domain| derive_seed(17, domain))
+                .collect::<Vec<_>>()
+        );
+        for (index, seed) in derived.iter().enumerate() {
+            assert!(
+                !derived[..index].contains(seed),
+                "seed domain collision at index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_intent_controls_process_success_without_qualifying_pilots() {
+        let admitted_pilot = RunOutcome {
+            evidence_intent: EvidenceIntent::Pilot,
+            environment_admitted: true,
+            declared_wall_clock_criteria_satisfied: false,
+        };
+        let rejected_pilot = RunOutcome {
+            environment_admitted: false,
+            ..admitted_pilot
+        };
+        let rejected_candidate = RunOutcome {
+            evidence_intent: EvidenceIntent::QualificationCandidate,
+            environment_admitted: true,
+            declared_wall_clock_criteria_satisfied: false,
+        };
+        let admitted_candidate = RunOutcome {
+            declared_wall_clock_criteria_satisfied: true,
+            ..rejected_candidate
+        };
+
+        assert!(admitted_pilot.exit_success());
+        assert!(!admitted_pilot.declared_wall_clock_criteria_satisfied);
+        assert!(!rejected_pilot.exit_success());
+        assert!(!rejected_candidate.exit_success());
+        assert!(admitted_candidate.exit_success());
+    }
+
+    #[test]
+    fn operation_and_set_models_are_mode_specific() {
+        assert_eq!(
+            timed_operation_model(RostlTimingMode::HitMiss),
+            "mixed_duplicate_and_unique_insert_current_single_cell_baseline_v1"
+        );
+        assert_eq!(
+            timed_operation_model(RostlTimingMode::ForcedHit),
+            "duplicate_insert_current_single_cell_control_v1"
+        );
+        assert_eq!(
+            timed_operation_model(RostlTimingMode::ForcedMiss),
+            "unique_insert_current_single_cell_control_v1"
+        );
+        assert_eq!(
+            table_set_relation(RostlTimingMode::HitMiss),
+            "one_record_substitution_equal_cardinality"
+        );
+        assert_eq!(
+            table_set_relation(RostlTimingMode::ForcedHit),
+            "identical_key_sets"
+        );
+        assert_eq!(
+            table_set_relation(RostlTimingMode::ForcedMiss),
+            "identical_key_sets"
+        );
+    }
+
+    #[test]
     fn cli_modes_map_to_library_modes() {
         let cases = [
             ("hit-miss", RostlTimingMode::HitMiss),
@@ -698,6 +1085,54 @@ mod tests {
                 .expect("documented timing mode must parse");
             assert_eq!(parsed.rostl_mode(), expected);
         }
+    }
+
+    #[test]
+    fn cli_accepts_explicit_pilot_pair_counts() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "zainod-oram-timing",
+            "--evidence-intent",
+            "pilot",
+            "--pairs",
+            "12",
+            "--warmup-pairs",
+            "4",
+            "--directory-capacity",
+            "64",
+            "--directory-initial-occupancy",
+            "8",
+            "--event-capacity",
+            "64",
+            "--event-initial-occupancy",
+            "8",
+            "--mean-bound-nanos",
+            "10",
+            "--cdf-distance-bound",
+            "0.2",
+            "--max-load-average-1m",
+            "1",
+            "--max-competing-processes",
+            "0",
+            "--max-runqueue-wait-ratio",
+            "0.01",
+            "--seed",
+            "7",
+            "--output",
+            "pilot.json",
+        ])?;
+
+        assert_eq!(cli.evidence_intent, EvidenceIntent::Pilot);
+        assert_eq!(cli.pairs, 12);
+        assert_eq!(cli.warmup_pairs, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_rejects_legacy_occupancy_names_with_changed_semantics() {
+        let error = Cli::try_parse_from(["zainod-oram-timing", "--directory-occupancy", "8"])
+            .expect_err("the v2 occupancy name must not silently select v3 semantics");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

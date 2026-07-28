@@ -1,19 +1,20 @@
 //! Paired-timing equivalence statistics for access-path qualification.
 //!
 //! Phase 0 kill-gate 2 requires that a host observer cannot distinguish a hit
-//! from a miss on the ORAM insertion path. Static codegen evidence shows the
-//! secret reaches no branch; this module supplies the *dynamic* half — the
+//! from a miss on the ORAM insertion path. Static codegen evidence must test
+//! whether the secret reaches a branch; this module supplies the wall-clock
 //! statistics for a paired experiment that tries, and should fail, to tell the
-//! two apart by wall-clock time.
+//! two apart.
 //!
 //! Everything here is pure and deterministic given a seed, so a published
 //! result can be recomputed exactly from its recorded inputs. That is a
 //! requirement for evidence, not a convenience: a qualification number nobody
 //! can reproduce is not evidence.
 //!
-//! The experiment driver that produces [`Pair`]s — fresh equal-occupancy
-//! tables, CPU pinning, warm-up, randomised AB/BA ordering — is separate and
-//! platform-specific. This module never measures anything itself.
+//! The platform-specific experiment driver that produces [`Pair`]s owns state
+//! control, CPU pinning, warm-up, and randomised AB/BA ordering. This module
+//! never measures anything itself and does not assume that sequential pairs
+//! are statistically independent.
 //!
 //! # Reading the result
 //!

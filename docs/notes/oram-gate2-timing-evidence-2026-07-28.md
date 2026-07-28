@@ -23,14 +23,20 @@ or event insertion-path hit from a miss using wall-clock time.
 
 The supported driver:
 
-- rebuilds a fresh, equal-occupancy table before every measurement;
-- inserts the same probe key in both labelled arms, changing only whether the
-  key is already present;
-- uses warm-up pairs and balanced, randomized AB/BA ordering;
+- builds two long-lived logical twin tables once per record kind;
+- maintains equal public occupancy and either a one-record substitution with
+  one exclusive key per table (`hit-miss`) or identical key sets (forced
+  modes);
+- inserts the same probe key in both labelled arms, then performs one untimed
+  fixed-work cover insertion on each physical table;
+- runs covers in fixed physical order `[0, 1]`, alternates logical roles, and
+  maximally balances randomized AB/BA ordering inside each physical-role
+  stratum;
+- grows both tables by exactly one record after every warm-up and measured pair;
 - measures both directory and event records in each invocation;
-- records the raw pairs, experiment plans, schedule seeds, shape, selected
-  timing mode, scheduler counters, and host-policy snapshots in one JSON
-  artifact;
+- records raw pairs, experiment plans, distinct schedule/resampling seeds,
+  deterministic occupancy windows, state-control semantics, selected timing
+  mode, scheduler counters, and host-policy snapshots in one JSON artifact;
 - requires CPU affinity, scheduler-stat availability, runqueue-wait admission,
   and the declared quiescence policy; and
 - evaluates the predeclared pooled, order-conditioned, and
@@ -38,8 +44,11 @@ The supported driver:
 
 The pooled mean in an equivalence report is the scheduled hit-label duration
 minus the scheduled miss-label duration. It is not a first-position minus
-second-position contrast. Different seed values are schedule and resampling
-seeds; they do not by themselves make sequential same-host runs independent.
+second-position contrast. Distinct schedule and resampling seeds do not make
+sequential same-host runs independent. V3 rounds carry state forward and grow
+occupancy, while the current bootstrap and DKW intervals assume independent
+rounds; their stated coverage is therefore nominal, not a formal qualification
+guarantee.
 
 Classifier AUC is retained as a descriptive diagnostic. It has no universal
 acceptance threshold and does not replace the predeclared mean/CDF equivalence
@@ -67,9 +76,20 @@ driver and committed verbatim under `docs/notes/artifacts/oram-gate2/`.
 
 - Historical `zaino-oram-insert-timing-v1` artifacts, if recovered, remain
   unchanged and can be described only as legacy hit/miss evidence.
-- New `zaino-oram-insert-timing-v2` artifacts identify their timing mode, the
+- Historical `zaino-oram-insert-timing-v2` artifacts retain the fresh-table
+  semantics and identify their timing mode, the
   quiescence-policy result for every environment snapshot, and the aggregate
   affinity, scheduler-stat, and runqueue-wait admission results.
+- New `zaino-oram-insert-timing-v3` artifacts use the long-lived logical-twin
+  model and record pilot versus qualification-candidate intent, configurable
+  counts, exact occupancy growth, physical-role order blocking, and explicit
+  negative scope flags. V2 and V3 evidence must never be pooled.
+- Qualification-candidate v3 runs require at least 500 measured pairs, a count
+  divisible by four, and an even warm-up count. A pilot can validate apparatus
+  with smaller positive counts and exits successfully when its environment is
+  admitted, but cannot satisfy the declared wall-clock criteria. Measured
+  qualification strata are exactly balanced; odd-length pilot or warm-up
+  strata differ by one with opposite extras preserving global balance.
 - A completed run rejected by a post-start admission check is retained as a
   negative artifact rather than discarded. Pre-start refusal or a measurement
   error produces no timing artifact.
@@ -82,6 +102,14 @@ Numbers will not be reconstructed from console output, prose, or memory.
 
 - No exact timing JSON is committed, so there is no auditable dynamic result to
   summarize yet.
+- The currently measured event record is one immutable event per cell, not the
+  selected target chunked/generational production projection. V3 records that
+  the target projection is not yet implemented.
+- Upstream `rostl` initializes part of its physical position state using ambient
+  randomness, so the raw driver cannot yet bind an ORAM-state seed.
+- Long-lived v3 rounds are serially dependent. Independent process-level repeat
+  blocks or an accepted block/time-series method are still required for formal
+  inference.
 - The experiment is wall-clock only. PMU, cache-timing, and co-resident
   adversary measurements require a suitable qualification host.
 - The operator-supplied upstream trust assumption leaves the upstream compiled
@@ -91,7 +119,11 @@ Numbers will not be reconstructed from console output, prose, or memory.
 
 ## Effect on Gate 2
 
-None. Gate 2 remains **NO-GO**. A future update may add narrowly scoped,
+None. Gate 2 remains **NO-GO**. V3 explicitly records `wall_clock_only=true`,
+`physical_trace_complete=false`, `oram_state_seed_bound=false`, and
+`can_clear_gate2=false`. A future update may add narrowly scoped,
 artifact-derived descriptive findings after admitted hit/miss and forced-mode
-runs are retained. Clearing Gate 2 still requires the work listed in the
-normative kill-gate report and written review of that decision.
+runs are retained. Clearing Gate 2 still requires a predeclared retained
+multi-run manifest, exact binary/codegen binding, physical trace evidence, the
+work listed in the normative kill-gate report, and written review of that
+decision.

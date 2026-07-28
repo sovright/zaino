@@ -25,7 +25,7 @@ use super::*;
 mod worker;
 
 #[cfg(feature = "rostl-experimental")]
-pub(crate) use worker::rostl_insert_timing_probe;
+pub(crate) use worker::{rostl_insert_timing_probe, validate_rostl_insert_timing_shape};
 #[cfg(feature = "corpus-zaino")]
 pub(crate) use worker::{
     shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,

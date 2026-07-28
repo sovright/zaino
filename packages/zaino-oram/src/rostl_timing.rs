@@ -48,6 +48,9 @@ pub enum RostlTimingError {
     SchedulerStats,
     /// The timed insertion returned an outcome inconsistent with its arm.
     WrongOutcome,
+    /// The long-lived probe did not observe exactly one hit and one miss label
+    /// before a pair boundary, or its matched-state invariant drifted.
+    PairState,
 }
 
 impl fmt::Display for RostlTimingError {
@@ -65,6 +68,9 @@ impl fmt::Display for RostlTimingError {
             }
             Self::WrongOutcome => {
                 formatter.write_str("rostl timing probe observed an unexpected insertion outcome")
+            }
+            Self::PairState => {
+                formatter.write_str("rostl timing probe pair-state invariant failed")
             }
         }
     }
@@ -108,7 +114,7 @@ impl RostlTimingRun {
     }
 }
 
-/// Runs one record kind against fresh equal-occupancy tables.
+/// Runs one record kind against long-lived, logically matched tables.
 ///
 /// The caller owns platform controls: it must check CPU affinity and machine
 /// quiescence immediately before and after this call.
@@ -138,7 +144,14 @@ pub fn run_rostl_insert_timing_mode(
 ) -> Result<RostlTimingRun, RostlTimingError> {
     #[cfg(feature = "rostl-experimental")]
     {
-        let mut probe = crate::layout::rostl_insert_timing_probe(kind, mode, capacity, occupancy)?;
+        validate_rostl_timing_shape(kind, capacity, occupancy, plan)?;
+        let mut probe = crate::layout::rostl_insert_timing_probe(
+            kind,
+            mode,
+            capacity,
+            occupancy,
+            plan.total_pairs(),
+        )?;
         let pairs = crate::timing_experiment::run(plan, &mut probe)?;
         let scheduler = summarize_scheduler(&pairs)?;
         Ok(RostlTimingRun { pairs, scheduler })
@@ -207,21 +220,17 @@ pub fn validate_rostl_timing_shape(
     kind: RostlTimingRecordKind,
     capacity: usize,
     occupancy: usize,
+    plan: &ExperimentPlan,
 ) -> Result<(), RostlTimingError> {
     #[cfg(feature = "rostl-experimental")]
     {
-        crate::layout::rostl_insert_timing_probe(
-            kind,
-            RostlTimingMode::HitMiss,
-            capacity,
-            occupancy,
-        )
-        .map(|_| ())
+        let _ = kind;
+        crate::layout::validate_rostl_insert_timing_shape(capacity, occupancy, plan.total_pairs())
     }
 
     #[cfg(not(feature = "rostl-experimental"))]
     {
-        let _ = (kind, capacity, occupancy);
+        let _ = (kind, capacity, occupancy, plan);
         Err(RostlTimingError::UnsupportedPlatform)
     }
 }
@@ -257,7 +266,7 @@ mod tests {
             RostlTimingRecordKind::Event,
         ] {
             for mode in [RostlTimingMode::ForcedHit, RostlTimingMode::ForcedMiss] {
-                let run = run_rostl_insert_timing_mode(kind, mode, 8, 7, &plan)?;
+                let run = run_rostl_insert_timing_mode(kind, mode, 1_024, 7, &plan)?;
                 let (pairs, _) = run.into_parts();
                 assert_eq!(pairs.len(), MINIMUM_PAIRS);
 
@@ -285,6 +294,20 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn long_lived_probe_requires_pair_growth_headroom() {
+        let plan = ExperimentPlan::new(3, 2, TimingSeed::new(7)).expect("valid pilot plan");
+
+        assert_eq!(
+            validate_rostl_timing_shape(RostlTimingRecordKind::Directory, 8, 3, &plan),
+            Err(RostlTimingError::InvalidShape)
+        );
+        assert!(
+            validate_rostl_timing_shape(RostlTimingRecordKind::Directory, 16, 3, &plan).is_ok()
+        );
     }
 
     fn measured_pair(
