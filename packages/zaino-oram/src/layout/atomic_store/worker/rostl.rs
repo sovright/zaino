@@ -1387,6 +1387,70 @@ mod tests {
         Ok(())
     }
 
+    /// Null control: a probe whose two arms perform the *identical* operation.
+    ///
+    /// Any separation this reports comes from the harness — pairing, ordering,
+    /// timing overhead, machine noise — and not from the hit/miss distinction,
+    /// because there is no hit/miss distinction to measure. It calibrates how
+    /// much apparent separation is measurement artefact, so a real experiment's
+    /// AUC can be read against a baseline instead of against theory.
+    ///
+    /// Ignored by default: it performs the full 500-pair schedule and takes
+    /// tens of seconds. Run explicitly with `--run-ignored all`.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "long-running calibration; run explicitly on a quiescent host"]
+    fn null_control_reports_no_separation_when_both_arms_are_identical(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        struct NullProbe {
+            inner: InsertProbe<PersistentAddressDirectory>,
+            forced: Arm,
+        }
+
+        impl PairedProbe for NullProbe {
+            type Error = RostlTimingError;
+
+            fn measure(&mut self, _labelled: Arm) -> Result<ArmMeasurement, Self::Error> {
+                // The label is discarded: both arms do the same work.
+                self.inner.measure(self.forced)
+            }
+        }
+
+        for forced in [Arm::Miss, Arm::Hit] {
+            let mut probe = NullProbe {
+                inner: InsertProbe::<PersistentAddressDirectory>::new(1_024, 256)?,
+                forced,
+            };
+            let plan = ExperimentPlan::new(500, 50, TimingSeed::new(20_260_728))?;
+            let pairs = crate::timing_experiment::run(&plan, &mut probe)?;
+            let report = crate::timing_equivalence::evaluate(
+                &pairs,
+                EquivalenceBounds::new(1_000_000.0, 1.0),
+                TimingSeed::new(20_260_728),
+            );
+
+            println!(
+                "null control forced={forced:?} auc={:.4} cdf={:.4} mean={:.1}ns p={:.4}",
+                report.classifier_auc(),
+                report.empirical_cdf_distance(),
+                report.mean_difference_nanos(),
+                report.permutation_p_value(),
+            );
+
+            // A harness with no bias sits at chance. This tolerance is wide on
+            // purpose: it is a smoke test for gross bias, and the printed
+            // numbers are the actual calibration output.
+            let separation = (report.classifier_auc() - 0.5).abs();
+            assert!(
+                separation < 0.10,
+                "null control separated by {separation:.4}; the harness itself \
+                 distinguishes identical operations, so no measured AUC is \
+                 interpretable until this is explained"
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn probe_shape_reserves_growth_and_one_union_key() {
