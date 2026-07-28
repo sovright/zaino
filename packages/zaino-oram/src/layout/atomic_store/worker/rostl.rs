@@ -1402,6 +1402,8 @@ mod tests {
     #[ignore = "long-running calibration; run explicitly on a quiescent host"]
     fn null_control_reports_no_separation_when_both_arms_are_identical(
     ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{EquivalenceBounds, ExperimentPlan, TimingSeed};
+
         struct NullProbe {
             inner: InsertProbe<PersistentAddressDirectory>,
             forced: Arm,
