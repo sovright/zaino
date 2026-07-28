@@ -1427,7 +1427,7 @@ mod tests {
             let pairs = crate::timing_experiment::run(&plan, &mut probe)?;
             let report = crate::timing_equivalence::evaluate(
                 &pairs,
-                EquivalenceBounds::new(1_000_000.0, 1.0),
+                EquivalenceBounds::new(1_000_000.0, 1.0)?,
                 TimingSeed::new(20_260_728),
             );
 
