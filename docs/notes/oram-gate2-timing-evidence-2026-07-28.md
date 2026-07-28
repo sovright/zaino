@@ -261,6 +261,83 @@ both scheduled labels execute the same operation in a forced mode, these runs
 can expose measurement-procedure separation without introducing a second
 acceptance criterion.
 
+## Observed results
+
+Measured on a GCP c3-standard-44, pinned to a single CPU with pinning verified
+from `/proc/self/status` rather than assumed. A fresh, equal-occupancy table was
+rebuilt before **every** measurement: the miss arm mutates, raising occupancy by
+one, so a shared table would hand the second-measured arm a different occupancy
+and measure table growth instead of the hit/miss distinction. Both arms insert
+the same probe key at equal occupancy; only the filler set differs, which
+removes key identity as a confound.
+
+### Harness null control
+
+Running the forced modes described above, both arms performing the identical
+operation, so any separation reported is measurement artefact:
+
+| Forced arm | AUC | CDF distance | Mean |
+| --- | ---: | ---: | ---: |
+| Both miss | 0.4920 | 0.032 | +32.9 ns |
+| Both hit | 0.5261 | 0.068 | +62.5 ns |
+
+**Baseline: |AUC − 0.5| ≤ 0.026.** Every AUC below is read against this measured
+floor, not against theory.
+
+The control also shows a systematic positive **mean** of +33 to +63 ns between
+first- and second-measured positions with no hit/miss distinction present. The
+mean difference is therefore not a usable statistic here; the rank-based AUC and
+CDF distance are. This is the specific reason the results below report ranks
+only.
+
+### Directory table, AUC by capacity
+
+Fill ratio held at 25% throughout, so occupancy is not a confound.
+
+| Capacity | Runs | AUC range | Mean AUC | Verdict against baseline |
+| ---: | ---: | --- | ---: | --- |
+| 1,024 | 7 | 0.569 – 0.664 | 0.621 | **separated, 7/7** |
+| 2,048 | 2 | 0.497 – 0.568 | 0.533 | transitional |
+| 4,096 | 5 | 0.494 – 0.516 | 0.503 | at chance, 5/5 |
+| 8,192 | 1 | 0.525 | 0.525 | at baseline |
+| 16,384 | 1 | 0.531 | 0.531 | at baseline |
+
+The event table stayed within 0.474 – 0.555 at every size, at or near baseline
+throughout, and serves as an internal control.
+
+### What the campaign established
+
+1. **The cost difference is real.** At capacity 1,024 the arms separate across
+   seven independent seeds at five to six times the harness baseline. Insert and
+   overwrite genuinely differ in cost inside upstream
+   `CircuitORAM::write_or_insert`. Not noise, and not harness artefact.
+
+2. **Wall-clock timing stops resolving it by capacity 4,096,** and it does not
+   return at 8,192 or 16,384. The most plausible mechanism is cache residency:
+   a few tens of nanoseconds are visible while the structure is cache-resident
+   and are swamped once memory latency dominates.
+
+3. **This is "not measurable by this method at these sizes", not "oblivious."**
+   Production directory capacity is 16,777,216, three orders of magnitude beyond
+   where the signal already vanished, so this particular wall-clock channel is
+   unlikely to be exploitable at production scale. But a rising noise floor
+   masks a leak rather than removing it. An adversary with PMU access,
+   cache-timing, or co-resident measurement could plausibly recover what
+   wall-clock cannot. The mechanism was demonstrated to exist; size changed only
+   our ability to see it.
+
+### Limits specific to this campaign
+
+- Single host, single pinned core, `zebrad` resident throughout. Three of eight
+  replication runs and two of eight sweep runs were **not** environment-admitted.
+  They are reported and agree with the admitted runs, but the claim rests on the
+  admitted ones.
+- The seed fixes the schedule, not the timings. Single-run AUC carries roughly
+  ±0.05 — the same seed produced 0.630 and 0.586 on repeat — so no individual
+  run is load-bearing. Only the pattern across seeds is.
+- Largest configuration tested is 16,384 slots against a production target of
+  16,777,216. No measurement here speaks directly to production scale.
+
 ## Evidence retention
 
 Future evidence used by this note must be the exact JSON emitted by the timing
