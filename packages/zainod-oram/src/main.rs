@@ -50,6 +50,11 @@ use crate::execution_identity::{
 #[cfg(feature = "typed-qualification")]
 use crate::full_map_saturation_artifact::publish_full_map_saturation;
 #[cfg(feature = "typed-qualification")]
+use crate::gate2::{
+    create_timing_manifest, inspect_timing_manifest, verify_timing_manifest,
+    TimingManifestCreateInputs, TimingManifestInspectInputs, TimingManifestVerifyInputs,
+};
+#[cfg(feature = "typed-qualification")]
 use crate::qualification_artifact::publish_qualification;
 #[cfg(feature = "typed-qualification")]
 use crate::stress_qualification_artifact::publish_stress_qualification;
@@ -63,6 +68,8 @@ mod corpus_artifact;
 mod execution_identity;
 #[cfg(feature = "typed-qualification")]
 mod full_map_saturation_artifact;
+#[cfg(feature = "typed-qualification")]
+mod gate2;
 #[cfg(feature = "private-service")]
 mod private_proto;
 #[cfg(feature = "private-service")]
@@ -73,6 +80,8 @@ mod qualification_artifact;
 mod stress_qualification_artifact;
 #[cfg(feature = "typed-qualification")]
 mod target_load_artifact;
+#[cfg(feature = "typed-qualification")]
+mod timing_contract;
 
 type RunnerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -179,6 +188,73 @@ enum QualificationSubcommand {
     TargetLoad(QualificationTargetLoadArgs),
     /// Rebuild a typed worker from a fixed canonical source snapshot.
     ColdRebuild(QualificationColdRebuildArgs),
+    /// Create, inspect, and verify a Gate 2 timing matrix manifest.
+    Timing(QualificationTimingCommand),
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTimingCommand {
+    #[command(subcommand)]
+    command: QualificationTimingSubcommand,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Subcommand)]
+enum QualificationTimingSubcommand {
+    /// Create an immutable receipt- and host-bound timing manifest.
+    #[command(name = "create-manifest")]
+    Create(QualificationTimingCreateManifestArgs),
+    /// Structurally verify retained bytes against an externally retained digest.
+    #[command(name = "inspect-manifest")]
+    Inspect(QualificationTimingInspectManifestArgs),
+    /// Revalidate same-boot execution admission against this binary and host.
+    #[command(name = "verify-manifest")]
+    Verify(QualificationTimingVerifyManifestArgs),
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTimingCreateManifestArgs {
+    /// Strict manifest-request-v1 JSON containing every matrix axis and threshold.
+    #[arg(long, value_name = "FILE")]
+    request: PathBuf,
+
+    /// Canonical release receipt for this invoking zainod-oram executable.
+    #[arg(long, value_name = "FILE")]
+    release_receipt: PathBuf,
+
+    /// New directory that will receive manifest.json and the exact receipt bytes.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTimingVerifyManifestArgs {
+    /// Complete two-file timing-manifest artifact directory.
+    #[arg(long, value_name = "DIR")]
+    manifest_dir: PathBuf,
+
+    /// Canonical release receipt for this invoking zainod-oram executable.
+    #[arg(long, value_name = "FILE")]
+    release_receipt: PathBuf,
+
+    /// Externally retained BLAKE2s-256 digest of canonical manifest.json.
+    #[arg(long, value_name = "HEX")]
+    expected_manifest_blake2s256: String,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTimingInspectManifestArgs {
+    /// Complete two-file timing-manifest artifact directory.
+    #[arg(long, value_name = "DIR")]
+    manifest_dir: PathBuf,
+
+    /// Externally retained BLAKE2s-256 digest of canonical manifest.json.
+    #[arg(long, value_name = "HEX")]
+    expected_manifest_blake2s256: String,
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -442,8 +518,69 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             QualificationSubcommand::Stress(args) => run_stress_qualification(args),
             QualificationSubcommand::TargetLoad(args) => run_target_load(args),
             QualificationSubcommand::ColdRebuild(args) => run_cold_rebuild(args).await,
+            QualificationSubcommand::Timing(command) => match command.command {
+                QualificationTimingSubcommand::Create(args) => run_timing_create_manifest(args),
+                QualificationTimingSubcommand::Inspect(args) => run_timing_inspect_manifest(args),
+                QualificationTimingSubcommand::Verify(args) => run_timing_verify_manifest(args),
+            },
         },
     }
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_timing_create_manifest(args: QualificationTimingCreateManifestArgs) -> RunnerResult<()> {
+    let output_dir = args.output_dir.clone();
+    let summary = create_timing_manifest(
+        TimingManifestCreateInputs {
+            request: args.request,
+            release_receipt: args.release_receipt,
+            output_dir: args.output_dir,
+        },
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!(
+        "timing_manifest={},manifest_blake2s256:{},cells:{}",
+        output_dir.display(),
+        summary.manifest_blake2s256(),
+        summary.cell_count()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_timing_verify_manifest(args: QualificationTimingVerifyManifestArgs) -> RunnerResult<()> {
+    let manifest_dir = args.manifest_dir.clone();
+    let summary = verify_timing_manifest(
+        TimingManifestVerifyInputs {
+            manifest_dir: args.manifest_dir,
+            release_receipt: args.release_receipt,
+            expected_manifest_blake2s256: args.expected_manifest_blake2s256,
+        },
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!(
+        "timing_manifest_verified={},manifest_blake2s256:{},cells:{}",
+        manifest_dir.display(),
+        summary.manifest_blake2s256(),
+        summary.cell_count()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_timing_inspect_manifest(args: QualificationTimingInspectManifestArgs) -> RunnerResult<()> {
+    let manifest_dir = args.manifest_dir.clone();
+    let summary = inspect_timing_manifest(TimingManifestInspectInputs {
+        manifest_dir: args.manifest_dir,
+        expected_manifest_blake2s256: args.expected_manifest_blake2s256,
+    })?;
+    println!(
+        "timing_manifest_inspected={},manifest_blake2s256:{},cells:{}",
+        manifest_dir.display(),
+        summary.manifest_blake2s256(),
+        summary.cell_count()
+    );
+    Ok(())
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -1345,6 +1482,52 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_timing_manifest_create_args() -> [&'static str; 10] {
+        [
+            "zainod-oram",
+            "qualification",
+            "timing",
+            "create-manifest",
+            "--request",
+            "/tmp/timing-manifest-request.json",
+            "--release-receipt",
+            "/tmp/release-receipt.json",
+            "--output-dir",
+            "/tmp/timing-manifest",
+        ]
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    fn valid_timing_manifest_verify_args() -> [&'static str; 10] {
+        [
+            "zainod-oram",
+            "qualification",
+            "timing",
+            "verify-manifest",
+            "--manifest-dir",
+            "/tmp/timing-manifest",
+            "--release-receipt",
+            "/tmp/release-receipt.json",
+            "--expected-manifest-blake2s256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ]
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    fn valid_timing_manifest_inspect_args() -> [&'static str; 8] {
+        [
+            "zainod-oram",
+            "qualification",
+            "timing",
+            "inspect-manifest",
+            "--manifest-dir",
+            "/tmp/timing-manifest",
+            "--expected-manifest-blake2s256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ]
+    }
+
     fn parsed_corpus(cli: Cli) -> CorpusCommand {
         match cli.command {
             Command::Corpus(command) => command,
@@ -1369,6 +1552,9 @@ mod tests {
                 QualificationSubcommand::ColdRebuild(_) => {
                     panic!("cold-rebuild arguments parsed as stress")
                 }
+                QualificationSubcommand::Timing(_) => {
+                    panic!("timing arguments parsed as stress")
+                }
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
             Command::Release(_) => panic!("stress arguments parsed as release"),
@@ -1391,6 +1577,9 @@ mod tests {
                 QualificationSubcommand::ColdRebuild(_) => {
                     panic!("cold-rebuild arguments parsed as fixed qualification")
                 }
+                QualificationSubcommand::Timing(_) => {
+                    panic!("timing arguments parsed as fixed qualification")
+                }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
             Command::Release(_) => panic!("qualification arguments parsed as release"),
@@ -1401,6 +1590,141 @@ mod tests {
             let mut args = valid_qualification_args().to_vec();
             args.extend([rejected, "8"]);
             assert!(Cli::try_parse_from(args).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn timing_manifest_cli_requires_only_predeclared_inputs() -> Result<(), clap::Error> {
+        let create = Cli::try_parse_from(valid_timing_manifest_create_args())?;
+        match create.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::Timing(command) => match command.command {
+                    QualificationTimingSubcommand::Create(args) => {
+                        assert_eq!(
+                            args.request,
+                            PathBuf::from("/tmp/timing-manifest-request.json")
+                        );
+                        assert_eq!(
+                            args.release_receipt,
+                            PathBuf::from("/tmp/release-receipt.json")
+                        );
+                        assert_eq!(args.output_dir, PathBuf::from("/tmp/timing-manifest"));
+                    }
+                    QualificationTimingSubcommand::Verify(_) => {
+                        panic!("manifest creation arguments parsed as verification")
+                    }
+                    QualificationTimingSubcommand::Inspect(_) => {
+                        panic!("manifest creation arguments parsed as retained inspection")
+                    }
+                },
+                _ => panic!("timing manifest arguments parsed as another qualification command"),
+            },
+            _ => panic!("timing manifest arguments parsed as another top-level command"),
+        }
+
+        for required in ["--request", "--release-receipt", "--output-dir"] {
+            let mut command = valid_timing_manifest_create_args().to_vec();
+            let index = command
+                .iter()
+                .position(|argument| *argument == required)
+                .expect("required timing manifest argument is present");
+            command.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+        for (rejected, value) in [
+            ("--pairs", "500"),
+            ("--warmup-pairs", "50"),
+            ("--mode", "hit-miss"),
+            ("--directory-capacity", "1024"),
+            ("--directory-initial-occupancy", "16"),
+            ("--event-capacity", "1024"),
+            ("--event-initial-occupancy", "16"),
+            ("--seed", "1"),
+            ("--mean-bound-nanos", "1000"),
+            ("--cdf-distance-bound", "0.1"),
+            ("--max-load-average-1m", "1.0"),
+            ("--max-competing-processes", "0"),
+            ("--max-runqueue-wait-ratio", "0.01"),
+            ("--host-identity", "/tmp/host.json"),
+            ("--output", "/tmp/timing-v3.json"),
+            ("--config", "/tmp/zainod.toml"),
+        ] {
+            let mut command = valid_timing_manifest_create_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+
+        let verify = Cli::try_parse_from(valid_timing_manifest_verify_args())?;
+        match verify.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::Timing(command) => match command.command {
+                    QualificationTimingSubcommand::Verify(args) => {
+                        assert_eq!(args.manifest_dir, PathBuf::from("/tmp/timing-manifest"));
+                        assert_eq!(
+                            args.release_receipt,
+                            PathBuf::from("/tmp/release-receipt.json")
+                        );
+                        assert_eq!(
+                            args.expected_manifest_blake2s256,
+                            "1111111111111111111111111111111111111111111111111111111111111111"
+                        );
+                    }
+                    QualificationTimingSubcommand::Create(_) => {
+                        panic!("manifest verification arguments parsed as creation")
+                    }
+                    QualificationTimingSubcommand::Inspect(_) => {
+                        panic!("manifest verification arguments parsed as retained inspection")
+                    }
+                },
+                _ => panic!("timing manifest arguments parsed as another qualification command"),
+            },
+            _ => panic!("timing manifest arguments parsed as another top-level command"),
+        }
+
+        for required in [
+            "--manifest-dir",
+            "--release-receipt",
+            "--expected-manifest-blake2s256",
+        ] {
+            let mut command = valid_timing_manifest_verify_args().to_vec();
+            let index = command
+                .iter()
+                .position(|argument| *argument == required)
+                .expect("required timing manifest verification argument is present");
+            command.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+
+        let inspect = Cli::try_parse_from(valid_timing_manifest_inspect_args())?;
+        match inspect.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::Timing(command) => match command.command {
+                    QualificationTimingSubcommand::Inspect(args) => {
+                        assert_eq!(args.manifest_dir, PathBuf::from("/tmp/timing-manifest"));
+                        assert_eq!(
+                            args.expected_manifest_blake2s256,
+                            "1111111111111111111111111111111111111111111111111111111111111111"
+                        );
+                    }
+                    QualificationTimingSubcommand::Create(_)
+                    | QualificationTimingSubcommand::Verify(_) => {
+                        panic!("retained inspection arguments parsed as execution admission")
+                    }
+                },
+                _ => panic!("timing manifest arguments parsed as another qualification command"),
+            },
+            _ => panic!("timing manifest arguments parsed as another top-level command"),
+        }
+        for required in ["--manifest-dir", "--expected-manifest-blake2s256"] {
+            let mut command = valid_timing_manifest_inspect_args().to_vec();
+            let index = command
+                .iter()
+                .position(|argument| *argument == required)
+                .expect("required timing manifest inspection argument is present");
+            command.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(command).is_err());
         }
         Ok(())
     }
@@ -1483,7 +1807,8 @@ mod tests {
                 QualificationSubcommand::TargetLoad(args) => args,
                 QualificationSubcommand::Run(_)
                 | QualificationSubcommand::Stress(_)
-                | QualificationSubcommand::ColdRebuild(_) => {
+                | QualificationSubcommand::ColdRebuild(_)
+                | QualificationSubcommand::Timing(_) => {
                     panic!("target-load arguments parsed as another qualification command")
                 }
             },
@@ -1521,7 +1846,8 @@ mod tests {
                 QualificationSubcommand::ColdRebuild(args) => args,
                 QualificationSubcommand::Run(_)
                 | QualificationSubcommand::Stress(_)
-                | QualificationSubcommand::TargetLoad(_) => {
+                | QualificationSubcommand::TargetLoad(_)
+                | QualificationSubcommand::Timing(_) => {
                     panic!("cold-rebuild arguments parsed as another qualification command")
                 }
             },

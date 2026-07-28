@@ -745,7 +745,9 @@ fn open_artifact_output(output_dir: &Path) -> Result<ArtifactOutput, ArtifactErr
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-fn open_artifact_directory(directory: &Path) -> Result<ArtifactDirectory, ArtifactError> {
+pub(super) fn open_artifact_directory(
+    directory: &Path,
+) -> Result<ArtifactDirectory, ArtifactError> {
     let fd = open(
         directory,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -759,7 +761,9 @@ fn open_artifact_directory(directory: &Path) -> Result<ArtifactDirectory, Artifa
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-fn open_artifact_directory(_directory: &Path) -> Result<ArtifactDirectory, ArtifactError> {
+pub(super) fn open_artifact_directory(
+    _directory: &Path,
+) -> Result<ArtifactDirectory, ArtifactError> {
     Err(ArtifactError::UnsupportedPlatform)
 }
 
@@ -1225,6 +1229,20 @@ pub(super) fn read_artifact_file(
     maximum_bytes: usize,
 ) -> Result<Vec<u8>, ArtifactError> {
     read_file(directory, name, maximum_bytes)
+}
+
+/// Requires an opened artifact directory to contain exactly the named files.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn validate_artifact_file_set(
+    directory: &ArtifactDirectory,
+    names: &[&'static str],
+) -> Result<(), ArtifactError> {
+    let files: Vec<_> = names
+        .iter()
+        .map(|name| ArtifactFile::new(name, Vec::new()))
+        .collect();
+    let expected = validate_file_names(&files)?;
+    validate_file_set(directory, &expected)
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]

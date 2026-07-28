@@ -18,25 +18,23 @@ use tempfile::NamedTempFile;
 use zaino_oram::{
     evaluate_timing_equivalence, run_rostl_insert_timing_mode, single_allowed_cpu,
     validate_rostl_timing_shape, EquivalenceBounds, EquivalenceReport, ExperimentPlan, Pair,
-    Quiescence, QuiescencePolicy, RostlTimingError, RostlTimingMode, RostlTimingRecordKind,
+    Quiescence, QuiescencePolicy, RostlTimingMode, RostlTimingRecordKind,
     RostlTimingSchedulerSummary, TimingSeed, MINIMUM_PAIRS,
 };
 
-type DriverResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+#[path = "../timing_contract.rs"]
+mod timing_contract;
 
-const SCHEMA: &str = "zaino-oram-insert-timing-v3";
-const DEFAULT_WARMUP_PAIRS: usize = 50;
-const DIRECTORY_SCHEDULE_SEED_DOMAIN: u64 = 0x5e12_33a1_a341_71d1;
-const DIRECTORY_REPORT_SEED_DOMAIN: u64 = 0x6127_0c6f_3475_8a0b;
-const EVENT_SCHEDULE_SEED_DOMAIN: u64 = 0xe7e1_82a5_7b9c_4d31;
-const EVENT_REPORT_SEED_DOMAIN: u64 = 0x7b91_ed09_451f_83c7;
-const STATE_CONTROL: &str = "matched_long_lived_logical_twin_tables_v1";
-const LABEL_ASSIGNMENT: &str = "alternating_physical_tables";
-const ORDER_BLOCKING: &str = "physical_table_role_parity_v1";
-const DIRECTORY_RECORD_MODEL: &str = "directory_single_cell_v1";
-const EVENT_RECORD_MODEL: &str = "event_single_immutable_cell_v1";
-const TARGET_PROJECTION_MODEL: &str = "chunked_generational_events";
-const STATISTICAL_SCOPE: &str = "nominal_iid_bounds_on_serially_dependent_rounds";
+use timing_contract::{
+    derive_seed, occupancy_window, table_set_relation, timed_operation_model,
+    validate_evidence_intent, EvidenceIntent, DEFAULT_WARMUP_PAIRS, DIRECTORY_RECORD_MODEL,
+    DIRECTORY_REPORT_SEED_DOMAIN, DIRECTORY_SCHEDULE_SEED_DOMAIN, EVENT_RECORD_MODEL,
+    EVENT_REPORT_SEED_DOMAIN, EVENT_SCHEDULE_SEED_DOMAIN, LABEL_ASSIGNMENT, ORDER_BLOCKING,
+    STATE_CONTROL, STATISTICAL_SCOPE, SUPPORTED_MODES, TARGET_PROJECTION_MODEL,
+    TIMING_EVIDENCE_SCHEMA as SCHEMA,
+};
+
+type DriverResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -113,19 +111,12 @@ enum TimingModeArgument {
     ForcedMiss,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-enum EvidenceIntent {
-    Pilot,
-    QualificationCandidate,
-}
-
 impl TimingModeArgument {
     const fn rostl_mode(self) -> RostlTimingMode {
         match self {
-            Self::HitMiss => RostlTimingMode::HitMiss,
-            Self::ForcedHit => RostlTimingMode::ForcedHit,
-            Self::ForcedMiss => RostlTimingMode::ForcedMiss,
+            Self::HitMiss => SUPPORTED_MODES[0],
+            Self::ForcedHit => SUPPORTED_MODES[1],
+            Self::ForcedMiss => SUPPORTED_MODES[2],
         }
     }
 }
@@ -212,14 +203,6 @@ struct TimingEvidence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OccupancyWindow {
-    initial: usize,
-    measured_start: usize,
-    measured_last_pre: usize,
-    final_occupancy: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RunOutcome {
     evidence_intent: EvidenceIntent,
     environment_admitted: bool,
@@ -245,8 +228,6 @@ enum DriverError {
     CpuNotPinned,
     InvalidQuiescencePolicy,
     InvalidRunqueueWaitPolicy,
-    UnderpoweredQualificationCandidate { requested: usize },
-    UnbalancedQualificationCandidate,
     InitiallyNotQuiescent,
     InvalidSchedulerStatsControl,
     SchedulerStatsDisabled,
@@ -276,13 +257,6 @@ impl fmt::Display for DriverError {
             Self::InvalidRunqueueWaitPolicy => {
                 formatter.write_str("maximum run-queue wait ratio must be finite and within [0, 1]")
             }
-            Self::UnderpoweredQualificationCandidate { requested } => write!(
-                formatter,
-                "qualification candidate requested {requested} measured pairs; at least {MINIMUM_PAIRS} are required"
-            ),
-            Self::UnbalancedQualificationCandidate => formatter.write_str(
-                "qualification candidate requires measured pairs divisible by four and an even warm-up pair count",
-            ),
             Self::InitiallyNotQuiescent => {
                 formatter.write_str("host is not quiescent enough to start timing")
             }
@@ -503,71 +477,6 @@ fn run(cli: Cli) -> DriverResult<RunOutcome> {
         environment_admitted,
         declared_wall_clock_criteria_satisfied,
     })
-}
-
-fn validate_evidence_intent(
-    intent: EvidenceIntent,
-    pairs: usize,
-    warmup_pairs: usize,
-) -> Result<(), DriverError> {
-    if intent == EvidenceIntent::QualificationCandidate && pairs < MINIMUM_PAIRS {
-        return Err(DriverError::UnderpoweredQualificationCandidate { requested: pairs });
-    }
-    if intent == EvidenceIntent::QualificationCandidate
-        && (!pairs.is_multiple_of(4) || !warmup_pairs.is_multiple_of(2))
-    {
-        return Err(DriverError::UnbalancedQualificationCandidate);
-    }
-    Ok(())
-}
-
-const fn timed_operation_model(mode: RostlTimingMode) -> &'static str {
-    match mode {
-        RostlTimingMode::HitMiss => {
-            "mixed_duplicate_and_unique_insert_current_single_cell_baseline_v1"
-        }
-        RostlTimingMode::ForcedHit => "duplicate_insert_current_single_cell_control_v1",
-        RostlTimingMode::ForcedMiss => "unique_insert_current_single_cell_control_v1",
-    }
-}
-
-const fn table_set_relation(mode: RostlTimingMode) -> &'static str {
-    match mode {
-        RostlTimingMode::HitMiss => "one_record_substitution_equal_cardinality",
-        RostlTimingMode::ForcedHit | RostlTimingMode::ForcedMiss => "identical_key_sets",
-    }
-}
-
-fn occupancy_window(
-    initial: usize,
-    plan: &ExperimentPlan,
-) -> Result<OccupancyWindow, RostlTimingError> {
-    let measured_start = initial
-        .checked_add(plan.warmup_pairs())
-        .ok_or(RostlTimingError::InvalidShape)?;
-    let measured_last_pre = measured_start
-        .checked_add(
-            plan.pairs()
-                .checked_sub(1)
-                .ok_or(RostlTimingError::InvalidShape)?,
-        )
-        .ok_or(RostlTimingError::InvalidShape)?;
-    let final_occupancy = initial
-        .checked_add(plan.total_pairs())
-        .ok_or(RostlTimingError::InvalidShape)?;
-    Ok(OccupancyWindow {
-        initial,
-        measured_start,
-        measured_last_pre,
-        final_occupancy,
-    })
-}
-
-fn derive_seed(root: u64, domain: u64) -> u64 {
-    let mut value = root ^ domain;
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 fn evaluate_environment_admission(
@@ -937,7 +846,7 @@ mod tests {
                 MINIMUM_PAIRS - 1,
                 DEFAULT_WARMUP_PAIRS
             ),
-            Err(DriverError::UnderpoweredQualificationCandidate { .. })
+            Err(timing_contract::TimingContractError::UnderpoweredQualificationCandidate { .. })
         ));
         assert!(matches!(
             validate_evidence_intent(
@@ -945,7 +854,7 @@ mod tests {
                 MINIMUM_PAIRS + 1,
                 DEFAULT_WARMUP_PAIRS
             ),
-            Err(DriverError::UnbalancedQualificationCandidate)
+            Err(timing_contract::TimingContractError::UnbalancedQualificationCandidate)
         ));
         assert!(matches!(
             validate_evidence_intent(
@@ -953,7 +862,7 @@ mod tests {
                 MINIMUM_PAIRS + 2,
                 DEFAULT_WARMUP_PAIRS
             ),
-            Err(DriverError::UnbalancedQualificationCandidate)
+            Err(timing_contract::TimingContractError::UnbalancedQualificationCandidate)
         ));
         assert!(matches!(
             validate_evidence_intent(
@@ -961,7 +870,7 @@ mod tests {
                 MINIMUM_PAIRS,
                 DEFAULT_WARMUP_PAIRS + 1
             ),
-            Err(DriverError::UnbalancedQualificationCandidate)
+            Err(timing_contract::TimingContractError::UnbalancedQualificationCandidate)
         ));
         assert!(validate_evidence_intent(
             EvidenceIntent::QualificationCandidate,
@@ -978,7 +887,7 @@ mod tests {
 
         assert_eq!(
             occupancy_window(20, &plan)?,
-            OccupancyWindow {
+            timing_contract::OccupancyWindow {
                 initial: 20,
                 measured_start: 24,
                 measured_last_pre: 29,
