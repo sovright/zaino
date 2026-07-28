@@ -28,6 +28,8 @@ mod engine;
 mod envelope;
 #[cfg(feature = "corpus-zaino")]
 mod full_map_saturation;
+#[cfg(feature = "corpus-zaino")]
+mod hybrid_sizing;
 mod inner_codec;
 #[cfg(feature = "corpus-zaino")]
 mod insertion_bound;
@@ -64,6 +66,11 @@ mod zaino_fixtures;
 pub use full_map_saturation::{
     run_typed_worker_full_map_saturation, TypedWorkerFullMapSaturationError,
     TypedWorkerFullMapSaturationProfile, TypedWorkerFullMapSaturationReport,
+};
+#[cfg(feature = "corpus-zaino")]
+pub use hybrid_sizing::{
+    SourceBoundHybridSizingError, SourceBoundHybridSizingProfile, SourceBoundHybridSizingReport,
+    SourceBoundHybridSizingSession,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use insertion_bound::{

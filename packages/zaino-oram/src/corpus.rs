@@ -123,14 +123,22 @@ struct AddressStats {
     peak_live_utxos: u64,
 }
 
-/// Dense identity and ordinal resolved while the aggregate scanner owns the
-/// canonical live-output map.
+/// Authoritative replay direction resolved from the canonical live-output map.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AppliedStandardAddressEventKind {
+    Created,
+    Spent,
+}
+
+/// Dense identity, ordinal, and replay kind resolved while the aggregate
+/// scanner owns the canonical live-output map.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct AppliedStandardAddressEvent {
     pub(super) address: CorpusAddress,
     pub(super) address_index: u32,
     pub(super) ordinal: u64,
     pub(super) first_for_address: bool,
+    pub(super) kind: AppliedStandardAddressEventKind,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +280,7 @@ impl CorpusAccumulator {
                     address_index: current.address_index,
                     ordinal: current.events,
                     first_for_address: current.events == 0,
+                    kind: AppliedStandardAddressEventKind::Created,
                 });
                 self.addresses.insert(address, next);
                 LiveOutputOwner::Standard(address)
@@ -331,6 +340,7 @@ impl CorpusAccumulator {
                 address_index: current.address_index,
                 ordinal: current.events,
                 first_for_address: false,
+                kind: AppliedStandardAddressEventKind::Spent,
             })
         } else {
             None
@@ -590,8 +600,14 @@ impl CorpusMeasurement {
         &self.events_per_address
     }
 
-    const fn live_utxos_per_address(&self) -> &BTreeMap<u64, u64> {
+    pub(super) const fn live_utxos_per_address(&self) -> &BTreeMap<u64, u64> {
         &self.live_utxos_per_address
+    }
+
+    pub(super) fn maximum_live_utxos_per_address(&self) -> u64 {
+        self.live_utxos_per_address
+            .last_key_value()
+            .map_or(0, |(live_utxos, _)| *live_utxos)
     }
 
     pub(super) fn validate(&self) -> Result<(), CorpusError> {
@@ -1331,6 +1347,37 @@ mod tests {
 
     fn growth() -> Result<GrowthAssumption, CorpusError> {
         GrowthAssumption::new(2, 1_000)
+    }
+
+    #[test]
+    fn resolved_standard_events_preserve_created_spent_kind_order() -> Result<(), CorpusError> {
+        let address = address(0xaa, CorpusScriptClass::PayToPublicKeyHash);
+        let outpoint = outpoint(0x11, 0);
+        let mut accumulator = CorpusAccumulator::from_genesis();
+
+        let created = accumulator
+            .apply_resolving_standard_address(CorpusEvent::Created {
+                outpoint,
+                address: Some(address),
+                script_class: CorpusScriptClass::PayToPublicKeyHash,
+            })?
+            .expect("standard address creation emits an applied event");
+        let spent = accumulator
+            .apply_resolving_standard_address(CorpusEvent::Spent { previous: outpoint })?
+            .expect("standard address spend emits an applied event");
+
+        assert!(matches!(
+            created.kind,
+            AppliedStandardAddressEventKind::Created
+        ));
+        assert!(matches!(spent.kind, AppliedStandardAddressEventKind::Spent));
+        assert_eq!(created.address, spent.address);
+        assert_eq!(created.address_index, spent.address_index);
+        assert_eq!(created.ordinal, 0);
+        assert_eq!(spent.ordinal, 1);
+        assert!(created.first_for_address);
+        assert!(!spent.first_for_address);
+        Ok(())
     }
 
     #[test]
