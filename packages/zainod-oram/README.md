@@ -215,6 +215,73 @@ thresholds are caller-selected. A true
 is self-reported and is not signed, source-bound, execution-attested, or bound
 to a predeclared multi-run manifest.
 
+### Manifest-bound timing attempts
+
+Qualification matrices use the `zainod-oram` main binary rather than the
+standalone pilot interface. Create and externally retain the digest of an
+immutable timing manifest, then create an empty real ledger directory. The
+builder must provide `/usr/bin/numactl`; attempt admission fails closed if
+`numactl --show` is missing, exits unsuccessfully, warns on stderr, or emits an
+unknown policy field.
+
+```console
+zainod-oram qualification timing create-manifest \
+  --request request.json \
+  --release-receipt release-receipt.json \
+  --output-dir manifest-v1
+
+mkdir timing-ledger-v2
+
+taskset -c <CPU> zainod-oram qualification timing run-cell \
+  --manifest-dir manifest-v1 \
+  --release-receipt release-receipt.json \
+  --expected-manifest-blake2s256 <RETAINED_MANIFEST_DIGEST> \
+  --ledger-dir timing-ledger-v2
+```
+
+Invoke `run-cell` in a fresh pinned process once per manifest cell. The CLI
+cannot override cell inputs. Before the first ORAM operation it publishes a
+durable `Started` record; it then publishes exactly one positive, negative, or
+error terminal. A post-start crash leaves a consumed dangling cell. Record it
+without rerunning the workload:
+
+```console
+zainod-oram qualification timing seal-dangling \
+  --manifest-dir manifest-v1 \
+  --expected-manifest-blake2s256 <RETAINED_MANIFEST_DIGEST> \
+  --ledger-dir timing-ledger-v2
+```
+
+Inspect the chain and optionally compare its exact current head with an
+independently retained append-only/WORM witness:
+
+```console
+zainod-oram qualification timing inspect-ledger \
+  --manifest-dir manifest-v1 \
+  --expected-manifest-blake2s256 <RETAINED_MANIFEST_DIGEST> \
+  --ledger-dir timing-ledger-v2 \
+  --expected-head-sequence <RETAINED_SEQUENCE> \
+  --expected-head-blake2s256 <RETAINED_RECORD_DIGEST>
+```
+
+The v2 chain binds the manifest/release/host/cell, exact raw-v3 bytes, selected
+CPU, task mitigations, frequency/SMT/turbo controls, and NUMA cpuset and policy;
+stable controls must also agree across cells. Before publishing a completion,
+and again during `inspect-ledger`, the runner strictly parses the full raw-v3
+schema and deterministically recomputes the seeded AB/BA schedule, statistical
+reports, scheduler summaries and admission, quiescence/affinity admission, and
+final wall-clock outcome from the retained pairs. A true
+`wall_clock_matrix_recomputed_positive` means every cell was terminal-positive
+under that replay. The evaluator uses the same audited Rust implementation as
+the producer; it is not an independent implementation, and the samples and
+host remain self-reported and unattested. Without an external witness the
+ledger cannot detect suffix/root deletion. Every record keeps
+`can_clear_gate2=false`.
+
+Manifest admission bounds evaluator work to 2,048 measured pairs and 512
+warm-up pairs per cell and 256 cells per matrix. These are resource ceilings,
+not statistical pass criteria.
+
 ## Typed-worker correctness qualification
 
 The default-off `typed-qualification` feature exposes one fixed, listener-free

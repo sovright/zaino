@@ -31,6 +31,7 @@ use crate::{
         DIRECTORY_RECORD_MODEL, LABEL_ASSIGNMENT, ORDER_BLOCKING, STATE_CONTROL, STATISTICAL_SCOPE,
         SUPPORTED_MODES, TARGET_PROJECTION_MODEL, TIMING_EVIDENCE_SCHEMA,
     },
+    timing_driver::TimingRunInputs,
 };
 
 const REQUEST_SCHEMA: &str = "zaino-oram-timing-manifest-request-v1";
@@ -50,6 +51,9 @@ const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_HOST_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_AXIS_ENTRIES: usize = 64;
+const MAX_MEASURED_PAIRS: usize = 2_048;
+const MAX_WARMUP_PAIRS: usize = 512;
+const MAX_TIMING_CELLS: usize = 256;
 const MAX_IDENTIFIER_BYTES: usize = 64;
 const DIGEST_HEX_BYTES: usize = 64;
 
@@ -91,6 +95,65 @@ impl TimingManifestSummary {
 
     pub(crate) const fn cell_count(&self) -> usize {
         self.cell_count
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TimingManifestRecordBindingV1 {
+    manifest_blake2s256: String,
+    runner_version: String,
+    release: ReleaseBindingV1,
+    host: QualificationHostV1,
+}
+
+impl TimingManifestRecordBindingV1 {
+    pub(super) fn manifest_blake2s256(&self) -> &str {
+        &self.manifest_blake2s256
+    }
+
+    pub(super) fn runner_version(&self) -> &str {
+        &self.runner_version
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TimingExecutionCellV1 {
+    ordinal: usize,
+    id: String,
+    occupancy_point_id: String,
+    repeat_block_id: String,
+    cell_seed_hex: String,
+    inputs: TimingRunInputs,
+}
+
+impl TimingExecutionCellV1 {
+    pub(super) const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub(super) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(super) fn inputs(&self) -> &TimingRunInputs {
+        &self.inputs
+    }
+}
+
+pub(super) struct AdmittedTimingManifest {
+    record_binding: TimingManifestRecordBindingV1,
+    cells: Vec<TimingExecutionCellV1>,
+}
+
+impl AdmittedTimingManifest {
+    pub(super) fn record_binding(&self) -> &TimingManifestRecordBindingV1 {
+        &self.record_binding
+    }
+
+    pub(super) fn cells(&self) -> &[TimingExecutionCellV1] {
+        &self.cells
     }
 }
 
@@ -406,6 +469,11 @@ impl CompanionRequirementsV1 {
 
 impl TimingPolicyV1 {
     fn plan(&self) -> Result<ExperimentPlan, TimingManifestError> {
+        if self.pairs > MAX_MEASURED_PAIRS || self.warmup_pairs > MAX_WARMUP_PAIRS {
+            return Err(TimingManifestError::InvalidRequest {
+                reason: "timing pair counts exceed the Gate 2 resource limits",
+            });
+        }
         validate_evidence_intent(
             EvidenceIntent::QualificationCandidate,
             self.pairs,
@@ -510,13 +578,20 @@ impl TimingManifestRequestV1 {
     }
 
     fn cell_count(&self) -> Result<usize, TimingManifestError> {
-        self.repeat_blocks
+        let count = self
+            .repeat_blocks
             .len()
             .checked_mul(self.occupancy_points.len())
             .and_then(|count| count.checked_mul(self.modes.len()))
             .ok_or(TimingManifestError::InvalidRequest {
                 reason: "timing manifest cell count overflows usize",
-            })
+            })?;
+        if count > MAX_TIMING_CELLS {
+            return Err(TimingManifestError::InvalidRequest {
+                reason: "timing manifest cell count exceeds the Gate 2 resource limit",
+            });
+        }
+        Ok(count)
     }
 
     fn canonical_bytes(&self) -> Result<Vec<u8>, TimingManifestError> {
@@ -620,6 +695,52 @@ impl LoadedTimingManifest {
             cell_count: self.manifest.cells.len(),
         })
     }
+
+    fn admitted(&self) -> Result<AdmittedTimingManifest, TimingManifestError> {
+        let mut cells = Vec::with_capacity(self.manifest.cells.len());
+        for (ordinal, cell) in self.manifest.cells.iter().enumerate() {
+            let point = self
+                .manifest
+                .occupancy_points
+                .iter()
+                .find(|point| point.id == cell.occupancy_point_id)
+                .ok_or(TimingManifestError::InvalidManifest {
+                    reason: "timing cell references an unknown occupancy point",
+                })?;
+            cells.push(TimingExecutionCellV1 {
+                ordinal,
+                id: cell.id.clone(),
+                occupancy_point_id: cell.occupancy_point_id.clone(),
+                repeat_block_id: cell.repeat_block_id.clone(),
+                cell_seed_hex: cell.cell_seed_hex.clone(),
+                inputs: TimingRunInputs::new(
+                    cell.mode,
+                    EvidenceIntent::QualificationCandidate,
+                    self.manifest.policy.pairs,
+                    self.manifest.policy.warmup_pairs,
+                    point.directory_capacity,
+                    point.directory_initial_occupancy,
+                    point.event_capacity,
+                    point.event_initial_occupancy,
+                    self.manifest.policy.mean_bound_nanos,
+                    self.manifest.policy.cdf_distance_bound,
+                    self.manifest.policy.max_load_average_1m,
+                    self.manifest.policy.max_competing_processes,
+                    self.manifest.policy.max_runqueue_wait_ratio,
+                    parse_seed(&cell.cell_seed_hex)?,
+                ),
+            });
+        }
+        Ok(AdmittedTimingManifest {
+            record_binding: TimingManifestRecordBindingV1 {
+                manifest_blake2s256: self.manifest.digest()?,
+                runner_version: self.manifest.runner_version.clone(),
+                release: self.manifest.release_binding.clone(),
+                host: self.manifest.host_binding.clone(),
+            },
+            cells,
+        })
+    }
 }
 
 pub(crate) fn create_timing_manifest(
@@ -653,8 +774,22 @@ pub(crate) fn verify_timing_manifest(
     inputs: TimingManifestVerifyInputs,
     runner_version: &str,
 ) -> Result<TimingManifestSummary, TimingManifestError> {
+    verify_loaded_timing_manifest(inputs, runner_version)?.summary()
+}
+
+pub(super) fn admit_timing_manifest(
+    inputs: TimingManifestVerifyInputs,
+    runner_version: &str,
+) -> Result<AdmittedTimingManifest, TimingManifestError> {
+    verify_loaded_timing_manifest(inputs, runner_version)?.admitted()
+}
+
+fn verify_loaded_timing_manifest(
+    inputs: TimingManifestVerifyInputs,
+    runner_version: &str,
+) -> Result<LoadedTimingManifest, TimingManifestError> {
     let loaded = load_manifest_artifact(&inputs.manifest_dir)?;
-    let summary = validate_expected_manifest_digest(&loaded, &inputs.expected_manifest_blake2s256)?;
+    let _ = validate_expected_manifest_digest(&loaded, &inputs.expected_manifest_blake2s256)?;
     if loaded.manifest.runner_version != runner_version {
         return Err(TimingManifestError::RunnerVersionMismatch);
     }
@@ -669,7 +804,7 @@ pub(crate) fn verify_timing_manifest(
     if loaded.manifest.host_binding != current_host {
         return Err(TimingManifestError::HostBindingMismatch);
     }
-    Ok(summary)
+    Ok(loaded)
 }
 
 pub(crate) fn inspect_timing_manifest(
@@ -677,6 +812,14 @@ pub(crate) fn inspect_timing_manifest(
 ) -> Result<TimingManifestSummary, TimingManifestError> {
     let loaded = load_manifest_artifact(&inputs.manifest_dir)?;
     validate_expected_manifest_digest(&loaded, &inputs.expected_manifest_blake2s256)
+}
+
+pub(super) fn inspect_timing_manifest_execution(
+    inputs: TimingManifestInspectInputs,
+) -> Result<AdmittedTimingManifest, TimingManifestError> {
+    let loaded = load_manifest_artifact(&inputs.manifest_dir)?;
+    let _ = validate_expected_manifest_digest(&loaded, &inputs.expected_manifest_blake2s256)?;
+    loaded.admitted()
 }
 
 fn validate_expected_manifest_digest(
@@ -826,6 +969,92 @@ fn parse_seed(seed: &str) -> Result<u64, TimingManifestError> {
     u64::from_str_radix(seed, 16).map_err(|_| TimingManifestError::InvalidRequest {
         reason: "repeat root seed is not valid hexadecimal",
     })
+}
+
+#[cfg(test)]
+pub(super) fn test_admitted_timing_manifest(cell_count: usize) -> AdmittedTimingManifest {
+    test_admitted_timing_manifest_with_runner(cell_count, "test-runner")
+}
+
+#[cfg(test)]
+pub(super) fn test_admitted_timing_manifest_with_runner(
+    cell_count: usize,
+    runner_version: &str,
+) -> AdmittedTimingManifest {
+    test_admitted_timing_manifest_with_policy(cell_count, runner_version, 4, 0.1)
+}
+
+#[cfg(test)]
+pub(super) fn test_admitted_timing_manifest_with_pairs(
+    cell_count: usize,
+    pairs: usize,
+    cdf_distance_bound: f64,
+) -> AdmittedTimingManifest {
+    test_admitted_timing_manifest_with_policy(cell_count, "test-runner", pairs, cdf_distance_bound)
+}
+
+#[cfg(test)]
+fn test_admitted_timing_manifest_with_policy(
+    cell_count: usize,
+    runner_version: &str,
+    pairs: usize,
+    cdf_distance_bound: f64,
+) -> AdmittedTimingManifest {
+    let record_binding = TimingManifestRecordBindingV1 {
+        manifest_blake2s256: "11".repeat(32),
+        runner_version: runner_version.to_owned(),
+        release: ReleaseBindingV1 {
+            receipt_blake2s256: "22".repeat(32),
+            source_revision: "33".repeat(20),
+            binary_sha256: "44".repeat(32),
+            binary_size_bytes: 1,
+        },
+        host: QualificationHostV1 {
+            schema: HOST_SCHEMA.to_owned(),
+            normalization: HOST_NORMALIZATION.to_owned(),
+            fingerprint_blake2s256: "55".repeat(32),
+            target_os: "linux".to_owned(),
+            target_arch: "x86_64".to_owned(),
+            kernel_release: "test-kernel".to_owned(),
+            logical_cpu_count: 1,
+            memory_total_kib: 1,
+            boot_scoped: true,
+            attested: false,
+            tdx_qualified: false,
+        },
+    };
+    let cells = (0..cell_count)
+        .map(|ordinal| {
+            let seed = ordinal as u64 + 1;
+            TimingExecutionCellV1 {
+                ordinal,
+                id: format!("repeat::{ordinal:04}::hit_miss"),
+                occupancy_point_id: format!("{ordinal:04}"),
+                repeat_block_id: "repeat".to_owned(),
+                cell_seed_hex: format!("{seed:016x}"),
+                inputs: TimingRunInputs::new(
+                    RostlTimingMode::HitMiss,
+                    EvidenceIntent::QualificationCandidate,
+                    pairs,
+                    2,
+                    16,
+                    4,
+                    16,
+                    4,
+                    1_000.0,
+                    cdf_distance_bound,
+                    1.0,
+                    0,
+                    0.01,
+                    seed,
+                ),
+            }
+        })
+        .collect();
+    AdmittedTimingManifest {
+        record_binding,
+        cells,
+    }
 }
 
 fn validate_identifier(identifier: &str) -> Result<(), TimingManifestError> {
@@ -1372,6 +1601,49 @@ mod tests {
         let mut no_headroom = request();
         no_headroom.occupancy_points[0].directory_capacity = 512;
         assert!(no_headroom.validate().is_err());
+    }
+
+    #[test]
+    fn request_rejects_resource_amplifying_policy_and_matrix() {
+        let mut maximum_policy = policy();
+        maximum_policy.pairs = MAX_MEASURED_PAIRS;
+        maximum_policy.warmup_pairs = MAX_WARMUP_PAIRS;
+        assert!(maximum_policy.plan().is_ok());
+
+        let mut excessive_pairs = policy();
+        excessive_pairs.pairs = MAX_MEASURED_PAIRS + 4;
+        assert!(matches!(
+            excessive_pairs.plan(),
+            Err(TimingManifestError::InvalidRequest {
+                reason: "timing pair counts exceed the Gate 2 resource limits"
+            })
+        ));
+
+        let mut excessive_warmup = policy();
+        excessive_warmup.warmup_pairs = MAX_WARMUP_PAIRS + 2;
+        assert!(matches!(
+            excessive_warmup.plan(),
+            Err(TimingManifestError::InvalidRequest {
+                reason: "timing pair counts exceed the Gate 2 resource limits"
+            })
+        ));
+
+        let mut excessive_matrix = request();
+        excessive_matrix.occupancy_points = (0..43)
+            .map(|index| OccupancyPointV1 {
+                id: format!("point-{index:02}"),
+                directory_capacity: 2_048,
+                directory_initial_occupancy: 1 + index,
+                event_capacity: 2_048,
+                event_initial_occupancy: 64 + index,
+            })
+            .collect();
+        assert!(matches!(
+            excessive_matrix.validate(),
+            Err(TimingManifestError::InvalidRequest {
+                reason: "timing manifest cell count exceeds the Gate 2 resource limit"
+            })
+        ));
     }
 
     #[test]

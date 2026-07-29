@@ -26,7 +26,9 @@
 use std::fmt;
 
 use crate::timing_equivalence::{ArmMeasurement, Pair, PairOrder, Rng, Seed};
-use serde::Serialize;
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+
+const TIMING_ORDER_SEED_DOMAIN: u64 = 0xa1b2_c3d4_e5f6_0789;
 
 /// Which side of the pair is being measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +132,35 @@ impl ExperimentPlan {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedExperimentPlan {
+    pairs: usize,
+    warmup_pairs: usize,
+    total_pairs: usize,
+    seed: Seed,
+}
+
+impl<'de> Deserialize<'de> for ExperimentPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let serialized = SerializedExperimentPlan::deserialize(deserializer)?;
+        let plan = Self::new(serialized.pairs, serialized.warmup_pairs, serialized.seed)
+            .map_err(D::Error::custom)?;
+        if plan.total_pairs != serialized.total_pairs {
+            return Err(D::Error::custom(
+                "timing plan total_pairs does not equal pairs plus warmup_pairs",
+            ));
+        }
+        Ok(plan)
+    }
+}
+
 /// An observation of how busy the machine was.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Quiescence {
     load_average_1m: f64,
     competing_processes: usize,
@@ -148,7 +177,8 @@ impl Quiescence {
 }
 
 /// The machine conditions a run requires.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuiescencePolicy {
     max_load_average_1m: f64,
     max_competing_processes: usize,
@@ -184,7 +214,7 @@ pub(crate) fn run<P: PairedProbe>(
     plan: &ExperimentPlan,
     probe: &mut P,
 ) -> Result<Vec<Pair>, P::Error> {
-    let mut rng = Rng::new(plan.seed.value() ^ 0xa1b2_c3d4_e5f6_0789);
+    let mut rng = timing_order_rng(plan);
     let warmup_orders = balanced_orders(plan.warmup_pairs, &mut rng);
     measure_orders(probe, &warmup_orders, |_| {})?;
 
@@ -192,6 +222,39 @@ pub(crate) fn run<P: PairedProbe>(
     let mut pairs = Vec::with_capacity(plan.pairs);
     measure_orders(probe, &measured_orders, |pair| pairs.push(pair))?;
     Ok(pairs)
+}
+
+/// Reproduces the retained AB/BA schedule declared by `plan`.
+///
+/// The warm-up schedule is generated and discarded first so the retained
+/// sequence reflects the exact RNG state used by [`run`].
+pub fn expected_timing_pair_orders(plan: &ExperimentPlan) -> Vec<PairOrder> {
+    let mut rng = timing_order_rng(plan);
+    drop(balanced_orders(plan.warmup_pairs, &mut rng));
+    let measured_orders = balanced_orders(plan.pairs, &mut rng);
+    measured_orders.into_iter().map(pair_order).collect()
+}
+
+/// Whether retained timing pairs exactly follow the schedule declared by `plan`.
+pub fn timing_pair_orders_match_plan(plan: &ExperimentPlan, pairs: &[Pair]) -> bool {
+    let expected_orders = expected_timing_pair_orders(plan);
+    pairs.len() == expected_orders.len()
+        && pairs
+            .iter()
+            .zip(expected_orders)
+            .all(|(pair, expected)| pair.order() == expected)
+}
+
+fn timing_order_rng(plan: &ExperimentPlan) -> Rng {
+    Rng::new(plan.seed.value() ^ TIMING_ORDER_SEED_DOMAIN)
+}
+
+const fn pair_order(miss_first: bool) -> PairOrder {
+    if miss_first {
+        PairOrder::MissFirst
+    } else {
+        PairOrder::HitFirst
+    }
 }
 
 fn measure_orders<P, F>(
@@ -232,14 +295,15 @@ fn balanced_orders(count: usize, rng: &mut Rng) -> Vec<bool> {
 }
 
 fn measure_pair<P: PairedProbe>(probe: &mut P, miss_first: bool) -> Result<Pair, P::Error> {
+    let order = pair_order(miss_first);
     let pair = if miss_first {
         let miss = probe.measure(Arm::Miss)?;
         let hit = probe.measure(Arm::Hit)?;
-        Pair::from_measurements(hit, miss, PairOrder::MissFirst)
+        Pair::from_measurements(hit, miss, order)
     } else {
         let hit = probe.measure(Arm::Hit)?;
         let miss = probe.measure(Arm::Miss)?;
-        Pair::from_measurements(hit, miss, PairOrder::HitFirst)
+        Pair::from_measurements(hit, miss, order)
     };
     probe.finish_pair()?;
     Ok(pair)
@@ -319,6 +383,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn experiment_plan_deserialization_preserves_validation_and_rejects_unknown_fields(
+    ) -> Result<(), serde_json::Error> {
+        let plan = ExperimentPlan::new(8, 3, Seed::new(11)).expect("valid plan");
+        let encoded = serde_json::to_string(&plan)?;
+
+        assert_eq!(serde_json::from_str::<ExperimentPlan>(&encoded)?, plan);
+        assert!(serde_json::from_str::<ExperimentPlan>(
+            r#"{"pairs":8,"warmup_pairs":0,"total_pairs":8,"seed":11}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ExperimentPlan>(
+            r#"{"pairs":8,"warmup_pairs":3,"total_pairs":12,"seed":11}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ExperimentPlan>(
+            r#"{"pairs":8,"warmup_pairs":3,"total_pairs":11,"seed":11,"extra":true}"#
+        )
+        .is_err());
+        Ok(())
+    }
+
     /// A noisy environment is inadmissible evidence in either direction.
     #[test]
     fn a_busy_machine_is_rejected_by_policy() {
@@ -331,6 +417,72 @@ mod tests {
         assert!(!policy.admits(&competing));
         assert!(policy.admits(&Quiescence::new(0.1, 0)));
         assert!(!QuiescencePolicy::new(f64::NAN, 0).admits(&Quiescence::new(0.1, 0)));
+    }
+
+    #[test]
+    fn quiescence_evidence_round_trips_through_json() -> Result<(), serde_json::Error> {
+        let observed = Quiescence::new(0.25, 1);
+        let policy = QuiescencePolicy::new(0.5, 2);
+
+        let observed_json = serde_json::to_string(&observed)?;
+        let policy_json = serde_json::to_string(&policy)?;
+
+        assert_eq!(
+            serde_json::from_str::<Quiescence>(&observed_json)?,
+            observed
+        );
+        assert_eq!(
+            serde_json::from_str::<QuiescencePolicy>(&policy_json)?,
+            policy
+        );
+        assert!(serde_json::from_str::<Quiescence>(
+            r#"{"load_average_1m":0.25,"competing_processes":1,"extra":true}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<QuiescencePolicy>(
+            r#"{"max_load_average_1m":0.5,"max_competing_processes":2,"extra":true}"#
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn expected_pair_orders_bind_the_exact_retained_schedule() {
+        let plan = ExperimentPlan::new(8, 3, Seed::new(11)).expect("valid plan");
+
+        assert_eq!(
+            expected_timing_pair_orders(&plan),
+            vec![
+                PairOrder::MissFirst,
+                PairOrder::HitFirst,
+                PairOrder::MissFirst,
+                PairOrder::MissFirst,
+                PairOrder::HitFirst,
+                PairOrder::HitFirst,
+                PairOrder::HitFirst,
+                PairOrder::MissFirst,
+            ]
+        );
+    }
+
+    #[test]
+    fn pair_order_plan_match_rejects_reordering_and_wrong_lengths() {
+        let plan = ExperimentPlan::new(8, 3, Seed::new(11)).expect("valid plan");
+        let mut probe = FakeProbe::default();
+        let pairs = run(&plan, &mut probe).expect("probe succeeds");
+        assert!(timing_pair_orders_match_plan(&plan, &pairs));
+
+        let mut reordered = pairs.clone();
+        reordered.swap(0, 1);
+        assert!(!timing_pair_orders_match_plan(&plan, &reordered));
+        assert!(!timing_pair_orders_match_plan(
+            &plan,
+            &pairs[..pairs.len() - 1]
+        ));
+
+        let mut extra = pairs;
+        extra.push(Pair::new(1_000, 1_000, PairOrder::HitFirst));
+        assert!(!timing_pair_orders_match_plan(&plan, &extra));
     }
 
     #[test]
