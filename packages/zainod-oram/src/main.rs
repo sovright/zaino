@@ -51,7 +51,10 @@ use crate::execution_identity::{
 use crate::full_map_saturation_artifact::publish_full_map_saturation;
 #[cfg(feature = "typed-qualification")]
 use crate::gate2::{
-    create_timing_manifest, inspect_timing_manifest, verify_timing_manifest,
+    create_timing_manifest, inspect_timing_attempt_ledger, inspect_timing_manifest,
+    run_timing_attempt, seal_dangling_timing_attempt, verify_timing_manifest,
+    TimingAttemptInspectInputs, TimingAttemptOutcome, TimingAttemptRunInputs,
+    TimingAttemptSealInputs, TimingAttemptSummary, TimingAttemptTerminalState,
     TimingManifestCreateInputs, TimingManifestInspectInputs, TimingManifestVerifyInputs,
 };
 #[cfg(feature = "typed-qualification")]
@@ -82,6 +85,8 @@ mod stress_qualification_artifact;
 mod target_load_artifact;
 #[cfg(feature = "typed-qualification")]
 mod timing_contract;
+#[cfg(feature = "typed-qualification")]
+mod timing_driver;
 
 type RunnerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -211,6 +216,15 @@ enum QualificationTimingSubcommand {
     /// Revalidate same-boot execution admission against this binary and host.
     #[command(name = "verify-manifest")]
     Verify(QualificationTimingVerifyManifestArgs),
+    /// Run exactly the next unconsumed manifest cell with a durable start link.
+    #[command(name = "run-cell")]
+    RunCell(QualificationTimingRunCellArgs),
+    /// Inspect the retained attempt chain, optionally against an external head.
+    #[command(name = "inspect-ledger")]
+    InspectLedger(QualificationTimingInspectLedgerArgs),
+    /// Consume a crash-left started cell without rerunning its timing workload.
+    #[command(name = "seal-dangling")]
+    SealDangling(QualificationTimingSealDanglingArgs),
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -255,6 +269,66 @@ struct QualificationTimingInspectManifestArgs {
     /// Externally retained BLAKE2s-256 digest of canonical manifest.json.
     #[arg(long, value_name = "HEX")]
     expected_manifest_blake2s256: String,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTimingRunCellArgs {
+    /// Complete two-file timing-manifest artifact directory.
+    #[arg(long, value_name = "DIR")]
+    manifest_dir: PathBuf,
+
+    /// Canonical release receipt for this invoking zainod-oram executable.
+    #[arg(long, value_name = "FILE")]
+    release_receipt: PathBuf,
+
+    /// Externally retained BLAKE2s-256 digest of canonical manifest.json.
+    #[arg(long, value_name = "HEX")]
+    expected_manifest_blake2s256: String,
+
+    /// Existing real directory that holds immutable numeric attempt links.
+    #[arg(long, value_name = "DIR")]
+    ledger_dir: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTimingInspectLedgerArgs {
+    /// Complete two-file timing-manifest artifact directory.
+    #[arg(long, value_name = "DIR")]
+    manifest_dir: PathBuf,
+
+    /// Externally retained BLAKE2s-256 digest of canonical manifest.json.
+    #[arg(long, value_name = "HEX")]
+    expected_manifest_blake2s256: String,
+
+    /// Existing real directory that holds immutable numeric attempt links.
+    #[arg(long, value_name = "DIR")]
+    ledger_dir: PathBuf,
+
+    /// Optional externally retained final link sequence.
+    #[arg(long, requires = "expected_head_blake2s256")]
+    expected_head_sequence: Option<u64>,
+
+    /// Optional externally retained final record digest.
+    #[arg(long, value_name = "HEX", requires = "expected_head_sequence")]
+    expected_head_blake2s256: Option<String>,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationTimingSealDanglingArgs {
+    /// Complete two-file timing-manifest artifact directory.
+    #[arg(long, value_name = "DIR")]
+    manifest_dir: PathBuf,
+
+    /// Externally retained BLAKE2s-256 digest of canonical manifest.json.
+    #[arg(long, value_name = "HEX")]
+    expected_manifest_blake2s256: String,
+
+    /// Existing real directory whose final link is a dangling started state.
+    #[arg(long, value_name = "DIR")]
+    ledger_dir: PathBuf,
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -487,15 +561,45 @@ impl CorpusSizeArgs {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    zaino_common::logging::init();
-
-    match run(Cli::parse()).await {
+fn main() -> ExitCode {
+    match run_from_cli(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("ORAM research runner failed: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+enum RunnerDispatch {
+    #[cfg(feature = "typed-qualification")]
+    TimingCell(QualificationTimingRunCellArgs),
+    Async(Cli),
+}
+
+fn classify_runner_dispatch(cli: Cli) -> RunnerDispatch {
+    match cli.command {
+        #[cfg(feature = "typed-qualification")]
+        Command::Qualification(QualificationCommand {
+            command:
+                QualificationSubcommand::Timing(QualificationTimingCommand {
+                    command: QualificationTimingSubcommand::RunCell(args),
+                }),
+        }) => RunnerDispatch::TimingCell(args),
+        command => RunnerDispatch::Async(Cli { command }),
+    }
+}
+
+fn run_from_cli(cli: Cli) -> RunnerResult<()> {
+    match classify_runner_dispatch(cli) {
+        #[cfg(feature = "typed-qualification")]
+        RunnerDispatch::TimingCell(args) => run_timing_cell(args),
+        RunnerDispatch::Async(cli) => {
+            zaino_common::logging::init();
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run(cli))
         }
     }
 }
@@ -522,6 +626,13 @@ async fn run(cli: Cli) -> RunnerResult<()> {
                 QualificationTimingSubcommand::Create(args) => run_timing_create_manifest(args),
                 QualificationTimingSubcommand::Inspect(args) => run_timing_inspect_manifest(args),
                 QualificationTimingSubcommand::Verify(args) => run_timing_verify_manifest(args),
+                QualificationTimingSubcommand::RunCell(_) => {
+                    Err(RunnerError::TimingAttemptRequiresSynchronousDispatch.into())
+                }
+                QualificationTimingSubcommand::InspectLedger(args) => {
+                    run_timing_inspect_ledger(args)
+                }
+                QualificationTimingSubcommand::SealDangling(args) => run_timing_seal_dangling(args),
             },
         },
     }
@@ -581,6 +692,105 @@ fn run_timing_inspect_manifest(args: QualificationTimingInspectManifestArgs) -> 
         summary.cell_count()
     );
     Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_timing_cell(args: QualificationTimingRunCellArgs) -> RunnerResult<()> {
+    let outcome = run_timing_attempt(
+        TimingAttemptRunInputs {
+            manifest_dir: args.manifest_dir,
+            release_receipt: args.release_receipt,
+            expected_manifest_blake2s256: args.expected_manifest_blake2s256,
+            ledger_dir: args.ledger_dir,
+        },
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    match outcome {
+        TimingAttemptOutcome::Completed(summary) => {
+            print_timing_attempt_summary(&summary);
+            match summary.terminal_state() {
+                TimingAttemptTerminalState::CompletedPositive => Ok(()),
+                TimingAttemptTerminalState::CompletedNegative => {
+                    Err(RunnerError::TimingAttemptNegative {
+                        cell_id: summary.cell_id().to_owned(),
+                    }
+                    .into())
+                }
+                TimingAttemptTerminalState::StartedError => {
+                    Err(RunnerError::TimingAttemptUnexpectedTerminal.into())
+                }
+            }
+        }
+        TimingAttemptOutcome::ExecutionError { summary, source } => {
+            print_timing_attempt_summary(&summary);
+            Err(source)
+        }
+    }
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_timing_inspect_ledger(args: QualificationTimingInspectLedgerArgs) -> RunnerResult<()> {
+    let summary = inspect_timing_attempt_ledger(TimingAttemptInspectInputs {
+        manifest_dir: args.manifest_dir,
+        expected_manifest_blake2s256: args.expected_manifest_blake2s256,
+        ledger_dir: args.ledger_dir,
+        expected_head_sequence: args.expected_head_sequence,
+        expected_head_blake2s256: args.expected_head_blake2s256,
+    })?;
+    let head = summary.head().map_or_else(
+        || "none".to_owned(),
+        |(sequence, digest)| format!("{sequence}:{digest}"),
+    );
+    println!(
+        "timing_ledger=valid,manifest_blake2s256:{},cells:{},started:{},terminal:{},positive:{},negative:{},started_error:{},dangling:{},head:{},externally_witnessed:{},all_cells_terminal:{},all_cells_declared_positive:{},can_clear_gate2:false",
+        summary.manifest_blake2s256(),
+        summary.cell_count(),
+        summary.started_cells(),
+        summary.terminal_cells(),
+        summary.positive_cells(),
+        summary.negative_cells(),
+        summary.started_error_cells(),
+        summary.dangling_cell_id().unwrap_or("none"),
+        head,
+        summary.externally_witnessed(),
+        summary.all_cells_terminal(),
+        summary.all_cells_declared_positive(),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_timing_seal_dangling(args: QualificationTimingSealDanglingArgs) -> RunnerResult<()> {
+    let summary = seal_dangling_timing_attempt(
+        TimingAttemptSealInputs {
+            manifest_dir: args.manifest_dir,
+            expected_manifest_blake2s256: args.expected_manifest_blake2s256,
+            ledger_dir: args.ledger_dir,
+        },
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    print_timing_attempt_summary(&summary);
+    Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn print_timing_attempt_summary(summary: &TimingAttemptSummary) {
+    println!(
+        "timing_attempt=retained,cell:{},state:{},head_sequence:{},head_blake2s256:{}",
+        summary.cell_id(),
+        timing_attempt_terminal_state_name(summary.terminal_state()),
+        summary.head_sequence(),
+        summary.head_blake2s256(),
+    );
+}
+
+#[cfg(feature = "typed-qualification")]
+const fn timing_attempt_terminal_state_name(state: TimingAttemptTerminalState) -> &'static str {
+    match state {
+        TimingAttemptTerminalState::CompletedPositive => "completed_positive",
+        TimingAttemptTerminalState::CompletedNegative => "completed_negative",
+        TimingAttemptTerminalState::StartedError => "started_error",
+    }
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -1090,6 +1300,14 @@ enum RunnerError {
     DeclaredRebuildBudgetMiss {
         declared_seconds: u64,
     },
+    #[cfg(feature = "typed-qualification")]
+    TimingAttemptRequiresSynchronousDispatch,
+    #[cfg(feature = "typed-qualification")]
+    TimingAttemptNegative {
+        cell_id: String,
+    },
+    #[cfg(feature = "typed-qualification")]
+    TimingAttemptUnexpectedTerminal,
     IncompleteCheckpoint,
     InvalidCheckpointHash,
     TargetAboveServiceable {
@@ -1138,6 +1356,19 @@ impl fmt::Display for RunnerError {
                 f,
                 "fresh-worker rebuild exceeded the declared {declared_seconds}-second allocation-through-readiness budget; the valid negative artifact was published"
             ),
+            #[cfg(feature = "typed-qualification")]
+            Self::TimingAttemptRequiresSynchronousDispatch => f.write_str(
+                "timing run-cell must be dispatched before constructing the asynchronous runtime",
+            ),
+            #[cfg(feature = "typed-qualification")]
+            Self::TimingAttemptNegative { cell_id } => write!(
+                f,
+                "timing cell {cell_id} retained a valid negative terminal record"
+            ),
+            #[cfg(feature = "typed-qualification")]
+            Self::TimingAttemptUnexpectedTerminal => {
+                f.write_str("timing run-cell returned an unexpected terminal state")
+            }
             Self::IncompleteCheckpoint => {
                 f.write_str("target height and target hash must be supplied together")
             }
@@ -1528,6 +1759,56 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_timing_run_cell_args() -> [&'static str; 12] {
+        [
+            "zainod-oram",
+            "qualification",
+            "timing",
+            "run-cell",
+            "--manifest-dir",
+            "/tmp/timing-manifest",
+            "--release-receipt",
+            "/tmp/release-receipt.json",
+            "--expected-manifest-blake2s256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--ledger-dir",
+            "/tmp/timing-ledger",
+        ]
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    fn valid_timing_inspect_ledger_args() -> [&'static str; 10] {
+        [
+            "zainod-oram",
+            "qualification",
+            "timing",
+            "inspect-ledger",
+            "--manifest-dir",
+            "/tmp/timing-manifest",
+            "--expected-manifest-blake2s256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--ledger-dir",
+            "/tmp/timing-ledger",
+        ]
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    fn valid_timing_seal_dangling_args() -> [&'static str; 10] {
+        [
+            "zainod-oram",
+            "qualification",
+            "timing",
+            "seal-dangling",
+            "--manifest-dir",
+            "/tmp/timing-manifest",
+            "--expected-manifest-blake2s256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--ledger-dir",
+            "/tmp/timing-ledger",
+        ]
+    }
+
     fn parsed_corpus(cli: Cli) -> CorpusCommand {
         match cli.command {
             Command::Corpus(command) => command,
@@ -1618,6 +1899,11 @@ mod tests {
                     QualificationTimingSubcommand::Inspect(_) => {
                         panic!("manifest creation arguments parsed as retained inspection")
                     }
+                    QualificationTimingSubcommand::RunCell(_)
+                    | QualificationTimingSubcommand::InspectLedger(_)
+                    | QualificationTimingSubcommand::SealDangling(_) => {
+                        panic!("manifest creation arguments parsed as attempt-ledger command")
+                    }
                 },
                 _ => panic!("timing manifest arguments parsed as another qualification command"),
             },
@@ -1677,6 +1963,11 @@ mod tests {
                     QualificationTimingSubcommand::Inspect(_) => {
                         panic!("manifest verification arguments parsed as retained inspection")
                     }
+                    QualificationTimingSubcommand::RunCell(_)
+                    | QualificationTimingSubcommand::InspectLedger(_)
+                    | QualificationTimingSubcommand::SealDangling(_) => {
+                        panic!("manifest verification arguments parsed as attempt-ledger command")
+                    }
                 },
                 _ => panic!("timing manifest arguments parsed as another qualification command"),
             },
@@ -1712,6 +2003,11 @@ mod tests {
                     | QualificationTimingSubcommand::Verify(_) => {
                         panic!("retained inspection arguments parsed as execution admission")
                     }
+                    QualificationTimingSubcommand::RunCell(_)
+                    | QualificationTimingSubcommand::InspectLedger(_)
+                    | QualificationTimingSubcommand::SealDangling(_) => {
+                        panic!("retained inspection arguments parsed as attempt-ledger command")
+                    }
                 },
                 _ => panic!("timing manifest arguments parsed as another qualification command"),
             },
@@ -1726,6 +2022,108 @@ mod tests {
             command.drain(index..=index + 1);
             assert!(Cli::try_parse_from(command).is_err());
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn timing_attempt_cli_is_manifest_driven_and_run_cell_is_sync_dispatched(
+    ) -> Result<(), clap::Error> {
+        let run_cell = Cli::try_parse_from(valid_timing_run_cell_args())?;
+        match classify_runner_dispatch(run_cell) {
+            RunnerDispatch::TimingCell(args) => {
+                assert_eq!(args.manifest_dir, PathBuf::from("/tmp/timing-manifest"));
+                assert_eq!(
+                    args.release_receipt,
+                    PathBuf::from("/tmp/release-receipt.json")
+                );
+                assert_eq!(
+                    args.expected_manifest_blake2s256,
+                    "1111111111111111111111111111111111111111111111111111111111111111"
+                );
+                assert_eq!(args.ledger_dir, PathBuf::from("/tmp/timing-ledger"));
+            }
+            RunnerDispatch::Async(_) => {
+                panic!("timing run-cell arguments were routed through Tokio")
+            }
+        }
+        for required in [
+            "--manifest-dir",
+            "--release-receipt",
+            "--expected-manifest-blake2s256",
+            "--ledger-dir",
+        ] {
+            let mut command = valid_timing_run_cell_args().to_vec();
+            let index = command
+                .iter()
+                .position(|argument| *argument == required)
+                .expect("required timing run-cell argument is present");
+            command.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+
+        let inspect = Cli::try_parse_from(valid_timing_inspect_ledger_args())?;
+        match classify_runner_dispatch(inspect) {
+            RunnerDispatch::Async(Cli {
+                command:
+                    Command::Qualification(QualificationCommand {
+                        command:
+                            QualificationSubcommand::Timing(QualificationTimingCommand {
+                                command: QualificationTimingSubcommand::InspectLedger(args),
+                            }),
+                    }),
+            }) => {
+                assert_eq!(args.manifest_dir, PathBuf::from("/tmp/timing-manifest"));
+                assert_eq!(args.ledger_dir, PathBuf::from("/tmp/timing-ledger"));
+                assert_eq!(args.expected_head_sequence, None);
+                assert_eq!(args.expected_head_blake2s256, None);
+            }
+            _ => panic!("timing inspect-ledger arguments parsed as another command"),
+        }
+
+        let mut witnessed = valid_timing_inspect_ledger_args().to_vec();
+        witnessed.extend([
+            "--expected-head-sequence",
+            "9",
+            "--expected-head-blake2s256",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        ]);
+        assert!(Cli::try_parse_from(witnessed).is_ok());
+
+        for incomplete_witness in [
+            ["--expected-head-sequence", "9"],
+            [
+                "--expected-head-blake2s256",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            ],
+        ] {
+            let mut command = valid_timing_inspect_ledger_args().to_vec();
+            command.extend(incomplete_witness);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+
+        let seal = Cli::try_parse_from(valid_timing_seal_dangling_args())?;
+        match classify_runner_dispatch(seal) {
+            RunnerDispatch::Async(Cli {
+                command:
+                    Command::Qualification(QualificationCommand {
+                        command:
+                            QualificationSubcommand::Timing(QualificationTimingCommand {
+                                command: QualificationTimingSubcommand::SealDangling(args),
+                            }),
+                    }),
+            }) => {
+                assert_eq!(args.manifest_dir, PathBuf::from("/tmp/timing-manifest"));
+                assert_eq!(args.ledger_dir, PathBuf::from("/tmp/timing-ledger"));
+            }
+            _ => panic!("timing seal-dangling arguments parsed as another command"),
+        }
+
+        let ordinary = Cli::try_parse_from(valid_args())?;
+        assert!(matches!(
+            classify_runner_dispatch(ordinary),
+            RunnerDispatch::Async(_)
+        ));
         Ok(())
     }
 

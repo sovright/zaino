@@ -1,9 +1,9 @@
 # ORAM Gate 2 dynamic timing evidence — 2026-07-28
 
-This note is preliminary. It describes the supported dynamic timing experiment,
-but it does not report a timing result because the exact driver-emitted JSON
-artifacts from the builder have not been retained in this repository. The
-normative decision remains in the
+This note is preliminary. It describes the supported dynamic timing experiment
+and its manifest-bound durable attempt ledger, but it does not report a timing
+result because no complete builder ledger has been retained in this repository.
+The normative decision remains in the
 [Phase 0 kill-gate report](oram-phase0-kill-gates-2026-07-23.md), and Gate 2
 remains **NO-GO**.
 
@@ -16,7 +16,7 @@ inherits it silently. It does not replace the uncompleted upstream branch and
 indirect-call audit, and it does not alter the static compiled-path finding in
 the kill-gate report.
 
-## Manifest-v1 status
+## Manifest-v1 and attempt-ledger status
 
 The runner now implements an immutable `zaino-oram-timing-manifest-v1`
 artifact. A strict `zaino-oram-timing-manifest-request-v1` supplies:
@@ -100,19 +100,84 @@ zainod-oram qualification timing inspect-manifest \
   --expected-manifest-blake2s256 <retained-digest>
 ```
 
-This machinery does not yet prove temporal predeclaration. The standalone
-timing driver cannot consume a manifest or bind output to a manifest cell, no
-attempt ledger or external append-only witness exists, and no real
-qualification manifest has been retained. A manifest could still be created
-after observing an unbound run.
+The standalone `zainod-oram-timing` binary remains useful for pilots, but its
+output is not manifest-bound. Qualification attempts use the synchronous
+`run-cell` command in the release-bound main binary. The operator must create a
+real empty ledger directory before the first attempt and invoke one fresh,
+CPU-pinned process per cell:
+
+```text
+mkdir timing-ledger-v1
+
+taskset -c <CPU> zainod-oram qualification timing run-cell \
+  --manifest-dir manifest-v1 \
+  --release-receipt release-receipt.json \
+  --expected-manifest-blake2s256 <retained-manifest-digest> \
+  --ledger-dir timing-ledger-v1
+```
+
+`run-cell` redoes same-boot manifest, release-binary, host, CPU-affinity,
+quiescence, scheduler-stat, and attempt-control admission. It always selects
+the next unconsumed manifest cell; there are no CLI flags that can alter the
+cell. The command is dispatched before logging or Tokio initialization. It
+durably publishes a canonical `Started` link before the first ORAM operation,
+then publishes exactly one `CompletedPositive`, `CompletedNegative`, or
+`StartedError` terminal link. Positive and negative completions retain the
+exact raw `zaino-oram-insert-timing-v3` bytes beside the terminal record.
+Pre-start refusal publishes no link.
+
+Each link is an immutable, fixed-width numeric child directory. Canonical
+minified `record.json` links to the preceding record digest and binds the
+manifest digest, manifest runner version, release identity, boot-scoped host,
+complete cell inputs, and fixed limitation flags. A killed publisher can leave
+an internal stage directory; replay ignores only the publisher's exact
+numeric-stage grammar after proving the entry is a real directory without
+following links. Every other unexpected file, directory, symlink, name gap,
+illegal state transition, digest mismatch, or raw-v3 mismatch fails replay.
+
+If a process dies after `Started` but before its terminal link, the cell is
+already consumed and must not be rerun. Seal it explicitly:
+
+```text
+zainod-oram qualification timing seal-dangling \
+  --manifest-dir manifest-v1 \
+  --expected-manifest-blake2s256 <retained-manifest-digest> \
+  --ledger-dir timing-ledger-v1
+```
+
+Sealing records `prior_process_interrupted` as `StartedError`, advances to the
+next cell, and is non-repeatable. Inspect retained state offline, optionally
+requiring an exact externally retained head:
+
+```text
+zainod-oram qualification timing inspect-ledger \
+  --manifest-dir manifest-v1 \
+  --expected-manifest-blake2s256 <retained-manifest-digest> \
+  --ledger-dir timing-ledger-v1 \
+  --expected-head-sequence <retained-sequence> \
+  --expected-head-blake2s256 <retained-record-digest>
+```
+
+Retain each reported head in an independently administered append-only or WORM
+system. The in-ledger hash chain detects retained interior omission, but it
+cannot detect deletion of an unwitnessed suffix or the entire ledger root.
+The external witness is deliberately not asserted by the self-reported record.
 
 The host binding is self-reported, boot-scoped, unattested, and
 `tdx_qualified=false`. Raw machine ID, boot ID, CPU model/microcode, and DMI
 strings affect the combined fingerprint but are not persisted; kernel release,
 logical CPU count, memory size, target OS/architecture, and the combined
 fingerprint are public. Same-boot admission intentionally fails after reboot.
-Selected CPU, SMT, governor/frequency/turbo, mitigation state, and other
-attempt-time controls still need binding in the attempt record.
+Each attempt additionally binds the selected CPU and allowance, online and
+sibling topology, SMT state, scaling driver/governor/minimum/maximum/current
+frequency, boost/turbo controls, microcode, CPU flags and bugs, vulnerability
+files, kernel command line, clocksource, scheduler-stat control, per-task
+speculation controls, NUMA cpuset, and effective NUMA policy. Effective policy
+is obtained fail-closed from `/usr/bin/numactl --show`; the reporter's absolute
+path and BLAKE2s digest are recorded. The same stable controls must match before
+and after each cell and across the entire matrix; observed current frequency is
+recorded but excluded from equality. This remains self-reported evidence, and a
+substituted reporter can lie.
 
 The embedded release receipt is unsigned. It proves local canonical receipt
 integrity and binary digest/size agreement, not source derivation or execution
@@ -197,8 +262,8 @@ driver and committed verbatim under `docs/notes/artifacts/oram-gate2/`.
   qualification strata are exactly balanced; odd-length pilot or warm-up
   strata differ by one with opposite extras preserving global balance.
 - A completed run rejected by a post-start admission check is retained as a
-  negative artifact rather than discarded. Pre-start refusal or a measurement
-  error produces no timing artifact.
+  negative terminal rather than discarded. A post-start measurement error
+  becomes `StartedError`; only a pre-start refusal produces no attempt link.
 - Numerical claims must cite committed artifact paths and be reproducible from
   their raw pairs.
 
@@ -208,11 +273,16 @@ Numbers will not be reconstructed from console output, prose, or memory.
 
 - No exact timing JSON is committed, so there is no auditable dynamic result to
   summarize yet.
-- No real qualification manifest or externally witnessed manifest digest is
-  retained, and raw v3 output is not yet bound to a manifest cell.
-- There is no durable attempt chain. Pre-start refusals, started runs, terminal
-  negative results, and dangling starts therefore cannot yet be audited as a
-  complete sequence.
+- No real qualification manifest, complete attempt ledger, or independently
+  witnessed manifest/head sequence is retained yet.
+- The ledger and host/control snapshots are self-reported and not temporally
+  attested. The record contains no external/WORM head witness and cannot detect
+  deletion of an unwitnessed suffix or the ledger root.
+- Replay validates raw-v3 identity, shape, seeds, policy fields, declared
+  booleans, and terminal consistency, but it does not independently recompute
+  every statistical report, scheduler ratio, or environment decision from raw
+  samples. `all_cells_declared_positive=true` is therefore a retained
+  runner-declaration summary, not verifier-derived Gate 2 admission.
 - The currently measured event record is one immutable event per cell, not the
   selected target chunked/generational production projection. V3 records that
   the target projection is not yet implemented.
@@ -230,13 +300,14 @@ Numbers will not be reconstructed from console output, prose, or memory.
 
 ## Effect on Gate 2
 
-None. Gate 2 remains **NO-GO**. V3 explicitly records `wall_clock_only=true`,
-`physical_trace_complete=false`, `oram_state_seed_bound=false`, and
-`can_clear_gate2=false`. A future update may add narrowly scoped,
-artifact-derived descriptive findings after admitted hit/miss and forced-mode
-runs are retained. Clearing Gate 2 still requires a predeclared retained
-multi-run manifest created before attempts and externally witnessed, durable
-manifest-cell attempt binding, exact codegen evidence for both executable
-paths, directory/event physical traces, fixed normative coverage and threshold
-policy, the work listed in the normative kill-gate report, and written review
-of that decision.
+None. Gate 2 remains **NO-GO**. V3 and every attempt record explicitly retain
+`can_clear_gate2=false`; V3 also records `wall_clock_only=true`,
+`physical_trace_complete=false`, and `oram_state_seed_bound=false`. The
+manifest and durable cell binding now exist, but no real matrix has been run or
+externally witnessed. A future update may add narrowly scoped,
+artifact-derived descriptive findings after the admitted hit/miss and forced
+matrix is retained. Clearing Gate 2 still requires independent raw-outcome
+evaluation, accepted inference for process-level repeat blocks, exact codegen
+evidence for both executable paths, directory/event physical traces, fixed
+normative coverage and threshold policy, the work listed in the normative
+kill-gate report, and written review of that decision.
