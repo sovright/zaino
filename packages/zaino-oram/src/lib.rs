@@ -48,6 +48,7 @@ mod protection;
 mod qualification;
 mod recent_snapshot;
 mod records;
+mod rostl_timing;
 mod runtime_security;
 mod sizing;
 mod store;
@@ -55,6 +56,8 @@ mod store;
 mod stress_qualification;
 #[cfg(feature = "corpus-zaino")]
 mod target_load;
+mod timing_equivalence;
+mod timing_experiment;
 mod trace;
 mod xchacha20;
 #[cfg(feature = "corpus-zaino")]
@@ -87,6 +90,11 @@ pub use projection_owner::{
 pub use qualification::{
     run_typed_worker_qualification, TypedWorkerQualificationError, TypedWorkerQualificationReport,
 };
+pub use rostl_timing::{
+    run_rostl_insert_timing, run_rostl_insert_timing_mode, summarize_rostl_timing_scheduler,
+    validate_rostl_timing_shape, RostlTimingError, RostlTimingMode, RostlTimingRecordKind,
+    RostlTimingRun, RostlTimingSchedulerSummary,
+};
 #[cfg(feature = "corpus-zaino")]
 pub use stress_qualification::{
     run_typed_worker_stress_qualification, TypedWorkerStressProfile,
@@ -96,6 +104,14 @@ pub use stress_qualification::{
 pub use target_load::{
     run_typed_worker_target_load, TypedWorkerTargetLoadError, TypedWorkerTargetLoadProfile,
     TypedWorkerTargetLoadReport,
+};
+pub use timing_equivalence::{
+    evaluate as evaluate_timing_equivalence, BoundError as TimingBoundError, EquivalenceBounds,
+    EquivalenceReport, Pair, PairOrder, Seed as TimingSeed, MINIMUM_PAIRS,
+};
+pub use timing_experiment::{
+    expected_timing_pair_orders, single_allowed_cpu, timing_pair_orders_match_plan, ExperimentPlan,
+    PlanError, Quiescence, QuiescencePolicy,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use zaino_corpus::{

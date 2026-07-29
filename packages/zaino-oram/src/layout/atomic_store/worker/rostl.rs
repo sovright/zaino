@@ -8,6 +8,9 @@
 
 use std::{fmt, marker::PhantomData};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::{fs, time::Instant};
+
 use bytemuck::Pod;
 use rostl_primitives::traits::Cmov;
 
@@ -20,8 +23,17 @@ use super::AtomicWorkerBuildError;
 use super::{AtomicQueueCapacity, AtomicWorker, AtomicWorkerError};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use crate::layout::FixedProbeLayout;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::records::{
+    AddressDirectory, AddressEventPage, AddressKey, UtxoEvent, UtxoScriptClass, TXID_BYTES,
+};
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use crate::records::{PersistentAddressDirectory, PersistentAddressEventPage};
+use crate::timing_equivalence::ArmMeasurement;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::timing_equivalence::TimedSchedulerDelta;
+use crate::timing_experiment::{Arm, PairedProbe};
+use crate::{RostlTimingError, RostlTimingMode, RostlTimingRecordKind};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use rand::Rng as _;
@@ -38,10 +50,40 @@ enum UniqueInsertDisposition {
     Duplicate,
 }
 
+/// The raw outcome of one fixed two-access insertion.
+///
+/// This is deliberately a dumb record. It carries the secret-derived flags out
+/// of the access path without interpreting them, so the access path itself
+/// needs no control flow at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UniqueInsertCommit {
-    disposition: UniqueInsertDisposition,
+    found_before: bool,
+    found_after: bool,
+    occupied_before: u64,
     occupied_records: u64,
+}
+
+impl UniqueInsertCommit {
+    /// Classifies a completed commit.
+    ///
+    /// Every branch here runs after both ORAM accesses have already been
+    /// performed, so none of them can change the schedule a host observer sees.
+    fn classify(self) -> Result<UniqueInsertDisposition, RostlStoreError> {
+        if self.found_after != self.found_before {
+            return Err(RostlStoreError::FoundMismatch);
+        }
+        // A hit on an empty table is corruption rather than a duplicate. It is
+        // rejected here, not before the second access, so that the corrupt and
+        // healthy cases keep the same two-access schedule.
+        if self.found_before && self.occupied_before == 0 {
+            return Err(RostlStoreError::OccupancyInvariant);
+        }
+        if self.found_before {
+            Ok(UniqueInsertDisposition::Duplicate)
+        } else {
+            Ok(UniqueInsertDisposition::Inserted)
+        }
+    }
 }
 
 trait FixedUniqueInsertAccess<T> {
@@ -50,13 +92,42 @@ trait FixedUniqueInsertAccess<T> {
     fn write_or_insert_and_remap(&mut self, key: usize, value: T) -> bool;
 }
 
+/// Decides from public state alone whether an insertion may be attempted.
+///
+/// This runs before the first access and deliberately cannot observe the
+/// record. A full table therefore refuses every insertion with zero accesses
+/// and a non-full table always performs exactly two, so occupancy — which is
+/// public — is the only thing that selects between those two schedules.
+fn admit_insert(occupied_records: u64, capacity: u64) -> Result<(), RostlStoreError> {
+    if occupied_records > capacity {
+        return Err(RostlStoreError::OccupancyInvariant);
+    }
+    if occupied_records == capacity {
+        return Err(RostlStoreError::TableFull);
+    }
+    Ok(())
+}
+
+/// Performs the fixed two-access insertion.
+///
+/// The body contains no control flow: the secret hit/miss result reaches only
+/// `Cmov` and integer arithmetic. Callers must first admit the insertion via
+/// [`admit_insert`], which establishes `occupied_records < capacity`, and
+/// [`RostlTable::new`] caps capacity at `u32::MAX`, so the increment cannot
+/// overflow and needs no checked-arithmetic branch.
+///
+/// `#[inline(never)]` is load-bearing rather than a performance hint: it keeps
+/// each monomorphization as its own symbol so `check-oram-codegen` can
+/// disassemble the access path and reject any branch that could carry the
+/// secret. One call per insertion is negligible against the measured fixed-work
+/// floor of 13,440,092 logical accesses per request.
+#[inline(never)]
 fn fixed_unique_insert<T, A>(
     access: &mut A,
     key: usize,
     candidate: T,
     occupied_records: u64,
-    capacity: u64,
-) -> Result<UniqueInsertCommit, RostlStoreError>
+) -> UniqueInsertCommit
 where
     T: Cmov + Copy + Default,
     A: FixedUniqueInsertAccess<T>,
@@ -64,34 +135,16 @@ where
     let mut prior = T::default();
     let found_before = access.read_and_remap(key, &mut prior);
 
-    // A healthy accepted-domain miss and duplicate both continue to the second
-    // access. These early exits are only for already-inconsistent occupancy,
-    // where attempting a missing-key insertion could exceed physical capacity.
-    if occupied_records > capacity
-        || (found_before && occupied_records == 0)
-        || (!found_before && occupied_records == capacity)
-    {
-        return Err(RostlStoreError::OccupancyInvariant);
-    }
-    let next_occupied = occupied_records
-        .checked_add(u64::from(!found_before))
-        .ok_or(RostlStoreError::OccupancyInvariant)?;
-
     let mut selected = candidate;
     selected.cmov(&prior, found_before);
     let found_after = access.write_or_insert_and_remap(key, selected);
-    if found_after != found_before {
-        return Err(RostlStoreError::FoundMismatch);
-    }
 
-    Ok(UniqueInsertCommit {
-        disposition: if found_before {
-            UniqueInsertDisposition::Duplicate
-        } else {
-            UniqueInsertDisposition::Inserted
-        },
-        occupied_records: next_occupied,
-    })
+    UniqueInsertCommit {
+        found_before,
+        found_after,
+        occupied_before: occupied_records,
+        occupied_records: occupied_records + u64::from(!found_before),
+    }
 }
 
 struct RostlTable<T>
@@ -113,9 +166,7 @@ where
     T: Cmov + Pod + Default + Clone + fmt::Debug,
 {
     fn new(capacity: usize) -> Result<Self, RostlStoreError> {
-        if capacity < 2 || capacity > u32::MAX as usize || !capacity.is_power_of_two() {
-            return Err(RostlStoreError::InvalidCapacity);
-        }
+        validate_capacity(capacity)?;
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
@@ -169,18 +220,26 @@ where
                 RostlStoreError::OccupancyInvariant
             })?;
             let occupied_records = self.occupied_records;
-            let result = catch_upstream(|| {
-                fixed_unique_insert(self, key, value, occupied_records, capacity)
-            });
-            let commit = match self.finish_upstream(result)? {
-                Ok(commit) => commit,
+            // Admitted from public occupancy before the access path runs, so a
+            // refusal never depends on whether the key is present.
+            match admit_insert(occupied_records, capacity) {
+                Ok(()) => {}
+                // A full table is a consistent state and a plain refusal, so it
+                // leaves the store usable. Only an impossible occupancy is
+                // corruption worth latching.
+                Err(RostlStoreError::TableFull) => return Err(RostlStoreError::TableFull),
                 Err(error) => {
                     self.failed_closed = true;
                     return Err(error);
                 }
-            };
+            }
+            let result = catch_upstream(|| fixed_unique_insert(self, key, value, occupied_records));
+            let commit = self.finish_upstream(result)?;
+            let disposition = commit.classify().inspect_err(|_| {
+                self.failed_closed = true;
+            })?;
             self.occupied_records = commit.occupied_records;
-            match commit.disposition {
+            match disposition {
                 UniqueInsertDisposition::Inserted => Ok(()),
                 UniqueInsertDisposition::Duplicate => Err(RostlStoreError::DuplicateKey),
             }
@@ -229,6 +288,14 @@ where
                 Err(RostlStoreError::UpstreamPanic)
             }
         }
+    }
+}
+
+fn validate_capacity(capacity: usize) -> Result<(), RostlStoreError> {
+    if capacity < 2 || capacity > u32::MAX as usize || !capacity.is_power_of_two() {
+        Err(RostlStoreError::InvalidCapacity)
+    } else {
+        Ok(())
     }
 }
 
@@ -291,6 +358,7 @@ enum RostlStoreError {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     DuplicateKey,
     OccupancyInvariant,
+    TableFull,
     FoundMismatch,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     UpstreamPanic,
@@ -307,6 +375,7 @@ impl fmt::Display for RostlStoreError {
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Self::DuplicateKey => f.write_str("typed rostl store rejected a duplicate key"),
             Self::OccupancyInvariant => f.write_str("typed rostl store occupancy is inconsistent"),
+            Self::TableFull => f.write_str("typed rostl store is at capacity"),
             Self::FoundMismatch => f.write_str("typed rostl store access results are inconsistent"),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Self::UpstreamPanic => f.write_str("typed rostl store failed closed"),
@@ -381,6 +450,504 @@ fn build_rostl_worker<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
     AtomicWorker::spawn(executor, queue_capacity).map_err(RostlWorkerBuildError::Worker)
 }
 
+/// Opaque probe returned only to the crate's high-level timing entry point.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) struct RostlInsertTimingProbe {
+    inner: RostlInsertTimingProbeKind,
+    mode: RostlTimingMode,
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+pub(crate) struct RostlInsertTimingProbe;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+enum RostlInsertTimingProbeKind {
+    Directory(InsertProbe<PersistentAddressDirectory>),
+    Event(InsertProbe<PersistentAddressEventPage>),
+}
+
+pub(crate) fn rostl_insert_timing_probe(
+    kind: RostlTimingRecordKind,
+    mode: RostlTimingMode,
+    capacity: usize,
+    occupancy: usize,
+    total_pairs: usize,
+) -> Result<RostlInsertTimingProbe, RostlTimingError> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        match kind {
+            RostlTimingRecordKind::Directory => {
+                InsertProbe::new(capacity, occupancy, total_pairs, mode).map(|probe| {
+                    RostlInsertTimingProbe {
+                        inner: RostlInsertTimingProbeKind::Directory(probe),
+                        mode,
+                    }
+                })
+            }
+            RostlTimingRecordKind::Event => {
+                InsertProbe::new(capacity, occupancy, total_pairs, mode).map(|probe| {
+                    RostlInsertTimingProbe {
+                        inner: RostlInsertTimingProbeKind::Event(probe),
+                        mode,
+                    }
+                })
+            }
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = (kind, mode, capacity, occupancy, total_pairs);
+        Err(RostlTimingError::UnsupportedPlatform)
+    }
+}
+
+pub(crate) fn validate_rostl_insert_timing_shape(
+    capacity: usize,
+    occupancy: usize,
+    total_pairs: usize,
+) -> Result<(), RostlTimingError> {
+    if validate_capacity(capacity).is_err() || occupancy == 0 || total_pairs == 0 {
+        return Err(RostlTimingError::InvalidShape);
+    }
+    let final_occupancy = occupancy
+        .checked_add(total_pairs)
+        .ok_or(RostlTimingError::InvalidShape)?;
+    // The hit/miss invariant holds one exclusive key per table, so the union
+    // needs one key-space slot beyond each table's final occupancy. The final
+    // duplicate cover insertion also requires public occupancy below capacity.
+    if final_occupancy >= capacity {
+        return Err(RostlTimingError::InvalidShape);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl RostlInsertTimingProbe {
+    fn executed_arm(&self, scheduled: Arm) -> Arm {
+        match self.mode {
+            RostlTimingMode::HitMiss => scheduled,
+            RostlTimingMode::ForcedHit => Arm::Hit,
+            RostlTimingMode::ForcedMiss => Arm::Miss,
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl PairedProbe for RostlInsertTimingProbe {
+    type Error = RostlTimingError;
+
+    fn measure(&mut self, scheduled: Arm) -> Result<ArmMeasurement, Self::Error> {
+        let executed = self.executed_arm(scheduled);
+        match &mut self.inner {
+            RostlInsertTimingProbeKind::Directory(probe) => probe.measure(scheduled, executed),
+            RostlInsertTimingProbeKind::Event(probe) => probe.measure(scheduled, executed),
+        }
+    }
+
+    fn finish_pair(&mut self) -> Result<(), Self::Error> {
+        match &mut self.inner {
+            RostlInsertTimingProbeKind::Directory(probe) => probe.finish_pair(),
+            RostlInsertTimingProbeKind::Event(probe) => probe.finish_pair(),
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+impl PairedProbe for RostlInsertTimingProbe {
+    type Error = RostlTimingError;
+
+    fn measure(&mut self, _arm: Arm) -> Result<ArmMeasurement, Self::Error> {
+        Err(RostlTimingError::UnsupportedPlatform)
+    }
+
+    fn finish_pair(&mut self) -> Result<(), Self::Error> {
+        Err(RostlTimingError::UnsupportedPlatform)
+    }
+}
+
+/// Times insertions against two long-lived, logically matched tables.
+///
+/// At every pair boundary both tables have equal public occupancy. Hit/miss
+/// mode keeps a one-record substitution (one exclusive key per table) and
+/// alternates the physical table assigned to each label. Forced modes keep
+/// identical key sets. After both timed arms, one untimed fixed-work cover
+/// insertion runs on each physical table and restores the invariant for the
+/// next pair.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+struct InsertProbe<T>
+where
+    T: TimingProbeRecord,
+{
+    tables: [RostlTable<T>; 2],
+    mode: RostlTimingMode,
+    hit_label_table: usize,
+    probe_key: usize,
+    substitute_key: Option<usize>,
+    next_fresh_key: usize,
+    current_occupancy: usize,
+    measured_hit: bool,
+    measured_miss: bool,
+    #[cfg(test)]
+    cover_trace: Vec<usize>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl<T> InsertProbe<T>
+where
+    T: TimingProbeRecord,
+{
+    fn new(
+        capacity: usize,
+        occupancy: usize,
+        total_pairs: usize,
+        mode: RostlTimingMode,
+    ) -> Result<Self, RostlTimingError> {
+        validate_rostl_insert_timing_shape(capacity, occupancy, total_pairs)?;
+        let (tables, probe_key, substitute_key, next_fresh_key) = match mode {
+            RostlTimingMode::HitMiss => {
+                let common_records = occupancy - 1;
+                let hit_key = common_records;
+                let miss_key = occupancy;
+                (
+                    [
+                        build_timing_table(capacity, common_records, Some(hit_key))?,
+                        build_timing_table(capacity, common_records, Some(miss_key))?,
+                    ],
+                    hit_key,
+                    Some(miss_key),
+                    occupancy
+                        .checked_add(1)
+                        .ok_or(RostlTimingError::InvalidShape)?,
+                )
+            }
+            RostlTimingMode::ForcedHit => (
+                [
+                    build_timing_table(capacity, occupancy, None)?,
+                    build_timing_table(capacity, occupancy, None)?,
+                ],
+                occupancy - 1,
+                None,
+                occupancy,
+            ),
+            RostlTimingMode::ForcedMiss => (
+                [
+                    build_timing_table(capacity, occupancy, None)?,
+                    build_timing_table(capacity, occupancy, None)?,
+                ],
+                occupancy,
+                None,
+                occupancy
+                    .checked_add(1)
+                    .ok_or(RostlTimingError::InvalidShape)?,
+            ),
+        };
+        Ok(Self {
+            tables,
+            mode,
+            hit_label_table: 0,
+            probe_key,
+            substitute_key,
+            next_fresh_key,
+            current_occupancy: occupancy,
+            measured_hit: false,
+            measured_miss: false,
+            #[cfg(test)]
+            cover_trace: Vec::new(),
+        })
+    }
+
+    fn measure(
+        &mut self,
+        scheduled: Arm,
+        executed: Arm,
+    ) -> Result<ArmMeasurement, RostlTimingError> {
+        self.admit_arm(scheduled, executed)?;
+        let table_index = self.table_index(scheduled)?;
+        let table = self
+            .tables
+            .get_mut(table_index)
+            .ok_or(RostlTimingError::PairState)?;
+        let occupied_before = usize::try_from(
+            table
+                .occupied_record_count()
+                .map_err(|_| RostlTimingError::PairState)?,
+        )
+        .map_err(|_| RostlTimingError::PairState)?;
+        if occupied_before != self.current_occupancy {
+            return Err(RostlTimingError::PairState);
+        }
+        let candidate = T::filler(self.probe_key)?;
+
+        let scheduler_before = read_scheduler_counters()?;
+        let started = Instant::now();
+        let outcome = table.insert_record_unique(self.probe_key, candidate);
+        let elapsed = started.elapsed();
+        let scheduler_after = read_scheduler_counters()?;
+        let scheduler = scheduler_after.delta_from(scheduler_before)?;
+        require_insert_outcome(executed, outcome)?;
+
+        match scheduled {
+            Arm::Hit => self.measured_hit = true,
+            Arm::Miss => self.measured_miss = true,
+        }
+        let nanos =
+            u64::try_from(elapsed.as_nanos()).map_err(|_| RostlTimingError::WrongOutcome)?;
+        Ok(ArmMeasurement::with_scheduler(nanos, scheduler))
+    }
+
+    fn finish_pair(&mut self) -> Result<(), RostlTimingError> {
+        if !self.measured_hit || !self.measured_miss {
+            return Err(RostlTimingError::PairState);
+        }
+        match self.mode {
+            RostlTimingMode::HitMiss => self.finish_hit_miss_pair()?,
+            RostlTimingMode::ForcedHit => self.finish_forced_hit_pair()?,
+            RostlTimingMode::ForcedMiss => self.finish_forced_miss_pair()?,
+        }
+        let next_occupancy = self
+            .current_occupancy
+            .checked_add(1)
+            .ok_or(RostlTimingError::PairState)?;
+        self.verify_pair_boundary(next_occupancy)?;
+        self.current_occupancy = next_occupancy;
+        self.hit_label_table = other_table(self.hit_label_table)?;
+        self.measured_hit = false;
+        self.measured_miss = false;
+        Ok(())
+    }
+
+    fn verify_pair_boundary(&self, expected_occupancy: usize) -> Result<(), RostlTimingError> {
+        for table in &self.tables {
+            let observed = usize::try_from(
+                table
+                    .occupied_record_count()
+                    .map_err(|_| RostlTimingError::PairState)?,
+            )
+            .map_err(|_| RostlTimingError::PairState)?;
+            if observed != expected_occupancy {
+                return Err(RostlTimingError::PairState);
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_arm(&self, scheduled: Arm, executed: Arm) -> Result<(), RostlTimingError> {
+        let already_measured = match scheduled {
+            Arm::Hit => self.measured_hit,
+            Arm::Miss => self.measured_miss,
+        };
+        let expected = match self.mode {
+            RostlTimingMode::HitMiss => scheduled,
+            RostlTimingMode::ForcedHit => Arm::Hit,
+            RostlTimingMode::ForcedMiss => Arm::Miss,
+        };
+        if already_measured || executed != expected {
+            return Err(RostlTimingError::PairState);
+        }
+        Ok(())
+    }
+
+    fn table_index(&self, scheduled: Arm) -> Result<usize, RostlTimingError> {
+        match scheduled {
+            Arm::Hit => Ok(self.hit_label_table),
+            Arm::Miss => other_table(self.hit_label_table),
+        }
+    }
+
+    fn finish_hit_miss_pair(&mut self) -> Result<(), RostlTimingError> {
+        let hit_table = self.hit_label_table;
+        for table_index in 0..self.tables.len() {
+            let (key, expected) = if table_index == hit_table {
+                (self.next_fresh_key, Arm::Miss)
+            } else {
+                (self.probe_key, Arm::Hit)
+            };
+            insert_cover(
+                self.tables
+                    .get_mut(table_index)
+                    .ok_or(RostlTimingError::PairState)?,
+                key,
+                expected,
+            )?;
+            #[cfg(test)]
+            self.cover_trace.push(table_index);
+        }
+        self.probe_key = self
+            .substitute_key
+            .replace(self.next_fresh_key)
+            .ok_or(RostlTimingError::PairState)?;
+        self.next_fresh_key = self
+            .next_fresh_key
+            .checked_add(1)
+            .ok_or(RostlTimingError::PairState)?;
+        Ok(())
+    }
+
+    fn finish_forced_hit_pair(&mut self) -> Result<(), RostlTimingError> {
+        for table in &mut self.tables {
+            insert_cover(table, self.next_fresh_key, Arm::Miss)?;
+        }
+        self.probe_key = self.next_fresh_key;
+        self.next_fresh_key = self
+            .next_fresh_key
+            .checked_add(1)
+            .ok_or(RostlTimingError::PairState)?;
+        Ok(())
+    }
+
+    fn finish_forced_miss_pair(&mut self) -> Result<(), RostlTimingError> {
+        for table in &mut self.tables {
+            insert_cover(table, self.probe_key, Arm::Hit)?;
+        }
+        self.probe_key = self.next_fresh_key;
+        self.next_fresh_key = self
+            .next_fresh_key
+            .checked_add(1)
+            .ok_or(RostlTimingError::PairState)?;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn build_timing_table<T>(
+    capacity: usize,
+    common_records: usize,
+    exclusive_key: Option<usize>,
+) -> Result<RostlTable<T>, RostlTimingError>
+where
+    T: TimingProbeRecord,
+{
+    let mut table = RostlTable::<T>::new(capacity).map_err(|_| RostlTimingError::Setup)?;
+    for key in 0..common_records {
+        insert_cover(&mut table, key, Arm::Miss).map_err(|_| RostlTimingError::Setup)?;
+    }
+    if let Some(key) = exclusive_key {
+        insert_cover(&mut table, key, Arm::Miss).map_err(|_| RostlTimingError::Setup)?;
+    }
+    Ok(table)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn insert_cover<T>(
+    table: &mut RostlTable<T>,
+    key: usize,
+    expected: Arm,
+) -> Result<(), RostlTimingError>
+where
+    T: TimingProbeRecord,
+{
+    let candidate = T::filler(key)?;
+    require_insert_outcome(expected, table.insert_record_unique(key, candidate))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn require_insert_outcome(
+    expected: Arm,
+    outcome: Result<(), RostlStoreError>,
+) -> Result<(), RostlTimingError> {
+    if matches!(
+        (expected, outcome),
+        (Arm::Hit, Err(RostlStoreError::DuplicateKey)) | (Arm::Miss, Ok(()))
+    ) {
+        Ok(())
+    } else {
+        Err(RostlTimingError::WrongOutcome)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn other_table(table: usize) -> Result<usize, RostlTimingError> {
+    match table {
+        0 => Ok(1),
+        1 => Ok(0),
+        _ => Err(RostlTimingError::PairState),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Debug, Clone, Copy)]
+struct SchedulerCounters {
+    cpu_time_nanos: u64,
+    runqueue_wait_nanos: u64,
+    timeslices: u64,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl SchedulerCounters {
+    fn delta_from(self, before: Self) -> Result<TimedSchedulerDelta, RostlTimingError> {
+        Ok(TimedSchedulerDelta {
+            cpu_time_nanos: self
+                .cpu_time_nanos
+                .checked_sub(before.cpu_time_nanos)
+                .ok_or(RostlTimingError::SchedulerStats)?,
+            runqueue_wait_nanos: self
+                .runqueue_wait_nanos
+                .checked_sub(before.runqueue_wait_nanos)
+                .ok_or(RostlTimingError::SchedulerStats)?,
+            timeslices: self
+                .timeslices
+                .checked_sub(before.timeslices)
+                .ok_or(RostlTimingError::SchedulerStats)?,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_scheduler_counters() -> Result<SchedulerCounters, RostlTimingError> {
+    let schedstat =
+        fs::read_to_string("/proc/self/schedstat").map_err(|_| RostlTimingError::SchedulerStats)?;
+    let mut fields = schedstat.split_whitespace();
+    let mut next_counter = || {
+        fields
+            .next()
+            .ok_or(RostlTimingError::SchedulerStats)?
+            .parse::<u64>()
+            .map_err(|_| RostlTimingError::SchedulerStats)
+    };
+    Ok(SchedulerCounters {
+        cpu_time_nanos: next_counter()?,
+        runqueue_wait_nanos: next_counter()?,
+        timeslices: next_counter()?,
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+trait TimingProbeRecord: Cmov + Pod + Default + Clone + fmt::Debug {
+    fn filler(index: usize) -> Result<Self, RostlTimingError>;
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl TimingProbeRecord for PersistentAddressDirectory {
+    fn filler(index: usize) -> Result<Self, RostlTimingError> {
+        let slot = u32::try_from(index).map_err(|_| RostlTimingError::Setup)?;
+        let byte = (index % 251) as u8 + 1;
+        Ok(Self::from_business(&AddressDirectory::real(
+            slot,
+            AddressKey::new([byte; 32]),
+        )))
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl TimingProbeRecord for PersistentAddressEventPage {
+    fn filler(index: usize) -> Result<Self, RostlTimingError> {
+        let directory_slot = u32::try_from(index).map_err(|_| RostlTimingError::Setup)?;
+        let byte = (index % 251) as u8 + 1;
+        let event = UtxoEvent::created(
+            [byte; TXID_BYTES],
+            1,
+            50_000,
+            100,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [byte; 20],
+        );
+        let page = AddressEventPage::real(directory_slot, 0, event)
+            .map_err(|_| RostlTimingError::Setup)?;
+        Ok(Self::from_business(&page))
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn catch_upstream<R>(operation: impl FnOnce() -> R) -> Result<R, ()> {
     catch_unwind(AssertUnwindSafe(operation)).map_err(|_| ())
@@ -434,29 +1001,75 @@ mod tests {
         }
     }
 
-    #[test]
-    fn healthy_missing_and_duplicate_use_the_same_two_access_schedule(
-    ) -> Result<(), RostlStoreError> {
-        let mut missing = FakeAccess::default();
-        let inserted = fixed_unique_insert(&mut missing, 3, 7, 0, 8)?;
-        assert_eq!(inserted.disposition, UniqueInsertDisposition::Inserted);
-        assert_eq!(inserted.occupied_records, 1);
-        assert_eq!(missing.record, Some(7));
-
-        let mut duplicate = FakeAccess {
-            record: Some(11),
+    /// Runs the whole insertion path against a fake backend and reports both the
+    /// classified result and the exact access schedule it produced.
+    fn run_insert(
+        record: Option<u64>,
+        occupied_records: u64,
+        capacity: u64,
+    ) -> (
+        Result<UniqueInsertDisposition, RostlStoreError>,
+        Vec<AccessKind>,
+        Option<u64>,
+    ) {
+        let mut access = FakeAccess {
+            record,
             ..FakeAccess::default()
         };
-        let rejected = fixed_unique_insert(&mut duplicate, 3, 99, 1, 8)?;
-        assert_eq!(rejected.disposition, UniqueInsertDisposition::Duplicate);
-        assert_eq!(rejected.occupied_records, 1);
-        assert_eq!(duplicate.record, Some(11));
-        assert_eq!(missing.trace, duplicate.trace);
+        let result = admit_insert(occupied_records, capacity)
+            .and_then(|()| fixed_unique_insert(&mut access, 3, 7, occupied_records).classify());
+        (result, access.trace, access.record)
+    }
+
+    /// The Gate 2 property: at every public occupancy a present record and an
+    /// absent record must produce identical access schedules.
+    #[test]
+    fn hit_and_miss_share_an_access_schedule_at_every_public_occupancy() {
+        const CAPACITY: u64 = 8;
+        for occupied in [0, 1, 7, CAPACITY] {
+            let (_, hit, _) = run_insert(Some(11), occupied, CAPACITY);
+            let (_, miss, _) = run_insert(None, occupied, CAPACITY);
+            assert_eq!(hit, miss, "schedules diverged at occupied={occupied}");
+        }
+    }
+
+    /// Pins the two schedules the property test compares so it cannot pass
+    /// vacuously by refusing, or accessing, in every state alike.
+    #[test]
+    fn admitted_insertions_access_twice_and_refused_insertions_never_access() {
+        const CAPACITY: u64 = 8;
+        let (_, admitted, _) = run_insert(None, 1, CAPACITY);
+        assert_eq!(admitted, vec![AccessKind::Read, AccessKind::WriteOrInsert]);
+
+        let (refused, refused_trace, _) = run_insert(None, CAPACITY, CAPACITY);
+        assert_eq!(refused, Err(RostlStoreError::TableFull));
+        assert_eq!(refused_trace, Vec::new());
+    }
+
+    #[test]
+    fn healthy_missing_and_duplicate_use_the_same_two_access_schedule() {
+        let (inserted, inserted_trace, stored) = run_insert(None, 0, 8);
+        assert_eq!(inserted, Ok(UniqueInsertDisposition::Inserted));
+        assert_eq!(stored, Some(7));
+
+        let (duplicate, duplicate_trace, preserved) = run_insert(Some(11), 1, 8);
+        assert_eq!(duplicate, Ok(UniqueInsertDisposition::Duplicate));
+        assert_eq!(preserved, Some(11));
+
+        assert_eq!(inserted_trace, duplicate_trace);
         assert_eq!(
-            missing.trace,
+            inserted_trace,
             vec![AccessKind::Read, AccessKind::WriteOrInsert]
         );
-        Ok(())
+    }
+
+    /// This case formerly short-circuited after a single access. A hit on an
+    /// empty table now costs the full schedule and is rejected only afterwards.
+    #[test]
+    fn hit_on_an_empty_table_is_rejected_after_both_accesses() {
+        let (result, trace, _) = run_insert(Some(11), 0, 8);
+        assert_eq!(result, Err(RostlStoreError::OccupancyInvariant));
+        assert_eq!(trace, vec![AccessKind::Read, AccessKind::WriteOrInsert]);
     }
 
     #[test]
@@ -467,7 +1080,7 @@ mod tests {
             ..FakeAccess::default()
         };
         assert_eq!(
-            fixed_unique_insert(&mut access, 3, 99, 1, 8),
+            fixed_unique_insert(&mut access, 3, 99, 1).classify(),
             Err(RostlStoreError::FoundMismatch)
         );
         assert_eq!(
@@ -478,13 +1091,10 @@ mod tests {
     }
 
     #[test]
-    fn impossible_occupancy_fails_before_a_risky_second_access() {
-        let mut access = FakeAccess::default();
-        assert_eq!(
-            fixed_unique_insert(&mut access, 3, 99, 8, 8),
-            Err(RostlStoreError::OccupancyInvariant)
-        );
-        assert_eq!(access.trace, vec![AccessKind::Read]);
+    fn inconsistent_occupancy_is_refused_before_any_access() {
+        let (result, trace, _) = run_insert(None, 9, 8);
+        assert_eq!(result, Err(RostlStoreError::OccupancyInvariant));
+        assert_eq!(trace, Vec::new());
     }
 
     #[test]
@@ -576,21 +1186,26 @@ mod tests {
         Ok(())
     }
 
+    /// A full table is refused from public occupancy alone, before any access,
+    /// so no insertion into it can reveal whether the key was present.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn full_store_duplicate_still_completes_both_accesses() -> Result<(), RostlStoreError> {
+    fn full_store_refuses_every_insertion_without_accessing() -> Result<(), RostlStoreError> {
         let mut store = RostlTable::<PersistentAddressDirectory>::new(8)?;
         for key in 0..8 {
             store.insert_record_unique(key, directory_record(key as u8 + 1, key as u32))?;
         }
         assert_eq!(store.occupied_record_count()?, 8);
+
         let before = store.oram.evict_counter;
         assert_eq!(
             store.insert_record_unique(3, directory_record(0xf0, 7)),
-            Err(RostlStoreError::DuplicateKey)
+            Err(RostlStoreError::TableFull)
         );
-        let after = store.oram.evict_counter;
-        assert_eq!((after + 8 - before) % 8, 4);
+        assert_eq!(store.oram.evict_counter, before);
+
+        // A full table is a refusal, not corruption: the store must stay
+        // readable rather than latching failed-closed.
         assert_eq!(store.occupied_record_count()?, 8);
         assert_eq!(store.read_record(3)?, Some(directory_record(4, 3)));
         Ok(())
@@ -630,6 +1245,167 @@ mod tests {
         assert_eq!(snapshot.completed, 2);
         assert_eq!(snapshot.failed, 0);
         Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn probe_contains<T>(
+        probe: &mut InsertProbe<T>,
+        table: usize,
+        key: usize,
+    ) -> Result<bool, RostlTimingError>
+    where
+        T: TimingProbeRecord,
+    {
+        probe
+            .tables
+            .get_mut(table)
+            .ok_or(RostlTimingError::PairState)?
+            .read_record(key)
+            .map(|record| record.is_some())
+            .map_err(|_| RostlTimingError::PairState)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn assert_probe_boundary<T>(
+        probe: &mut InsertProbe<T>,
+        mode: RostlTimingMode,
+        expected_occupancy: usize,
+    ) -> Result<(), RostlTimingError>
+    where
+        T: TimingProbeRecord,
+    {
+        assert_eq!(probe.current_occupancy, expected_occupancy);
+        for table in &probe.tables {
+            assert_eq!(
+                usize::try_from(
+                    table
+                        .occupied_record_count()
+                        .map_err(|_| RostlTimingError::PairState)?
+                )
+                .map_err(|_| RostlTimingError::PairState)?,
+                expected_occupancy
+            );
+        }
+        let hit_table = probe.hit_label_table;
+        let miss_table = other_table(hit_table)?;
+        let probe_key = probe.probe_key;
+        match mode {
+            RostlTimingMode::HitMiss => {
+                let substitute = probe.substitute_key.ok_or(RostlTimingError::PairState)?;
+                assert!(probe_contains(probe, hit_table, probe_key)?);
+                assert!(!probe_contains(probe, miss_table, probe_key)?);
+                assert!(!probe_contains(probe, hit_table, substitute)?);
+                assert!(probe_contains(probe, miss_table, substitute)?);
+            }
+            RostlTimingMode::ForcedHit => {
+                assert!(probe_contains(probe, hit_table, probe_key)?);
+                assert!(probe_contains(probe, miss_table, probe_key)?);
+            }
+            RostlTimingMode::ForcedMiss => {
+                assert!(!probe_contains(probe, hit_table, probe_key)?);
+                assert!(!probe_contains(probe, miss_table, probe_key)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn exercise_long_lived_probe<T>(mode: RostlTimingMode) -> Result<(), RostlTimingError>
+    where
+        T: TimingProbeRecord,
+    {
+        const INITIAL_OCCUPANCY: usize = 3;
+        const PAIRS: usize = 4;
+        let mut probe = InsertProbe::<T>::new(16, INITIAL_OCCUPANCY, PAIRS, mode)?;
+
+        for pair in 0..PAIRS {
+            assert_probe_boundary(&mut probe, mode, INITIAL_OCCUPANCY + pair)?;
+            let before_hit_table = probe.hit_label_table;
+            let scheduled = if pair.is_multiple_of(2) {
+                [Arm::Hit, Arm::Miss]
+            } else {
+                [Arm::Miss, Arm::Hit]
+            };
+            for arm in scheduled {
+                let executed = match mode {
+                    RostlTimingMode::HitMiss => arm,
+                    RostlTimingMode::ForcedHit => Arm::Hit,
+                    RostlTimingMode::ForcedMiss => Arm::Miss,
+                };
+                let _ = probe.measure(arm, executed)?;
+            }
+            probe.finish_pair()?;
+            assert_eq!(probe.hit_label_table, other_table(before_hit_table)?);
+        }
+        assert_probe_boundary(&mut probe, mode, INITIAL_OCCUPANCY + PAIRS)?;
+        if mode == RostlTimingMode::HitMiss {
+            assert_eq!(probe.cover_trace, vec![0, 1, 0, 1, 0, 1, 0, 1]);
+        }
+        Ok(())
+    }
+
+    /// Both scheduled orders preserve equal occupancy and the mode-specific key
+    /// invariant for both production record widths.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn long_lived_probes_preserve_pair_invariants_for_both_record_kinds(
+    ) -> Result<(), RostlTimingError> {
+        for mode in [
+            RostlTimingMode::HitMiss,
+            RostlTimingMode::ForcedHit,
+            RostlTimingMode::ForcedMiss,
+        ] {
+            exercise_long_lived_probe::<PersistentAddressDirectory>(mode)?;
+            exercise_long_lived_probe::<PersistentAddressEventPage>(mode)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn malformed_pair_lifecycle_fails_closed() -> Result<(), RostlTimingError> {
+        let mut duplicate =
+            InsertProbe::<PersistentAddressDirectory>::new(16, 3, 2, RostlTimingMode::HitMiss)?;
+        let _ = duplicate.measure(Arm::Hit, Arm::Hit)?;
+        assert_eq!(
+            duplicate.measure(Arm::Hit, Arm::Hit),
+            Err(RostlTimingError::PairState)
+        );
+
+        let mut incomplete =
+            InsertProbe::<PersistentAddressDirectory>::new(16, 3, 2, RostlTimingMode::HitMiss)?;
+        let _ = incomplete.measure(Arm::Hit, Arm::Hit)?;
+        assert_eq!(incomplete.finish_pair(), Err(RostlTimingError::PairState));
+
+        let mut drifted =
+            InsertProbe::<PersistentAddressDirectory>::new(16, 3, 2, RostlTimingMode::HitMiss)?;
+        drifted.tables[0].occupied_records = 4;
+        assert_eq!(
+            drifted.verify_pair_boundary(3),
+            Err(RostlTimingError::PairState)
+        );
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn probe_shape_reserves_growth_and_one_union_key() {
+        assert_eq!(
+            InsertProbe::<PersistentAddressDirectory>::new(8, 0, 1, RostlTimingMode::HitMiss).err(),
+            Some(RostlTimingError::InvalidShape)
+        );
+        assert_eq!(
+            InsertProbe::<PersistentAddressDirectory>::new(8, 3, 5, RostlTimingMode::HitMiss).err(),
+            Some(RostlTimingError::InvalidShape)
+        );
+        assert!(
+            InsertProbe::<PersistentAddressDirectory>::new(16, 3, 5, RostlTimingMode::HitMiss)
+                .is_ok()
+        );
+        assert_eq!(
+            InsertProbe::<PersistentAddressDirectory>::new(7, 3, 1, RostlTimingMode::HitMiss).err(),
+            Some(RostlTimingError::InvalidShape)
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
