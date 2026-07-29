@@ -1060,15 +1060,18 @@ where
 /// unique-insert state transitions. This is only a codegen retention anchor:
 /// it is not exact-upsert timing evidence or production executor wiring.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+type ExactUpsertAnchor<T> = fn(
+    &mut RostlTable<T>,
+    usize,
+    InsertOrUpdateRequest<T>,
+) -> Result<ExactUpsertDisposition, RostlStoreError>;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn retain_exact_upsert_codegen<T>()
 where
     T: TimingProbeRecord,
 {
-    let anchor: fn(
-        &mut RostlTable<T>,
-        usize,
-        InsertOrUpdateRequest<T>,
-    ) -> Result<ExactUpsertDisposition, RostlStoreError> = RostlTable::insert_or_update_record;
+    let anchor: ExactUpsertAnchor<T> = RostlTable::insert_or_update_record;
     std::hint::black_box(anchor);
 }
 
