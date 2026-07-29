@@ -26,3 +26,10 @@ The first bundle admitted under this convention is the
 [Gate 1 current-layout insertion result](gate1/insertion-mainnet-a4c55992-h3425046-p4-s8-b0/).
 Its human-readable context and claim boundary are in the
 [dated evidence log](../../notes/oram-gate1-mainnet-insertion-bound-log-2026-07-27.md).
+
+The retained
+[Gate 1 Mainnet hybrid-sizing result](gate1/hybrid-mainnet-2316644-h3425046-v1/)
+is interpreted in its
+[dated result note](../../notes/oram-gate1-hybrid-sizing-result-2026-07-29.md).
+It identifies one provisional logical finalist and does not claim physical
+qualification or Mainnet readiness.
