@@ -1412,18 +1412,31 @@ mod tests {
         impl PairedProbe for NullProbe {
             type Error = RostlTimingError;
 
-            fn measure(&mut self, _labelled: Arm) -> Result<ArmMeasurement, Self::Error> {
+            fn measure(&mut self, labelled: Arm) -> Result<ArmMeasurement, Self::Error> {
                 // The label is discarded: both arms do the same work.
-                self.inner.measure(self.forced)
+                self.inner.measure(labelled, self.forced)
+            }
+
+            fn finish_pair(&mut self) -> Result<(), Self::Error> {
+                self.inner.finish_pair()
             }
         }
 
+        let plan = ExperimentPlan::new(500, 50, TimingSeed::new(20_260_728))?;
         for forced in [Arm::Miss, Arm::Hit] {
+            let mode = match forced {
+                Arm::Hit => RostlTimingMode::ForcedHit,
+                Arm::Miss => RostlTimingMode::ForcedMiss,
+            };
             let mut probe = NullProbe {
-                inner: InsertProbe::<PersistentAddressDirectory>::new(1_024, 256)?,
+                inner: InsertProbe::<PersistentAddressDirectory>::new(
+                    1_024,
+                    256,
+                    plan.total_pairs(),
+                    mode,
+                )?,
                 forced,
             };
-            let plan = ExperimentPlan::new(500, 50, TimingSeed::new(20_260_728))?;
             let pairs = crate::timing_experiment::run(&plan, &mut probe)?;
             let report = crate::timing_equivalence::evaluate(
                 &pairs,
