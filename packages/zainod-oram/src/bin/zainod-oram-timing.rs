@@ -2,10 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+use std::fs;
 use std::{
     error::Error,
     fmt,
-    fs::{self, File},
+    fs::File,
     io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -15,28 +17,32 @@ use clap::{Parser, ValueEnum};
 use rustix::fs::{renameat_with, RenameFlags, CWD};
 use serde::Serialize;
 use tempfile::NamedTempFile;
-use zaino_oram::{
-    evaluate_timing_equivalence, run_rostl_insert_timing_mode, single_allowed_cpu,
-    validate_rostl_timing_shape, EquivalenceBounds, EquivalenceReport, ExperimentPlan, Pair,
-    Quiescence, QuiescencePolicy, RostlTimingError, RostlTimingMode, RostlTimingRecordKind,
-    RostlTimingSchedulerSummary, TimingSeed, MINIMUM_PAIRS,
+#[cfg(test)]
+use zaino_oram::{ExperimentPlan, Quiescence, QuiescencePolicy, TimingSeed};
+use zaino_oram::{RostlTimingMode, MINIMUM_PAIRS};
+
+#[path = "../timing_contract.rs"]
+mod timing_contract;
+#[path = "../timing_driver.rs"]
+mod timing_driver;
+
+#[cfg(test)]
+use timing_contract::{
+    derive_seed, occupancy_window, table_set_relation, timed_operation_model,
+    validate_evidence_intent, DIRECTORY_REPORT_SEED_DOMAIN, DIRECTORY_SCHEDULE_SEED_DOMAIN,
+    EVENT_REPORT_SEED_DOMAIN, EVENT_SCHEDULE_SEED_DOMAIN, STATISTICAL_SCOPE,
+    TARGET_PROJECTION_MODEL, TIMING_EVIDENCE_SCHEMA as SCHEMA,
 };
+use timing_contract::{EvidenceIntent, DEFAULT_WARMUP_PAIRS, SUPPORTED_MODES};
+#[cfg(test)]
+use timing_driver::{
+    evaluate_environment_admission, parse_cpus_allowed_list, parse_loadavg,
+    parse_scheduler_stats_control, EnvironmentAdmission, EnvironmentSnapshot, TimingDriverError,
+    TimingEvidenceMetadata,
+};
+use timing_driver::{execute_prepared_timing_run, prepare_timing_run, RunOutcome, TimingRunInputs};
 
 type DriverResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
-
-const SCHEMA: &str = "zaino-oram-insert-timing-v3";
-const DEFAULT_WARMUP_PAIRS: usize = 50;
-const DIRECTORY_SCHEDULE_SEED_DOMAIN: u64 = 0x5e12_33a1_a341_71d1;
-const DIRECTORY_REPORT_SEED_DOMAIN: u64 = 0x6127_0c6f_3475_8a0b;
-const EVENT_SCHEDULE_SEED_DOMAIN: u64 = 0xe7e1_82a5_7b9c_4d31;
-const EVENT_REPORT_SEED_DOMAIN: u64 = 0x7b91_ed09_451f_83c7;
-const STATE_CONTROL: &str = "matched_long_lived_logical_twin_tables_v1";
-const LABEL_ASSIGNMENT: &str = "alternating_physical_tables";
-const ORDER_BLOCKING: &str = "physical_table_role_parity_v1";
-const DIRECTORY_RECORD_MODEL: &str = "directory_single_cell_v1";
-const EVENT_RECORD_MODEL: &str = "event_single_immutable_cell_v1";
-const TARGET_PROJECTION_MODEL: &str = "chunked_generational_events";
-const STATISTICAL_SCOPE: &str = "nominal_iid_bounds_on_serially_dependent_rounds";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -113,185 +119,26 @@ enum TimingModeArgument {
     ForcedMiss,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-enum EvidenceIntent {
-    Pilot,
-    QualificationCandidate,
-}
-
 impl TimingModeArgument {
     const fn rostl_mode(self) -> RostlTimingMode {
         match self {
-            Self::HitMiss => RostlTimingMode::HitMiss,
-            Self::ForcedHit => RostlTimingMode::ForcedHit,
-            Self::ForcedMiss => RostlTimingMode::ForcedMiss,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct EnvironmentSnapshot {
-    cpus_allowed_list: String,
-    allowed_cpu: Option<u32>,
-    quiescence: Quiescence,
-    scheduler_stats_enabled: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct RecordEvidence {
-    kind: RostlTimingRecordKind,
-    capacity: usize,
-    initial_occupancy: usize,
-    measured_start_occupancy: usize,
-    measured_last_pre_occupancy: usize,
-    final_occupancy: usize,
-    growth_per_pair: usize,
-    table_count: usize,
-    state_control: &'static str,
-    label_assignment: &'static str,
-    order_blocking: &'static str,
-    record_model: &'static str,
-    plan: ExperimentPlan,
-    report_seed: TimingSeed,
-    raw_pairs: Vec<Pair>,
-    report: EquivalenceReport,
-    timed_scheduler: RostlTimingSchedulerSummary,
-    scheduler_admitted: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct EnvironmentAdmission {
-    before_quiescence_admitted: bool,
-    between_records_quiescence_admitted: bool,
-    after_quiescence_admitted: bool,
-    affinity_stable: bool,
-    scheduler_stats_stayed_enabled: bool,
-    directory_scheduler_admitted: bool,
-    event_scheduler_admitted: bool,
-    environment_admitted: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct TimingEvidenceMetadata {
-    schema: &'static str,
-    runner_version: &'static str,
-    platform_os: &'static str,
-    platform_arch: &'static str,
-    mode: RostlTimingMode,
-    evidence_intent: EvidenceIntent,
-    minimum_qualification_pairs: usize,
-    wall_clock_only: bool,
-    physical_trace_complete: bool,
-    oram_state_seed_bound: bool,
-    serial_independence_established: bool,
-    statistical_scope: &'static str,
-    target_projection_model: &'static str,
-    target_projection_model_implemented: bool,
-    timed_operation_model: &'static str,
-    cover_insertions_per_table_per_pair: usize,
-    cover_physical_order: [usize; 2],
-    table_set_relation: &'static str,
-    can_clear_gate2: bool,
-    policy: QuiescencePolicy,
-    before: EnvironmentSnapshot,
-    between_records: EnvironmentSnapshot,
-    after: EnvironmentSnapshot,
-    max_runqueue_wait_ratio: f64,
-    #[serde(flatten)]
-    admission: EnvironmentAdmission,
-}
-
-#[derive(Debug, Serialize)]
-struct TimingEvidence {
-    #[serde(flatten)]
-    metadata: TimingEvidenceMetadata,
-    directory: RecordEvidence,
-    event: RecordEvidence,
-    declared_wall_clock_criteria_satisfied: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OccupancyWindow {
-    initial: usize,
-    measured_start: usize,
-    measured_last_pre: usize,
-    final_occupancy: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RunOutcome {
-    evidence_intent: EvidenceIntent,
-    environment_admitted: bool,
-    declared_wall_clock_criteria_satisfied: bool,
-}
-
-impl RunOutcome {
-    const fn exit_success(self) -> bool {
-        match self.evidence_intent {
-            EvidenceIntent::Pilot => self.environment_admitted,
-            EvidenceIntent::QualificationCandidate => self.declared_wall_clock_criteria_satisfied,
+            Self::HitMiss => SUPPORTED_MODES[0],
+            Self::ForcedHit => SUPPORTED_MODES[1],
+            Self::ForcedMiss => SUPPORTED_MODES[2],
         }
     }
 }
 
 #[derive(Debug)]
 enum DriverError {
-    UnsupportedPlatform,
     OutputExists,
-    MissingCpuAllowance,
-    InvalidLoadAverage,
-    InvalidRunnableProcesses,
-    CpuNotPinned,
-    InvalidQuiescencePolicy,
-    InvalidRunqueueWaitPolicy,
-    UnderpoweredQualificationCandidate { requested: usize },
-    UnbalancedQualificationCandidate,
-    InitiallyNotQuiescent,
-    InvalidSchedulerStatsControl,
-    SchedulerStatsDisabled,
     PublishedButDurabilityUncertain { source: io::Error },
 }
 
 impl fmt::Display for DriverError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedPlatform => {
-                formatter.write_str("timing qualification requires Linux x86_64")
-            }
             Self::OutputExists => formatter.write_str("timing output path already exists"),
-            Self::MissingCpuAllowance => {
-                formatter.write_str("/proc/self/status has no Cpus_allowed_list")
-            }
-            Self::InvalidLoadAverage => formatter.write_str("/proc/loadavg is malformed"),
-            Self::InvalidRunnableProcesses => {
-                formatter.write_str("/proc/loadavg has an invalid runnable-process count")
-            }
-            Self::CpuNotPinned => {
-                formatter.write_str("timing process must be pinned to exactly one CPU")
-            }
-            Self::InvalidQuiescencePolicy => {
-                formatter.write_str("maximum load average must be finite and non-negative")
-            }
-            Self::InvalidRunqueueWaitPolicy => {
-                formatter.write_str("maximum run-queue wait ratio must be finite and within [0, 1]")
-            }
-            Self::UnderpoweredQualificationCandidate { requested } => write!(
-                formatter,
-                "qualification candidate requested {requested} measured pairs; at least {MINIMUM_PAIRS} are required"
-            ),
-            Self::UnbalancedQualificationCandidate => formatter.write_str(
-                "qualification candidate requires measured pairs divisible by four and an even warm-up pair count",
-            ),
-            Self::InitiallyNotQuiescent => {
-                formatter.write_str("host is not quiescent enough to start timing")
-            }
-            Self::InvalidSchedulerStatsControl => {
-                formatter.write_str("/proc/sys/kernel/sched_schedstats is malformed")
-            }
-            Self::SchedulerStatsDisabled => {
-                formatter.write_str("Linux scheduler statistics must be enabled before timing")
-            }
             Self::PublishedButDurabilityUncertain { .. } => formatter
                 .write_str("timing output was published but parent durability is uncertain"),
         }
@@ -322,354 +169,57 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> DriverResult<RunOutcome> {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return Err(DriverError::UnsupportedPlatform.into());
-    }
     if cli.output.try_exists()? {
         return Err(DriverError::OutputExists.into());
     }
-    if !cli.max_load_average_1m.is_finite() || cli.max_load_average_1m < 0.0 {
-        return Err(DriverError::InvalidQuiescencePolicy.into());
-    }
-    if !cli.max_runqueue_wait_ratio.is_finite()
-        || !(0.0..=1.0).contains(&cli.max_runqueue_wait_ratio)
-    {
-        return Err(DriverError::InvalidRunqueueWaitPolicy.into());
-    }
-    validate_evidence_intent(cli.evidence_intent, cli.pairs, cli.warmup_pairs)?;
-
-    let directory_schedule_seed = derive_seed(cli.seed, DIRECTORY_SCHEDULE_SEED_DOMAIN);
-    let directory_report_seed = derive_seed(cli.seed, DIRECTORY_REPORT_SEED_DOMAIN);
-    let event_schedule_seed = derive_seed(cli.seed, EVENT_SCHEDULE_SEED_DOMAIN);
-    let event_report_seed = derive_seed(cli.seed, EVENT_REPORT_SEED_DOMAIN);
-    let directory_plan = ExperimentPlan::new(
+    let inputs = TimingRunInputs::new(
+        cli.mode.rostl_mode(),
+        cli.evidence_intent,
         cli.pairs,
         cli.warmup_pairs,
-        TimingSeed::new(directory_schedule_seed),
-    )?;
-    let event_plan = ExperimentPlan::new(
-        cli.pairs,
-        cli.warmup_pairs,
-        TimingSeed::new(event_schedule_seed),
-    )?;
-
-    validate_rostl_timing_shape(
-        RostlTimingRecordKind::Directory,
         cli.directory_capacity,
         cli.directory_initial_occupancy,
-        &directory_plan,
-    )?;
-    validate_rostl_timing_shape(
-        RostlTimingRecordKind::Event,
         cli.event_capacity,
         cli.event_initial_occupancy,
-        &event_plan,
-    )?;
-
-    let bounds = EquivalenceBounds::new(cli.mean_bound_nanos, cli.cdf_distance_bound)?;
-    let policy = QuiescencePolicy::new(cli.max_load_average_1m, cli.max_competing_processes);
-    let before = read_environment()?;
-    let Some(pinned_cpu) = before.allowed_cpu else {
-        return Err(DriverError::CpuNotPinned.into());
-    };
-    if !before.scheduler_stats_enabled {
-        return Err(DriverError::SchedulerStatsDisabled.into());
-    }
-    if !policy.admits(&before.quiescence) {
-        return Err(DriverError::InitiallyNotQuiescent.into());
-    }
-
-    let mode = cli.mode.rostl_mode();
-    let directory_run = run_rostl_insert_timing_mode(
-        RostlTimingRecordKind::Directory,
-        mode,
-        cli.directory_capacity,
-        cli.directory_initial_occupancy,
-        &directory_plan,
-    )?;
-    let (directory_pairs, directory_scheduler) = directory_run.into_parts();
-    let between_records = read_environment()?;
-    let event_run = run_rostl_insert_timing_mode(
-        RostlTimingRecordKind::Event,
-        mode,
-        cli.event_capacity,
-        cli.event_initial_occupancy,
-        &event_plan,
-    )?;
-    let (event_pairs, event_scheduler) = event_run.into_parts();
-    let after = read_environment()?;
-
-    let directory_report = evaluate_timing_equivalence(
-        &directory_pairs,
-        bounds,
-        TimingSeed::new(directory_report_seed),
+        cli.mean_bound_nanos,
+        cli.cdf_distance_bound,
+        cli.max_load_average_1m,
+        cli.max_competing_processes,
+        cli.max_runqueue_wait_ratio,
+        cli.seed,
     );
-    let event_report =
-        evaluate_timing_equivalence(&event_pairs, bounds, TimingSeed::new(event_report_seed));
-    let directory_scheduler_admitted = directory_scheduler.admits(cli.max_runqueue_wait_ratio);
-    let event_scheduler_admitted = event_scheduler.admits(cli.max_runqueue_wait_ratio);
-    let admission = evaluate_environment_admission(
-        &policy,
-        pinned_cpu,
-        &before,
-        &between_records,
-        &after,
-        directory_scheduler_admitted,
-        event_scheduler_admitted,
-    );
-    let declared_wall_clock_criteria_satisfied = cli.evidence_intent
-        == EvidenceIntent::QualificationCandidate
-        && admission.environment_admitted
-        && directory_report.bounds_satisfied()
-        && event_report.bounds_satisfied();
-    let environment_admitted = admission.environment_admitted;
-    let directory_occupancy = occupancy_window(cli.directory_initial_occupancy, &directory_plan)?;
-    let event_occupancy = occupancy_window(cli.event_initial_occupancy, &event_plan)?;
-
-    let evidence = TimingEvidence {
-        metadata: TimingEvidenceMetadata {
-            schema: SCHEMA,
-            runner_version: env!("CARGO_PKG_VERSION"),
-            platform_os: std::env::consts::OS,
-            platform_arch: std::env::consts::ARCH,
-            mode,
-            evidence_intent: cli.evidence_intent,
-            minimum_qualification_pairs: MINIMUM_PAIRS,
-            wall_clock_only: true,
-            physical_trace_complete: false,
-            oram_state_seed_bound: false,
-            serial_independence_established: false,
-            statistical_scope: STATISTICAL_SCOPE,
-            target_projection_model: TARGET_PROJECTION_MODEL,
-            target_projection_model_implemented: false,
-            timed_operation_model: timed_operation_model(mode),
-            cover_insertions_per_table_per_pair: 1,
-            cover_physical_order: [0, 1],
-            table_set_relation: table_set_relation(mode),
-            can_clear_gate2: false,
-            policy,
-            before,
-            between_records,
-            after,
-            max_runqueue_wait_ratio: cli.max_runqueue_wait_ratio,
-            admission,
-        },
-        directory: RecordEvidence {
-            kind: RostlTimingRecordKind::Directory,
-            capacity: cli.directory_capacity,
-            initial_occupancy: directory_occupancy.initial,
-            measured_start_occupancy: directory_occupancy.measured_start,
-            measured_last_pre_occupancy: directory_occupancy.measured_last_pre,
-            final_occupancy: directory_occupancy.final_occupancy,
-            growth_per_pair: 1,
-            table_count: 2,
-            state_control: STATE_CONTROL,
-            label_assignment: LABEL_ASSIGNMENT,
-            order_blocking: ORDER_BLOCKING,
-            record_model: DIRECTORY_RECORD_MODEL,
-            plan: directory_plan,
-            report_seed: TimingSeed::new(directory_report_seed),
-            raw_pairs: directory_pairs,
-            report: directory_report,
-            timed_scheduler: directory_scheduler,
-            scheduler_admitted: directory_scheduler_admitted,
-        },
-        event: RecordEvidence {
-            kind: RostlTimingRecordKind::Event,
-            capacity: cli.event_capacity,
-            initial_occupancy: event_occupancy.initial,
-            measured_start_occupancy: event_occupancy.measured_start,
-            measured_last_pre_occupancy: event_occupancy.measured_last_pre,
-            final_occupancy: event_occupancy.final_occupancy,
-            growth_per_pair: 1,
-            table_count: 2,
-            state_control: STATE_CONTROL,
-            label_assignment: LABEL_ASSIGNMENT,
-            order_blocking: ORDER_BLOCKING,
-            record_model: EVENT_RECORD_MODEL,
-            plan: event_plan,
-            report_seed: TimingSeed::new(event_report_seed),
-            raw_pairs: event_pairs,
-            report: event_report,
-            timed_scheduler: event_scheduler,
-            scheduler_admitted: event_scheduler_admitted,
-        },
-        declared_wall_clock_criteria_satisfied,
-    };
-    publish_json(&cli.output, &evidence)?;
+    let completed = execute_prepared_timing_run(prepare_timing_run(inputs)?)?;
+    publish_bytes(&cli.output, completed.raw_v3_bytes())?;
     println!("timing_evidence={}", cli.output.display());
-    Ok(RunOutcome {
-        evidence_intent: cli.evidence_intent,
-        environment_admitted,
-        declared_wall_clock_criteria_satisfied,
-    })
+    Ok(completed.outcome())
 }
 
-fn validate_evidence_intent(
-    intent: EvidenceIntent,
-    pairs: usize,
-    warmup_pairs: usize,
-) -> Result<(), DriverError> {
-    if intent == EvidenceIntent::QualificationCandidate && pairs < MINIMUM_PAIRS {
-        return Err(DriverError::UnderpoweredQualificationCandidate { requested: pairs });
-    }
-    if intent == EvidenceIntent::QualificationCandidate
-        && (!pairs.is_multiple_of(4) || !warmup_pairs.is_multiple_of(2))
-    {
-        return Err(DriverError::UnbalancedQualificationCandidate);
-    }
-    Ok(())
-}
-
-const fn timed_operation_model(mode: RostlTimingMode) -> &'static str {
-    match mode {
-        RostlTimingMode::HitMiss => {
-            "mixed_duplicate_and_unique_insert_current_single_cell_baseline_v1"
-        }
-        RostlTimingMode::ForcedHit => "duplicate_insert_current_single_cell_control_v1",
-        RostlTimingMode::ForcedMiss => "unique_insert_current_single_cell_control_v1",
-    }
-}
-
-const fn table_set_relation(mode: RostlTimingMode) -> &'static str {
-    match mode {
-        RostlTimingMode::HitMiss => "one_record_substitution_equal_cardinality",
-        RostlTimingMode::ForcedHit | RostlTimingMode::ForcedMiss => "identical_key_sets",
-    }
-}
-
-fn occupancy_window(
-    initial: usize,
-    plan: &ExperimentPlan,
-) -> Result<OccupancyWindow, RostlTimingError> {
-    let measured_start = initial
-        .checked_add(plan.warmup_pairs())
-        .ok_or(RostlTimingError::InvalidShape)?;
-    let measured_last_pre = measured_start
-        .checked_add(
-            plan.pairs()
-                .checked_sub(1)
-                .ok_or(RostlTimingError::InvalidShape)?,
-        )
-        .ok_or(RostlTimingError::InvalidShape)?;
-    let final_occupancy = initial
-        .checked_add(plan.total_pairs())
-        .ok_or(RostlTimingError::InvalidShape)?;
-    Ok(OccupancyWindow {
-        initial,
-        measured_start,
-        measured_last_pre,
-        final_occupancy,
-    })
-}
-
-fn derive_seed(root: u64, domain: u64) -> u64 {
-    let mut value = root ^ domain;
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn evaluate_environment_admission(
-    policy: &QuiescencePolicy,
-    pinned_cpu: u32,
-    before: &EnvironmentSnapshot,
-    between_records: &EnvironmentSnapshot,
-    after: &EnvironmentSnapshot,
-    directory_scheduler_admitted: bool,
-    event_scheduler_admitted: bool,
-) -> EnvironmentAdmission {
-    let before_quiescence_admitted = policy.admits(&before.quiescence);
-    let between_records_quiescence_admitted = policy.admits(&between_records.quiescence);
-    let after_quiescence_admitted = policy.admits(&after.quiescence);
-    let affinity_stable = [before, between_records, after]
-        .iter()
-        .all(|snapshot| snapshot.allowed_cpu == Some(pinned_cpu));
-    let scheduler_stats_stayed_enabled = [before, between_records, after]
-        .iter()
-        .all(|snapshot| snapshot.scheduler_stats_enabled);
-    let environment_admitted = before_quiescence_admitted
-        && between_records_quiescence_admitted
-        && after_quiescence_admitted
-        && affinity_stable
-        && scheduler_stats_stayed_enabled
-        && directory_scheduler_admitted
-        && event_scheduler_admitted;
-    EnvironmentAdmission {
-        before_quiescence_admitted,
-        between_records_quiescence_admitted,
-        after_quiescence_admitted,
-        affinity_stable,
-        scheduler_stats_stayed_enabled,
-        directory_scheduler_admitted,
-        event_scheduler_admitted,
-        environment_admitted,
-    }
-}
-
-fn read_environment() -> DriverResult<EnvironmentSnapshot> {
-    let status = fs::read_to_string("/proc/self/status")?;
-    let cpus_allowed_list = parse_cpus_allowed_list(&status)?.to_owned();
-    let allowed_cpu = single_allowed_cpu(&cpus_allowed_list);
-    let loadavg = fs::read_to_string("/proc/loadavg")?;
-    let quiescence = parse_loadavg(&loadavg)?;
-    let scheduler_stats_control = fs::read_to_string("/proc/sys/kernel/sched_schedstats")?;
-    let scheduler_stats_enabled = parse_scheduler_stats_control(&scheduler_stats_control)?;
-    Ok(EnvironmentSnapshot {
-        cpus_allowed_list,
-        allowed_cpu,
-        quiescence,
-        scheduler_stats_enabled,
-    })
-}
-
-fn parse_cpus_allowed_list(status: &str) -> Result<&str, DriverError> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or(DriverError::MissingCpuAllowance)
-}
-
-fn parse_loadavg(loadavg: &str) -> Result<Quiescence, DriverError> {
-    let mut fields = loadavg.split_whitespace();
-    let load_average_1m = fields
-        .next()
-        .ok_or(DriverError::InvalidLoadAverage)?
-        .parse::<f64>()
-        .map_err(|_| DriverError::InvalidLoadAverage)?;
-    if !load_average_1m.is_finite() || load_average_1m < 0.0 {
-        return Err(DriverError::InvalidLoadAverage);
-    }
-    let runnable = fields.nth(2).ok_or(DriverError::InvalidRunnableProcesses)?;
-    let (running, _) = runnable
-        .split_once('/')
-        .ok_or(DriverError::InvalidRunnableProcesses)?;
-    let running = running
-        .parse::<usize>()
-        .map_err(|_| DriverError::InvalidRunnableProcesses)?;
-    if running == 0 {
-        return Err(DriverError::InvalidRunnableProcesses);
-    }
-    Ok(Quiescence::new(load_average_1m, running.saturating_sub(1)))
-}
-
-fn parse_scheduler_stats_control(value: &str) -> Result<bool, DriverError> {
-    match value.trim() {
-        "0" => Ok(false),
-        "1" => Ok(true),
-        _ => Err(DriverError::InvalidSchedulerStatsControl),
-    }
-}
-
+#[allow(dead_code)]
 fn publish_json(path: &Path, evidence: &impl Serialize) -> DriverResult<()> {
     publish_json_with_parent_sync(path, evidence, sync_parent)
 }
 
+#[allow(dead_code)]
 fn publish_json_with_parent_sync<F>(
     path: &Path,
     evidence: &impl Serialize,
+    sync_parent: F,
+) -> DriverResult<()>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    let mut encoded = serde_json::to_vec_pretty(evidence)?;
+    encoded.push(b'\n');
+    publish_bytes_with_parent_sync(path, &encoded, sync_parent)
+}
+
+fn publish_bytes(path: &Path, encoded: &[u8]) -> DriverResult<()> {
+    publish_bytes_with_parent_sync(path, encoded, sync_parent)
+}
+
+fn publish_bytes_with_parent_sync<F>(
+    path: &Path,
+    encoded: &[u8],
     sync_parent: F,
 ) -> DriverResult<()>
 where
@@ -679,12 +229,10 @@ where
         .parent()
         .filter(|candidate| !candidate.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut encoded = serde_json::to_vec_pretty(evidence)?;
-    encoded.push(b'\n');
-    let _: serde_json::Value = serde_json::from_slice(&encoded)?;
+    let _: serde_json::Value = serde_json::from_slice(encoded)?;
 
     let mut temporary = NamedTempFile::new_in(parent)?;
-    temporary.write_all(&encoded)?;
+    temporary.write_all(encoded)?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
     match renameat_with(CWD, temporary.path(), CWD, path, RenameFlags::NOREPLACE) {
@@ -755,23 +303,23 @@ mod tests {
     fn rejects_malformed_linux_environment_fields() {
         assert!(matches!(
             parse_cpus_allowed_list("Name:\tzainod\n"),
-            Err(DriverError::MissingCpuAllowance)
+            Err(TimingDriverError::MissingCpuAllowance)
         ));
         assert!(matches!(
             parse_loadavg("not-a-number 0.1 0.2 1/2 3"),
-            Err(DriverError::InvalidLoadAverage)
+            Err(TimingDriverError::InvalidLoadAverage)
         ));
         assert!(matches!(
             parse_loadavg("0.1 0.1 0.2 invalid 3"),
-            Err(DriverError::InvalidRunnableProcesses)
+            Err(TimingDriverError::InvalidRunnableProcesses)
         ));
         assert!(matches!(
             parse_loadavg("0.1 0.1 0.2 0/3 4"),
-            Err(DriverError::InvalidRunnableProcesses)
+            Err(TimingDriverError::InvalidRunnableProcesses)
         ));
         assert!(matches!(
             parse_scheduler_stats_control("enabled"),
-            Err(DriverError::InvalidSchedulerStatsControl)
+            Err(TimingDriverError::InvalidSchedulerStatsControl)
         ));
     }
 
@@ -937,7 +485,7 @@ mod tests {
                 MINIMUM_PAIRS - 1,
                 DEFAULT_WARMUP_PAIRS
             ),
-            Err(DriverError::UnderpoweredQualificationCandidate { .. })
+            Err(timing_contract::TimingContractError::UnderpoweredQualificationCandidate { .. })
         ));
         assert!(matches!(
             validate_evidence_intent(
@@ -945,7 +493,7 @@ mod tests {
                 MINIMUM_PAIRS + 1,
                 DEFAULT_WARMUP_PAIRS
             ),
-            Err(DriverError::UnbalancedQualificationCandidate)
+            Err(timing_contract::TimingContractError::UnbalancedQualificationCandidate)
         ));
         assert!(matches!(
             validate_evidence_intent(
@@ -953,7 +501,7 @@ mod tests {
                 MINIMUM_PAIRS + 2,
                 DEFAULT_WARMUP_PAIRS
             ),
-            Err(DriverError::UnbalancedQualificationCandidate)
+            Err(timing_contract::TimingContractError::UnbalancedQualificationCandidate)
         ));
         assert!(matches!(
             validate_evidence_intent(
@@ -961,7 +509,7 @@ mod tests {
                 MINIMUM_PAIRS,
                 DEFAULT_WARMUP_PAIRS + 1
             ),
-            Err(DriverError::UnbalancedQualificationCandidate)
+            Err(timing_contract::TimingContractError::UnbalancedQualificationCandidate)
         ));
         assert!(validate_evidence_intent(
             EvidenceIntent::QualificationCandidate,
@@ -978,7 +526,7 @@ mod tests {
 
         assert_eq!(
             occupancy_window(20, &plan)?,
-            OccupancyWindow {
+            timing_contract::OccupancyWindow {
                 initial: 20,
                 measured_start: 24,
                 measured_last_pre: 29,

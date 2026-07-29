@@ -77,9 +77,9 @@ pub use qualification::{
     run_typed_worker_qualification, TypedWorkerQualificationError, TypedWorkerQualificationReport,
 };
 pub use rostl_timing::{
-    run_rostl_insert_timing, run_rostl_insert_timing_mode, validate_rostl_timing_shape,
-    RostlTimingError, RostlTimingMode, RostlTimingRecordKind, RostlTimingRun,
-    RostlTimingSchedulerSummary,
+    run_rostl_insert_timing, run_rostl_insert_timing_mode, summarize_rostl_timing_scheduler,
+    validate_rostl_timing_shape, RostlTimingError, RostlTimingMode, RostlTimingRecordKind,
+    RostlTimingRun, RostlTimingSchedulerSummary,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use stress_qualification::{
@@ -96,7 +96,8 @@ pub use timing_equivalence::{
     EquivalenceReport, Pair, PairOrder, Seed as TimingSeed, MINIMUM_PAIRS,
 };
 pub use timing_experiment::{
-    single_allowed_cpu, ExperimentPlan, PlanError, Quiescence, QuiescencePolicy,
+    expected_timing_pair_orders, single_allowed_cpu, timing_pair_orders_match_plan, ExperimentPlan,
+    PlanError, Quiescence, QuiescencePolicy,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use zaino_corpus::{
