@@ -1,0 +1,5 @@
+{
+  "schema": "zaino-oram-source-bound-hybrid-sizing-provenance-v1",
+  "runner_version": "0.1.0",
+  "hybrid_sizing_blake2s256": "2c44f5dcdf851a12053cd8e684c4f97f202f4ff88e49102ad6232b984a746828"
+}
