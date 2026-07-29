@@ -251,7 +251,7 @@ mod tests {
         target_os = "linux",
         target_arch = "x86_64"
     ))]
-    use crate::{TimingSeed, MINIMUM_PAIRS};
+    use crate::{EquivalenceBounds, TimingSeed, MINIMUM_PAIRS};
 
     #[test]
     fn timing_modes_use_stable_snake_case_names() -> Result<(), serde_json::Error> {
@@ -307,6 +307,74 @@ mod tests {
                         && pair["miss_scheduler"].is_object()
                 }));
             }
+        }
+        Ok(())
+    }
+
+    /// Runs both identical-operation controls through the production timing
+    /// entry point and rejects gross label-dependent harness separation.
+    ///
+    /// Scheduled labels still select the matched physical table and retain the
+    /// normal AB/BA lifecycle. The forced mode changes only the executed
+    /// insertion outcome, so both labels perform the same logical operation.
+    ///
+    /// Ignored by default: it performs two full 500-pair schedules and must run
+    /// only on a pinned, quiescent Linux host.
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    #[ignore = "long-running calibration; run explicitly on a quiescent host"]
+    fn production_forced_modes_stay_within_null_control_bounds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // With 500 balanced pairs, the order-conditioned contrasts have only
+        // 250 samples per arm and a roughly 0.23 distribution-free confidence
+        // floor. The CDF bound leaves about 0.17 empirical-distance headroom:
+        // wide enough for a stable smoke control, but still able to reject
+        // gross symmetric shape separation that AUC can miss.
+        const MEAN_BOUND_NANOS: f64 = 1_000.0;
+        const CDF_DISTANCE_BOUND: f64 = 0.40;
+        const AUC_DEVIATION_BOUND: f64 = 0.10;
+
+        let seed = TimingSeed::new(20_260_728);
+        let plan = ExperimentPlan::new(500, 50, seed)?;
+        let bounds = EquivalenceBounds::new(MEAN_BOUND_NANOS, CDF_DISTANCE_BOUND)?;
+
+        for mode in [RostlTimingMode::ForcedMiss, RostlTimingMode::ForcedHit] {
+            let run = run_rostl_insert_timing_mode(
+                RostlTimingRecordKind::Directory,
+                mode,
+                1_024,
+                256,
+                &plan,
+            )?;
+            let (pairs, _) = run.into_parts();
+            let report = crate::timing_equivalence::evaluate(&pairs, bounds, seed);
+
+            println!(
+                "null control mode={mode:?} auc={:.4} cdf={:.4} \
+                 cdf_upper_95={:.4} mean={:.1}ns p={:.4}",
+                report.classifier_auc(),
+                report.empirical_cdf_distance(),
+                report.cdf_distance_upper_95(),
+                report.mean_difference_nanos(),
+                report.permutation_p_value(),
+            );
+
+            assert!(
+                report.bounds_satisfied(),
+                "null control mode {mode:?} exceeded the predeclared mean or \
+                 distribution bound: {report:?}"
+            );
+
+            let auc_deviation = (report.classifier_auc() - 0.5).abs();
+            assert!(
+                auc_deviation < AUC_DEVIATION_BOUND,
+                "null control mode {mode:?} has AUC deviation \
+                 {auc_deviation:.4}; rank separation remains uninterpretable"
+            );
         }
         Ok(())
     }
