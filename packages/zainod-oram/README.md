@@ -465,6 +465,64 @@ or freshness ownership, target hardware or TDX behavior, physical access-trace
 obliviousness, attestation, signed provenance, full-mainnet feasibility, or
 mainnet readiness.
 
+## Source-bound insertion-budget qualification
+
+The default build exposes a listener-free deterministic insertion analyzer for
+the exact retained mainnet corpus:
+
+```console
+cargo run -p zainod-oram -- \
+  qualification insertion-bound \
+  --profile current-four-probe-v1 \
+  --config <MAINNET_ZAINOD_TOML> \
+  --capture-dir <CAPTURE_DIR> \
+  --sizing-dir <SIZING_DIR> \
+  --failure-budget-bps <BPS> \
+  --output-dir <NEW_DIR> \
+  --progress-interval <BLOCKS>
+```
+
+The runner revalidates the complete capture and sizing bundles, requires a
+mainnet configuration, and freezes one non-finalized source snapshot. It
+verifies the captured checkpoint height and hash against that source before
+allocating the analyzer, then replays the exact genesis-forward block and
+standard-address event order. The current profile tests only the sizing
+model's 1x directory/event capacities with four probes under eight fixed,
+non-caller-selectable deterministic schedules. The caller supplies only the
+sampled failed-seed budget in basis points, not capacities, probe counts, or
+seed material.
+
+The new output directory contains:
+
+- `insertion-bound.json`: the
+  `zaino-oram-source-bound-insertion-budget-v1` typed wrapper, including
+  capture/sizing lineage, source snapshot, sampled budget, curve, trials, and
+  explicit evidence scope;
+- `insertion-bound.txt`: the exact human-readable report; and
+- `provenance.json`: runner version plus the canonical compact-JSON
+  BLAKE2s-256 digest under schema
+  `zaino-oram-source-bound-insertion-budget-provenance-v1`.
+
+The bundle uses the same bounded no-follow reads, sibling staging,
+read-back validation, and atomic no-replace publication as the other derived
+artifacts. After publication the runner prints
+`insertion_bound_artifact=<DIR>`. If no tested curve point meets the declared
+sampled budget, the valid typed NO-GO artifact remains published and the
+command then exits unsuccessfully. That status is a verdict signal, not an
+artifact-publication failure.
+
+GO or NO-GO applies only to the exact captured corpus, selected fixed profile,
+eight deterministic schedules, and declared sampled budget. It establishes no
+probability distribution, probabilistic or worst-case failure bound, probe
+independence, projected growth, alternative capacity/probe profile, isolated
+single-table resize, physical ORAM trace, backend calibration, target-hardware
+or TDX qualification, or mainnet readiness.
+
+The checked-in
+[2026-07-27 current-profile NO-GO bundle](../../docs/evidence/oram/gate1/insertion-mainnet-a4c55992-h3425046-p4-s8-b0/)
+is a small sanitized evidence example, not a golden output for future source
+revisions.
+
 ## Corpus capture
 
 `corpus capture` produces an identifier-free measurement of the transparent

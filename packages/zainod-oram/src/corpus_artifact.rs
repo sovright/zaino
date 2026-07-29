@@ -37,6 +37,7 @@ const MAX_QUALIFICATION_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_QUALIFICATION_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVENANCE_JSON_BYTES: usize = 64 * 1024;
 const MAX_STAGE_ATTEMPTS: u64 = 128;
+const SOURCE_CACHE_MODE: &str = "uncontrolled";
 
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -79,6 +80,57 @@ pub(super) enum SelectionMode {
     ServiceableTip,
     /// Capture an explicitly supplied public height and hash.
     ExplicitCheckpoint,
+}
+
+/// Public source-snapshot facts verified before allocating a replay consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreverifiedSourceSnapshotV1 {
+    backend_kind: BackendKind,
+    snapshot_mode: SnapshotMode,
+    serviceable_height: u32,
+    verified_checkpoint_height: u32,
+    verified_checkpoint_hash: String,
+    checkpoint_preverified_before_allocation: bool,
+    source_cache_mode: String,
+}
+
+impl PreverifiedSourceSnapshotV1 {
+    pub(super) fn new_verified(
+        backend_kind: BackendKind,
+        serviceable_height: u32,
+        measurement: &MainnetCorpusMeasurement,
+    ) -> Result<Self, ArtifactError> {
+        let source = Self {
+            backend_kind,
+            snapshot_mode: SnapshotMode::NonFinalizedState,
+            serviceable_height,
+            verified_checkpoint_height: measurement.checkpoint().height(),
+            verified_checkpoint_hash: measurement.checkpoint().hash().to_owned(),
+            checkpoint_preverified_before_allocation: true,
+            source_cache_mode: SOURCE_CACHE_MODE.to_owned(),
+        };
+        source.validate(measurement)?;
+        Ok(source)
+    }
+
+    pub(super) fn validate(
+        &self,
+        measurement: &MainnetCorpusMeasurement,
+    ) -> Result<(), ArtifactError> {
+        if self.snapshot_mode != SnapshotMode::NonFinalizedState
+            || self.serviceable_height < self.verified_checkpoint_height
+            || self.verified_checkpoint_height != measurement.checkpoint().height()
+            || self.verified_checkpoint_hash != measurement.checkpoint().hash()
+            || !self.checkpoint_preverified_before_allocation
+            || self.source_cache_mode != SOURCE_CACHE_MODE
+        {
+            return Err(ArtifactError::InvalidArtifact {
+                reason: "preverified source snapshot evidence is invalid",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,7 +342,6 @@ impl SizingProvenanceV1 {
 
 /// A semantically validated sizing qualification with its canonical typed lineage.
 pub(super) struct ValidatedSizing {
-    #[cfg(feature = "typed-qualification")]
     directory: ArtifactDirectory,
     qualification: MainnetSizingQualification,
     measurement_blake2s256: String,
@@ -343,7 +394,6 @@ pub(super) fn load_sizing(
     let (artifact, _) = read_validated_sizing_directory(&directory, capture)?;
     let qualification_blake2s256 = artifact.digest()?;
     Ok(ValidatedSizing {
-        #[cfg(feature = "typed-qualification")]
         directory,
         qualification: artifact.qualification,
         measurement_blake2s256: artifact.measurement_blake2s256,
@@ -352,7 +402,6 @@ pub(super) fn load_sizing(
 }
 
 /// Revalidates the common capture-to-sizing lineage for derived evidence.
-#[cfg(feature = "typed-qualification")]
 pub(super) fn validate_derived_source_lineage(
     capture: &ValidatedCapture,
     sizing: &ValidatedSizing,
@@ -524,7 +573,6 @@ pub(super) fn publish_verified_child_artifact(
 }
 
 /// Publishes a derived artifact outside both validated source directories.
-#[cfg(feature = "typed-qualification")]
 pub(super) fn publish_verified_derived_artifact(
     output_dir: &Path,
     capture: &ValidatedCapture,
@@ -1359,7 +1407,6 @@ fn read_file(
 }
 
 /// Reads one regular artifact file without following links and with a byte cap.
-#[cfg(feature = "typed-qualification")]
 pub(super) fn read_artifact_file(
     directory: &ArtifactDirectory,
     name: &'static str,
@@ -1464,7 +1511,6 @@ fn blake2s256_hex(bytes: &[u8]) -> String {
 }
 
 /// Returns the canonical artifact digest encoding shared by sibling formats.
-#[cfg(feature = "typed-qualification")]
 pub(super) fn artifact_blake2s256_hex(bytes: &[u8]) -> String {
     blake2s256_hex(bytes)
 }

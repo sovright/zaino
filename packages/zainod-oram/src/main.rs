@@ -15,7 +15,6 @@ use std::{
 #[cfg(feature = "typed-qualification")]
 use std::{num::NonZeroU64, time::Duration};
 
-#[cfg(feature = "typed-qualification")]
 use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
 use futures::{stream, StreamExt};
@@ -28,8 +27,15 @@ use zaino_oram::{
     TypedWorkerFullMapSaturationProfile, TypedWorkerStressProfile, TypedWorkerTargetLoadProfile,
 };
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
+use zaino_oram::{
+    SourceBoundHybridSizingProfile, SourceBoundHybridSizingReport, SourceBoundHybridSizingSession,
+};
+use zaino_oram::{
+    SourceBoundInsertionBudgetProfile, SourceBoundInsertionBudgetReport,
+    SourceBoundInsertionBudgetSession,
+};
 use zaino_state::{
-    chain_index::NonFinalizedSnapshot, ChainIndex, ChainIndexSnapshot, Height,
+    chain_index::NonFinalizedSnapshot, ChainIndex, ChainIndexSnapshot, Height, IndexedBlock,
     NodeBackedIndexerService, NodeBackedIndexerServiceConfig, ZcashService,
 };
 use zainodlib::{
@@ -38,10 +44,10 @@ use zainodlib::{
 };
 
 #[cfg(feature = "typed-qualification")]
-use crate::cold_rebuild_artifact::{publish_cold_rebuild, ColdRebuildSourceSnapshotV1};
+use crate::cold_rebuild_artifact::publish_cold_rebuild;
 use crate::corpus_artifact::{
     load_capture, load_sizing, publish_capture, publish_sizing, BackendKind, CaptureProvenance,
-    SelectionMode, SnapshotMode, ValidatedSizing,
+    PreverifiedSourceSnapshotV1, SelectionMode, SnapshotMode, ValidatedCapture, ValidatedSizing,
 };
 #[cfg(feature = "typed-qualification")]
 use crate::execution_identity::{
@@ -57,6 +63,8 @@ use crate::gate2::{
     TimingAttemptSealInputs, TimingAttemptSummary, TimingAttemptTerminalState,
     TimingManifestCreateInputs, TimingManifestInspectInputs, TimingManifestVerifyInputs,
 };
+use crate::hybrid_sizing_artifact::publish_hybrid_sizing;
+use crate::insertion_bound_artifact::publish_insertion_bound;
 #[cfg(feature = "typed-qualification")]
 use crate::qualification_artifact::publish_qualification;
 #[cfg(feature = "typed-qualification")]
@@ -73,6 +81,8 @@ mod execution_identity;
 mod full_map_saturation_artifact;
 #[cfg(feature = "typed-qualification")]
 mod gate2;
+mod hybrid_sizing_artifact;
+mod insertion_bound_artifact;
 #[cfg(feature = "private-service")]
 mod private_proto;
 #[cfg(feature = "private-service")]
@@ -110,8 +120,7 @@ enum Command {
     /// Create or verify a self-reported local-integrity receipt without a listener.
     #[cfg(feature = "typed-qualification")]
     Release(ReleaseCommand),
-    /// Exercise the fixed typed-worker correctness scenario without a listener.
-    #[cfg(feature = "typed-qualification")]
+    /// Run source-bound or typed-worker qualification procedures without a listener.
     Qualification(QualificationCommand),
 }
 
@@ -175,26 +184,33 @@ struct ReleaseVerifyReceiptArgs {
     receipt: PathBuf,
 }
 
-#[cfg(feature = "typed-qualification")]
 #[derive(Debug, Args)]
 struct QualificationCommand {
     #[command(subcommand)]
     command: QualificationSubcommand,
 }
 
-#[cfg(feature = "typed-qualification")]
 #[derive(Debug, Subcommand)]
 enum QualificationSubcommand {
     /// Run the fixed correctness scenario and publish aggregate evidence.
+    #[cfg(feature = "typed-qualification")]
     Run(QualificationRunArgs),
     /// Run a fixed stress profile and publish aggregate evidence.
+    #[cfg(feature = "typed-qualification")]
     Stress(QualificationStressArgs),
     /// Run a sizing-bound builder target-load profile and publish aggregate evidence.
+    #[cfg(feature = "typed-qualification")]
     TargetLoad(QualificationTargetLoadArgs),
     /// Rebuild a typed worker from a fixed canonical source snapshot.
+    #[cfg(feature = "typed-qualification")]
     ColdRebuild(QualificationColdRebuildArgs),
     /// Create, inspect, and verify a Gate 2 timing matrix manifest.
+    #[cfg(feature = "typed-qualification")]
     Timing(QualificationTimingCommand),
+    /// Replay a fixed source snapshot and qualify insertion failure against a declared budget.
+    InsertionBound(QualificationInsertionBoundArgs),
+    /// Replay a checkpoint-preverified source and measure neutral hybrid-sizing evidence.
+    HybridSizing(QualificationHybridSizingArgs),
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -358,11 +374,11 @@ struct QualificationTargetLoadArgs {
     #[arg(long, value_enum)]
     profile: TargetLoadProfileArg,
 
-    /// Complete three-file capture directory bound to the sizing input.
+    /// Complete three-file capture directory used as the analytical source.
     #[arg(long, value_name = "DIR")]
     capture_dir: PathBuf,
 
-    /// Complete three-file sizing directory to validate and consume.
+    /// Validated context lineage; its model values do not affect this analysis.
     #[arg(long, value_name = "DIR")]
     sizing_dir: PathBuf,
 
@@ -403,6 +419,67 @@ struct QualificationColdRebuildArgs {
     progress_interval: NonZeroU32,
 }
 
+#[derive(Debug, Args)]
+struct QualificationInsertionBoundArgs {
+    /// Versioned source-bound insertion-analysis profile to execute.
+    #[arg(long, value_enum)]
+    profile: InsertionBoundProfileArg,
+
+    /// Mainnet Zainod TOML config used to open the canonical indexed source.
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+
+    /// Complete three-file capture directory bound to the sizing input.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Complete three-file sizing directory to validate and consume.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+
+    /// Maximum sampled failed-seed rate accepted, in basis points.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(0..=10_000)
+    )]
+    failure_budget_bps: u64,
+
+    /// New directory that will receive the complete verified evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+
+    /// Emit aggregate progress every this many public block heights.
+    #[arg(long)]
+    progress_interval: NonZeroU32,
+}
+
+#[derive(Debug, Args)]
+struct QualificationHybridSizingArgs {
+    /// Versioned source-bound hybrid-sizing profile to execute.
+    #[arg(long, value_enum)]
+    profile: HybridSizingProfileArg,
+
+    /// Mainnet Zainod TOML config used to open the canonical indexed source.
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+
+    /// Complete three-file capture directory bound to the sizing input.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Complete three-file sizing directory to validate and consume.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+
+    /// New directory that will receive the complete verified evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+
+    /// Emit aggregate progress every this many public block heights.
+    #[arg(long)]
+    progress_interval: NonZeroU32,
+}
+
 #[cfg(feature = "typed-qualification")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StressQualificationProfileArg {
@@ -428,6 +505,20 @@ enum ColdRebuildProfileArg {
     /// Fixed source-bound single-caller profile for the generic builder.
     #[value(name = "source-bound-builder-v1")]
     SourceBoundBuilderV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum InsertionBoundProfileArg {
+    /// Exact source replay using eight fixed schedules for the current four-probe layout.
+    #[value(name = "current-four-probe-v1")]
+    CurrentFourProbeV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HybridSizingProfileArg {
+    /// Exact source replay measuring live-UTXO base and delta demand.
+    #[value(name = "live-utxo-base-delta-v1")]
+    LiveUtxoBaseDeltaV1,
 }
 
 #[derive(Debug, Args)]
@@ -616,12 +707,16 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             ReleaseSubcommand::CreateReceipt(args) => run_release_create_receipt(args),
             ReleaseSubcommand::VerifyReceipt(args) => run_release_verify_receipt(args),
         },
-        #[cfg(feature = "typed-qualification")]
         Command::Qualification(command) => match command.command {
+            #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::Run(args) => run_qualification(args),
+            #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::Stress(args) => run_stress_qualification(args),
+            #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::TargetLoad(args) => run_target_load(args),
+            #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::ColdRebuild(args) => run_cold_rebuild(args).await,
+            #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::Timing(command) => match command.command {
                 QualificationTimingSubcommand::Create(args) => run_timing_create_manifest(args),
                 QualificationTimingSubcommand::Inspect(args) => run_timing_inspect_manifest(args),
@@ -634,6 +729,8 @@ async fn run(cli: Cli) -> RunnerResult<()> {
                 }
                 QualificationTimingSubcommand::SealDangling(args) => run_timing_seal_dangling(args),
             },
+            QualificationSubcommand::InsertionBound(args) => run_insertion_bound(args).await,
+            QualificationSubcommand::HybridSizing(args) => run_hybrid_sizing(args).await,
         },
     }
 }
@@ -882,6 +979,104 @@ fn run_target_load(args: QualificationTargetLoadArgs) -> RunnerResult<()> {
     Ok(())
 }
 
+async fn run_insertion_bound(args: QualificationInsertionBoundArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    let config = load_config(&args.config)?;
+    if config.network != Network::Mainnet {
+        return Err(RunnerError::MainnetRequired {
+            configured: config.network,
+        }
+        .into());
+    }
+
+    let profile = match args.profile {
+        InsertionBoundProfileArg::CurrentFourProbeV1 => {
+            SourceBoundInsertionBudgetProfile::CurrentFourProbeV1
+        }
+    };
+    let source_backend = backend_kind(config.backend);
+    let service_config = NodeBackedIndexerServiceConfig::try_from(config)?;
+    let mut service = NodeBackedIndexerService::spawn(service_config).await?;
+    let analysis_result = analyze_insertion_bound_fixed_snapshot(
+        &service,
+        profile,
+        &capture,
+        &sizing,
+        args.failure_budget_bps,
+        source_backend,
+        args.progress_interval,
+    )
+    .await;
+    service.close();
+    let (report, source_snapshot) = analysis_result?;
+
+    publish_insertion_bound(
+        &args.output_dir,
+        &capture,
+        &sizing,
+        &report,
+        args.failure_budget_bps,
+        &source_snapshot,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!("insertion_bound_artifact={}", args.output_dir.display());
+    if report.is_go() {
+        Ok(())
+    } else {
+        Err(RunnerError::InsertionFailureBudgetMiss {
+            failure_budget_bps: args.failure_budget_bps,
+        }
+        .into())
+    }
+}
+
+async fn run_hybrid_sizing(args: QualificationHybridSizingArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    let config = load_config(&args.config)?;
+    if config.network != Network::Mainnet {
+        return Err(RunnerError::MainnetRequired {
+            configured: config.network,
+        }
+        .into());
+    }
+
+    let profile = match args.profile {
+        HybridSizingProfileArg::LiveUtxoBaseDeltaV1 => {
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1
+        }
+    };
+    let source_backend = backend_kind(config.backend);
+    let service_config = NodeBackedIndexerServiceConfig::try_from(config)?;
+    let mut service = NodeBackedIndexerService::spawn(service_config).await?;
+    let analysis_result = analyze_hybrid_sizing_fixed_snapshot(
+        &service,
+        profile,
+        &capture,
+        source_backend,
+        args.progress_interval,
+    )
+    .await;
+    service.close();
+    let (report, source_snapshot) = analysis_result?;
+
+    publish_hybrid_sizing(
+        &args.output_dir,
+        &capture,
+        &sizing,
+        &report,
+        &source_snapshot,
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!(
+        "hybrid_sizing_evidence_artifact={}",
+        args.output_dir.display()
+    );
+    println!("hybrid_sizing_verdict=not-assessed");
+    Ok(())
+}
+
 #[cfg(feature = "typed-qualification")]
 async fn run_cold_rebuild(args: QualificationColdRebuildArgs) -> RunnerResult<()> {
     let capture = load_capture(&args.capture_dir)?;
@@ -940,12 +1135,141 @@ async fn run_cold_rebuild(args: QualificationColdRebuildArgs) -> RunnerResult<()
 async fn rebuild_fixed_snapshot(
     service: &NodeBackedIndexerService,
     profile: TypedWorkerColdRebuildProfile,
-    capture: &crate::corpus_artifact::ValidatedCapture,
+    capture: &ValidatedCapture,
     sizing: &ValidatedSizing,
     declared_rebuild_budget: Duration,
     source_backend: BackendKind,
     progress_interval: NonZeroU32,
-) -> RunnerResult<(TypedWorkerColdRebuildReport, ColdRebuildSourceSnapshotV1)> {
+) -> RunnerResult<(TypedWorkerColdRebuildReport, PreverifiedSourceSnapshotV1)> {
+    replay_preverified_snapshot(
+        service,
+        capture,
+        source_backend,
+        progress_interval,
+        "cold_rebuild",
+        || {
+            Ok(TypedWorkerColdRebuildSession::start(
+                profile,
+                capture.measurement(),
+                sizing.qualification(),
+                capture.measurement_blake2s256(),
+                sizing.qualification_blake2s256(),
+                declared_rebuild_budget,
+            )?)
+        },
+        |session, block| {
+            session.push(block)?;
+            Ok(())
+        },
+        |session| {
+            let report = session.finish()?;
+            report.validate_against(
+                capture.measurement(),
+                sizing.qualification(),
+                capture.measurement_blake2s256(),
+                sizing.qualification_blake2s256(),
+                declared_rebuild_budget,
+            )?;
+            Ok(report)
+        },
+    )
+    .await
+}
+
+async fn analyze_insertion_bound_fixed_snapshot(
+    service: &NodeBackedIndexerService,
+    profile: SourceBoundInsertionBudgetProfile,
+    capture: &ValidatedCapture,
+    sizing: &ValidatedSizing,
+    failure_budget_bps: u64,
+    source_backend: BackendKind,
+    progress_interval: NonZeroU32,
+) -> RunnerResult<(
+    SourceBoundInsertionBudgetReport,
+    PreverifiedSourceSnapshotV1,
+)> {
+    replay_preverified_snapshot(
+        service,
+        capture,
+        source_backend,
+        progress_interval,
+        "insertion_bound",
+        || {
+            Ok(SourceBoundInsertionBudgetSession::start(
+                profile,
+                capture.measurement(),
+                sizing.qualification(),
+                capture.measurement_blake2s256(),
+                sizing.qualification_blake2s256(),
+                failure_budget_bps,
+            )?)
+        },
+        |session, block| {
+            session.push(block)?;
+            Ok(())
+        },
+        |session| {
+            let report = session.finish()?;
+            report.validate_against(
+                capture.measurement(),
+                sizing.qualification(),
+                capture.measurement_blake2s256(),
+                sizing.qualification_blake2s256(),
+                failure_budget_bps,
+            )?;
+            Ok(report)
+        },
+    )
+    .await
+}
+
+async fn analyze_hybrid_sizing_fixed_snapshot(
+    service: &NodeBackedIndexerService,
+    profile: SourceBoundHybridSizingProfile,
+    capture: &ValidatedCapture,
+    source_backend: BackendKind,
+    progress_interval: NonZeroU32,
+) -> RunnerResult<(SourceBoundHybridSizingReport, PreverifiedSourceSnapshotV1)> {
+    replay_preverified_snapshot(
+        service,
+        capture,
+        source_backend,
+        progress_interval,
+        "hybrid_sizing",
+        || {
+            Ok(SourceBoundHybridSizingSession::start(
+                profile,
+                capture.measurement(),
+                capture.measurement_blake2s256(),
+            )?)
+        },
+        |session, block| {
+            session.push(block)?;
+            Ok(())
+        },
+        |session| {
+            let report = session.finish()?;
+            report.validate_against(capture.measurement(), capture.measurement_blake2s256())?;
+            Ok(report)
+        },
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the helper keeps source preverification and ordered replay identical across consumers"
+)]
+async fn replay_preverified_snapshot<Session, Report>(
+    service: &NodeBackedIndexerService,
+    capture: &ValidatedCapture,
+    source_backend: BackendKind,
+    progress_interval: NonZeroU32,
+    progress_label: &str,
+    start: impl FnOnce() -> RunnerResult<Session>,
+    mut push: impl FnMut(&mut Session, &IndexedBlock) -> RunnerResult<()>,
+    finish: impl FnOnce(Session) -> RunnerResult<Report>,
+) -> RunnerResult<(Report, PreverifiedSourceSnapshotV1)> {
     let subscriber = service.get_subscriber().inner();
     let snapshot = subscriber.indexer.snapshot_nonfinalized_state().await?;
     classify_snapshot(&snapshot)?;
@@ -980,24 +1304,17 @@ async fn rebuild_fixed_snapshot(
         }
         .into());
     }
-    let source_snapshot = ColdRebuildSourceSnapshotV1::new_verified(
+    let source_snapshot = PreverifiedSourceSnapshotV1::new_verified(
         source_backend,
         serviceable_height,
         capture.measurement(),
     )?;
 
-    // Worker allocation begins only after the source snapshot has proven the
+    // Consumer allocation begins only after the source snapshot has proven the
     // exact public capture checkpoint above.
-    let mut session = TypedWorkerColdRebuildSession::start(
-        profile,
-        capture.measurement(),
-        sizing.qualification(),
-        capture.measurement_blake2s256(),
-        sizing.qualification_blake2s256(),
-        declared_rebuild_budget,
-    )?;
+    let mut session = start()?;
     eprintln!(
-        "cold_rebuild_start=mainnet,target_height:{checkpoint_height},serviceable_height:{serviceable_height}"
+        "{progress_label}_start=mainnet,target_height:{checkpoint_height},serviceable_height:{serviceable_height}"
     );
     for raw_height in 0..=checkpoint_height {
         let height = Height::try_from(raw_height)
@@ -1007,21 +1324,14 @@ async fn rebuild_fixed_snapshot(
             .get_indexed_block_by_height(&snapshot, &height)
             .await?
             .ok_or(RunnerError::MissingCanonicalBlock { height: raw_height })?;
-        session.push(&block)?;
+        push(&mut session, &block)?;
         if raw_height % progress_interval.get() == 0 || raw_height == checkpoint_height {
             eprintln!(
-                "cold_rebuild_progress=mainnet,current_height:{raw_height},target_height:{checkpoint_height}"
+                "{progress_label}_progress=mainnet,current_height:{raw_height},target_height:{checkpoint_height}"
             );
         }
     }
-    let report = session.finish()?;
-    report.validate_against(
-        capture.measurement(),
-        sizing.qualification(),
-        capture.measurement_blake2s256(),
-        sizing.qualification_blake2s256(),
-        declared_rebuild_budget,
-    )?;
+    let report = finish(session)?;
     Ok((report, source_snapshot))
 }
 
@@ -1287,12 +1597,10 @@ enum RunnerError {
     MissingCanonicalBlock {
         height: u32,
     },
-    #[cfg(feature = "typed-qualification")]
     CaptureCheckpointAboveServiceable {
         checkpoint: u32,
         serviceable: u32,
     },
-    #[cfg(feature = "typed-qualification")]
     CaptureCheckpointHashMismatch {
         height: u32,
     },
@@ -1308,6 +1616,9 @@ enum RunnerError {
     },
     #[cfg(feature = "typed-qualification")]
     TimingAttemptUnexpectedTerminal,
+    InsertionFailureBudgetMiss {
+        failure_budget_bps: u64,
+    },
     IncompleteCheckpoint,
     InvalidCheckpointHash,
     TargetAboveServiceable {
@@ -1326,7 +1637,7 @@ impl fmt::Display for RunnerError {
         match self {
             Self::MainnetRequired { configured } => write!(
                 f,
-                "corpus scans require a mainnet config; configured network is {configured}"
+                "source-backed ORAM tools require a mainnet config; configured network is {configured}"
             ),
             Self::HeightOutOfRange { height } => {
                 write!(
@@ -1338,7 +1649,6 @@ impl fmt::Display for RunnerError {
                 f,
                 "fixed canonical snapshot has no indexed block at public height {height}"
             ),
-            #[cfg(feature = "typed-qualification")]
             Self::CaptureCheckpointAboveServiceable {
                 checkpoint,
                 serviceable,
@@ -1346,7 +1656,6 @@ impl fmt::Display for RunnerError {
                 f,
                 "capture checkpoint height {checkpoint} exceeds fixed snapshot serviceable height {serviceable}"
             ),
-            #[cfg(feature = "typed-qualification")]
             Self::CaptureCheckpointHashMismatch { height } => write!(
                 f,
                 "fixed canonical snapshot does not match the capture checkpoint hash at height {height}"
@@ -1369,6 +1678,12 @@ impl fmt::Display for RunnerError {
             Self::TimingAttemptUnexpectedTerminal => {
                 f.write_str("timing run-cell returned an unexpected terminal state")
             }
+            Self::InsertionFailureBudgetMiss {
+                failure_budget_bps,
+            } => write!(
+                f,
+                "source-bound insertion analysis exceeded the declared {failure_budget_bps}-basis-point sampled failure budget; the valid NO-GO artifact was published"
+            ),
             Self::IncompleteCheckpoint => {
                 f.write_str("target height and target hash must be supplied together")
             }
@@ -1565,7 +1880,6 @@ mod tests {
                 }
             },
             Command::Corpus(_) => panic!("release arguments parsed as corpus"),
-            #[cfg(feature = "typed-qualification")]
             Command::Qualification(_) => panic!("release arguments parsed as qualification"),
         };
         assert_eq!(
@@ -1608,7 +1922,6 @@ mod tests {
                 }
             },
             Command::Corpus(_) => panic!("release arguments parsed as corpus"),
-            #[cfg(feature = "typed-qualification")]
             Command::Qualification(_) => panic!("release arguments parsed as qualification"),
         }
         Ok(())
@@ -1809,13 +2122,100 @@ mod tests {
         ]
     }
 
+    fn valid_insertion_bound_args() -> [&'static str; 17] {
+        [
+            "zainod-oram",
+            "qualification",
+            "insertion-bound",
+            "--profile",
+            "current-four-probe-v1",
+            "--config",
+            "/tmp/zainod.toml",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--failure-budget-bps",
+            "1250",
+            "--output-dir",
+            "/tmp/oram-insertion-bound",
+            "--progress-interval",
+            "5000",
+        ]
+    }
+
+    fn valid_hybrid_sizing_args() -> [&'static str; 15] {
+        [
+            "zainod-oram",
+            "qualification",
+            "hybrid-sizing",
+            "--profile",
+            "live-utxo-base-delta-v1",
+            "--config",
+            "/tmp/zainod.toml",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--output-dir",
+            "/tmp/oram-hybrid-sizing",
+            "--progress-interval",
+            "5000",
+        ]
+    }
+
     fn parsed_corpus(cli: Cli) -> CorpusCommand {
         match cli.command {
             Command::Corpus(command) => command,
             #[cfg(feature = "typed-qualification")]
             Command::Release(_) => panic!("release arguments parsed as corpus"),
-            #[cfg(feature = "typed-qualification")]
             Command::Qualification(_) => panic!("qualification arguments parsed as corpus"),
+        }
+    }
+
+    fn parsed_insertion_bound(cli: Cli) -> QualificationInsertionBoundArgs {
+        match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::InsertionBound(args) => args,
+                #[cfg(feature = "typed-qualification")]
+                QualificationSubcommand::Run(_)
+                | QualificationSubcommand::Stress(_)
+                | QualificationSubcommand::TargetLoad(_)
+                | QualificationSubcommand::ColdRebuild(_)
+                | QualificationSubcommand::Timing(_) => {
+                    panic!("insertion-bound arguments parsed as another qualification command")
+                }
+                QualificationSubcommand::HybridSizing(_) => {
+                    panic!("hybrid-sizing arguments parsed as insertion-bound")
+                }
+            },
+            Command::Corpus(_) => panic!("insertion-bound arguments parsed as corpus"),
+            #[cfg(feature = "typed-qualification")]
+            Command::Release(_) => panic!("insertion-bound arguments parsed as release"),
+        }
+    }
+
+    fn parsed_hybrid_sizing(cli: Cli) -> QualificationHybridSizingArgs {
+        match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::HybridSizing(args) => args,
+                #[cfg(feature = "typed-qualification")]
+                QualificationSubcommand::Run(_)
+                | QualificationSubcommand::Stress(_)
+                | QualificationSubcommand::TargetLoad(_)
+                | QualificationSubcommand::ColdRebuild(_)
+                | QualificationSubcommand::Timing(_)
+                | QualificationSubcommand::InsertionBound(_) => {
+                    panic!("hybrid-sizing arguments parsed as another qualification command")
+                }
+                #[cfg(not(feature = "typed-qualification"))]
+                QualificationSubcommand::InsertionBound(_) => {
+                    panic!("hybrid-sizing arguments parsed as insertion-bound")
+                }
+            },
+            Command::Corpus(_) => panic!("hybrid-sizing arguments parsed as corpus"),
+            #[cfg(feature = "typed-qualification")]
+            Command::Release(_) => panic!("hybrid-sizing arguments parsed as release"),
         }
     }
 
@@ -1835,6 +2235,12 @@ mod tests {
                 }
                 QualificationSubcommand::Timing(_) => {
                     panic!("timing arguments parsed as stress")
+                }
+                QualificationSubcommand::InsertionBound(_) => {
+                    panic!("insertion-bound arguments parsed as stress")
+                }
+                QualificationSubcommand::HybridSizing(_) => {
+                    panic!("hybrid-sizing arguments parsed as stress")
                 }
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
@@ -1860,6 +2266,12 @@ mod tests {
                 }
                 QualificationSubcommand::Timing(_) => {
                     panic!("timing arguments parsed as fixed qualification")
+                }
+                QualificationSubcommand::InsertionBound(_) => {
+                    panic!("insertion-bound arguments parsed as fixed qualification")
+                }
+                QualificationSubcommand::HybridSizing(_) => {
+                    panic!("hybrid-sizing arguments parsed as fixed qualification")
                 }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
@@ -2206,7 +2618,9 @@ mod tests {
                 QualificationSubcommand::Run(_)
                 | QualificationSubcommand::Stress(_)
                 | QualificationSubcommand::ColdRebuild(_)
-                | QualificationSubcommand::Timing(_) => {
+                | QualificationSubcommand::Timing(_)
+                | QualificationSubcommand::InsertionBound(_)
+                | QualificationSubcommand::HybridSizing(_) => {
                     panic!("target-load arguments parsed as another qualification command")
                 }
             },
@@ -2245,7 +2659,9 @@ mod tests {
                 QualificationSubcommand::Run(_)
                 | QualificationSubcommand::Stress(_)
                 | QualificationSubcommand::TargetLoad(_)
-                | QualificationSubcommand::Timing(_) => {
+                | QualificationSubcommand::Timing(_)
+                | QualificationSubcommand::InsertionBound(_)
+                | QualificationSubcommand::HybridSizing(_) => {
                     panic!("cold-rebuild arguments parsed as another qualification command")
                 }
             },
@@ -2289,6 +2705,132 @@ mod tests {
         let mut unknown_profile = valid_cold_rebuild_args();
         unknown_profile[4] = "custom";
         assert!(Cli::try_parse_from(unknown_profile).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn insertion_bound_cli_requires_source_config_lineage_budget_output_and_progress(
+    ) -> Result<(), clap::Error> {
+        let args = parsed_insertion_bound(Cli::try_parse_from(valid_insertion_bound_args())?);
+        assert_eq!(args.profile, InsertionBoundProfileArg::CurrentFourProbeV1);
+        assert_eq!(args.config, PathBuf::from("/tmp/zainod.toml"));
+        assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
+        assert_eq!(args.failure_budget_bps, 1_250);
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-insertion-bound"));
+        assert_eq!(args.progress_interval.get(), 5_000);
+
+        for required in [
+            "--profile",
+            "--config",
+            "--capture-dir",
+            "--sizing-dir",
+            "--failure-budget-bps",
+            "--output-dir",
+            "--progress-interval",
+        ] {
+            let mut missing = valid_insertion_bound_args().to_vec();
+            let Some(index) = missing.iter().position(|value| *value == required) else {
+                panic!("valid insertion-bound fixture must contain {required}");
+            };
+            missing.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(missing).is_err());
+        }
+
+        for (budget, expected) in [("0", 0), ("10000", 10_000)] {
+            let mut boundary = valid_insertion_bound_args();
+            boundary[12] = budget;
+            let args = parsed_insertion_bound(Cli::try_parse_from(boundary)?);
+            assert_eq!(args.failure_budget_bps, expected);
+        }
+
+        let mut over_budget = valid_insertion_bound_args();
+        over_budget[12] = "10001";
+        assert!(Cli::try_parse_from(over_budget).is_err());
+
+        let mut zero_progress = valid_insertion_bound_args();
+        zero_progress[16] = "0";
+        assert!(Cli::try_parse_from(zero_progress).is_err());
+
+        let mut unknown_profile = valid_insertion_bound_args();
+        unknown_profile[4] = "custom";
+        assert!(Cli::try_parse_from(unknown_profile).is_err());
+
+        for (rejected, value) in [
+            ("--seed", "1"),
+            ("--directory-capacity", "64"),
+            ("--probe-count", "4"),
+            ("--tdx-memory-bytes", "1000000"),
+        ] {
+            let mut command = valid_insertion_bound_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_sizing_cli_requires_profile_source_lineage_output_and_progress(
+    ) -> Result<(), clap::Error> {
+        let args = parsed_hybrid_sizing(Cli::try_parse_from(valid_hybrid_sizing_args())?);
+        assert_eq!(args.profile, HybridSizingProfileArg::LiveUtxoBaseDeltaV1);
+        assert_eq!(args.config, PathBuf::from("/tmp/zainod.toml"));
+        assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
+        assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-hybrid-sizing"));
+        assert_eq!(args.progress_interval.get(), 5_000);
+
+        for required in [
+            "--profile",
+            "--config",
+            "--capture-dir",
+            "--sizing-dir",
+            "--output-dir",
+            "--progress-interval",
+        ] {
+            let mut missing = valid_hybrid_sizing_args().to_vec();
+            let Some(index) = missing.iter().position(|value| *value == required) else {
+                panic!("valid hybrid-sizing fixture must contain {required}");
+            };
+            missing.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(missing).is_err());
+        }
+
+        let mut zero_progress = valid_hybrid_sizing_args();
+        zero_progress[14] = "0";
+        assert!(Cli::try_parse_from(zero_progress).is_err());
+
+        let mut unknown_profile = valid_hybrid_sizing_args();
+        unknown_profile[4] = "custom";
+        assert!(Cli::try_parse_from(unknown_profile).is_err());
+
+        for (rejected, value) in [
+            ("--failure-budget-bps", "1000"),
+            ("--directory-capacity", "64"),
+            ("--tdx-memory-bytes", "1000000"),
+        ] {
+            let mut command = valid_hybrid_sizing_args().to_vec();
+            command.extend([rejected, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "typed-qualification"))]
+    #[test]
+    fn insertion_bound_cli_remains_available_without_typed_qualification() -> Result<(), clap::Error>
+    {
+        let args = parsed_insertion_bound(Cli::try_parse_from(valid_insertion_bound_args())?);
+        assert_eq!(args.failure_budget_bps, 1_250);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "typed-qualification"))]
+    #[test]
+    fn hybrid_sizing_cli_remains_available_without_typed_qualification() -> Result<(), clap::Error>
+    {
+        let args = parsed_hybrid_sizing(Cli::try_parse_from(valid_hybrid_sizing_args())?);
+        assert_eq!(args.profile, HybridSizingProfileArg::LiveUtxoBaseDeltaV1);
         Ok(())
     }
 

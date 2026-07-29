@@ -60,7 +60,11 @@ impl CorpusAddress {
         }
     }
 
-    const fn script_class(self) -> CorpusScriptClass {
+    pub(super) const fn script_hash(self) -> [u8; 20] {
+        self.script_hash
+    }
+
+    pub(super) const fn script_class(self) -> CorpusScriptClass {
         self.script_class
     }
 }
@@ -111,11 +115,30 @@ impl fmt::Debug for CorpusEvent {
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct AddressStats {
+    address_index: u32,
     events: u64,
     outputs: u64,
     spends: u64,
     live_utxos: u64,
     peak_live_utxos: u64,
+}
+
+/// Authoritative replay direction resolved from the canonical live-output map.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AppliedStandardAddressEventKind {
+    Created,
+    Spent,
+}
+
+/// Dense identity, ordinal, and replay kind resolved while the aggregate
+/// scanner owns the canonical live-output map.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct AppliedStandardAddressEvent {
+    pub(super) address: CorpusAddress,
+    pub(super) address_index: u32,
+    pub(super) ordinal: u64,
+    pub(super) first_for_address: bool,
+    pub(super) kind: AppliedStandardAddressEventKind,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +197,15 @@ impl CorpusAccumulator {
 
     /// Applies one event without emitting or formatting its identifiers.
     pub(super) fn apply(&mut self, event: CorpusEvent) -> Result<(), CorpusError> {
+        self.apply_resolving_standard_address(event).map(|_| ())
+    }
+
+    /// Applies one event and returns its standard owner, when any, without
+    /// duplicating the accumulator's live-output map.
+    pub(super) fn apply_resolving_standard_address(
+        &mut self,
+        event: CorpusEvent,
+    ) -> Result<Option<AppliedStandardAddressEvent>, CorpusError> {
         match event {
             CorpusEvent::Created {
                 outpoint,
@@ -189,7 +221,7 @@ impl CorpusAccumulator {
         outpoint: CorpusOutpoint,
         address: Option<CorpusAddress>,
         script_class: CorpusScriptClass,
-    ) -> Result<(), CorpusError> {
+    ) -> Result<Option<AppliedStandardAddressEvent>, CorpusError> {
         if self.live_outputs.contains_key(&outpoint) {
             return Err(CorpusError::DuplicateCreatedOutpoint);
         }
@@ -213,10 +245,22 @@ impl CorpusAccumulator {
             CounterQuantity::ScriptLiveUtxos,
         )?;
 
+        let mut applied_standard_event = None;
         let owner = match address {
             Some(address) => {
-                let current = self.addresses.get(&address).copied().unwrap_or_default();
+                let current = match self.addresses.get(&address).copied() {
+                    Some(current) => current,
+                    None => AddressStats {
+                        address_index: u32::try_from(self.addresses.len()).map_err(|_| {
+                            CorpusError::CounterOverflow {
+                                quantity: CounterQuantity::DistinctAddresses,
+                            }
+                        })?,
+                        ..AddressStats::default()
+                    },
+                };
                 let next = AddressStats {
+                    address_index: current.address_index,
                     events: checked_add(current.events, 1, CounterQuantity::AddressEvents)?,
                     outputs: checked_add(current.outputs, 1, CounterQuantity::AddressOutputs)?,
                     spends: current.spends,
@@ -231,6 +275,13 @@ impl CorpusAccumulator {
                         CounterQuantity::AddressPeakLiveUtxos,
                     )?),
                 };
+                applied_standard_event = Some(AppliedStandardAddressEvent {
+                    address,
+                    address_index: current.address_index,
+                    ordinal: current.events,
+                    first_for_address: current.events == 0,
+                    kind: AppliedStandardAddressEventKind::Created,
+                });
                 self.addresses.insert(address, next);
                 LiveOutputOwner::Standard(address)
             }
@@ -240,10 +291,13 @@ impl CorpusAccumulator {
         self.outputs = next_outputs;
         self.script_totals[script_index] = next_script_totals;
         self.live_outputs.insert(outpoint, owner);
-        Ok(())
+        Ok(applied_standard_event)
     }
 
-    fn apply_spent(&mut self, previous: CorpusOutpoint) -> Result<(), CorpusError> {
+    fn apply_spent(
+        &mut self,
+        previous: CorpusOutpoint,
+    ) -> Result<Option<AppliedStandardAddressEvent>, CorpusError> {
         let owner = self
             .live_outputs
             .get(&previous)
@@ -263,13 +317,14 @@ impl CorpusAccumulator {
             .ok_or(CorpusError::LiveUtxoUnderflow)?;
         let next_spends = checked_add(self.spends, 1, CounterQuantity::Spends)?;
 
-        if let LiveOutputOwner::Standard(address) = owner {
+        let applied_standard_event = if let LiveOutputOwner::Standard(address) = owner {
             let current = self
                 .addresses
                 .get(&address)
                 .copied()
                 .ok_or(CorpusError::MissingAddressState)?;
             let next = AddressStats {
+                address_index: current.address_index,
                 events: checked_add(current.events, 1, CounterQuantity::AddressEvents)?,
                 outputs: current.outputs,
                 spends: checked_add(current.spends, 1, CounterQuantity::AddressSpends)?,
@@ -280,12 +335,21 @@ impl CorpusAccumulator {
                 peak_live_utxos: current.peak_live_utxos,
             };
             self.addresses.insert(address, next);
-        }
+            Some(AppliedStandardAddressEvent {
+                address,
+                address_index: current.address_index,
+                ordinal: current.events,
+                first_for_address: false,
+                kind: AppliedStandardAddressEventKind::Spent,
+            })
+        } else {
+            None
+        };
 
         self.spends = next_spends;
         self.script_totals[script_index] = next_script_totals;
         self.live_outputs.remove(&previous);
-        Ok(())
+        Ok(applied_standard_event)
     }
 
     /// Consumes all identifier-bearing state and produces aggregate measurements.
@@ -513,6 +577,17 @@ impl CorpusMeasurement {
         self.distinct_standard_addresses
     }
 
+    pub(super) fn standard_address_events(&self) -> Option<u64> {
+        histogram_weighted_sum(&self.events_per_address)
+            .and_then(|events| u64::try_from(events).ok())
+    }
+
+    pub(super) fn maximum_events_per_address(&self) -> u64 {
+        self.events_per_address
+            .last_key_value()
+            .map_or(0, |(events, _)| *events)
+    }
+
     pub(super) const fn live_standard_utxos(&self) -> u64 {
         self.live_standard_utxos
     }
@@ -525,8 +600,14 @@ impl CorpusMeasurement {
         &self.events_per_address
     }
 
-    const fn live_utxos_per_address(&self) -> &BTreeMap<u64, u64> {
+    pub(super) const fn live_utxos_per_address(&self) -> &BTreeMap<u64, u64> {
         &self.live_utxos_per_address
+    }
+
+    pub(super) fn maximum_live_utxos_per_address(&self) -> u64 {
+        self.live_utxos_per_address
+            .last_key_value()
+            .map_or(0, |(live_utxos, _)| *live_utxos)
     }
 
     pub(super) fn validate(&self) -> Result<(), CorpusError> {
@@ -1266,6 +1347,37 @@ mod tests {
 
     fn growth() -> Result<GrowthAssumption, CorpusError> {
         GrowthAssumption::new(2, 1_000)
+    }
+
+    #[test]
+    fn resolved_standard_events_preserve_created_spent_kind_order() -> Result<(), CorpusError> {
+        let address = address(0xaa, CorpusScriptClass::PayToPublicKeyHash);
+        let outpoint = outpoint(0x11, 0);
+        let mut accumulator = CorpusAccumulator::from_genesis();
+
+        let created = accumulator
+            .apply_resolving_standard_address(CorpusEvent::Created {
+                outpoint,
+                address: Some(address),
+                script_class: CorpusScriptClass::PayToPublicKeyHash,
+            })?
+            .expect("standard address creation emits an applied event");
+        let spent = accumulator
+            .apply_resolving_standard_address(CorpusEvent::Spent { previous: outpoint })?
+            .expect("standard address spend emits an applied event");
+
+        assert!(matches!(
+            created.kind,
+            AppliedStandardAddressEventKind::Created
+        ));
+        assert!(matches!(spent.kind, AppliedStandardAddressEventKind::Spent));
+        assert_eq!(created.address, spent.address);
+        assert_eq!(created.address_index, spent.address_index);
+        assert_eq!(created.ordinal, 0);
+        assert_eq!(spent.ordinal, 1);
+        assert!(created.first_for_address);
+        assert!(!spent.first_for_address);
+        Ok(())
     }
 
     #[test]

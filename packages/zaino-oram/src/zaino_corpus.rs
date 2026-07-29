@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use zaino_state::{
@@ -11,9 +11,11 @@ use crate::{
         CanonicalBlockCursor, CanonicalChainError, CanonicalNetwork, PublicChainCheckpoint,
     },
     corpus::{
-        CorpusAccumulator, CorpusAddress, CorpusError, CorpusEvent, CorpusMeasurement,
-        CorpusOutpoint, CorpusScriptClass, CorpusSizingQualification, GrowthAssumption,
+        AppliedStandardAddressEvent, AppliedStandardAddressEventKind, CorpusAccumulator,
+        CorpusAddress, CorpusError, CorpusEvent, CorpusMeasurement, CorpusOutpoint,
+        CorpusScriptClass, CorpusSizingQualification, GrowthAssumption,
     },
+    layout::{StandardAddress, StandardScriptKind},
     sizing::{SizingParameters, StorageEstimate},
 };
 
@@ -210,6 +212,56 @@ pub struct MainnetCorpusScanner {
     inner: ZainoCorpusScanner,
 }
 
+/// One standard-address event resolved by the scanner's existing live-output
+/// state, with a stable dense address index and zero-based event ordinal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct CollectedStandardAddressEvent {
+    pub(super) address: StandardAddress,
+    pub(super) address_index: u32,
+    pub(super) ordinal: u64,
+    pub(super) first_for_address: bool,
+}
+
+/// One standard-address delta with its authoritative created/spent replay kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct CollectedStandardAddressDeltaEvent {
+    address: StandardAddress,
+    address_index: u32,
+    ordinal: u64,
+    first_for_address: bool,
+    kind: AppliedStandardAddressEventKind,
+}
+
+impl CollectedStandardAddressDeltaEvent {
+    pub(super) const fn address_index(&self) -> u32 {
+        self.address_index
+    }
+
+    pub(super) const fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    pub(super) const fn first_for_address(&self) -> bool {
+        self.first_for_address
+    }
+
+    pub(super) const fn is_created(&self) -> bool {
+        matches!(self.kind, AppliedStandardAddressEventKind::Created)
+    }
+
+    pub(super) const fn is_spent(&self) -> bool {
+        matches!(self.kind, AppliedStandardAddressEventKind::Spent)
+    }
+}
+
+struct DecodedStandardAddressEventParts {
+    address: StandardAddress,
+    address_index: u32,
+    ordinal: u64,
+    first_for_address: bool,
+    kind: AppliedStandardAddressEventKind,
+}
+
 impl MainnetCorpusScanner {
     /// Starts an empty scanner bound to the canonical mainnet genesis hash.
     pub fn new() -> Self {
@@ -223,12 +275,94 @@ impl MainnetCorpusScanner {
         self.inner.push(block).map_err(Into::into)
     }
 
+    /// Applies one canonical block and returns its resolved standard-address
+    /// events without allocating a second live-output owner map.
+    pub(super) fn push_collect_standard_addresses(
+        &mut self,
+        block: &IndexedBlock,
+    ) -> Result<Vec<CollectedStandardAddressEvent>, MainnetCorpusError> {
+        let events = self
+            .inner
+            .push_collect_standard_addresses(block)
+            .map_err(MainnetCorpusError::from)?;
+        events
+            .into_iter()
+            .map(|event| {
+                decode_applied_standard_address_event(event)
+                    .map(collected_standard_address_event_from_parts)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Applies one canonical block and returns its resolved standard-address
+    /// deltas in authoritative created/spent replay order.
+    pub(super) fn push_collect_standard_address_deltas(
+        &mut self,
+        block: &IndexedBlock,
+    ) -> Result<Vec<CollectedStandardAddressDeltaEvent>, MainnetCorpusError> {
+        let events = self
+            .inner
+            .push_collect_standard_addresses(block)
+            .map_err(MainnetCorpusError::from)?;
+        events
+            .into_iter()
+            .map(|event| {
+                decode_applied_standard_address_event(event)
+                    .map(collected_standard_address_delta_event_from_parts)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Consumes all identifier-bearing scan state and returns aggregates only.
     pub fn finish(self) -> Result<MainnetCorpusMeasurement, MainnetCorpusError> {
         self.inner
             .finish()
             .map(MainnetCorpusMeasurement::from_zaino)
             .map_err(Into::into)
+    }
+}
+
+fn decode_applied_standard_address_event(
+    event: AppliedStandardAddressEvent,
+) -> Result<DecodedStandardAddressEventParts, ZainoCorpusError> {
+    let script_kind = match event.address.script_class() {
+        CorpusScriptClass::PayToPublicKeyHash => StandardScriptKind::PayToPublicKeyHash,
+        CorpusScriptClass::PayToScriptHash => StandardScriptKind::PayToScriptHash,
+        CorpusScriptClass::NonStandard => {
+            return Err(ZainoCorpusError::InvalidResolvedStandardAddress);
+        }
+    };
+    Ok(DecodedStandardAddressEventParts {
+        address: StandardAddress::new(script_kind, event.address.script_hash()),
+        address_index: event.address_index,
+        ordinal: event.ordinal,
+        first_for_address: event.first_for_address,
+        kind: event.kind,
+    })
+}
+
+fn collected_standard_address_event_from_parts(
+    parts: DecodedStandardAddressEventParts,
+) -> CollectedStandardAddressEvent {
+    CollectedStandardAddressEvent {
+        address: parts.address,
+        address_index: parts.address_index,
+        ordinal: parts.ordinal,
+        first_for_address: parts.first_for_address,
+    }
+}
+
+fn collected_standard_address_delta_event_from_parts(
+    parts: DecodedStandardAddressEventParts,
+) -> CollectedStandardAddressDeltaEvent {
+    CollectedStandardAddressDeltaEvent {
+        address: parts.address,
+        address_index: parts.address_index,
+        ordinal: parts.ordinal,
+        first_for_address: parts.first_for_address,
+        kind: parts.kind,
     }
 }
 
@@ -326,6 +460,30 @@ impl MainnetCorpusMeasurement {
 
     pub(super) const fn output_count(&self) -> u64 {
         self.aggregate.output_count()
+    }
+
+    pub(super) const fn distinct_standard_addresses(&self) -> u64 {
+        self.aggregate.distinct_standard_addresses()
+    }
+
+    pub(super) fn standard_address_events(&self) -> Option<u64> {
+        self.aggregate.standard_address_events()
+    }
+
+    pub(super) fn maximum_events_per_address(&self) -> u64 {
+        self.aggregate.maximum_events_per_address()
+    }
+
+    pub(super) const fn live_standard_utxos(&self) -> u64 {
+        self.aggregate.live_standard_utxos()
+    }
+
+    pub(super) const fn live_utxos_per_address(&self) -> &BTreeMap<u64, u64> {
+        self.aggregate.live_utxos_per_address()
+    }
+
+    pub(super) fn maximum_live_utxos_per_address(&self) -> u64 {
+        self.aggregate.maximum_live_utxos_per_address()
     }
 
     /// Revalidates every redundant aggregate field after deserialization.
@@ -782,6 +940,23 @@ impl ZainoCorpusScanner {
     /// failure consumes the accumulator and permanently poisons the scanner so
     /// partially applied state cannot be reused.
     fn push(&mut self, block: &IndexedBlock) -> Result<(), ZainoCorpusError> {
+        self.push_with_standard_event(block, |_| {})
+    }
+
+    fn push_collect_standard_addresses(
+        &mut self,
+        block: &IndexedBlock,
+    ) -> Result<Vec<AppliedStandardAddressEvent>, ZainoCorpusError> {
+        let mut events = Vec::new();
+        self.push_with_standard_event(block, |event| events.push(event))?;
+        Ok(events)
+    }
+
+    fn push_with_standard_event(
+        &mut self,
+        block: &IndexedBlock,
+        mut on_standard_event: impl FnMut(AppliedStandardAddressEvent),
+    ) -> Result<(), ZainoCorpusError> {
         if self.accumulator.is_none() {
             return Err(ZainoCorpusError::ScannerPoisoned);
         }
@@ -803,7 +978,9 @@ impl ZainoCorpusScanner {
             .record_block(transaction_count)
             .map_err(ZainoCorpusError::Aggregate)?;
         for event in events {
-            apply_transparent_event(&mut accumulator, event)?;
+            if let Some(event) = apply_transparent_event(&mut accumulator, event)? {
+                on_standard_event(event);
+            }
         }
 
         let (cursor, _) = self
@@ -832,7 +1009,7 @@ impl ZainoCorpusScanner {
 fn apply_transparent_event(
     accumulator: &mut CorpusAccumulator,
     event: TransparentBlockEvent,
-) -> Result<(), ZainoCorpusError> {
+) -> Result<Option<AppliedStandardAddressEvent>, ZainoCorpusError> {
     let event = match event {
         TransparentBlockEvent::Created {
             outpoint,
@@ -851,7 +1028,7 @@ fn apply_transparent_event(
         },
     };
     accumulator
-        .apply(event)
+        .apply_resolving_standard_address(event)
         .map_err(ZainoCorpusError::Aggregate)
 }
 
@@ -871,6 +1048,7 @@ pub(super) enum ZainoCorpusError {
     ScannerPoisoned,
     InvalidMainnetMeasurement,
     InvalidMainnetSizingQualification,
+    InvalidResolvedStandardAddress,
     CanonicalChain(CanonicalChainError),
     /// One block contains more transactions than an aggregate `u64` can count.
     TransactionCountOverflow {
@@ -898,6 +1076,9 @@ impl fmt::Display for ZainoCorpusError {
             Self::InvalidMainnetSizingQualification => {
                 f.write_str("mainnet corpus sizing qualification failed semantic validation")
             }
+            Self::InvalidResolvedStandardAddress => {
+                f.write_str("resolved corpus event violated the standard-address invariant")
+            }
             Self::CanonicalChain(error) => {
                 write!(f, "corpus canonical-chain validation failed: {error}")
             }
@@ -921,6 +1102,7 @@ impl std::error::Error for ZainoCorpusError {
             | Self::ScannerPoisoned
             | Self::InvalidMainnetMeasurement
             | Self::InvalidMainnetSizingQualification
+            | Self::InvalidResolvedStandardAddress
             | Self::TransactionCountOverflow { .. } => None,
         }
     }
@@ -929,7 +1111,6 @@ impl std::error::Error for ZainoCorpusError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use zaino_state::{AddrScript, IndexedBlock, Outpoint, ScriptType, TxInCompact, TxLocation};
 
     use crate::zaino_fixtures::{indexed_block, output, transaction};
@@ -1008,6 +1189,38 @@ mod tests {
         )
     }
 
+    fn standard_event_fixture() -> Result<[IndexedBlock; 2], Box<dyn std::error::Error>> {
+        let genesis_hash = CanonicalNetwork::Mainnet.genesis_hash().0;
+        let created_txid = [0x51; 32];
+        let genesis = transaction(
+            0,
+            created_txid,
+            vec![TxInCompact::null_prevout()],
+            vec![
+                output(50, [0xa1; 20], ScriptType::P2PKH)?,
+                output(75, [0xb2; 20], ScriptType::P2SH)?,
+                output(100, [0xc3; 20], ScriptType::NonStandard)?,
+            ],
+        );
+        let second = transaction(
+            0,
+            [0x52; 32],
+            vec![
+                TxInCompact::new(created_txid, 0),
+                TxInCompact::new(created_txid, 1),
+                TxInCompact::new(created_txid, 2),
+            ],
+            vec![
+                output(40, [0xa1; 20], ScriptType::P2PKH)?,
+                output(60, [0xd4; 20], ScriptType::P2SH)?,
+            ],
+        );
+        Ok([
+            indexed_block(0, genesis_hash, [0; 32], vec![genesis])?,
+            indexed_block(1, [0x92; 32], genesis_hash, vec![second])?,
+        ])
+    }
+
     #[test]
     fn network_labels_bind_canonical_genesis_hashes() {
         assert_eq!(
@@ -1073,6 +1286,128 @@ mod tests {
 
         assert_eq!(incremental.to_string(), iterator.to_string());
         assert!(incremental.to_string().contains("final_height=1"));
+        Ok(())
+    }
+
+    #[test]
+    fn collected_standard_events_preserve_dense_identity_and_contiguous_ordinals(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let [genesis, second] = standard_event_fixture()?;
+        let mut scanner = MainnetCorpusScanner::new();
+
+        let genesis_events = scanner.push_collect_standard_addresses(&genesis)?;
+        assert_eq!(genesis_events.len(), 2);
+        assert_eq!(
+            genesis_events[0].address,
+            StandardAddress::new(StandardScriptKind::PayToPublicKeyHash, [0xa1; 20])
+        );
+        assert_eq!(genesis_events[0].address_index, 0);
+        assert_eq!(genesis_events[0].ordinal, 0);
+        assert!(genesis_events[0].first_for_address);
+        assert_eq!(
+            genesis_events[1].address,
+            StandardAddress::new(StandardScriptKind::PayToScriptHash, [0xb2; 20])
+        );
+        assert_eq!(genesis_events[1].address_index, 1);
+        assert_eq!(genesis_events[1].ordinal, 0);
+        assert!(genesis_events[1].first_for_address);
+
+        let second_events = scanner.push_collect_standard_addresses(&second)?;
+        assert_eq!(second_events.len(), 4);
+        assert_eq!(second_events[0].address, genesis_events[0].address);
+        assert_eq!(second_events[0].address_index, 0);
+        assert_eq!(second_events[0].ordinal, 1);
+        assert!(!second_events[0].first_for_address);
+        assert_eq!(second_events[1].address, genesis_events[1].address);
+        assert_eq!(second_events[1].address_index, 1);
+        assert_eq!(second_events[1].ordinal, 1);
+        assert!(!second_events[1].first_for_address);
+        assert_eq!(second_events[2].address, genesis_events[0].address);
+        assert_eq!(second_events[2].address_index, 0);
+        assert_eq!(second_events[2].ordinal, 2);
+        assert!(!second_events[2].first_for_address);
+        assert_eq!(
+            second_events[3].address,
+            StandardAddress::new(StandardScriptKind::PayToScriptHash, [0xd4; 20])
+        );
+        assert_eq!(second_events[3].address_index, 2);
+        assert_eq!(second_events[3].ordinal, 0);
+        assert!(second_events[3].first_for_address);
+
+        let measurement = scanner.finish()?;
+        assert_eq!(measurement.distinct_standard_addresses(), 3);
+        assert_eq!(measurement.standard_address_events(), Some(6));
+        assert_eq!(measurement.maximum_events_per_address(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn collected_standard_deltas_preserve_created_spent_replay_order(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let [genesis, second] = standard_event_fixture()?;
+        let mut scanner = MainnetCorpusScanner::new();
+
+        let genesis_events = scanner.push_collect_standard_address_deltas(&genesis)?;
+        assert_eq!(genesis_events.len(), 2);
+        assert!(genesis_events
+            .iter()
+            .all(|event| matches!(event.kind, AppliedStandardAddressEventKind::Created)));
+
+        let second_events = scanner.push_collect_standard_address_deltas(&second)?;
+        assert_eq!(second_events.len(), 4);
+        assert!(matches!(
+            second_events[0].kind,
+            AppliedStandardAddressEventKind::Spent
+        ));
+        assert_eq!(second_events[0].address, genesis_events[0].address);
+        assert_eq!(second_events[0].address_index, 0);
+        assert_eq!(second_events[0].ordinal, 1);
+        assert!(!second_events[0].first_for_address);
+        assert!(matches!(
+            second_events[1].kind,
+            AppliedStandardAddressEventKind::Spent
+        ));
+        assert_eq!(second_events[1].address, genesis_events[1].address);
+        assert_eq!(second_events[1].address_index, 1);
+        assert_eq!(second_events[1].ordinal, 1);
+        assert!(!second_events[1].first_for_address);
+        assert!(matches!(
+            second_events[2].kind,
+            AppliedStandardAddressEventKind::Created
+        ));
+        assert_eq!(second_events[2].address, genesis_events[0].address);
+        assert_eq!(second_events[2].address_index, 0);
+        assert_eq!(second_events[2].ordinal, 2);
+        assert!(!second_events[2].first_for_address);
+        assert!(matches!(
+            second_events[3].kind,
+            AppliedStandardAddressEventKind::Created
+        ));
+        assert_eq!(
+            second_events[3].address,
+            StandardAddress::new(StandardScriptKind::PayToScriptHash, [0xd4; 20])
+        );
+        assert_eq!(second_events[3].address_index, 2);
+        assert_eq!(second_events[3].ordinal, 0);
+        assert!(second_events[3].first_for_address);
+        Ok(())
+    }
+
+    #[test]
+    fn mainnet_measurement_exposes_zero_live_standard_utxo_bucket(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let [genesis, second] = standard_event_fixture()?;
+        let mut scanner = MainnetCorpusScanner::new();
+        scanner.push(&genesis)?;
+        scanner.push(&second)?;
+
+        let measurement = scanner.finish()?;
+        assert_eq!(measurement.live_standard_utxos(), 2);
+        assert_eq!(
+            measurement.live_utxos_per_address(),
+            &BTreeMap::from([(0, 1), (1, 2)])
+        );
+        assert_eq!(measurement.maximum_live_utxos_per_address(), 1);
         Ok(())
     }
 
