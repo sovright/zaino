@@ -106,3 +106,10 @@ jobs:
           cargo run --locked --release
           --manifest-path tools/workbench/Cargo.toml
           --bin check-oram-codegen -- target/release/zainod-oram
+
+      - name: Check the ORAM exact-upsert codegen profile
+        run: >-
+          cargo run --locked --release
+          --manifest-path tools/workbench/Cargo.toml
+          --bin check-oram-codegen --
+          --profile fixed-exact-upsert target/release/zainod-oram

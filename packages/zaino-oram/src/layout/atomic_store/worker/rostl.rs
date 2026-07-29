@@ -147,6 +147,156 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactUpsertDisposition {
+    Inserted,
+    Updated,
+}
+
+#[derive(Clone, Copy)]
+struct InsertOrUpdateRequest<T> {
+    expected_present: bool,
+    expected_prior: T,
+    replacement: T,
+}
+
+impl<T> InsertOrUpdateRequest<T>
+where
+    T: Default,
+{
+    fn insert(replacement: T) -> Self {
+        Self {
+            expected_present: false,
+            expected_prior: T::default(),
+            replacement,
+        }
+    }
+
+    fn update(expected_prior: T, replacement: T) -> Self {
+        Self {
+            expected_present: true,
+            expected_prior,
+            replacement,
+        }
+    }
+}
+
+/// The raw result of one exact insert-or-update schedule.
+///
+/// Classification deliberately happens only after both protected accesses.
+/// An unexpected absence is therefore materialized by the write-or-insert
+/// access before the mismatch fails the table closed. The owner must discard
+/// that whole generation rather than retrying or publishing the mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactUpsertCommit {
+    found_before: bool,
+    found_after: bool,
+    expected_present: bool,
+    prior_matches: bool,
+    occupied_before: u64,
+    occupied_records: u64,
+}
+
+impl ExactUpsertCommit {
+    #[allow(clippy::needless_bitwise_bool)]
+    fn classify(self) -> Result<ExactUpsertDisposition, RostlStoreError> {
+        if self.found_after != self.found_before {
+            return Err(RostlStoreError::FoundMismatch);
+        }
+        if self.found_before && self.occupied_before == 0 {
+            return Err(RostlStoreError::OccupancyInvariant);
+        }
+
+        let expectation_matches = (!self.expected_present & !self.found_before)
+            | (self.expected_present & self.found_before & self.prior_matches);
+        if !expectation_matches {
+            return Err(RostlStoreError::ExactUpsertMismatch);
+        }
+
+        if self.expected_present {
+            Ok(ExactUpsertDisposition::Updated)
+        } else {
+            Ok(ExactUpsertDisposition::Inserted)
+        }
+    }
+}
+
+/// Admits an insert-or-update from public occupancy alone.
+///
+/// Every accepted call starts with at least two physical slots free. An
+/// unexpected absence can therefore consume one slot before post-schedule
+/// classification fails closed while still retaining the profile's mandatory
+/// public spare slot.
+fn admit_exact_upsert(occupied_records: u64, capacity: u64) -> Result<(), RostlStoreError> {
+    if capacity < 2 || occupied_records > capacity {
+        return Err(RostlStoreError::OccupancyInvariant);
+    }
+    if occupied_records >= capacity - 1 {
+        return Err(RostlStoreError::UpsertReserveExhausted);
+    }
+    Ok(())
+}
+
+/// Compares every byte of two fixed-width plain-data records.
+///
+/// The loop bound is a public compile-time record width. Its result feeds only
+/// bitwise boolean composition and `Cmov` inside [`fixed_exact_upsert`].
+#[inline(always)]
+fn fixed_width_pod_eq<T>(left: &T, right: &T) -> bool
+where
+    T: Pod,
+{
+    let left = bytemuck::bytes_of(left);
+    let right = bytemuck::bytes_of(right);
+    let mut difference = 0_u8;
+    for index in 0..std::mem::size_of::<T>() {
+        difference |= left[index] ^ right[index];
+    }
+    difference == 0
+}
+
+/// Performs one fixed-schedule exact insert or compare-and-update.
+///
+/// The secret hit and equality results cannot select an access: every admitted
+/// call performs one read/remap followed by one write-or-insert/remap. On an
+/// absent key the replacement is always written, including when presence was
+/// expected; that mismatch is classified only after the complete schedule and
+/// requires the caller to discard the failed-closed generation. On an occupied
+/// key, an expectation or value mismatch writes the prior value back.
+///
+/// `#[inline(never)]` preserves one inspectable symbol per record type for the
+/// dedicated `fixed-exact-upsert` codegen gate.
+#[allow(clippy::needless_bitwise_bool)]
+#[inline(never)]
+fn fixed_exact_upsert<T, A>(
+    access: &mut A,
+    key: usize,
+    request: InsertOrUpdateRequest<T>,
+    occupied_records: u64,
+) -> ExactUpsertCommit
+where
+    T: Cmov + Copy + Default + Pod,
+    A: FixedUniqueInsertAccess<T>,
+{
+    let mut prior = T::default();
+    let found_before = access.read_and_remap(key, &mut prior);
+    let prior_matches = fixed_width_pod_eq(&prior, &request.expected_prior);
+
+    let write_replacement = !found_before | (request.expected_present & prior_matches);
+    let mut selected = prior;
+    selected.cmov(&request.replacement, write_replacement);
+    let found_after = access.write_or_insert_and_remap(key, selected);
+
+    ExactUpsertCommit {
+        found_before,
+        found_after,
+        expected_present: request.expected_present,
+        prior_matches,
+        occupied_before: occupied_records,
+        occupied_records: occupied_records + u64::from(!found_before),
+    }
+}
+
 struct RostlTable<T>
 where
     T: Cmov + Pod + Default + Clone + fmt::Debug,
@@ -252,6 +402,39 @@ where
         }
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn insert_or_update_record(
+        &mut self,
+        key: usize,
+        request: InsertOrUpdateRequest<T>,
+    ) -> Result<ExactUpsertDisposition, RostlStoreError> {
+        self.validate_key(key)?;
+
+        let capacity = u64::try_from(self.capacity).map_err(|_| {
+            self.failed_closed = true;
+            RostlStoreError::OccupancyInvariant
+        })?;
+        let occupied_records = self.occupied_records;
+        match admit_exact_upsert(occupied_records, capacity) {
+            Ok(()) => {}
+            Err(RostlStoreError::UpsertReserveExhausted) => {
+                return Err(RostlStoreError::UpsertReserveExhausted);
+            }
+            Err(error) => {
+                self.failed_closed = true;
+                return Err(error);
+            }
+        }
+
+        let result = catch_upstream(|| fixed_exact_upsert(self, key, request, occupied_records));
+        let commit = self.finish_upstream(result)?;
+        let disposition = commit.classify().inspect_err(|_| {
+            self.failed_closed = true;
+        })?;
+        self.occupied_records = commit.occupied_records;
+        Ok(disposition)
+    }
+
     fn occupied_record_count(&self) -> Result<u64, RostlStoreError> {
         self.ensure_ready()?;
         Ok(self.occupied_records)
@@ -304,12 +487,18 @@ impl<T> FixedUniqueInsertAccess<T> for RostlTable<T>
 where
     T: Cmov + Pod + Default + Clone + fmt::Debug,
 {
+    /// Kept inside each inspected fixed-access symbol so the codegen gate does
+    /// not move protected access control flow behind an uninspected direct
+    /// call.
+    #[inline(always)]
     fn read_and_remap(&mut self, key: usize, value: &mut T) -> bool {
         let new_position = self.sample_new_position();
         let old_position = self.position_map.access_position(key, new_position);
         self.oram.read(old_position, new_position, key, value)
     }
 
+    /// See [`Self::read_and_remap`].
+    #[inline(always)]
     fn write_or_insert_and_remap(&mut self, key: usize, value: T) -> bool {
         let new_position = self.sample_new_position();
         let old_position = self.position_map.access_position(key, new_position);
@@ -360,6 +549,8 @@ enum RostlStoreError {
     OccupancyInvariant,
     TableFull,
     FoundMismatch,
+    ExactUpsertMismatch,
+    UpsertReserveExhausted,
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     UpstreamPanic,
     FailedClosed,
@@ -377,6 +568,12 @@ impl fmt::Display for RostlStoreError {
             Self::OccupancyInvariant => f.write_str("typed rostl store occupancy is inconsistent"),
             Self::TableFull => f.write_str("typed rostl store is at capacity"),
             Self::FoundMismatch => f.write_str("typed rostl store access results are inconsistent"),
+            Self::ExactUpsertMismatch => {
+                f.write_str("typed rostl store exact upsert expectation did not match")
+            }
+            Self::UpsertReserveExhausted => {
+                f.write_str("typed rostl store mutable spare reserve is exhausted")
+            }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             Self::UpstreamPanic => f.write_str("typed rostl store failed closed"),
             Self::FailedClosed => f.write_str("typed rostl store is failed closed"),
@@ -820,12 +1017,37 @@ where
 {
     let mut table = RostlTable::<T>::new(capacity).map_err(|_| RostlTimingError::Setup)?;
     for key in 0..common_records {
-        insert_cover(&mut table, key, Arm::Miss).map_err(|_| RostlTimingError::Setup)?;
+        insert_exact_setup(&mut table, key)?;
     }
     if let Some(key) = exclusive_key {
-        insert_cover(&mut table, key, Arm::Miss).map_err(|_| RostlTimingError::Setup)?;
+        insert_exact_setup(&mut table, key)?;
     }
     Ok(table)
+}
+
+/// Builds the timing tables through the additive backend upsert seam.
+///
+/// This setup work is outside every measured interval. Timed arms and cover
+/// writes continue to use `insert_record_unique`, so the existing insertion
+/// evidence contract is unchanged. Exercising both an insertion and a matching
+/// update for both record monomorphizations here keeps the separate
+/// `fixed-exact-upsert` codegen profile non-vacuous in release binaries that
+/// contain the timing driver. This setup anchor is not exact-upsert timing
+/// evidence and does not wire the primitive into the production executor.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn insert_exact_setup<T>(table: &mut RostlTable<T>, key: usize) -> Result<(), RostlTimingError>
+where
+    T: TimingProbeRecord,
+{
+    let candidate = T::filler(key)?;
+    match table.insert_or_update_record(key, InsertOrUpdateRequest::insert(candidate)) {
+        Ok(ExactUpsertDisposition::Inserted) => Ok(()),
+        Ok(ExactUpsertDisposition::Updated) | Err(_) => Err(RostlTimingError::Setup),
+    }?;
+    match table.insert_or_update_record(key, InsertOrUpdateRequest::update(candidate, candidate)) {
+        Ok(ExactUpsertDisposition::Updated) => Ok(()),
+        Ok(ExactUpsertDisposition::Inserted) | Err(_) => Err(RostlTimingError::Setup),
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1021,6 +1243,149 @@ mod tests {
         (result, access.trace, access.record)
     }
 
+    fn run_exact_upsert(
+        record: Option<u64>,
+        request: InsertOrUpdateRequest<u64>,
+        occupied_records: u64,
+        capacity: u64,
+    ) -> (
+        Result<ExactUpsertDisposition, RostlStoreError>,
+        Vec<AccessKind>,
+        Option<u64>,
+        Option<u64>,
+    ) {
+        let mut access = FakeAccess {
+            record,
+            ..FakeAccess::default()
+        };
+        let (result, occupied_after) = match admit_exact_upsert(occupied_records, capacity) {
+            Ok(()) => {
+                let commit = fixed_exact_upsert(&mut access, 3, request, occupied_records);
+                (commit.classify(), Some(commit.occupied_records))
+            }
+            Err(error) => (Err(error), None),
+        };
+        (result, access.trace, access.record, occupied_after)
+    }
+
+    #[test]
+    fn exact_upsert_matrix_preserves_the_fixed_schedule_and_expected_state() {
+        const SCHEDULE: [AccessKind; 2] = [AccessKind::Read, AccessKind::WriteOrInsert];
+        let cases = [
+            (
+                "expected absent, actual absent",
+                None,
+                InsertOrUpdateRequest::insert(7),
+                Ok(ExactUpsertDisposition::Inserted),
+                Some(7),
+                2,
+            ),
+            (
+                "expected absent, actual present",
+                Some(11),
+                InsertOrUpdateRequest::insert(7),
+                Err(RostlStoreError::ExactUpsertMismatch),
+                Some(11),
+                1,
+            ),
+            (
+                "expected present, actual absent",
+                None,
+                InsertOrUpdateRequest::update(11, 7),
+                Err(RostlStoreError::ExactUpsertMismatch),
+                Some(7),
+                2,
+            ),
+            (
+                "expected present, matching actual",
+                Some(11),
+                InsertOrUpdateRequest::update(11, 7),
+                Ok(ExactUpsertDisposition::Updated),
+                Some(7),
+                1,
+            ),
+            (
+                "expected present, mismatching actual",
+                Some(11),
+                InsertOrUpdateRequest::update(12, 7),
+                Err(RostlStoreError::ExactUpsertMismatch),
+                Some(11),
+                1,
+            ),
+        ];
+
+        for (name, record, request, expected, stored, occupied_after) in cases {
+            let (result, trace, actual_stored, actual_occupied_after) =
+                run_exact_upsert(record, request, 1, 8);
+            assert_eq!(result, expected, "{name}");
+            assert_eq!(trace, SCHEDULE, "{name}");
+            assert_eq!(actual_stored, stored, "{name}");
+            assert_eq!(actual_occupied_after, Some(occupied_after), "{name}");
+        }
+    }
+
+    #[test]
+    fn exact_upsert_reserve_and_invalid_occupancy_refuse_before_access() {
+        let (_, admitted_trace, _, _) =
+            run_exact_upsert(None, InsertOrUpdateRequest::insert(7), 6, 8);
+        assert_eq!(
+            admitted_trace,
+            vec![AccessKind::Read, AccessKind::WriteOrInsert]
+        );
+
+        for (occupied, expected) in [
+            (7, RostlStoreError::UpsertReserveExhausted),
+            (8, RostlStoreError::UpsertReserveExhausted),
+            (9, RostlStoreError::OccupancyInvariant),
+        ] {
+            let (result, trace, _, occupied_after) =
+                run_exact_upsert(None, InsertOrUpdateRequest::insert(7), occupied, 8);
+            assert_eq!(result, Err(expected), "occupied={occupied}");
+            assert_eq!(trace, Vec::new(), "occupied={occupied}");
+            assert_eq!(occupied_after, None, "occupied={occupied}");
+        }
+    }
+
+    #[test]
+    fn exact_upsert_corruption_is_classified_after_both_accesses() {
+        let (result, trace, stored, occupied_after) =
+            run_exact_upsert(Some(11), InsertOrUpdateRequest::update(11, 7), 0, 8);
+        assert_eq!(result, Err(RostlStoreError::OccupancyInvariant));
+        assert_eq!(trace, vec![AccessKind::Read, AccessKind::WriteOrInsert]);
+        assert_eq!(stored, Some(7));
+        assert_eq!(occupied_after, Some(0));
+    }
+
+    #[test]
+    fn exact_upsert_found_mismatch_is_rejected_after_both_accesses() {
+        let mut access = FakeAccess {
+            record: Some(11),
+            forced_write_result: Some(false),
+            ..FakeAccess::default()
+        };
+        let commit = fixed_exact_upsert(&mut access, 3, InsertOrUpdateRequest::update(11, 7), 1);
+        assert_eq!(commit.classify(), Err(RostlStoreError::FoundMismatch));
+        assert_eq!(
+            access.trace,
+            vec![AccessKind::Read, AccessKind::WriteOrInsert]
+        );
+        assert_eq!(access.record, Some(7));
+    }
+
+    #[test]
+    fn fixed_width_equality_checks_every_record_position() {
+        let baseline = [0x5a_u8; 8];
+        assert!(fixed_width_pod_eq(&baseline, &baseline));
+        for index in 0..baseline.len() {
+            let mut different = baseline;
+            different[index] ^= 1;
+            assert!(
+                !fixed_width_pod_eq(&baseline, &different),
+                "difference at index {index} was ignored"
+            );
+        }
+    }
+
     /// The Gate 2 property: at every public occupancy a present record and an
     /// absent record must produce identical access schedules.
     #[test]
@@ -1183,6 +1548,127 @@ mod tests {
         );
         assert_eq!(events.occupied_record_count()?, 1);
         assert_eq!(events.read_record(3)?, Some(event_original));
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn exact_typed_stores_insert_and_update_both_record_widths(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut directory = RostlTable::<PersistentAddressDirectory>::new(8)?;
+        let directory_original = directory_record(0x31, 3);
+        let directory_replacement = directory_record(0x32, 3);
+
+        let directory_before = directory.oram.evict_counter;
+        assert_eq!(
+            directory
+                .insert_or_update_record(3, InsertOrUpdateRequest::insert(directory_original))?,
+            ExactUpsertDisposition::Inserted
+        );
+        let directory_after_insert = directory.oram.evict_counter;
+        assert_eq!((directory_after_insert + 8 - directory_before) % 8, 4);
+        assert_eq!(directory.occupied_record_count()?, 1);
+
+        assert_eq!(
+            directory.insert_or_update_record(
+                3,
+                InsertOrUpdateRequest::update(directory_original, directory_replacement)
+            )?,
+            ExactUpsertDisposition::Updated
+        );
+        let directory_after_update = directory.oram.evict_counter;
+        assert_eq!((directory_after_update + 8 - directory_after_insert) % 8, 4);
+        assert_eq!(directory.occupied_record_count()?, 1);
+        assert_eq!(directory.read_record(3)?, Some(directory_replacement));
+
+        let mut events = RostlTable::<PersistentAddressEventPage>::new(8)?;
+        let event_original = event_record(0x41, 3)?;
+        let event_replacement = event_record(0x42, 3)?;
+        assert_eq!(
+            events.insert_or_update_record(3, InsertOrUpdateRequest::insert(event_original))?,
+            ExactUpsertDisposition::Inserted
+        );
+        assert_eq!(
+            events.insert_or_update_record(
+                3,
+                InsertOrUpdateRequest::update(event_original, event_replacement)
+            )?,
+            ExactUpsertDisposition::Updated
+        );
+        assert_eq!(events.occupied_record_count()?, 1);
+        assert_eq!(events.read_record(3)?, Some(event_replacement));
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn exact_upsert_mismatches_latch_the_real_store_after_full_schedule(
+    ) -> Result<(), RostlStoreError> {
+        let original = directory_record(0x31, 3);
+        let replacement = directory_record(0x32, 3);
+        let wrong_prior = directory_record(0x33, 3);
+
+        let mut occupied_mismatch = RostlTable::<PersistentAddressDirectory>::new(8)?;
+        assert_eq!(
+            occupied_mismatch
+                .insert_or_update_record(3, InsertOrUpdateRequest::insert(original))?,
+            ExactUpsertDisposition::Inserted
+        );
+        let before_occupied_mismatch = occupied_mismatch.oram.evict_counter;
+        assert_eq!(
+            occupied_mismatch.insert_or_update_record(
+                3,
+                InsertOrUpdateRequest::update(wrong_prior, replacement)
+            ),
+            Err(RostlStoreError::ExactUpsertMismatch)
+        );
+        assert_eq!(
+            (occupied_mismatch.oram.evict_counter + 8 - before_occupied_mismatch) % 8,
+            4
+        );
+        assert_eq!(
+            occupied_mismatch.read_record(3),
+            Err(RostlStoreError::FailedClosed)
+        );
+
+        let mut absent_mismatch = RostlTable::<PersistentAddressDirectory>::new(8)?;
+        let before_absent_mismatch = absent_mismatch.oram.evict_counter;
+        assert_eq!(
+            absent_mismatch
+                .insert_or_update_record(3, InsertOrUpdateRequest::update(original, replacement)),
+            Err(RostlStoreError::ExactUpsertMismatch)
+        );
+        assert_eq!(
+            (absent_mismatch.oram.evict_counter + 8 - before_absent_mismatch) % 8,
+            4
+        );
+        assert_eq!(
+            absent_mismatch.occupied_record_count(),
+            Err(RostlStoreError::FailedClosed)
+        );
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn exact_upsert_reserve_refusal_keeps_the_real_store_usable() -> Result<(), RostlStoreError> {
+        let mut store = RostlTable::<PersistentAddressDirectory>::new(8)?;
+        for key in 0..7 {
+            store.insert_record_unique(key, directory_record(key as u8 + 1, key as u32))?;
+        }
+        assert_eq!(store.occupied_record_count()?, 7);
+
+        let before = store.oram.evict_counter;
+        assert_eq!(
+            store.insert_or_update_record(
+                3,
+                InsertOrUpdateRequest::update(directory_record(4, 3), directory_record(0xf0, 3))
+            ),
+            Err(RostlStoreError::UpsertReserveExhausted)
+        );
+        assert_eq!(store.oram.evict_counter, before);
+        assert_eq!(store.occupied_record_count()?, 7);
+        assert_eq!(store.read_record(3)?, Some(directory_record(4, 3)));
         Ok(())
     }
 

@@ -31,7 +31,12 @@
 //! multiplicity per monomorphization, and rejects everything else. Before
 //! classification, every instruction must have an approved measured mnemonic
 //! and its raw bytes must cover the exact `nm` symbol range without gaps,
-//! overlaps, duplicates, or an inferred final instruction boundary.
+//! overlaps, duplicates, or an inferred final instruction boundary. The
+//! `fixed-exact-upsert` profile additionally rejects every direct call: a
+//! direct call would move uninspected control flow (including a compiler-lowered
+//! `memcmp`/`bcmp`) outside this symbol. Its only call allowances are the exact
+//! relocation-proven fixed targets listed below. The legacy
+//! `fixed-unique-insert` profile retains its measured direct-call policy.
 //!
 //! The historical failure — a *forward* jump immediately after a compare
 //! against the returned boolean (`cmp $0x0,%al` then `je`) — matches neither
@@ -41,16 +46,27 @@
 //! keeps its own symbol. That attribute is load-bearing for this check: without
 //! it the function dissolves into its caller and there is nothing to inspect.
 //!
-//! Usage: `check-oram-codegen <path-to-x86_64-elf>`
+//! Usage:
+//!
+//! - `check-oram-codegen <path-to-x86_64-elf>` guards `fixed_unique_insert`.
+//! - `check-oram-codegen --profile fixed-exact-upsert <path-to-x86_64-elf>`
+//!   guards `fixed_exact_upsert`.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 use workbench::run;
 
-/// The access-path function whose body must match the approved profile.
+/// The original access-path function whose body must match the approved
+/// profile. These constants remain the default so the historical one-argument
+/// invocation keeps the exact same guard.
 const GUARDED: &str = "fixed_unique_insert";
 const GUARDED_SYMBOL: &str = "zaino_oram::layout::atomic_store::worker::rostl::fixed_unique_insert";
+
+const FIXED_EXACT_UPSERT: &str = "fixed_exact_upsert";
+const FIXED_EXACT_UPSERT_SYMBOL: &str =
+    "zaino_oram::layout::atomic_store::worker::rostl::fixed_exact_upsert";
 
 /// Both record monomorphizations must be present: the 38-byte directory record
 /// and the 82-byte event record. Finding fewer means the build did not select
@@ -66,6 +82,7 @@ const RNG_REFCOUNT_DECREMENT: &str = "0x0(%r13)";
 
 fn main() {
     run("check-oram-codegen", check, |report: Report| {
+        let guarded = report.profile.guarded();
         for symbol in &report.symbols {
             for allowed in &symbol.allowed {
                 println!("check-oram-codegen: allowed — {allowed}");
@@ -76,13 +93,54 @@ fn main() {
             );
         }
         println!(
-            "check-oram-codegen: ok — {} `{GUARDED}` monomorphizations match the approved structural codegen profile",
+            "check-oram-codegen: ok — {} `{guarded}` monomorphizations match the approved structural codegen profile",
             report.symbols.len()
         );
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardedProfile {
+    FixedUniqueInsert,
+    FixedExactUpsert,
+}
+
+impl GuardedProfile {
+    fn from_selector(selector: &str) -> Option<Self> {
+        match selector {
+            "fixed-unique-insert" => Some(Self::FixedUniqueInsert),
+            "fixed-exact-upsert" => Some(Self::FixedExactUpsert),
+            _ => None,
+        }
+    }
+
+    const fn guarded(self) -> &'static str {
+        match self {
+            Self::FixedUniqueInsert => GUARDED,
+            Self::FixedExactUpsert => FIXED_EXACT_UPSERT,
+        }
+    }
+
+    const fn guarded_symbol(self) -> &'static str {
+        match self {
+            Self::FixedUniqueInsert => GUARDED_SYMBOL,
+            Self::FixedExactUpsert => FIXED_EXACT_UPSERT_SYMBOL,
+        }
+    }
+
+    const fn expected_monomorphizations(self) -> usize {
+        EXPECTED_MONOMORPHIZATIONS
+    }
+}
+
+#[derive(Debug)]
+struct Invocation {
+    profile: GuardedProfile,
+    artifact: std::path::PathBuf,
+}
+
 struct Report {
+    profile: GuardedProfile,
     symbols: Vec<Inspected>,
 }
 
@@ -231,14 +289,18 @@ enum RecordLoop {
 }
 
 fn check() -> Result<Report, Vec<String>> {
-    let artifact = artifact_path()?;
-    let symbols = guarded_symbols(&artifact)?;
+    let invocation = invocation()?;
+    let profile = invocation.profile;
+    let artifact = invocation.artifact;
+    let symbols = guarded_symbols(&artifact, profile)?;
     let relocations = dynamic_relocations(&artifact)?;
 
-    if symbols.len() != EXPECTED_MONOMORPHIZATIONS {
+    let expected_monomorphizations = profile.expected_monomorphizations();
+    if symbols.len() != expected_monomorphizations {
+        let guarded = profile.guarded();
         return Err(vec![
             format!(
-                "found {} `{GUARDED}` symbol(s) in {}, expected exactly {EXPECTED_MONOMORPHIZATIONS}",
+                "found {} `{guarded}` symbol(s) in {}, expected exactly {expected_monomorphizations}",
                 symbols.len(),
                 artifact.display()
             ),
@@ -251,7 +313,7 @@ fn check() -> Result<Report, Vec<String>> {
     let mut inspected = Vec::new();
     let mut failures = Vec::new();
     for symbol in symbols {
-        match inspect(&artifact, &symbol, &relocations) {
+        match inspect(&artifact, &symbol, &relocations, profile) {
             Ok(report) => inspected.push(report),
             Err(lines) => failures.extend(lines),
         }
@@ -279,36 +341,81 @@ fn check() -> Result<Report, Vec<String>> {
              found directory={directory}, event={event}"
         )]);
     }
-    Ok(Report { symbols: inspected })
+    Ok(Report {
+        profile,
+        symbols: inspected,
+    })
 }
 
-fn artifact_path() -> Result<std::path::PathBuf, Vec<String>> {
-    let path = std::env::args_os()
-        .nth(1)
-        .ok_or_else(|| vec!["usage: check-oram-codegen <path-to-x86_64-elf>".to_string()])?;
-    let path = std::path::PathBuf::from(path);
-    if !path.is_file() {
-        return Err(vec![format!("not a file: {}", path.display())]);
+fn invocation() -> Result<Invocation, Vec<String>> {
+    let invocation = parse_invocation(std::env::args_os().skip(1).collect())?;
+    if !invocation.artifact.is_file() {
+        return Err(vec![format!(
+            "not a file: {}",
+            invocation.artifact.display()
+        )]);
     }
-    Ok(path)
+    Ok(invocation)
+}
+
+fn parse_invocation(args: Vec<OsString>) -> Result<Invocation, Vec<String>> {
+    const USAGE: &str = "usage: check-oram-codegen <path-to-x86_64-elf>";
+    const PROFILE_USAGE: &str = "usage: check-oram-codegen --profile \
+                                 <fixed-unique-insert|fixed-exact-upsert> \
+                                 <path-to-x86_64-elf>";
+
+    match args.as_slice() {
+        [] => Err(vec![USAGE.to_string()]),
+        [flag] if flag == "--profile" => Err(vec![PROFILE_USAGE.to_string()]),
+        [artifact] => Ok(Invocation {
+            profile: GuardedProfile::FixedUniqueInsert,
+            artifact: artifact.into(),
+        }),
+        [flag, selector, artifact] if flag == "--profile" => {
+            let selector = selector
+                .to_str()
+                .ok_or_else(|| vec!["codegen profile selector is not utf-8".to_string()])?;
+            let profile = GuardedProfile::from_selector(selector).ok_or_else(|| {
+                vec![
+                    format!("unknown ORAM codegen profile: {selector}"),
+                    PROFILE_USAGE.to_string(),
+                ]
+            })?;
+            Ok(Invocation {
+                profile,
+                artifact: artifact.into(),
+            })
+        }
+        _ => Err(vec![PROFILE_USAGE.to_string()]),
+    }
 }
 
 /// Every defined, sized text symbol with the exact guarded demangled name.
 ///
 /// Legacy symbol mangling drops generic parameters, so the monomorphizations
 /// are distinguished by count and size rather than by record type name.
-fn guarded_symbols(artifact: &Path) -> Result<Vec<Symbol>, Vec<String>> {
+fn guarded_symbols(artifact: &Path, profile: GuardedProfile) -> Result<Vec<Symbol>, Vec<String>> {
     let listing = tool(
         "nm",
         &["-nSC", "--defined-only", &artifact.display().to_string()],
     )?;
-    parse_guarded_symbols(&listing)
+    parse_guarded_symbols_for_profile(&listing, profile)
 }
 
+#[cfg(test)]
 fn parse_guarded_symbols(listing: &str) -> Result<Vec<Symbol>, Vec<String>> {
+    parse_guarded_symbols_for_profile(listing, GuardedProfile::FixedUniqueInsert)
+}
+
+fn parse_guarded_symbols_for_profile(
+    listing: &str,
+    profile: GuardedProfile,
+) -> Result<Vec<Symbol>, Vec<String>> {
+    let guarded = profile.guarded();
+    let guarded_symbol = profile.guarded_symbol();
     let mut symbols = Vec::new();
     for line in listing.lines() {
-        if !line.contains(GUARDED) {
+        if !line.contains(guarded) {
             continue;
         }
         // `<address> <size> <type> <name>`; unsized symbols have three fields
@@ -316,27 +423,27 @@ fn parse_guarded_symbols(listing: &str) -> Result<Vec<Symbol>, Vec<String>> {
         let mut fields = line.split_whitespace();
         let (Some(address), Some(size), Some(kind)) = (fields.next(), fields.next(), fields.next())
         else {
-            return Err(vec![format!("malformed `{GUARDED}` symbol line: {line}")]);
+            return Err(vec![format!("malformed `{guarded}` symbol line: {line}")]);
         };
         let name = fields.collect::<Vec<_>>().join(" ");
         if !matches!(kind, "T" | "t") {
-            return Err(vec![format!("`{GUARDED}` symbol is not text: {line}")]);
+            return Err(vec![format!("`{guarded}` symbol is not text: {line}")]);
         }
-        if name != GUARDED_SYMBOL {
+        if name != guarded_symbol {
             return Err(vec![format!(
-                "unexpected demangled `{GUARDED}` symbol identity: {line}"
+                "unexpected demangled `{guarded}` symbol identity: {line}"
             )]);
         }
         let address = u64::from_str_radix(address, 16)
-            .map_err(|_| vec![format!("invalid `{GUARDED}` symbol address: {line}")])?;
+            .map_err(|_| vec![format!("invalid `{guarded}` symbol address: {line}")])?;
         let size = u64::from_str_radix(size, 16)
-            .map_err(|_| vec![format!("invalid `{GUARDED}` symbol size: {line}")])?;
+            .map_err(|_| vec![format!("invalid `{guarded}` symbol size: {line}")])?;
         if size == 0 {
-            return Err(vec![format!("zero-sized `{GUARDED}` symbol: {line}")]);
+            return Err(vec![format!("zero-sized `{guarded}` symbol: {line}")]);
         }
         address
             .checked_add(size)
-            .ok_or_else(|| vec![format!("`{GUARDED}` symbol range overflows: {line}")])?;
+            .ok_or_else(|| vec![format!("`{guarded}` symbol range overflows: {line}")])?;
         symbols.push(Symbol {
             name,
             address,
@@ -350,13 +457,13 @@ fn parse_guarded_symbols(listing: &str) -> Result<Vec<Symbol>, Vec<String>> {
             .checked_add(adjacent[0].size)
             .ok_or_else(|| {
                 vec![format!(
-                    "`{GUARDED}` symbol range overflows: {}",
+                    "`{guarded}` symbol range overflows: {}",
                     adjacent[0].name
                 )]
             })?;
         if adjacent[1].address < previous_end {
             return Err(vec![format!(
-                "overlapping `{GUARDED}` symbols: {} and {}",
+                "overlapping `{guarded}` symbols: {} and {}",
                 adjacent[0].name, adjacent[1].name
             )]);
         }
@@ -508,6 +615,7 @@ fn inspect(
     artifact: &Path,
     symbol: &Symbol,
     relocations: &DynamicRelocations,
+    profile: GuardedProfile,
 ) -> Result<Inspected, Vec<String>> {
     let symbol_end = symbol
         .address
@@ -528,6 +636,7 @@ fn inspect(
         &disassembly,
         &symbol.name,
         relocations,
+        profile,
         Some((symbol.address, symbol_end)),
     );
 
@@ -560,13 +669,29 @@ struct Scan {
 /// instruction shapes measured on the x86_64 builder.
 #[cfg(test)]
 fn scan(disassembly: &str, symbol: &str, relocations: &DynamicRelocations) -> Scan {
-    scan_with_range(disassembly, symbol, relocations, None)
+    scan_for_profile(
+        disassembly,
+        symbol,
+        relocations,
+        GuardedProfile::FixedUniqueInsert,
+    )
+}
+
+#[cfg(test)]
+fn scan_for_profile(
+    disassembly: &str,
+    symbol: &str,
+    relocations: &DynamicRelocations,
+    profile: GuardedProfile,
+) -> Scan {
+    scan_with_range(disassembly, symbol, relocations, profile, None)
 }
 
 fn scan_with_range(
     disassembly: &str,
     symbol: &str,
     relocations: &DynamicRelocations,
+    profile: GuardedProfile,
     symbol_range: Option<(u64, u64)>,
 ) -> Scan {
     let mut allowed = Vec::new();
@@ -614,7 +739,7 @@ fn scan_with_range(
         });
     }
     for (index, current) in decoded.iter().take(instructions).enumerate() {
-        match classify(&decoded, index, relocations) {
+        match classify(&decoded, index, relocations, profile) {
             Verdict::Branchless => {}
             Verdict::Allowed(allowance) => {
                 allowances.push(allowance);
@@ -741,6 +866,7 @@ fn classify(
     instructions: &[Instruction],
     index: usize,
     relocations: &DynamicRelocations,
+    profile: GuardedProfile,
 ) -> Verdict {
     let current = &instructions[index];
     let mnemonic = current.bare_mnemonic();
@@ -763,7 +889,12 @@ fn classify(
                 Err(reason) => Verdict::Rejected(reason),
             };
         }
-        return Verdict::Branchless;
+        return match profile {
+            GuardedProfile::FixedUniqueInsert => Verdict::Branchless,
+            GuardedProfile::FixedExactUpsert => {
+                Verdict::Rejected("direct call is forbidden by the fixed-exact-upsert profile")
+            }
+        };
     }
     if mnemonic.starts_with('j') {
         if mnemonic == "jmp" {
@@ -1302,16 +1433,43 @@ mod tests {
         previous: Option<&Instruction>,
         current: &Instruction,
     ) -> Verdict {
+        classify_for_profile_without_relocations(
+            GuardedProfile::FixedUniqueInsert,
+            previous,
+            current,
+        )
+    }
+
+    fn classify_for_profile_without_relocations(
+        profile: GuardedProfile,
+        previous: Option<&Instruction>,
+        current: &Instruction,
+    ) -> Verdict {
         let mut instructions = previous.into_iter().cloned().collect::<Vec<_>>();
         instructions.push(current.clone());
         classify(
             &instructions,
             instructions.len() - 1,
             &DynamicRelocations::new(),
+            profile,
         )
     }
 
     fn classify_with_next(
+        current: Instruction,
+        next_address: u64,
+        relocations: &DynamicRelocations,
+    ) -> Verdict {
+        classify_for_profile_with_next(
+            GuardedProfile::FixedUniqueInsert,
+            current,
+            next_address,
+            relocations,
+        )
+    }
+
+    fn classify_for_profile_with_next(
+        profile: GuardedProfile,
         current: Instruction,
         next_address: u64,
         relocations: &DynamicRelocations,
@@ -1321,7 +1479,7 @@ mod tests {
             mnemonic: "ret".to_string(),
             operands: String::new(),
         };
-        classify(&[current, next], 0, relocations)
+        classify(&[current, next], 0, relocations, profile)
     }
 
     fn rip_call(slot: u64, next_address: u64) -> Instruction {
@@ -1343,6 +1501,80 @@ mod tests {
                 relative_target: target,
             },
         )])
+    }
+
+    #[test]
+    fn cli_without_a_profile_selector_keeps_the_insert_guard() {
+        let invocation = parse_invocation(vec![OsString::from("target/release/zainod-oram")])
+            .expect("legacy one-argument invocation is valid");
+
+        assert_eq!(invocation.profile, GuardedProfile::FixedUniqueInsert);
+        assert_eq!(
+            invocation.artifact,
+            std::path::PathBuf::from("target/release/zainod-oram")
+        );
+    }
+
+    #[test]
+    fn cli_explicitly_selects_each_guarded_profile() {
+        for (selector, expected) in [
+            ("fixed-unique-insert", GuardedProfile::FixedUniqueInsert),
+            ("fixed-exact-upsert", GuardedProfile::FixedExactUpsert),
+        ] {
+            let invocation = parse_invocation(vec![
+                OsString::from("--profile"),
+                OsString::from(selector),
+                OsString::from("zainod-oram"),
+            ])
+            .expect("documented profile invocation is valid");
+
+            assert_eq!(invocation.profile, expected, "{selector}");
+            assert_eq!(
+                invocation.artifact,
+                std::path::PathBuf::from("zainod-oram"),
+                "{selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_profile_selection_fails_closed() {
+        assert_eq!(
+            parse_invocation(Vec::new())
+                .expect_err("missing artifact must retain the legacy usage error"),
+            vec!["usage: check-oram-codegen <path-to-x86_64-elf>".to_string()]
+        );
+
+        for args in [
+            vec![OsString::from("--profile")],
+            vec![
+                OsString::from("--profile"),
+                OsString::from("fixed-exact-upsert"),
+            ],
+            vec![OsString::from("first"), OsString::from("second")],
+        ] {
+            assert!(parse_invocation(args).is_err());
+        }
+
+        let unknown = parse_invocation(vec![
+            OsString::from("--profile"),
+            OsString::from("unknown"),
+            OsString::from("zainod-oram"),
+        ])
+        .expect_err("unknown profiles must not fall back to the insert guard");
+        assert_eq!(unknown[0], "unknown ORAM codegen profile: unknown");
+    }
+
+    #[test]
+    fn both_profiles_require_two_record_width_monomorphizations() {
+        assert_eq!(
+            GuardedProfile::FixedUniqueInsert.expected_monomorphizations(),
+            2
+        );
+        assert_eq!(
+            GuardedProfile::FixedExactUpsert.expected_monomorphizations(),
+            2
+        );
     }
 
     #[test]
@@ -1506,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn non_control_instructions_and_direct_calls_are_accepted() {
+    fn legacy_profile_accepts_non_control_instructions_and_direct_calls() {
         for mnemonic in [
             "add", "call", "cmovne", "cmp", "decq", "inc", "int3", "lea", "mov", "movaps", "movq",
             "movups", "movw", "movzbl", "movzwl", "nopw", "pop", "push", "ret", "sub", "test",
@@ -1532,6 +1764,60 @@ mod tests {
             classify_without_relocations(None, &direct),
             Verdict::Rejected("unapproved unconditional jump")
         );
+    }
+
+    #[test]
+    fn exact_upsert_rejects_direct_calls_to_branchy_or_unknown_callees() {
+        for operands in [
+            "120 <memcmp@plt>",
+            "120 <bcmp@plt>",
+            "120 <unknown_local_helper>",
+        ] {
+            let call = Instruction {
+                address: 0x100,
+                mnemonic: "call".to_string(),
+                operands: operands.to_string(),
+            };
+            assert_eq!(
+                classify_for_profile_without_relocations(
+                    GuardedProfile::FixedExactUpsert,
+                    None,
+                    &call,
+                ),
+                Verdict::Rejected("direct call is forbidden by the fixed-exact-upsert profile"),
+                "{operands}"
+            );
+            assert_eq!(
+                classify_for_profile_without_relocations(
+                    GuardedProfile::FixedUniqueInsert,
+                    None,
+                    &call,
+                ),
+                Verdict::Branchless,
+                "legacy insert policy changed for {operands}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_upsert_scan_rejects_a_compiler_lowered_byte_comparison_call() {
+        for callee in ["memcmp@plt", "bcmp@plt"] {
+            let disassembly = format!("  100:\tcall 120 <{callee}>\n");
+            let scanned = scan_for_profile(
+                &disassembly,
+                "exact-upsert",
+                &DynamicRelocations::new(),
+                GuardedProfile::FixedExactUpsert,
+            );
+
+            assert_eq!(scanned.failures.len(), 1, "{callee}");
+            assert!(
+                scanned.failures[0]
+                    .contains("direct call is forbidden by the fixed-exact-upsert profile"),
+                "{}",
+                scanned.failures[0]
+            );
+        }
     }
 
     #[test]
@@ -1619,12 +1905,43 @@ mod tests {
     }
 
     #[test]
+    fn exact_upsert_accepts_only_a_relocation_proven_fixed_call_target() {
+        let call = rip_call(0x120, 0x106);
+        let relocations = relocation(
+            0x120,
+            "R_X86_64_RELATIVE",
+            Some(FixedCallTarget::PositionMapAccess),
+        );
+        assert_eq!(
+            classify_for_profile_with_next(
+                GuardedProfile::FixedExactUpsert,
+                call.clone(),
+                0x106,
+                &relocations,
+            ),
+            Verdict::Allowed(Allowance::FixedCall(FixedCallTarget::PositionMapAccess))
+        );
+
+        let unresolved = DynamicRelocations::new();
+        assert_eq!(
+            classify_for_profile_with_next(
+                GuardedProfile::FixedExactUpsert,
+                call,
+                0x106,
+                &unresolved,
+            ),
+            Verdict::Rejected("indirect call through an unresolved slot")
+        );
+    }
+
+    #[test]
     fn symbol_end_is_the_boundary_after_a_terminal_fixed_call() {
         let relocations = relocation(0x120, "R_X86_64_RELATIVE", Some(FixedCallTarget::ThreadRng));
         let scanned = scan_with_range(
             "  100:\tff 15 1a 00 00 00\tcall *0x1a(%rip) # 120 <_DYNAMIC>\n",
             "terminal",
             &relocations,
+            GuardedProfile::FixedUniqueInsert,
             Some((0x100, 0x106)),
         );
 
@@ -1646,6 +1963,7 @@ mod tests {
             exact,
             "coverage",
             &DynamicRelocations::new(),
+            GuardedProfile::FixedUniqueInsert,
             Some((0x100, 0x102)),
         );
         assert!(scanned.failures.is_empty());
@@ -1672,6 +1990,7 @@ mod tests {
                 malformed,
                 "coverage",
                 &DynamicRelocations::new(),
+                GuardedProfile::FixedUniqueInsert,
                 Some((0x100, 0x102)),
             );
             assert!(
@@ -1688,6 +2007,7 @@ mod tests {
             "  100:\t0f 0b\t(bad)\n",
             "bad",
             &DynamicRelocations::new(),
+            GuardedProfile::FixedUniqueInsert,
             Some((0x100, 0x102)),
         );
         assert_eq!(
@@ -2002,6 +2322,47 @@ mod tests {
         let decorated =
             format!("0000000000000100 0000000000000020 t {GUARDED_SYMBOL}::unexpected\n");
         assert!(parse_guarded_symbols(&decorated).is_err());
+    }
+
+    #[test]
+    fn upsert_profile_requires_its_exact_demangled_symbol_identity() {
+        let exact = format!(
+            "0000000000000100 0000000000000020 t {FIXED_EXACT_UPSERT_SYMBOL}\n\
+             0000000000000120 0000000000000020 T {FIXED_EXACT_UPSERT_SYMBOL}\n"
+        );
+        let symbols = parse_guarded_symbols_for_profile(&exact, GuardedProfile::FixedExactUpsert)
+            .expect("exact fixed-exact-upsert symbols are valid");
+        assert_eq!(symbols.len(), 2);
+
+        assert!(
+            parse_guarded_symbols_for_profile(&exact, GuardedProfile::FixedUniqueInsert)
+                .expect("an unrelated symbol is ignored")
+                .is_empty()
+        );
+
+        let old_symbols = format!(
+            "0000000000000100 0000000000000020 t {GUARDED_SYMBOL}\n\
+             0000000000000120 0000000000000020 T {GUARDED_SYMBOL}\n"
+        );
+        assert!(
+            parse_guarded_symbols_for_profile(&old_symbols, GuardedProfile::FixedExactUpsert)
+                .expect("an unrelated symbol is ignored")
+                .is_empty()
+        );
+
+        let wrong_namespace = "0000000000000100 0000000000000020 t other::fixed_exact_upsert\n";
+        assert!(parse_guarded_symbols_for_profile(
+            wrong_namespace,
+            GuardedProfile::FixedExactUpsert
+        )
+        .is_err());
+        let decorated = format!(
+            "0000000000000100 0000000000000020 t {FIXED_EXACT_UPSERT_SYMBOL}::unexpected\n"
+        );
+        assert!(
+            parse_guarded_symbols_for_profile(&decorated, GuardedProfile::FixedExactUpsert)
+                .is_err()
+        );
     }
 
     #[test]
