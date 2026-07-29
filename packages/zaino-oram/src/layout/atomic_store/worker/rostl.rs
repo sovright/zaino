@@ -1041,39 +1041,35 @@ fn build_timing_table<T>(
 where
     T: TimingProbeRecord,
 {
+    retain_exact_upsert_codegen::<T>();
     let mut table = RostlTable::<T>::new(capacity).map_err(|_| RostlTimingError::Setup)?;
     for key in 0..common_records {
-        insert_exact_setup(&mut table, key)?;
+        insert_cover(&mut table, key, Arm::Miss).map_err(|_| RostlTimingError::Setup)?;
     }
     if let Some(key) = exclusive_key {
-        insert_exact_setup(&mut table, key)?;
+        insert_cover(&mut table, key, Arm::Miss).map_err(|_| RostlTimingError::Setup)?;
     }
     Ok(table)
 }
 
-/// Builds the timing tables through the additive backend upsert seam.
+/// Retains the additive backend upsert seam for release-codegen inspection.
 ///
-/// This setup work is outside every measured interval. Timed arms and cover
-/// writes continue to use `insert_record_unique`, so the existing insertion
-/// evidence contract is unchanged. Exercising both an insertion and a matching
-/// update for both record monomorphizations here keeps the separate
-/// `fixed-exact-upsert` codegen profile non-vacuous in release binaries that
-/// contain the timing driver. This setup anchor is not exact-upsert timing
-/// evidence and does not wire the primitive into the production executor.
+/// The opaque function pointer makes the wrapper and its `#[inline(never)]`
+/// fixed access path addressable in the linked timing binary without executing
+/// either one. Legacy timing-table construction therefore keeps its original
+/// unique-insert state transitions. This is only a codegen retention anchor:
+/// it is not exact-upsert timing evidence or production executor wiring.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn insert_exact_setup<T>(table: &mut RostlTable<T>, key: usize) -> Result<(), RostlTimingError>
+fn retain_exact_upsert_codegen<T>()
 where
     T: TimingProbeRecord,
 {
-    let candidate = T::filler(key)?;
-    match table.insert_or_update_record(key, InsertOrUpdateRequest::insert(candidate)) {
-        Ok(ExactUpsertDisposition::Inserted) => Ok(()),
-        Ok(ExactUpsertDisposition::Updated) | Err(_) => Err(RostlTimingError::Setup),
-    }?;
-    match table.insert_or_update_record(key, InsertOrUpdateRequest::update(candidate, candidate)) {
-        Ok(ExactUpsertDisposition::Updated) => Ok(()),
-        Ok(ExactUpsertDisposition::Inserted) | Err(_) => Err(RostlTimingError::Setup),
-    }
+    let anchor: fn(
+        &mut RostlTable<T>,
+        usize,
+        InsertOrUpdateRequest<T>,
+    ) -> Result<ExactUpsertDisposition, RostlStoreError> = RostlTable::insert_or_update_record;
+    std::hint::black_box(anchor);
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

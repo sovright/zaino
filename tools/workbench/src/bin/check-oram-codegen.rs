@@ -32,11 +32,12 @@
 //! classification, every instruction must have an approved measured mnemonic
 //! and its raw bytes must cover the exact `nm` symbol range without gaps,
 //! overlaps, duplicates, or an inferred final instruction boundary. The
-//! `fixed-exact-upsert` profile additionally rejects every direct call: a
-//! direct call would move uninspected control flow (including a compiler-lowered
-//! `memcmp`/`bcmp`) outside this symbol. Its only call allowances are the exact
-//! relocation-proven fixed targets listed below. The legacy
-//! `fixed-unique-insert` profile retains its measured direct-call policy.
+//! `fixed-exact-upsert` profile additionally rejects every direct call except
+//! four exact, multiplicity-checked dependency targets and `_Unwind_Resume@plt`.
+//! This prevents a compiler-lowered `memcmp`/`bcmp` or an unknown helper from
+//! moving uninspected control flow outside the symbol. Its indirect-call
+//! allowances remain tied to exact relocation-proven fixed targets. The legacy
+//! `fixed-unique-insert` profile retains its measured call policy unchanged.
 //!
 //! The historical failure — a *forward* jump immediately after a compare
 //! against the returned boolean (`cmp $0x0,%al` then `je`) — matches neither
@@ -67,6 +68,13 @@ const GUARDED_SYMBOL: &str = "zaino_oram::layout::atomic_store::worker::rostl::f
 const FIXED_EXACT_UPSERT: &str = "fixed_exact_upsert";
 const FIXED_EXACT_UPSERT_SYMBOL: &str =
     "zaino_oram::layout::atomic_store::worker::rostl::fixed_exact_upsert";
+
+const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h6b3ca648fa0c8fb8E";
+const CIRCUIT_READ_RAW_SYMBOL: &str =
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h7476e1361c793b48E";
+const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h4d06f976a0b09474E";
+const UNWIND_DYNAMIC_SYMBOL: &str = "_Unwind_Resume@GCC_3.0";
 
 /// Both record monomorphizations must be present: the 38-byte directory record
 /// and the 82-byte event record. Finding fewer means the build did not select
@@ -199,7 +207,11 @@ enum Verdict {
 enum Allowance {
     DirectoryRecordLoop,
     EventRecordLoop,
+    DirectoryEqualityReduction,
+    EventEqualityReduction,
     RngRefcountDrop,
+    ExactCleanupJump,
+    ExactDirectCall(ExactDirectCallTarget),
     FixedCall(FixedCallTarget),
 }
 
@@ -208,8 +220,59 @@ impl Allowance {
         match self {
             Self::DirectoryRecordLoop => "38-byte record Cmov loop back-edge",
             Self::EventRecordLoop => "82-byte record Cmov loop back-edge",
+            Self::DirectoryEqualityReduction => "38-byte fixed-width equality reduction",
+            Self::EventEqualityReduction => "82-byte fixed-width equality reduction",
             Self::RngRefcountDrop => "thread-local RNG reference-count drop branch",
+            Self::ExactCleanupJump => "exact-upsert cleanup jump to unwind",
+            Self::ExactDirectCall(target) => target.description(),
             Self::FixedCall(target) => target.description(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactDirectCallTarget {
+    RandomRange,
+    CircuitRead,
+    CircuitWriteOrInsert,
+    UnwindResume,
+}
+
+impl ExactDirectCallTarget {
+    const EXPECTED_ORDER: [Self; 5] = [
+        Self::RandomRange,
+        Self::CircuitRead,
+        Self::RandomRange,
+        Self::CircuitWriteOrInsert,
+        Self::UnwindResume,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::RandomRange => "rand::rng::Rng::random_range",
+            Self::CircuitRead => "rostl_oram::circuit_oram::CircuitORAM<V>::read",
+            Self::CircuitWriteOrInsert => {
+                "rostl_oram::circuit_oram::CircuitORAM<V>::write_or_insert"
+            }
+            Self::UnwindResume => "_Unwind_Resume@plt",
+        }
+    }
+
+    const fn raw_symbol(self) -> Option<&'static str> {
+        match self {
+            Self::RandomRange => Some(RANDOM_RANGE_RAW_SYMBOL),
+            Self::CircuitRead => Some(CIRCUIT_READ_RAW_SYMBOL),
+            Self::CircuitWriteOrInsert => Some(CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL),
+            Self::UnwindResume => None,
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::RandomRange => "exact direct call to rand::rng::Rng::random_range",
+            Self::CircuitRead => "exact direct call to CircuitORAM<V>::read",
+            Self::CircuitWriteOrInsert => "exact direct call to CircuitORAM<V>::write_or_insert",
+            Self::UnwindResume => "exact direct call to _Unwind_Resume@plt",
         }
     }
 }
@@ -265,10 +328,18 @@ impl FixedCallTarget {
         }
     }
 
-    const fn expected_per_monomorphization(self) -> usize {
-        match self {
-            Self::RcDropSlow => 2,
-            Self::ThreadRng | Self::PositionMapAccess | Self::PanicInCleanup => 1,
+    const fn expected_per_monomorphization(self, profile: GuardedProfile) -> usize {
+        match (profile, self) {
+            (GuardedProfile::FixedUniqueInsert, Self::RcDropSlow) => 2,
+            (
+                GuardedProfile::FixedUniqueInsert,
+                Self::ThreadRng | Self::PositionMapAccess | Self::PanicInCleanup,
+            ) => 1,
+            (GuardedProfile::FixedExactUpsert, Self::RcDropSlow) => 4,
+            (
+                GuardedProfile::FixedExactUpsert,
+                Self::ThreadRng | Self::PositionMapAccess | Self::PanicInCleanup,
+            ) => 2,
         }
     }
 }
@@ -277,10 +348,12 @@ impl FixedCallTarget {
 struct DynamicRelocation {
     kind: String,
     relative_target: Option<FixedCallTarget>,
+    dynamic_symbol: Option<String>,
 }
 
 type DynamicRelocations = BTreeMap<u64, DynamicRelocation>;
 type TextSymbols = BTreeMap<u64, Vec<String>>;
+type ExactDirectCallSymbols = BTreeMap<u64, ExactDirectCallTarget>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordLoop {
@@ -293,7 +366,14 @@ fn check() -> Result<Report, Vec<String>> {
     let profile = invocation.profile;
     let artifact = invocation.artifact;
     let symbols = guarded_symbols(&artifact, profile)?;
-    let relocations = dynamic_relocations(&artifact)?;
+    let text_symbols = defined_text_symbols(&artifact)?;
+    let relocations = dynamic_relocations(&artifact, &text_symbols)?;
+    let exact_direct_calls = match profile {
+        GuardedProfile::FixedUniqueInsert => ExactDirectCallSymbols::new(),
+        GuardedProfile::FixedExactUpsert => {
+            exact_direct_call_symbols(&artifact, &text_symbols, &relocations)?
+        }
+    };
 
     let expected_monomorphizations = profile.expected_monomorphizations();
     if symbols.len() != expected_monomorphizations {
@@ -313,7 +393,13 @@ fn check() -> Result<Report, Vec<String>> {
     let mut inspected = Vec::new();
     let mut failures = Vec::new();
     for symbol in symbols {
-        match inspect(&artifact, &symbol, &relocations, profile) {
+        match inspect(
+            &artifact,
+            &symbol,
+            &relocations,
+            &exact_direct_calls,
+            profile,
+        ) {
             Ok(report) => inspected.push(report),
             Err(lines) => failures.extend(lines),
         }
@@ -474,10 +560,12 @@ fn parse_guarded_symbols_for_profile(
 /// Dynamic relocation slots, with `R_X86_64_RELATIVE` addends resolved only
 /// when they name one of the exact defined text symbols in the fixed-call
 /// profile.
-fn dynamic_relocations(artifact: &Path) -> Result<DynamicRelocations, Vec<String>> {
-    let text_symbols = defined_text_symbols(artifact)?;
+fn dynamic_relocations(
+    artifact: &Path,
+    text_symbols: &TextSymbols,
+) -> Result<DynamicRelocations, Vec<String>> {
     let listing = tool("objdump", &["-R", &artifact.display().to_string()])?;
-    parse_dynamic_relocations(&listing, &text_symbols)
+    parse_dynamic_relocations(&listing, text_symbols)
 }
 
 fn defined_text_symbols(artifact: &Path) -> Result<TextSymbols, Vec<String>> {
@@ -563,9 +651,11 @@ fn parse_dynamic_relocations(
         }
         let slot = u64::from_str_radix(slot, 16)
             .map_err(|_| vec![format!("invalid dynamic-relocation slot: {line}")])?;
+        let payload = fields.collect::<Vec<_>>();
         let relative_target = if kind == "R_X86_64_RELATIVE" {
-            let addend = fields
-                .next()
+            let addend = payload
+                .first()
+                .copied()
                 .and_then(parse_relative_addend)
                 .ok_or_else(|| vec![format!("invalid relative-relocation addend: {line}")])?;
             let candidates = text_symbols
@@ -589,11 +679,17 @@ fn parse_dynamic_relocations(
         } else {
             None
         };
+        let dynamic_symbol = if kind == "R_X86_64_RELATIVE" || payload.is_empty() {
+            None
+        } else {
+            Some(payload.join(" "))
+        };
         let previous = relocations.insert(
             slot,
             DynamicRelocation {
                 kind: kind.to_string(),
                 relative_target,
+                dynamic_symbol,
             },
         );
         if previous.is_some() {
@@ -610,11 +706,152 @@ fn parse_relative_addend(value: &str) -> Option<u64> {
     u64::from_str_radix(value, 16).ok()
 }
 
+fn exact_direct_call_symbols(
+    artifact: &Path,
+    text_symbols: &TextSymbols,
+    relocations: &DynamicRelocations,
+) -> Result<ExactDirectCallSymbols, Vec<String>> {
+    let unwind_listing = tool(
+        "objdump",
+        &[
+            "-d",
+            "--insn-width=16",
+            "--disassemble=_Unwind_Resume@plt",
+            &artifact.display().to_string(),
+        ],
+    )?;
+    parse_exact_direct_call_symbols(text_symbols, relocations, &unwind_listing)
+}
+
+fn parse_exact_direct_call_symbols(
+    text_symbols: &TextSymbols,
+    relocations: &DynamicRelocations,
+    unwind_listing: &str,
+) -> Result<ExactDirectCallSymbols, Vec<String>> {
+    let mut resolved = ExactDirectCallSymbols::new();
+    for target in [
+        ExactDirectCallTarget::RandomRange,
+        ExactDirectCallTarget::CircuitRead,
+        ExactDirectCallTarget::CircuitWriteOrInsert,
+    ] {
+        let raw_symbol = target
+            .raw_symbol()
+            .ok_or_else(|| vec!["internal direct-call identity error".to_string()])?;
+        let addresses = text_symbols
+            .iter()
+            .filter_map(|(address, names)| {
+                names
+                    .iter()
+                    .any(|name| name == raw_symbol)
+                    .then_some(*address)
+            })
+            .collect::<Vec<_>>();
+        let [address] = addresses.as_slice() else {
+            return Err(vec![format!(
+                "expected exactly one defined raw text identity `{raw_symbol}`; \
+                 found {}",
+                addresses.len()
+            )]);
+        };
+        insert_exact_direct_target(&mut resolved, *address, target)?;
+    }
+    let unwind = parse_unwind_plt_address(unwind_listing, relocations)?;
+    insert_exact_direct_target(&mut resolved, unwind, ExactDirectCallTarget::UnwindResume)?;
+    Ok(resolved)
+}
+
+fn insert_exact_direct_target(
+    resolved: &mut ExactDirectCallSymbols,
+    address: u64,
+    target: ExactDirectCallTarget,
+) -> Result<(), Vec<String>> {
+    if let Some(previous) = resolved.insert(address, target) {
+        return Err(vec![format!(
+            "direct-call address {address:x} resolves ambiguously to {previous:?} and {target:?}"
+        )]);
+    }
+    Ok(())
+}
+
+fn parse_unwind_plt_address(
+    listing: &str,
+    relocations: &DynamicRelocations,
+) -> Result<u64, Vec<String>> {
+    let addresses = listing
+        .lines()
+        .filter_map(|line| parse_symbol_header(line, "_Unwind_Resume@plt"))
+        .collect::<Vec<_>>();
+    let [address] = addresses.as_slice() else {
+        return Err(vec![format!(
+            "expected exactly one `_Unwind_Resume@plt` symbol; found {}",
+            addresses.len()
+        )]);
+    };
+    let mut decoded = Vec::new();
+    for line in listing.lines() {
+        match parse_instruction(line) {
+            Ok(Some(instruction)) => decoded.push(instruction),
+            Ok(None) => {}
+            Err(reason) => {
+                return Err(vec![format!(
+                    "_Unwind_Resume@plt: {reason}: {}",
+                    line.trim()
+                )]);
+            }
+        }
+    }
+    let entries = decoded
+        .iter()
+        .filter(|instruction| instruction.instruction.address == *address)
+        .collect::<Vec<_>>();
+    let [entry] = entries.as_slice() else {
+        return Err(vec![
+            "_Unwind_Resume@plt does not have exactly one decoded entry instruction".to_string(),
+        ]);
+    };
+    if entry.instruction.has_prefix() || entry.instruction.mnemonic != "jmp" {
+        return Err(vec![
+            "_Unwind_Resume@plt entry is not the measured direct GOT jump".to_string(),
+        ]);
+    }
+    let next_address = entry
+        .encoded_len
+        .and_then(|length| address.checked_add(length))
+        .ok_or_else(|| vec!["_Unwind_Resume@plt entry has no safe byte length".to_string()])?;
+    let slot = rip_relative_slot(&entry.instruction.operands, next_address)
+        .map_err(|reason| vec![format!("_Unwind_Resume@plt: {reason}")])?;
+    let Some(relocation) = relocations.get(&slot) else {
+        return Err(vec![format!(
+            "_Unwind_Resume@plt GOT slot {slot:x} has no dynamic relocation"
+        )]);
+    };
+    if relocation.kind != "R_X86_64_JUMP_SLOT"
+        || relocation.dynamic_symbol.as_deref() != Some(UNWIND_DYNAMIC_SYMBOL)
+    {
+        return Err(vec![format!(
+            "_Unwind_Resume@plt GOT slot {slot:x} is not the exact \
+             `{UNWIND_DYNAMIC_SYMBOL}` jump slot"
+        )]);
+    }
+    Ok(*address)
+}
+
+fn parse_symbol_header(line: &str, expected: &str) -> Option<u64> {
+    let line = line.trim();
+    let suffix = format!(" <{expected}>:");
+    let address = line.strip_suffix(&suffix)?;
+    if address.is_empty() || !address.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(address, 16).ok()
+}
+
 /// Disassembles one symbol and enforces the approved structural profile.
 fn inspect(
     artifact: &Path,
     symbol: &Symbol,
     relocations: &DynamicRelocations,
+    exact_direct_calls: &ExactDirectCallSymbols,
     profile: GuardedProfile,
 ) -> Result<Inspected, Vec<String>> {
     let symbol_end = symbol
@@ -636,6 +873,7 @@ fn inspect(
         &disassembly,
         &symbol.name,
         relocations,
+        exact_direct_calls,
         profile,
         Some((symbol.address, symbol_end)),
     );
@@ -649,7 +887,7 @@ fn inspect(
     if !scanned.failures.is_empty() {
         return Err(scanned.failures);
     }
-    let record_loop = validate_allowances(&scanned, &symbol.name)?;
+    let record_loop = validate_allowances_for_profile(&scanned, &symbol.name, profile)?;
     Ok(Inspected {
         name: symbol.name.clone(),
         instructions: scanned.instructions,
@@ -684,13 +922,38 @@ fn scan_for_profile(
     relocations: &DynamicRelocations,
     profile: GuardedProfile,
 ) -> Scan {
-    scan_with_range(disassembly, symbol, relocations, profile, None)
+    scan_for_profile_with_direct_calls(
+        disassembly,
+        symbol,
+        relocations,
+        &ExactDirectCallSymbols::new(),
+        profile,
+    )
+}
+
+#[cfg(test)]
+fn scan_for_profile_with_direct_calls(
+    disassembly: &str,
+    symbol: &str,
+    relocations: &DynamicRelocations,
+    exact_direct_calls: &ExactDirectCallSymbols,
+    profile: GuardedProfile,
+) -> Scan {
+    scan_with_range(
+        disassembly,
+        symbol,
+        relocations,
+        exact_direct_calls,
+        profile,
+        None,
+    )
 }
 
 fn scan_with_range(
     disassembly: &str,
     symbol: &str,
     relocations: &DynamicRelocations,
+    exact_direct_calls: &ExactDirectCallSymbols,
     profile: GuardedProfile,
     symbol_range: Option<(u64, u64)>,
 ) -> Scan {
@@ -738,8 +1001,19 @@ fn scan_with_range(
             operands: String::new(),
         });
     }
+    if profile == GuardedProfile::FixedExactUpsert {
+        if let Some((allowance, address)) =
+            exact_equality_reduction_motif(&decoded[..instructions], exact_direct_calls)
+        {
+            allowances.push(allowance);
+            allowed.push(format!(
+                "{symbol}: {} ending at {address:x}",
+                allowance.description()
+            ));
+        }
+    }
     for (index, current) in decoded.iter().take(instructions).enumerate() {
-        match classify(&decoded, index, relocations, profile) {
+        match classify(&decoded, index, relocations, exact_direct_calls, profile) {
             Verdict::Branchless => {}
             Verdict::Allowed(allowance) => {
                 allowances.push(allowance);
@@ -806,7 +1080,16 @@ fn validate_instruction_coverage(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_allowances(scanned: &Scan, symbol: &str) -> Result<RecordLoop, Vec<String>> {
+    validate_allowances_for_profile(scanned, symbol, GuardedProfile::FixedUniqueInsert)
+}
+
+fn validate_allowances_for_profile(
+    scanned: &Scan,
+    symbol: &str,
+    profile: GuardedProfile,
+) -> Result<RecordLoop, Vec<String>> {
     let directory_loops = scanned
         .allowances
         .iter()
@@ -833,19 +1116,24 @@ fn validate_allowances(scanned: &Scan, symbol: &str) -> Result<RecordLoop, Vec<S
             )]);
         }
     };
-    if refcount_drops != 2 {
+    let expected_refcount_drops = match profile {
+        GuardedProfile::FixedUniqueInsert => 2,
+        GuardedProfile::FixedExactUpsert => 4,
+    };
+    if refcount_drops != expected_refcount_drops {
         return Err(vec![format!(
-            "{symbol}: expected exactly two known thread-local RNG refcount branches; \
+            "{symbol}: expected exactly {expected_refcount_drops} known thread-local RNG refcount branches; \
              found {refcount_drops}"
         )]);
     }
+    validate_profile_specific_allowances(scanned, symbol, profile, record_loop)?;
     for target in FixedCallTarget::ALL {
         let actual = scanned
             .allowances
             .iter()
             .filter(|allowance| **allowance == Allowance::FixedCall(target))
             .count();
-        let expected = target.expected_per_monomorphization();
+        let expected = target.expected_per_monomorphization(profile);
         if actual != expected {
             return Err(vec![format!(
                 "{symbol}: expected {expected} relocation-proven call(s) to {}; found {actual}",
@@ -854,6 +1142,71 @@ fn validate_allowances(scanned: &Scan, symbol: &str) -> Result<RecordLoop, Vec<S
         }
     }
     Ok(record_loop)
+}
+
+fn validate_profile_specific_allowances(
+    scanned: &Scan,
+    symbol: &str,
+    profile: GuardedProfile,
+    record_loop: RecordLoop,
+) -> Result<(), Vec<String>> {
+    let directory_equalities = allowance_count(scanned, Allowance::DirectoryEqualityReduction);
+    let event_equalities = allowance_count(scanned, Allowance::EventEqualityReduction);
+    let cleanup_jumps = allowance_count(scanned, Allowance::ExactCleanupJump);
+    let direct_calls = scanned
+        .allowances
+        .iter()
+        .filter_map(|allowance| match allowance {
+            Allowance::ExactDirectCall(target) => Some(*target),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    match profile {
+        GuardedProfile::FixedUniqueInsert => {
+            if directory_equalities != 0
+                || event_equalities != 0
+                || cleanup_jumps != 0
+                || !direct_calls.is_empty()
+            {
+                return Err(vec![format!(
+                    "{symbol}: exact-upsert allowances appeared in the legacy insert profile"
+                )]);
+            }
+        }
+        GuardedProfile::FixedExactUpsert => {
+            let expected_equalities = match record_loop {
+                RecordLoop::Directory => (1, 0),
+                RecordLoop::Event => (0, 1),
+            };
+            if (directory_equalities, event_equalities) != expected_equalities {
+                return Err(vec![format!(
+                    "{symbol}: expected one width-matched fixed equality reduction; \
+                     found directory={directory_equalities}, event={event_equalities}"
+                )]);
+            }
+            if cleanup_jumps != 1 {
+                return Err(vec![format!(
+                    "{symbol}: expected exactly one measured cleanup jump; found {cleanup_jumps}"
+                )]);
+            }
+            if direct_calls != ExactDirectCallTarget::EXPECTED_ORDER {
+                return Err(vec![format!(
+                    "{symbol}: exact direct-call order or multiplicity changed; \
+                     found {direct_calls:?}"
+                )]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn allowance_count(scanned: &Scan, expected: Allowance) -> usize {
+    scanned
+        .allowances
+        .iter()
+        .filter(|allowance| **allowance == expected)
+        .count()
 }
 
 /// Classifies one instruction in its complete decoded-symbol context.
@@ -866,6 +1219,7 @@ fn classify(
     instructions: &[Instruction],
     index: usize,
     relocations: &DynamicRelocations,
+    exact_direct_calls: &ExactDirectCallSymbols,
     profile: GuardedProfile,
 ) -> Verdict {
     let current = &instructions[index];
@@ -877,7 +1231,7 @@ fn classify(
         return Verdict::Rejected("looping branch");
     }
     if mnemonic.starts_with("call") {
-        if !is_approved_mnemonic(mnemonic) {
+        if !is_approved_mnemonic(mnemonic, profile) {
             return Verdict::Rejected("mnemonic is outside the approved structural profile");
         }
         if current.operands.starts_with('*') {
@@ -892,29 +1246,82 @@ fn classify(
         return match profile {
             GuardedProfile::FixedUniqueInsert => Verdict::Branchless,
             GuardedProfile::FixedExactUpsert => {
-                Verdict::Rejected("direct call is forbidden by the fixed-exact-upsert profile")
+                match exact_direct_call_target(current, exact_direct_calls) {
+                    Ok(target) => Verdict::Allowed(Allowance::ExactDirectCall(target)),
+                    Err(reason) => Verdict::Rejected(reason),
+                }
             }
         };
     }
     if mnemonic.starts_with('j') {
         if mnemonic == "jmp" {
+            if profile == GuardedProfile::FixedExactUpsert
+                && exact_cleanup_jump_motif(instructions, index, relocations, exact_direct_calls)
+            {
+                return Verdict::Allowed(Allowance::ExactCleanupJump);
+            }
             return Verdict::Rejected("unapproved unconditional jump");
         }
         if mnemonic != "jne" {
             return Verdict::Rejected("conditional jump");
         }
-        if rng_drop_motif(instructions, index, relocations) {
+        if rng_drop_motif(
+            instructions,
+            index,
+            relocations,
+            exact_direct_calls,
+            profile,
+        ) {
             return Verdict::Allowed(Allowance::RngRefcountDrop);
         }
-        if let Some(allowance) = record_loop_motif(instructions, index) {
+        if let Some(allowance) = record_loop_motif(instructions, index, profile) {
             return Verdict::Allowed(allowance);
         }
         return Verdict::Rejected("conditional jump");
     }
-    if !is_approved_mnemonic(mnemonic) {
+    if !is_approved_mnemonic(mnemonic, profile) {
         return Verdict::Rejected("mnemonic is outside the approved structural profile");
     }
     Verdict::Branchless
+}
+
+fn exact_direct_call_target(
+    instruction: &Instruction,
+    exact_direct_calls: &ExactDirectCallSymbols,
+) -> Result<ExactDirectCallTarget, &'static str> {
+    if instruction.has_prefix()
+        || !instruction.bare_mnemonic().starts_with("call")
+        || instruction.operands.starts_with('*')
+    {
+        return Err("exact direct-call proof was requested for a non-direct call");
+    }
+    let mut fields = instruction.operands.split_whitespace();
+    let address = fields
+        .next()
+        .ok_or("exact direct call is missing its target address")?;
+    if address.is_empty()
+        || !address.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || u64::from_str_radix(address, 16).is_err()
+    {
+        return Err("exact direct call has an invalid target address");
+    }
+    let label = fields
+        .next()
+        .ok_or("exact direct call is missing its resolved target label")?;
+    if fields.next().is_some() {
+        return Err("exact direct call has unexpected operand text");
+    }
+    let label_target = ExactDirectCallTarget::EXPECTED_ORDER
+        .into_iter()
+        .find(|target| label == format!("<{}>", target.label()))
+        .ok_or("direct call target is outside the fixed-exact-upsert profile")?;
+    let address = u64::from_str_radix(address, 16)
+        .map_err(|_| "exact direct call has an invalid target address")?;
+    match exact_direct_calls.get(&address) {
+        Some(resolved) if *resolved == label_target => Ok(label_target),
+        Some(_) => Err("direct call label conflicts with its raw symbol identity"),
+        None => Err("direct call address has no approved raw symbol identity"),
+    }
 }
 
 fn fixed_call_target(
@@ -944,6 +1351,23 @@ fn rng_drop_motif(
     instructions: &[Instruction],
     branch_index: usize,
     relocations: &DynamicRelocations,
+    exact_direct_calls: &ExactDirectCallSymbols,
+    profile: GuardedProfile,
+) -> bool {
+    match profile {
+        GuardedProfile::FixedUniqueInsert => {
+            legacy_rng_drop_motif(instructions, branch_index, relocations)
+        }
+        GuardedProfile::FixedExactUpsert => {
+            exact_rng_drop_motif(instructions, branch_index, relocations, exact_direct_calls)
+        }
+    }
+}
+
+fn legacy_rng_drop_motif(
+    instructions: &[Instruction],
+    branch_index: usize,
+    relocations: &DynamicRelocations,
 ) -> bool {
     if !rng_r13_provenance(instructions, branch_index, relocations) {
         return false;
@@ -963,7 +1387,9 @@ fn rng_drop_motif(
     let Some(branch_target) = instructions.get(branch_index + 3) else {
         return false;
     };
-    let branch = &instructions[branch_index];
+    let Some(branch) = instructions.get(branch_index) else {
+        return false;
+    };
     !decrement.has_prefix()
         && decrement.mnemonic == "decq"
         && decrement.operands == RNG_REFCOUNT_DECREMENT
@@ -973,6 +1399,274 @@ fn rng_drop_motif(
         && jump_target(&branch.operands) == Some(branch_target.address)
         && fixed_call_target(drop_call, branch_target.address, relocations)
             == Ok(FixedCallTarget::RcDropSlow)
+}
+
+fn exact_rng_drop_motif(
+    instructions: &[Instruction],
+    branch_index: usize,
+    relocations: &DynamicRelocations,
+    exact_direct_calls: &ExactDirectCallSymbols,
+) -> bool {
+    if !exact_rng_handle_provenance(instructions, relocations, exact_direct_calls) {
+        return false;
+    }
+    exact_rng_drop_branch_shape(instructions, branch_index, relocations).is_some()
+}
+
+/// Returns whether this measured drop path needs the extra cleanup jump.
+fn exact_rng_drop_branch_shape(
+    instructions: &[Instruction],
+    branch_index: usize,
+    relocations: &DynamicRelocations,
+) -> Option<bool> {
+    let decrement = branch_index
+        .checked_sub(1)
+        .and_then(|index| instructions.get(index))?;
+    let drop_argument = instructions.get(branch_index + 1)?;
+    let drop_call = instructions.get(branch_index + 2)?;
+    let after_drop = instructions.get(branch_index + 3)?;
+    let branch = instructions.get(branch_index)?;
+    let branch_target = jump_target(&branch.operands)?;
+    let falls_through_to_target = after_drop.address == branch_target;
+    let cleanup_jumps_to_target =
+        after_drop.mnemonic == "jmp" && jump_target(&after_drop.operands) == Some(branch_target);
+
+    let exact = !decrement.has_prefix()
+        && decrement.mnemonic == "decq"
+        && decrement.operands == "(%rbx)"
+        && !branch.has_prefix()
+        && branch.mnemonic == "jne"
+        && !drop_argument.has_prefix()
+        && drop_argument.mnemonic == "lea"
+        && matches!(
+            drop_argument.operands.as_str(),
+            "0x8(%rsp),%rdi" | "0x10(%rsp),%rdi"
+        )
+        && fixed_call_target(drop_call, after_drop.address, relocations)
+            == Ok(FixedCallTarget::RcDropSlow)
+        && falls_through_to_target != cleanup_jumps_to_target;
+    exact.then_some(cleanup_jumps_to_target)
+}
+
+fn exact_rng_handle_provenance(
+    instructions: &[Instruction],
+    relocations: &DynamicRelocations,
+    exact_direct_calls: &ExactDirectCallSymbols,
+) -> bool {
+    let rng_calls = instructions
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, pair)| {
+            (fixed_call_target(&pair[0], pair[1].address, relocations)
+                == Ok(FixedCallTarget::ThreadRng))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let [first_rng_call, second_rng_call] = rng_calls.as_slice() else {
+        return false;
+    };
+    let assignments = [first_rng_call + 1, second_rng_call + 1];
+    if assignments.iter().any(|index| {
+        let assignment = &instructions[*index];
+        assignment.has_prefix()
+            || assignment.mnemonic != "mov"
+            || assignment.operands != "%rax,%rbx"
+    }) || instructions
+        .iter()
+        .filter(|instruction| {
+            !instruction.has_prefix()
+                && instruction.mnemonic == "mov"
+                && instruction.operands == "%rax,%rbx"
+        })
+        .count()
+        != 2
+    {
+        return false;
+    }
+
+    let random_range_calls = instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (exact_direct_call_target(instruction, exact_direct_calls)
+                == Ok(ExactDirectCallTarget::RandomRange))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let [first_random_range, second_random_range] = random_range_calls.as_slice() else {
+        return false;
+    };
+    let returns = instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            matches!(instruction.bare_mnemonic(), "ret" | "retq").then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let [return_index] = returns.as_slice() else {
+        return false;
+    };
+    let decrements = instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (!instruction.has_prefix()
+                && instruction.mnemonic == "decq"
+                && instruction.operands == "(%rbx)")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let [first_normal_drop, second_normal_drop, first_cleanup_drop, second_cleanup_drop] =
+        decrements.as_slice()
+    else {
+        return false;
+    };
+    if !(*first_rng_call < assignments[0]
+        && assignments[0] < *first_random_range
+        && *first_random_range < *first_normal_drop
+        && *first_normal_drop < *second_rng_call
+        && *second_rng_call < assignments[1]
+        && assignments[1] < *second_random_range
+        && *second_random_range < *second_normal_drop
+        && *second_normal_drop < *return_index
+        && *return_index < *first_cleanup_drop
+        && *first_cleanup_drop < *second_cleanup_drop)
+    {
+        return false;
+    }
+
+    let Some(first_slot) = rng_handle_stack_slot(instructions, assignments[0]) else {
+        return false;
+    };
+    let Some(second_slot) = rng_handle_stack_slot(instructions, assignments[1]) else {
+        return false;
+    };
+    for (assignment, normal_drop) in [
+        (assignments[0], *first_normal_drop),
+        (assignments[1], *second_normal_drop),
+    ] {
+        if instructions[assignment + 1..normal_drop]
+            .iter()
+            .any(writes_rbx)
+        {
+            return false;
+        }
+    }
+
+    // Unwind cleanups are laid out in reverse lifetime order: the second RNG
+    // lifetime reaches the first landing pad, and the first reaches the last.
+    for (drop, slot) in [
+        (*first_normal_drop, first_slot),
+        (*second_normal_drop, second_slot),
+        (*first_cleanup_drop, second_slot),
+        (*second_cleanup_drop, first_slot),
+    ] {
+        if !rng_drop_uses_stack_slot(instructions, drop, slot) {
+            return false;
+        }
+    }
+    for cleanup_drop in [*first_cleanup_drop, *second_cleanup_drop] {
+        let Some(landing) = cleanup_drop
+            .checked_sub(1)
+            .and_then(|index| instructions.get(index))
+        else {
+            return false;
+        };
+        if landing.has_prefix() || landing.mnemonic != "mov" || landing.operands != "%rax,%r14" {
+            return false;
+        }
+    }
+
+    exact_rng_drop_branch_shape(instructions, first_normal_drop + 1, relocations) == Some(false)
+        && exact_rng_drop_branch_shape(instructions, second_normal_drop + 1, relocations)
+            == Some(false)
+        && exact_rng_drop_branch_shape(instructions, first_cleanup_drop + 1, relocations)
+            == Some(true)
+        && exact_rng_drop_branch_shape(instructions, second_cleanup_drop + 1, relocations)
+            == Some(false)
+}
+
+fn rng_handle_stack_slot(instructions: &[Instruction], assignment_index: usize) -> Option<&str> {
+    let store = instructions.get(assignment_index + 1)?;
+    if store.has_prefix() || store.mnemonic != "mov" {
+        return None;
+    }
+    match store.operands.as_str() {
+        "%rax,0x8(%rsp)" => Some("0x8(%rsp)"),
+        "%rax,0x10(%rsp)" => Some("0x10(%rsp)"),
+        _ => None,
+    }
+}
+
+fn rng_drop_uses_stack_slot(
+    instructions: &[Instruction],
+    decrement_index: usize,
+    slot: &str,
+) -> bool {
+    let Some(argument) = instructions.get(decrement_index + 2) else {
+        return false;
+    };
+    !argument.has_prefix()
+        && argument.mnemonic == "lea"
+        && argument.operands == format!("{slot},%rdi")
+}
+
+fn writes_rbx(instruction: &Instruction) -> bool {
+    if matches!(
+        instruction.bare_mnemonic(),
+        "call" | "callq" | "cmp" | "jmp" | "jne" | "push" | "ret" | "retq" | "test"
+    ) {
+        return false;
+    }
+    instruction
+        .operands
+        .split_once('#')
+        .map_or(instruction.operands.as_str(), |(operands, _)| operands)
+        .rsplit(',')
+        .next()
+        .map(str::trim)
+        .is_some_and(|destination| matches!(destination, "%rbx" | "%ebx" | "%bx" | "%bl"))
+}
+
+fn exact_cleanup_jump_motif(
+    instructions: &[Instruction],
+    jump_index: usize,
+    relocations: &DynamicRelocations,
+    exact_direct_calls: &ExactDirectCallSymbols,
+) -> bool {
+    let Some(jump) = instructions.get(jump_index) else {
+        return false;
+    };
+    let Some(drop_call) = jump_index
+        .checked_sub(1)
+        .and_then(|index| instructions.get(index))
+    else {
+        return false;
+    };
+    let Some(target_address) = jump_target(&jump.operands) else {
+        return false;
+    };
+    let Some(target_index) = instructions
+        .iter()
+        .position(|instruction| instruction.address == target_address)
+    else {
+        return false;
+    };
+    let Some(move_exception) = instructions.get(target_index) else {
+        return false;
+    };
+    let Some(unwind_call) = instructions.get(target_index + 1) else {
+        return false;
+    };
+
+    jump.address < target_address
+        && fixed_call_target(drop_call, jump.address, relocations)
+            == Ok(FixedCallTarget::RcDropSlow)
+        && !move_exception.has_prefix()
+        && move_exception.mnemonic == "mov"
+        && move_exception.operands == "%r14,%rdi"
+        && exact_direct_call_target(unwind_call, exact_direct_calls)
+            == Ok(ExactDirectCallTarget::UnwindResume)
 }
 
 fn rng_r13_provenance(
@@ -1068,7 +1762,21 @@ fn mentions_r13_family(instruction: &Instruction) -> bool {
         .any(|register| instruction.operands.contains(register))
 }
 
-fn record_loop_motif(instructions: &[Instruction], branch_index: usize) -> Option<Allowance> {
+fn record_loop_motif(
+    instructions: &[Instruction],
+    branch_index: usize,
+    profile: GuardedProfile,
+) -> Option<Allowance> {
+    match profile {
+        GuardedProfile::FixedUniqueInsert => legacy_record_loop_motif(instructions, branch_index),
+        GuardedProfile::FixedExactUpsert => exact_record_loop_motif(instructions, branch_index),
+    }
+}
+
+fn legacy_record_loop_motif(
+    instructions: &[Instruction],
+    branch_index: usize,
+) -> Option<Allowance> {
     let start = branch_index.checked_sub(7)?;
     let motif = instructions.get(start..=branch_index)?;
     if motif.iter().any(Instruction::has_prefix) {
@@ -1125,6 +1833,359 @@ fn record_loop_motif(instructions: &[Instruction], branch_index: usize) -> Optio
     let branch = &motif[7];
     (branch.mnemonic == "jne" && jump_target(&branch.operands) == Some(motif[0].address))
         .then_some(allowance)
+}
+
+fn exact_record_loop_motif(instructions: &[Instruction], branch_index: usize) -> Option<Allowance> {
+    let start = branch_index.checked_sub(7)?;
+    let motif = instructions.get(start..=branch_index)?;
+    if motif.iter().any(Instruction::has_prefix) {
+        return None;
+    }
+    let (allowance, source, prior, output, bound, padding_operands) =
+        match motif[6].operands.as_str() {
+            "$0x26,%rcx" => (
+                Allowance::DirectoryRecordLoop,
+                "0x27(%r15,%rcx,1),%edx",
+                "0x70(%rsp,%rcx,1),%esi",
+                "%sil,0x70(%rsp,%rcx,1)",
+                "$0x26,%rcx",
+                "0x0(%rax)",
+            ),
+            "$0x52,%rcx" => (
+                Allowance::EventRecordLoop,
+                "0x53(%r13,%rcx,1),%edx",
+                "0x90(%rsp,%rcx,1),%esi",
+                "%sil,0x90(%rsp,%rcx,1)",
+                "$0x52,%rcx",
+                "0x0(%rax,%rax,1)",
+            ),
+            _ => return None,
+        };
+    let expected = [
+        ("movzbl", source),
+        ("movzbl", prior),
+        ("test", "%rax,%rax"),
+        ("cmovne", "%edx,%esi"),
+        ("mov", output),
+        ("inc", "%rcx"),
+        ("cmp", bound),
+    ];
+    if motif[..7]
+        .iter()
+        .zip(expected)
+        .any(|(instruction, (mnemonic, operands))| {
+            instruction.mnemonic != mnemonic || instruction.operands != operands
+        })
+    {
+        return None;
+    }
+    let found_to_index = start
+        .checked_sub(3)
+        .and_then(|index| instructions.get(index))?;
+    let zero_index = instructions.get(start - 2)?;
+    let padding = instructions.get(start - 1)?;
+    if found_to_index.has_prefix()
+        || found_to_index.mnemonic != "movzbl"
+        || found_to_index.operands != "%al,%eax"
+        || zero_index.has_prefix()
+        || zero_index.mnemonic != "xor"
+        || zero_index.operands != "%ecx,%ecx"
+        || padding.has_prefix()
+        || padding.mnemonic != "nopl"
+        || padding.operands != padding_operands
+    {
+        return None;
+    }
+    let branch = &motif[7];
+    (branch.mnemonic == "jne" && jump_target(&branch.operands) == Some(motif[0].address))
+        .then_some(allowance)
+}
+
+fn exact_equality_reduction_motif(
+    instructions: &[Instruction],
+    exact_direct_calls: &ExactDirectCallSymbols,
+) -> Option<(Allowance, u64)> {
+    let read_calls = instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (exact_direct_call_target(instruction, exact_direct_calls)
+                == Ok(ExactDirectCallTarget::CircuitRead))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let [read_index] = read_calls.as_slice() else {
+        return None;
+    };
+    let record_loops = instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, _)| {
+            exact_record_loop_motif(instructions, index).map(|allowance| (index, allowance))
+        })
+        .collect::<Vec<_>>();
+    let [(branch_index, record_loop)] = record_loops.as_slice() else {
+        return None;
+    };
+    let reduction_end = branch_index.checked_sub(10)?;
+    let reduction = instructions.get(read_index + 1..reduction_end)?;
+    let anchor = reduction.last()?.address;
+
+    let equality = match record_loop {
+        Allowance::DirectoryRecordLoop if directory_equality_reduction(reduction) => {
+            Allowance::DirectoryEqualityReduction
+        }
+        Allowance::EventRecordLoop if event_equality_reduction(reduction) => {
+            Allowance::EventEqualityReduction
+        }
+        _ => return None,
+    };
+    Some((equality, anchor))
+}
+
+const EVENT_EQUALITY_REDUCTION: &str = "\
+mov %eax,%r12d
+movdqu 0x41(%r13),%xmm5
+movdqa 0x70(%rsp),%xmm0
+movdqu 0x31(%r13),%xmm6
+movdqa 0x30(%rsp),%xmm1
+movdqa 0x40(%rsp),%xmm2
+movdqa 0x50(%rsp),%xmm3
+movdqa 0x60(%rsp),%xmm4
+pxor %xmm4,%xmm6
+movdqu 0x11(%r13),%xmm7
+pxor %xmm2,%xmm7
+por %xmm6,%xmm7
+movdqu 0x21(%r13),%xmm6
+pxor %xmm3,%xmm6
+movdqu 0x1(%r13),%xmm8
+pxor %xmm1,%xmm8
+por %xmm6,%xmm8
+por %xmm7,%xmm8
+pshufd $0xee,%xmm8,%xmm6
+por %xmm8,%xmm6
+pshufd $0x55,%xmm6,%xmm7
+por %xmm6,%xmm7
+movdqa %xmm7,%xmm6
+psrld $0x10,%xmm6
+por %xmm7,%xmm6
+movdqa %xmm6,%xmm7
+psrlw $0x8,%xmm7
+por %xmm6,%xmm7
+pand (%rip),%xmm7
+pxor %xmm0,%xmm5
+por %xmm5,%xmm7
+pshufd $0xee,%xmm7,%xmm5
+por %xmm7,%xmm5
+pshufd $0x55,%xmm5,%xmm6
+por %xmm5,%xmm6
+movdqa %xmm6,%xmm5
+psrld $0x10,%xmm5
+por %xmm6,%xmm5
+movdqa %xmm5,%xmm6
+psrlw $0x8,%xmm6
+por %xmm5,%xmm6
+movd %xmm6,%eax
+movzbl 0x51(%r13),%ecx
+xor 0x80(%rsp),%cl
+or %al,%cl
+movzbl 0x52(%r13),%ebp
+xor 0x81(%rsp),%bpl
+or %cl,%bpl
+sete %al
+mov %r12b,0x7(%rsp)
+xor $0x1,%r12b
+movzbl (%r13),%r15d
+and %r15b,%al
+or %r12b,%al
+movzwl 0x80(%rsp),%ecx
+movw %cx,0xe0(%rsp)
+movdqa %xmm0,0xd0(%rsp)
+movdqa %xmm4,0xc0(%rsp)
+movdqa %xmm3,0xb0(%rsp)
+movdqa %xmm2,0xa0(%rsp)
+movdqa %xmm1,0x90(%rsp)
+";
+
+const DIRECTORY_EQUALITY_REDUCTION: &str = "\
+mov %al,0xd(%rsp)
+movzbl 0x1(%r15),%eax
+movzbl 0x2(%r15),%ecx
+movzbl 0x3(%r15),%edx
+movzbl 0x4(%r15),%esi
+movzbl 0x5(%r15),%edi
+xor 0x21(%rsp),%cl
+xor 0x20(%rsp),%al
+movzbl 0x6(%r15),%r8d
+or %cl,%al
+xor 0x22(%rsp),%dl
+xor 0x23(%rsp),%sil
+or %dl,%sil
+or %al,%sil
+xor 0x24(%rsp),%dil
+xor 0x25(%rsp),%r8b
+or %sil,%dil
+or %dil,%r8b
+sete 0xe(%rsp)
+movdqu 0x26(%rsp),%xmm0
+movdqu 0x7(%r15),%xmm1
+pcmpeqb %xmm0,%xmm1
+pmovmskb %xmm1,%ebx
+test %bx,%bx
+sets 0xf(%rsp)
+mov %ebx,%ecx
+shr $0xe,%ecx
+mov %ebx,%edi
+shr $0xd,%edi
+mov %ebx,%r8d
+shr $0xc,%r8d
+mov %ebx,%r9d
+shr $0xb,%r9d
+mov %ebx,%r10d
+shr $0xa,%r10d
+mov %ebx,%esi
+shr $0x9,%esi
+mov %ebx,%edx
+shr $0x8,%edx
+test %bl,%bl
+sets %bpl
+mov %ebx,%r11d
+mov %ebx,%r12d
+mov %ebx,%r14d
+mov %ebx,%eax
+mov %ebx,%r13d
+shr %r13b
+and %bl,%r13b
+shr $0x6,%bl
+shr $0x5,%r11b
+and %bl,%r11b
+and %bpl,%r11b
+shr $0x3,%r14b
+shr $0x2,%al
+and %r14b,%al
+movzbl (%r15),%ebx
+movdqu 0x36(%rsp),%xmm0
+movdqu 0x17(%r15),%xmm1
+pcmpeqb %xmm0,%xmm1
+pmovmskb %xmm1,%ebp
+shr $0x4,%r12b
+and %r12b,%al
+and 0xe(%rsp),%r13b
+and %al,%r13b
+and %dl,%r11b
+and %r13b,%r11b
+and %r10b,%sil
+and %r9b,%sil
+and %r8b,%sil
+and %dil,%sil
+and %r11b,%sil
+and 0xf(%rsp),%cl
+and %bpl,%cl
+mov %ebp,%eax
+shr %al
+and %cl,%al
+mov %ebp,%ecx
+shr $0x2,%cl
+and %al,%cl
+and %sil,%cl
+mov %ebp,%eax
+shr $0x3,%al
+mov %ebp,%edx
+shr $0x4,%dl
+and %al,%dl
+mov %ebp,%eax
+shr $0x5,%al
+and %dl,%al
+mov %ebp,%edx
+shr $0x6,%dl
+and %al,%dl
+mov %ebp,%eax
+shr $0x8,%eax
+mov %ebp,%esi
+shr $0x7,%sil
+and %dl,%sil
+and %al,%sil
+mov %ebp,%eax
+shr $0x9,%eax
+and %sil,%al
+and %cl,%al
+mov %ebp,%ecx
+shr $0xa,%ecx
+mov %ebp,%edx
+shr $0xb,%edx
+and %cl,%dl
+mov %ebp,%ecx
+shr $0xc,%ecx
+and %dl,%cl
+mov %ebp,%edx
+shr $0xd,%edx
+and %cl,%dl
+mov %ebp,%ecx
+shr $0xe,%ecx
+and %dl,%cl
+shr $0xf,%ebp
+and %cl,%bpl
+and %al,%bpl
+movzbl 0xd(%rsp),%r14d
+xor $0x1,%r14b
+mov %ebp,%eax
+mov %ebx,%r12d
+and %bl,%al
+or %r14b,%al
+movaps 0x30(%rsp),%xmm0
+movaps %xmm0,0x80(%rsp)
+mov 0x3e(%rsp),%rcx
+mov %rcx,0x8e(%rsp)
+movaps 0x20(%rsp),%xmm0
+movaps %xmm0,0x70(%rsp)
+";
+
+fn directory_equality_reduction(instructions: &[Instruction]) -> bool {
+    normalized_instruction_range(instructions) == DIRECTORY_EQUALITY_REDUCTION
+}
+
+fn event_equality_reduction(instructions: &[Instruction]) -> bool {
+    normalized_instruction_range(instructions) == EVENT_EQUALITY_REDUCTION
+}
+
+fn normalized_instruction_range(instructions: &[Instruction]) -> String {
+    let mut normalized = String::new();
+    for instruction in instructions {
+        normalized.push_str(normalized_exact_mnemonic(&instruction.mnemonic));
+        normalized.push(' ');
+        normalized.push_str(&normalized_exact_operands(&instruction.operands));
+        normalized.push('\n');
+    }
+    normalized
+}
+
+fn normalized_exact_mnemonic(mnemonic: &str) -> &str {
+    match mnemonic {
+        "movb" | "movl" | "movq" => "mov",
+        "xorb" | "xorl" => "xor",
+        "orb" => "or",
+        "andb" => "and",
+        "shrb" | "shrl" => "shr",
+        "testb" | "testw" | "testq" => "test",
+        _ => mnemonic,
+    }
+}
+
+fn normalized_exact_operands(operands: &str) -> String {
+    let operands = operands
+        .split_once('#')
+        .map_or(operands, |(before, _)| before);
+    let mut compact = operands
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    if let Some(rip) = compact.find("(%rip)") {
+        let displacement = &compact[..rip];
+        if displacement.is_empty() || parse_signed_hex(displacement).is_some() {
+            compact.replace_range(..rip, "");
+        }
+    }
+    compact
 }
 
 /// The exact unsegmented GNU operand `*0xDISP(%rip) # SLOT`, independently
@@ -1300,7 +2361,32 @@ fn is_control_mnemonic(value: &str) -> bool {
         || value.starts_with("loop")
 }
 
-fn is_approved_mnemonic(value: &str) -> bool {
+fn is_approved_mnemonic(value: &str, profile: GuardedProfile) -> bool {
+    legacy_mnemonic(value)
+        || profile == GuardedProfile::FixedExactUpsert
+            && matches!(
+                value,
+                "and"
+                    | "movd"
+                    | "movdqa"
+                    | "movdqu"
+                    | "nopl"
+                    | "or"
+                    | "pand"
+                    | "pcmpeqb"
+                    | "pmovmskb"
+                    | "por"
+                    | "pshufd"
+                    | "psrld"
+                    | "psrlw"
+                    | "pxor"
+                    | "sete"
+                    | "sets"
+                    | "shr"
+            )
+}
+
+fn legacy_mnemonic(value: &str) -> bool {
     matches!(
         value,
         "add"
@@ -1429,6 +2515,30 @@ mod tests {
             .expect("measured dynamic relocations are valid")
     }
 
+    fn exact_direct_text_symbols() -> TextSymbols {
+        TextSymbols::from([
+            (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
+            (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
+            (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),
+        ])
+    }
+
+    fn unwind_jump_slot(dynamic_symbol: &str) -> DynamicRelocations {
+        DynamicRelocations::from([(
+            0x800,
+            DynamicRelocation {
+                kind: "R_X86_64_JUMP_SLOT".to_string(),
+                relative_target: None,
+                dynamic_symbol: Some(dynamic_symbol.to_string()),
+            },
+        )])
+    }
+
+    const UNWIND_PLT: &str = "\
+0000000000000700 <_Unwind_Resume@plt>:
+ 700:\tff 25 fa 00 00 00\tjmp *0xfa(%rip) # 800 <_Unwind_Resume@GCC_3.0>
+";
+
     fn classify_without_relocations(
         previous: Option<&Instruction>,
         current: &Instruction,
@@ -1445,12 +2555,27 @@ mod tests {
         previous: Option<&Instruction>,
         current: &Instruction,
     ) -> Verdict {
+        classify_for_profile_with_direct_calls(
+            profile,
+            previous,
+            current,
+            &ExactDirectCallSymbols::new(),
+        )
+    }
+
+    fn classify_for_profile_with_direct_calls(
+        profile: GuardedProfile,
+        previous: Option<&Instruction>,
+        current: &Instruction,
+        exact_direct_calls: &ExactDirectCallSymbols,
+    ) -> Verdict {
         let mut instructions = previous.into_iter().cloned().collect::<Vec<_>>();
         instructions.push(current.clone());
         classify(
             &instructions,
             instructions.len() - 1,
             &DynamicRelocations::new(),
+            exact_direct_calls,
             profile,
         )
     }
@@ -1479,7 +2604,13 @@ mod tests {
             mnemonic: "ret".to_string(),
             operands: String::new(),
         };
-        classify(&[current, next], 0, relocations, profile)
+        classify(
+            &[current, next],
+            0,
+            relocations,
+            &ExactDirectCallSymbols::new(),
+            profile,
+        )
     }
 
     fn rip_call(slot: u64, next_address: u64) -> Instruction {
@@ -1499,8 +2630,38 @@ mod tests {
             DynamicRelocation {
                 kind: kind.to_string(),
                 relative_target: target,
+                dynamic_symbol: None,
             },
         )])
+    }
+
+    fn instruction(address: u64, mnemonic: &str, operands: &str) -> Instruction {
+        Instruction {
+            address,
+            mnemonic: mnemonic.to_string(),
+            operands: operands.to_string(),
+        }
+    }
+
+    fn exact_direct_calls(entries: &[(u64, ExactDirectCallTarget)]) -> ExactDirectCallSymbols {
+        entries.iter().copied().collect()
+    }
+
+    fn canonical_equality_fixture(motif: &str) -> Vec<Instruction> {
+        motif
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let (mnemonic, operands) = line
+                    .split_once(' ')
+                    .expect("canonical equality instruction has operands");
+                instruction(
+                    0x100 + u64::try_from(index).expect("test fixture index fits u64"),
+                    mnemonic,
+                    operands,
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -1784,7 +2945,7 @@ mod tests {
                     None,
                     &call,
                 ),
-                Verdict::Rejected("direct call is forbidden by the fixed-exact-upsert profile"),
+                Verdict::Rejected("direct call target is outside the fixed-exact-upsert profile"),
                 "{operands}"
             );
             assert_eq!(
@@ -1813,9 +2974,164 @@ mod tests {
             assert_eq!(scanned.failures.len(), 1, "{callee}");
             assert!(
                 scanned.failures[0]
-                    .contains("direct call is forbidden by the fixed-exact-upsert profile"),
+                    .contains("direct call target is outside the fixed-exact-upsert profile"),
                 "{}",
                 scanned.failures[0]
+            );
+        }
+    }
+
+    #[test]
+    fn exact_upsert_direct_calls_require_exact_address_and_label_syntax() {
+        for target in [
+            ExactDirectCallTarget::RandomRange,
+            ExactDirectCallTarget::CircuitRead,
+            ExactDirectCallTarget::CircuitWriteOrInsert,
+            ExactDirectCallTarget::UnwindResume,
+        ] {
+            let call = instruction(0x100, "call", &format!("120 <{}>", target.label()));
+            let exact_direct_calls = exact_direct_calls(&[(0x120, target)]);
+            assert_eq!(
+                classify_for_profile_with_direct_calls(
+                    GuardedProfile::FixedExactUpsert,
+                    None,
+                    &call,
+                    &exact_direct_calls,
+                ),
+                Verdict::Allowed(Allowance::ExactDirectCall(target))
+            );
+        }
+
+        let exact_direct_calls = exact_direct_calls(&[(0x120, ExactDirectCallTarget::RandomRange)]);
+        for operands in [
+            "0x120 <rand::rng::Rng::random_range>",
+            "120 rand::rng::Rng::random_range",
+            "120 <rand::rng::Rng::random_range> trailing",
+            "not-hex <rand::rng::Rng::random_range>",
+            "120 <rand::rng::Rng::random_range::lookalike>",
+        ] {
+            let call = instruction(0x100, "call", operands);
+            assert!(matches!(
+                classify_for_profile_with_direct_calls(
+                    GuardedProfile::FixedExactUpsert,
+                    None,
+                    &call,
+                    &exact_direct_calls,
+                ),
+                Verdict::Rejected(_)
+            ));
+        }
+
+        let conflicting = instruction(
+            0x100,
+            "call",
+            "120 <rostl_oram::circuit_oram::CircuitORAM<V>::read>",
+        );
+        assert_eq!(
+            classify_for_profile_with_direct_calls(
+                GuardedProfile::FixedExactUpsert,
+                None,
+                &conflicting,
+                &exact_direct_calls,
+            ),
+            Verdict::Rejected("direct call label conflicts with its raw symbol identity")
+        );
+    }
+
+    #[test]
+    fn exact_direct_call_addresses_require_raw_symbol_and_unwind_plt_identities() {
+        let symbols = exact_direct_text_symbols();
+        let relocations = unwind_jump_slot(UNWIND_DYNAMIC_SYMBOL);
+        let resolved = parse_exact_direct_call_symbols(&symbols, &relocations, UNWIND_PLT)
+            .expect("raw symbols and unwind jump slot are exact");
+
+        assert_eq!(
+            resolved,
+            ExactDirectCallSymbols::from([
+                (0x600, ExactDirectCallTarget::RandomRange),
+                (0x610, ExactDirectCallTarget::CircuitRead),
+                (0x620, ExactDirectCallTarget::CircuitWriteOrInsert),
+                (0x700, ExactDirectCallTarget::UnwindResume),
+            ])
+        );
+
+        let mut colliding = symbols.clone();
+        colliding
+            .get_mut(&0x600)
+            .expect("random_range address exists")
+            .push(CIRCUIT_READ_RAW_SYMBOL.to_string());
+        colliding.remove(&0x610);
+        assert!(
+            parse_exact_direct_call_symbols(&colliding, &relocations, UNWIND_PLT).is_err(),
+            "two approved raw identities at one address must be ambiguous"
+        );
+
+        let duplicated = TextSymbols::from([
+            (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
+            (0x601, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
+            (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
+            (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),
+        ]);
+        assert!(
+            parse_exact_direct_call_symbols(&duplicated, &relocations, UNWIND_PLT).is_err(),
+            "one raw identity at two addresses must be ambiguous"
+        );
+    }
+
+    #[test]
+    fn unwind_plt_requires_the_exact_jump_slot_symbol_and_shape() {
+        let symbols = exact_direct_text_symbols();
+        for relocations in [
+            DynamicRelocations::new(),
+            unwind_jump_slot("_Unwind_Resume"),
+            DynamicRelocations::from([(
+                0x800,
+                DynamicRelocation {
+                    kind: "R_X86_64_GLOB_DAT".to_string(),
+                    relative_target: None,
+                    dynamic_symbol: Some(UNWIND_DYNAMIC_SYMBOL.to_string()),
+                },
+            )]),
+        ] {
+            assert!(
+                parse_exact_direct_call_symbols(&symbols, &relocations, UNWIND_PLT).is_err(),
+                "{relocations:?}"
+            );
+        }
+
+        let relocation = unwind_jump_slot(UNWIND_DYNAMIC_SYMBOL);
+        for listing in [
+            UNWIND_PLT.replace("jmp *0xfa", "call *0xfa"),
+            UNWIND_PLT.replace("# 800", "# 801"),
+            format!("{UNWIND_PLT}0000000000000710 <_Unwind_Resume@plt>:\n"),
+        ] {
+            assert!(
+                parse_exact_direct_call_symbols(&symbols, &relocation, &listing).is_err(),
+                "{listing}"
+            );
+        }
+    }
+
+    #[test]
+    fn equality_mnemonics_are_scoped_to_the_exact_upsert_profile() {
+        for mnemonic in [
+            "and", "movd", "movdqa", "movdqu", "nopl", "or", "pand", "pcmpeqb", "pmovmskb", "por",
+            "pshufd", "psrld", "psrlw", "pxor", "sete", "sets", "shr",
+        ] {
+            let instruction = instruction(0x100, mnemonic, "%rax,%rdx");
+            assert_eq!(
+                classify_for_profile_without_relocations(
+                    GuardedProfile::FixedExactUpsert,
+                    None,
+                    &instruction,
+                ),
+                Verdict::Branchless,
+                "exact profile rejected {mnemonic}"
+            );
+            assert_eq!(
+                classify_without_relocations(None, &instruction),
+                Verdict::Rejected("mnemonic is outside the approved structural profile"),
+                "legacy profile admitted {mnemonic}"
             );
         }
     }
@@ -1941,6 +3257,7 @@ mod tests {
             "  100:\tff 15 1a 00 00 00\tcall *0x1a(%rip) # 120 <_DYNAMIC>\n",
             "terminal",
             &relocations,
+            &ExactDirectCallSymbols::new(),
             GuardedProfile::FixedUniqueInsert,
             Some((0x100, 0x106)),
         );
@@ -1963,6 +3280,7 @@ mod tests {
             exact,
             "coverage",
             &DynamicRelocations::new(),
+            &ExactDirectCallSymbols::new(),
             GuardedProfile::FixedUniqueInsert,
             Some((0x100, 0x102)),
         );
@@ -1990,6 +3308,7 @@ mod tests {
                 malformed,
                 "coverage",
                 &DynamicRelocations::new(),
+                &ExactDirectCallSymbols::new(),
                 GuardedProfile::FixedUniqueInsert,
                 Some((0x100, 0x102)),
             );
@@ -2007,6 +3326,7 @@ mod tests {
             "  100:\t0f 0b\t(bad)\n",
             "bad",
             &DynamicRelocations::new(),
+            &ExactDirectCallSymbols::new(),
             GuardedProfile::FixedUniqueInsert,
             Some((0x100, 0x102)),
         );
@@ -2078,6 +3398,7 @@ mod tests {
             Some(&DynamicRelocation {
                 kind: "R_X86_64_RELATIVE".to_string(),
                 relative_target: Some(FixedCallTarget::ThreadRng),
+                dynamic_symbol: None,
             })
         );
         assert_eq!(
@@ -2085,6 +3406,7 @@ mod tests {
             Some(&DynamicRelocation {
                 kind: "R_X86_64_GLOB_DAT".to_string(),
                 relative_target: None,
+                dynamic_symbol: Some("rand::rngs::thread::rng".to_string()),
             })
         );
     }
@@ -2173,6 +3495,149 @@ mod tests {
     }
 
     #[test]
+    fn exact_upsert_requires_its_width_specific_selection_loops() {
+        let directory = "\
+  f0:\tmovzbl %al,%eax
+  f3:\txor %ecx,%ecx
+  f5:\tnopl 0x0(%rax)
+  100:\tmovzbl 0x27(%r15,%rcx,1),%edx
+  105:\tmovzbl 0x70(%rsp,%rcx,1),%esi
+  10a:\ttest %rax,%rax
+  10d:\tcmovne %edx,%esi
+  110:\tmov %sil,0x70(%rsp,%rcx,1)
+  114:\tinc %rcx
+  117:\tcmp $0x26,%rcx
+  11b:\tjne 100 <sym>
+";
+        let event = "\
+  f0:\tmovzbl %al,%eax
+  f3:\txor %ecx,%ecx
+  f5:\tnopl 0x0(%rax,%rax,1)
+  100:\tmovzbl 0x53(%r13,%rcx,1),%edx
+  105:\tmovzbl 0x90(%rsp,%rcx,1),%esi
+  10a:\ttest %rax,%rax
+  10d:\tcmovne %edx,%esi
+  110:\tmov %sil,0x90(%rsp,%rcx,1)
+  114:\tinc %rcx
+  117:\tcmp $0x52,%rcx
+  11b:\tjne 100 <sym>
+";
+
+        for (listing, expected) in [
+            (directory, Allowance::DirectoryRecordLoop),
+            (event, Allowance::EventRecordLoop),
+        ] {
+            let scanned = scan_for_profile(
+                listing,
+                "exact-loop",
+                &DynamicRelocations::new(),
+                GuardedProfile::FixedExactUpsert,
+            );
+            assert!(scanned.failures.is_empty(), "{:?}", scanned.failures);
+            assert!(scanned.allowances.contains(&expected));
+        }
+
+        for changed in [
+            directory.replace("0x27(%r15", "0x28(%r15"),
+            directory.replace("%sil,0x70", "%dl,0x70"),
+            directory.replace("nopl 0x0(%rax)", "nopl 0x0(%rax,%rax,1)"),
+            event.replace("$0x52,%rcx", "$0x26,%rcx"),
+            event.replace("0x90(%rsp", "0x80(%rsp"),
+        ] {
+            let scanned = scan_for_profile(
+                &changed,
+                "exact-loop-near-miss",
+                &DynamicRelocations::new(),
+                GuardedProfile::FixedExactUpsert,
+            );
+            assert!(
+                !scanned.allowances.iter().any(|allowance| matches!(
+                    allowance,
+                    Allowance::DirectoryRecordLoop | Allowance::EventRecordLoop
+                )),
+                "{changed}"
+            );
+            assert!(!scanned.failures.is_empty(), "{changed}");
+        }
+    }
+
+    #[test]
+    fn exact_upsert_directory_equality_requires_the_canonical_instruction_fingerprint() {
+        let exact = canonical_equality_fixture(DIRECTORY_EQUALITY_REDUCTION);
+        assert!(directory_equality_reduction(&exact));
+        assert!(!event_equality_reduction(&exact));
+
+        let mut reordered = exact.clone();
+        let first_fold = reordered
+            .iter()
+            .position(|instruction| instruction.mnemonic == "pcmpeqb")
+            .expect("fixture contains pcmpeqb");
+        reordered.swap(first_fold, first_fold + 1);
+        assert!(!directory_equality_reduction(&reordered));
+
+        let mut mutated_operand = exact.clone();
+        let input = mutated_operand
+            .iter_mut()
+            .find(|instruction| instruction.operands == "0x17(%r15),%xmm1")
+            .expect("fixture contains second SIMD input");
+        input.operands = "0x18(%r15),%xmm1".to_string();
+        assert!(!directory_equality_reduction(&mutated_operand));
+
+        let mut extra_approved_instruction = exact.clone();
+        extra_approved_instruction.insert(1, instruction(0x101, "mov", "%rax,%rax"));
+        assert!(!directory_equality_reduction(&extra_approved_instruction));
+
+        let mut extra_approved_call = exact;
+        extra_approved_call.insert(
+            1,
+            instruction(
+                0x101,
+                "call",
+                "120 <rostl_oram::circuit_oram::CircuitORAM<V>::read>",
+            ),
+        );
+        assert!(!directory_equality_reduction(&extra_approved_call));
+    }
+
+    #[test]
+    fn exact_upsert_event_equality_requires_the_canonical_instruction_fingerprint() {
+        let exact = canonical_equality_fixture(EVENT_EQUALITY_REDUCTION);
+        assert!(event_equality_reduction(&exact));
+        assert!(!directory_equality_reduction(&exact));
+
+        let mut reordered = exact.clone();
+        let first_reduce = reordered
+            .iter()
+            .position(|instruction| instruction.mnemonic == "por")
+            .expect("fixture contains por");
+        reordered.swap(first_reduce, first_reduce + 1);
+        assert!(!event_equality_reduction(&reordered));
+
+        let mut mutated_operand = exact.clone();
+        let tail = mutated_operand
+            .iter_mut()
+            .find(|instruction| instruction.operands == "0x52(%r13),%ebp")
+            .expect("fixture contains final scalar input");
+        tail.operands = "0x53(%r13),%ebp".to_string();
+        assert!(!event_equality_reduction(&mutated_operand));
+
+        let mut extra_approved_instruction = exact.clone();
+        extra_approved_instruction.insert(1, instruction(0x101, "mov", "%rax,%rax"));
+        assert!(!event_equality_reduction(&extra_approved_instruction));
+
+        let mut extra_approved_call = exact;
+        extra_approved_call.insert(
+            1,
+            instruction(
+                0x101,
+                "call",
+                "120 <rostl_oram::circuit_oram::CircuitORAM<V>::read>",
+            ),
+        );
+        assert!(!event_equality_reduction(&extra_approved_call));
+    }
+
+    #[test]
     fn complete_drop_motif_is_required() {
         let exact = "\
   80:\tcall *0xfa(%rip) # 180 <_DYNAMIC>
@@ -2195,6 +3660,7 @@ mod tests {
                 DynamicRelocation {
                     kind: "R_X86_64_RELATIVE".to_string(),
                     relative_target: Some(FixedCallTarget::ThreadRng),
+                    dynamic_symbol: None,
                 },
             ),
             (
@@ -2202,6 +3668,7 @@ mod tests {
                 DynamicRelocation {
                     kind: "R_X86_64_RELATIVE".to_string(),
                     relative_target: Some(FixedCallTarget::RcDropSlow),
+                    dynamic_symbol: None,
                 },
             ),
         ]);
@@ -2246,6 +3713,165 @@ mod tests {
                 scanned.failures
             );
         }
+    }
+
+    #[test]
+    fn exact_upsert_drop_and_cleanup_motifs_require_the_complete_unwind_shape() {
+        let mut instructions = vec![
+            rip_call(0x500, 0x106),
+            instruction(0x106, "mov", "%rax,%rbx"),
+            instruction(0x109, "mov", "%rax,0x8(%rsp)"),
+            instruction(0x10e, "mov", "%rax,%rdi"),
+            instruction(0x110, "call", "600 <rand::rng::Rng::random_range>"),
+            instruction(0x115, "mov", "%eax,%ebp"),
+            instruction(0x120, "decq", "(%rbx)"),
+            instruction(0x123, "jne", "130 <sym>"),
+            instruction(0x125, "lea", "0x8(%rsp),%rdi"),
+            rip_call(0x510, 0x130),
+            instruction(0x130, "mov", "%rdi,%rbx"),
+            rip_call(0x508, 0x140),
+            instruction(0x140, "mov", "%rax,%rbx"),
+            instruction(0x143, "mov", "%rax,0x8(%rsp)"),
+            instruction(0x148, "call", "600 <rand::rng::Rng::random_range>"),
+            instruction(0x150, "decq", "(%rbx)"),
+            instruction(0x153, "jne", "160 <sym>"),
+            instruction(0x155, "lea", "0x8(%rsp),%rdi"),
+            rip_call(0x518, 0x160),
+            instruction(0x160, "mov", "%rax,%rax"),
+            instruction(0x170, "ret", ""),
+            instruction(0x180, "mov", "%rax,%r14"),
+            instruction(0x183, "decq", "(%rbx)"),
+            instruction(0x186, "jne", "1b0 <sym>"),
+            instruction(0x188, "lea", "0x8(%rsp),%rdi"),
+            rip_call(0x520, 0x190),
+            instruction(0x190, "jmp", "1b0 <sym>"),
+            instruction(0x198, "mov", "%rax,%r14"),
+            instruction(0x19b, "decq", "(%rbx)"),
+            instruction(0x19e, "jne", "1b0 <sym>"),
+            instruction(0x1a0, "lea", "0x8(%rsp),%rdi"),
+            rip_call(0x528, 0x1b0),
+            instruction(0x1b0, "mov", "%r14,%rdi"),
+            instruction(0x1b3, "call", "700 <_Unwind_Resume@plt>"),
+        ];
+        let relocations = DynamicRelocations::from([
+            (
+                0x500,
+                DynamicRelocation {
+                    kind: "R_X86_64_RELATIVE".to_string(),
+                    relative_target: Some(FixedCallTarget::ThreadRng),
+                    dynamic_symbol: None,
+                },
+            ),
+            (
+                0x508,
+                DynamicRelocation {
+                    kind: "R_X86_64_RELATIVE".to_string(),
+                    relative_target: Some(FixedCallTarget::ThreadRng),
+                    dynamic_symbol: None,
+                },
+            ),
+            (
+                0x510,
+                DynamicRelocation {
+                    kind: "R_X86_64_RELATIVE".to_string(),
+                    relative_target: Some(FixedCallTarget::RcDropSlow),
+                    dynamic_symbol: None,
+                },
+            ),
+            (
+                0x518,
+                DynamicRelocation {
+                    kind: "R_X86_64_RELATIVE".to_string(),
+                    relative_target: Some(FixedCallTarget::RcDropSlow),
+                    dynamic_symbol: None,
+                },
+            ),
+            (
+                0x520,
+                DynamicRelocation {
+                    kind: "R_X86_64_RELATIVE".to_string(),
+                    relative_target: Some(FixedCallTarget::RcDropSlow),
+                    dynamic_symbol: None,
+                },
+            ),
+            (
+                0x528,
+                DynamicRelocation {
+                    kind: "R_X86_64_RELATIVE".to_string(),
+                    relative_target: Some(FixedCallTarget::RcDropSlow),
+                    dynamic_symbol: None,
+                },
+            ),
+        ]);
+        let exact_direct_calls = exact_direct_calls(&[
+            (0x600, ExactDirectCallTarget::RandomRange),
+            (0x700, ExactDirectCallTarget::UnwindResume),
+        ]);
+
+        let branches = instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| (instruction.mnemonic == "jne").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(branches.len(), 4);
+        assert!(branches.iter().all(|index| exact_rng_drop_motif(
+            &instructions,
+            *index,
+            &relocations,
+            &exact_direct_calls,
+        )));
+        let cleanup_jump = instructions
+            .iter()
+            .position(|instruction| instruction.mnemonic == "jmp")
+            .expect("fixture contains cleanup jump");
+        assert!(exact_cleanup_jump_motif(
+            &instructions,
+            cleanup_jump,
+            &relocations,
+            &exact_direct_calls,
+        ));
+        let exact_instructions = instructions.clone();
+
+        instructions[cleanup_jump].operands = "1b1 <sym>".to_string();
+        assert!(!exact_cleanup_jump_motif(
+            &instructions,
+            cleanup_jump,
+            &relocations,
+            &exact_direct_calls,
+        ));
+        instructions[cleanup_jump].operands = "1b0 <sym>".to_string();
+        let decrement = instructions
+            .iter_mut()
+            .find(|instruction| instruction.mnemonic == "decq")
+            .expect("fixture contains decrement");
+        decrement.operands = "(%r13)".to_string();
+        assert!(branches.iter().all(|index| !exact_rng_drop_motif(
+            &instructions,
+            *index,
+            &relocations,
+            &exact_direct_calls,
+        )));
+
+        let mut clobbered = exact_instructions;
+        let first_random_range = clobbered
+            .iter()
+            .position(|instruction| {
+                exact_direct_call_target(instruction, &exact_direct_calls)
+                    == Ok(ExactDirectCallTarget::RandomRange)
+            })
+            .expect("fixture contains random_range");
+        clobbered.insert(first_random_range, instruction(0x10f, "mov", "%rdi,%rbx"));
+        let clobbered_branches = clobbered
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| (instruction.mnemonic == "jne").then_some(index))
+            .collect::<Vec<_>>();
+        assert!(clobbered_branches.iter().all(|index| !exact_rng_drop_motif(
+            &clobbered,
+            *index,
+            &relocations,
+            &exact_direct_calls,
+        )));
     }
 
     #[test]
@@ -2439,6 +4065,110 @@ mod tests {
             failures: Vec::new(),
         };
         assert!(validate_allowances(&extra, "directory").is_err());
+    }
+
+    #[test]
+    fn exact_upsert_profile_requires_every_measured_multiplicity() {
+        let mut allowances = vec![
+            Allowance::DirectoryRecordLoop,
+            Allowance::DirectoryEqualityReduction,
+            Allowance::RngRefcountDrop,
+            Allowance::RngRefcountDrop,
+            Allowance::RngRefcountDrop,
+            Allowance::RngRefcountDrop,
+            Allowance::ExactCleanupJump,
+        ];
+        allowances.extend(
+            ExactDirectCallTarget::EXPECTED_ORDER
+                .into_iter()
+                .map(Allowance::ExactDirectCall),
+        );
+        for target in FixedCallTarget::ALL {
+            allowances.extend(std::iter::repeat_n(
+                Allowance::FixedCall(target),
+                target.expected_per_monomorphization(GuardedProfile::FixedExactUpsert),
+            ));
+        }
+        let complete = Scan {
+            instructions: 1,
+            allowed: Vec::new(),
+            allowances: allowances.clone(),
+            failures: Vec::new(),
+        };
+        assert_eq!(
+            validate_allowances_for_profile(
+                &complete,
+                "exact-directory",
+                GuardedProfile::FixedExactUpsert,
+            ),
+            Ok(RecordLoop::Directory)
+        );
+
+        let mutation_indices = [
+            allowances
+                .iter()
+                .position(|allowance| *allowance == Allowance::DirectoryEqualityReduction)
+                .expect("fixture contains equality"),
+            allowances
+                .iter()
+                .position(|allowance| *allowance == Allowance::ExactCleanupJump)
+                .expect("fixture contains cleanup jump"),
+            allowances
+                .iter()
+                .position(|allowance| {
+                    *allowance == Allowance::ExactDirectCall(ExactDirectCallTarget::CircuitRead)
+                })
+                .expect("fixture contains direct read"),
+            allowances
+                .iter()
+                .position(|allowance| {
+                    *allowance == Allowance::FixedCall(FixedCallTarget::RcDropSlow)
+                })
+                .expect("fixture contains Rc drop"),
+        ];
+        for index in mutation_indices {
+            let mut missing = allowances.clone();
+            missing.remove(index);
+            let scan = Scan {
+                instructions: 1,
+                allowed: Vec::new(),
+                allowances: missing,
+                failures: Vec::new(),
+            };
+            assert!(validate_allowances_for_profile(
+                &scan,
+                "exact-directory",
+                GuardedProfile::FixedExactUpsert,
+            )
+            .is_err());
+        }
+
+        let mut wrong_order = allowances;
+        let random = wrong_order
+            .iter()
+            .position(|allowance| {
+                *allowance == Allowance::ExactDirectCall(ExactDirectCallTarget::RandomRange)
+            })
+            .expect("fixture contains random_range");
+        let read = wrong_order
+            .iter()
+            .position(|allowance| {
+                *allowance == Allowance::ExactDirectCall(ExactDirectCallTarget::CircuitRead)
+            })
+            .expect("fixture contains read");
+        wrong_order.swap(random, read);
+        let scan = Scan {
+            instructions: 1,
+            allowed: Vec::new(),
+            allowances: wrong_order,
+            failures: Vec::new(),
+        };
+        assert!(validate_allowances_for_profile(
+            &scan,
+            "exact-directory",
+            GuardedProfile::FixedExactUpsert,
+        )
+        .is_err());
     }
 
     /// A refcount drop allowance must not launder a `loop` instruction.
