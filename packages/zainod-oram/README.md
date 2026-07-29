@@ -230,13 +230,13 @@ zainod-oram qualification timing create-manifest \
   --release-receipt release-receipt.json \
   --output-dir manifest-v1
 
-mkdir timing-ledger-v1
+mkdir timing-ledger-v2
 
 taskset -c <CPU> zainod-oram qualification timing run-cell \
   --manifest-dir manifest-v1 \
   --release-receipt release-receipt.json \
   --expected-manifest-blake2s256 <RETAINED_MANIFEST_DIGEST> \
-  --ledger-dir timing-ledger-v1
+  --ledger-dir timing-ledger-v2
 ```
 
 Invoke `run-cell` in a fresh pinned process once per manifest cell. The CLI
@@ -249,7 +249,7 @@ without rerunning the workload:
 zainod-oram qualification timing seal-dangling \
   --manifest-dir manifest-v1 \
   --expected-manifest-blake2s256 <RETAINED_MANIFEST_DIGEST> \
-  --ledger-dir timing-ledger-v1
+  --ledger-dir timing-ledger-v2
 ```
 
 Inspect the chain and optionally compare its exact current head with an
@@ -259,18 +259,28 @@ independently retained append-only/WORM witness:
 zainod-oram qualification timing inspect-ledger \
   --manifest-dir manifest-v1 \
   --expected-manifest-blake2s256 <RETAINED_MANIFEST_DIGEST> \
-  --ledger-dir timing-ledger-v1 \
+  --ledger-dir timing-ledger-v2 \
   --expected-head-sequence <RETAINED_SEQUENCE> \
   --expected-head-blake2s256 <RETAINED_RECORD_DIGEST>
 ```
 
-The chain binds the manifest/release/host/cell, exact raw-v3 bytes, selected
+The v2 chain binds the manifest/release/host/cell, exact raw-v3 bytes, selected
 CPU, task mitigations, frequency/SMT/turbo controls, and NUMA cpuset and policy;
-stable controls must also agree across cells. It is still self-reported and
-unattested. Without an external witness it cannot detect suffix/root deletion,
-and replay does not independently recompute every raw statistical or scheduler
-result. `all_cells_declared_positive=true` summarizes retained runner
-declarations only. Every record keeps `can_clear_gate2=false`.
+stable controls must also agree across cells. Before publishing a completion,
+and again during `inspect-ledger`, the runner strictly parses the full raw-v3
+schema and deterministically recomputes the seeded AB/BA schedule, statistical
+reports, scheduler summaries and admission, quiescence/affinity admission, and
+final wall-clock outcome from the retained pairs. A true
+`wall_clock_matrix_recomputed_positive` means every cell was terminal-positive
+under that replay. The evaluator uses the same audited Rust implementation as
+the producer; it is not an independent implementation, and the samples and
+host remain self-reported and unattested. Without an external witness the
+ledger cannot detect suffix/root deletion. Every record keeps
+`can_clear_gate2=false`.
+
+Manifest admission bounds evaluator work to 2,048 measured pairs and 512
+warm-up pairs per cell and 256 cells per matrix. These are resource ceilings,
+not statistical pass criteria.
 
 ## Typed-worker correctness qualification
 

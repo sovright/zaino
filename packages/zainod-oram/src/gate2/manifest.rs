@@ -51,6 +51,9 @@ const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_HOST_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_AXIS_ENTRIES: usize = 64;
+const MAX_MEASURED_PAIRS: usize = 2_048;
+const MAX_WARMUP_PAIRS: usize = 512;
+const MAX_TIMING_CELLS: usize = 256;
 const MAX_IDENTIFIER_BYTES: usize = 64;
 const DIGEST_HEX_BYTES: usize = 64;
 
@@ -466,6 +469,11 @@ impl CompanionRequirementsV1 {
 
 impl TimingPolicyV1 {
     fn plan(&self) -> Result<ExperimentPlan, TimingManifestError> {
+        if self.pairs > MAX_MEASURED_PAIRS || self.warmup_pairs > MAX_WARMUP_PAIRS {
+            return Err(TimingManifestError::InvalidRequest {
+                reason: "timing pair counts exceed the Gate 2 resource limits",
+            });
+        }
         validate_evidence_intent(
             EvidenceIntent::QualificationCandidate,
             self.pairs,
@@ -570,13 +578,20 @@ impl TimingManifestRequestV1 {
     }
 
     fn cell_count(&self) -> Result<usize, TimingManifestError> {
-        self.repeat_blocks
+        let count = self
+            .repeat_blocks
             .len()
             .checked_mul(self.occupancy_points.len())
             .and_then(|count| count.checked_mul(self.modes.len()))
             .ok_or(TimingManifestError::InvalidRequest {
                 reason: "timing manifest cell count overflows usize",
-            })
+            })?;
+        if count > MAX_TIMING_CELLS {
+            return Err(TimingManifestError::InvalidRequest {
+                reason: "timing manifest cell count exceeds the Gate 2 resource limit",
+            });
+        }
+        Ok(count)
     }
 
     fn canonical_bytes(&self) -> Result<Vec<u8>, TimingManifestError> {
@@ -966,6 +981,25 @@ pub(super) fn test_admitted_timing_manifest_with_runner(
     cell_count: usize,
     runner_version: &str,
 ) -> AdmittedTimingManifest {
+    test_admitted_timing_manifest_with_policy(cell_count, runner_version, 4, 0.1)
+}
+
+#[cfg(test)]
+pub(super) fn test_admitted_timing_manifest_with_pairs(
+    cell_count: usize,
+    pairs: usize,
+    cdf_distance_bound: f64,
+) -> AdmittedTimingManifest {
+    test_admitted_timing_manifest_with_policy(cell_count, "test-runner", pairs, cdf_distance_bound)
+}
+
+#[cfg(test)]
+fn test_admitted_timing_manifest_with_policy(
+    cell_count: usize,
+    runner_version: &str,
+    pairs: usize,
+    cdf_distance_bound: f64,
+) -> AdmittedTimingManifest {
     let record_binding = TimingManifestRecordBindingV1 {
         manifest_blake2s256: "11".repeat(32),
         runner_version: runner_version.to_owned(),
@@ -1001,14 +1035,14 @@ pub(super) fn test_admitted_timing_manifest_with_runner(
                 inputs: TimingRunInputs::new(
                     RostlTimingMode::HitMiss,
                     EvidenceIntent::QualificationCandidate,
-                    4,
+                    pairs,
                     2,
                     16,
                     4,
                     16,
                     4,
                     1_000.0,
-                    0.1,
+                    cdf_distance_bound,
                     1.0,
                     0,
                     0.01,
@@ -1567,6 +1601,49 @@ mod tests {
         let mut no_headroom = request();
         no_headroom.occupancy_points[0].directory_capacity = 512;
         assert!(no_headroom.validate().is_err());
+    }
+
+    #[test]
+    fn request_rejects_resource_amplifying_policy_and_matrix() {
+        let mut maximum_policy = policy();
+        maximum_policy.pairs = MAX_MEASURED_PAIRS;
+        maximum_policy.warmup_pairs = MAX_WARMUP_PAIRS;
+        assert!(maximum_policy.plan().is_ok());
+
+        let mut excessive_pairs = policy();
+        excessive_pairs.pairs = MAX_MEASURED_PAIRS + 4;
+        assert!(matches!(
+            excessive_pairs.plan(),
+            Err(TimingManifestError::InvalidRequest {
+                reason: "timing pair counts exceed the Gate 2 resource limits"
+            })
+        ));
+
+        let mut excessive_warmup = policy();
+        excessive_warmup.warmup_pairs = MAX_WARMUP_PAIRS + 2;
+        assert!(matches!(
+            excessive_warmup.plan(),
+            Err(TimingManifestError::InvalidRequest {
+                reason: "timing pair counts exceed the Gate 2 resource limits"
+            })
+        ));
+
+        let mut excessive_matrix = request();
+        excessive_matrix.occupancy_points = (0..43)
+            .map(|index| OccupancyPointV1 {
+                id: format!("point-{index:02}"),
+                directory_capacity: 2_048,
+                directory_initial_occupancy: 1 + index,
+                event_capacity: 2_048,
+                event_initial_occupancy: 64 + index,
+            })
+            .collect();
+        assert!(matches!(
+            excessive_matrix.validate(),
+            Err(TimingManifestError::InvalidRequest {
+                reason: "timing manifest cell count exceeds the Gate 2 resource limit"
+            })
+        ));
     }
 
     #[test]

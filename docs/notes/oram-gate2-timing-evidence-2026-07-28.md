@@ -16,7 +16,7 @@ inherits it silently. It does not replace the uncompleted upstream branch and
 indirect-call audit, and it does not alter the static compiled-path finding in
 the kill-gate report.
 
-## Manifest-v1 and attempt-ledger status
+## Manifest-v1 and attempt-ledger-v2 status
 
 The runner now implements an immutable `zaino-oram-timing-manifest-v1`
 artifact. A strict `zaino-oram-timing-manifest-request-v1` supplies:
@@ -27,6 +27,12 @@ artifact. A strict `zaino-oram-timing-manifest-request-v1` supplies:
   and
 - measured/warm-up pair counts plus mean, CDF, load, competing-process, and
   runqueue-wait bounds.
+
+Manifest admission caps one cell at 2,048 measured pairs and 512 warm-up
+pairs, and caps the complete Cartesian product at 256 cells. These are
+resource ceilings, not statistical acceptance thresholds; they bound raw-v3
+memory and the bootstrap/replay work while leaving substantial headroom above
+the documented 500/50, 12-cell experiment.
 
 An illustrative request (not a normative Gate 2 policy) is:
 
@@ -107,13 +113,13 @@ real empty ledger directory before the first attempt and invoke one fresh,
 CPU-pinned process per cell:
 
 ```text
-mkdir timing-ledger-v1
+mkdir timing-ledger-v2
 
 taskset -c <CPU> zainod-oram qualification timing run-cell \
   --manifest-dir manifest-v1 \
   --release-receipt release-receipt.json \
   --expected-manifest-blake2s256 <retained-manifest-digest> \
-  --ledger-dir timing-ledger-v1
+  --ledger-dir timing-ledger-v2
 ```
 
 `run-cell` redoes same-boot manifest, release-binary, host, CPU-affinity,
@@ -121,13 +127,16 @@ quiescence, scheduler-stat, and attempt-control admission. It always selects
 the next unconsumed manifest cell; there are no CLI flags that can alter the
 cell. The command is dispatched before logging or Tokio initialization. It
 durably publishes a canonical `Started` link before the first ORAM operation,
-then publishes exactly one `CompletedPositive`, `CompletedNegative`, or
+then strictly parses and independently re-evaluates the raw artifact before
+publishing exactly one `CompletedPositive`, `CompletedNegative`, or
 `StartedError` terminal link. Positive and negative completions retain the
-exact raw `zaino-oram-insert-timing-v3` bytes beside the terminal record.
-Pre-start refusal publishes no link.
+exact raw `zaino-oram-insert-timing-v3` bytes beside the terminal record; an
+evaluation failure becomes `StartedError`. Pre-start refusal publishes no
+link.
 
 Each link is an immutable, fixed-width numeric child directory. Canonical
-minified `record.json` links to the preceding record digest and binds the
+`zaino-oram-gate2-attempt-v2` `record.json` links to the preceding record
+digest and binds the
 manifest digest, manifest runner version, release identity, boot-scoped host,
 complete cell inputs, and fixed limitation flags. A killed publisher can leave
 an internal stage directory; replay ignores only the publisher's exact
@@ -142,7 +151,7 @@ already consumed and must not be rerun. Seal it explicitly:
 zainod-oram qualification timing seal-dangling \
   --manifest-dir manifest-v1 \
   --expected-manifest-blake2s256 <retained-manifest-digest> \
-  --ledger-dir timing-ledger-v1
+  --ledger-dir timing-ledger-v2
 ```
 
 Sealing records `prior_process_interrupted` as `StartedError`, advances to the
@@ -153,7 +162,7 @@ requiring an exact externally retained head:
 zainod-oram qualification timing inspect-ledger \
   --manifest-dir manifest-v1 \
   --expected-manifest-blake2s256 <retained-manifest-digest> \
-  --ledger-dir timing-ledger-v1 \
+  --ledger-dir timing-ledger-v2 \
   --expected-head-sequence <retained-sequence> \
   --expected-head-blake2s256 <retained-record-digest>
 ```
@@ -162,6 +171,18 @@ Retain each reported head in an independently administered append-only or WORM
 system. The in-ledger hash chain detects retained interior omission, but it
 cannot detect deletion of an unwitnessed suffix or the entire ledger root.
 The external witness is deliberately not asserted by the self-reported record.
+
+`inspect-ledger` strictly deserializes the complete raw-v3 schema and
+deterministically recomputes, from retained pairs, the exact seeded AB/BA
+schedule (including warm-up RNG advancement), every pooled and conditioned
+statistical report, scheduler totals and ratios, scheduler admission, all
+quiescence and single-CPU-affinity decisions, and the final wall-clock outcome.
+It also revalidates fixed experiment semantics and deterministic occupancy
+windows. The output
+`wall_clock_matrix_recomputed_positive=true` is emitted only after full replay
+finds every manifest cell terminal-positive. Resume and dangling-seal paths
+recheck the hash/raw bindings without repeatedly rerunning prior statistical
+work; each newly completed cell is fully evaluated before publication.
 
 The host binding is self-reported, boot-scoped, unattested, and
 `tdx_qualified=false`. Raw machine ID, boot ID, CPU model/microcode, and DMI
@@ -278,11 +299,11 @@ Numbers will not be reconstructed from console output, prose, or memory.
 - The ledger and host/control snapshots are self-reported and not temporally
   attested. The record contains no external/WORM head witness and cannot detect
   deletion of an unwitnessed suffix or the ledger root.
-- Replay validates raw-v3 identity, shape, seeds, policy fields, declared
-  booleans, and terminal consistency, but it does not independently recompute
-  every statistical report, scheduler ratio, or environment decision from raw
-  samples. `all_cells_declared_positive=true` is therefore a retained
-  runner-declaration summary, not verifier-derived Gate 2 admission.
+- Raw-v3 replay now recomputes statistical, scheduler, environment, and final
+  wall-clock outcomes from retained samples. It uses the same Rust
+  implementation as the producer, not an independently implemented verifier,
+  and cannot establish that the self-reported samples correspond to the
+  claimed physical execution.
 - The currently measured event record is one immutable event per cell, not the
   selected target chunked/generational production projection. V3 records that
   the target projection is not yet implemented.
@@ -306,8 +327,8 @@ None. Gate 2 remains **NO-GO**. V3 and every attempt record explicitly retain
 manifest and durable cell binding now exist, but no real matrix has been run or
 externally witnessed. A future update may add narrowly scoped,
 artifact-derived descriptive findings after the admitted hit/miss and forced
-matrix is retained. Clearing Gate 2 still requires independent raw-outcome
-evaluation, accepted inference for process-level repeat blocks, exact codegen
-evidence for both executable paths, directory/event physical traces, fixed
-normative coverage and threshold policy, the work listed in the normative
-kill-gate report, and written review of that decision.
+matrix is retained. Clearing Gate 2 still requires accepted inference for
+process-level repeat blocks, exact codegen evidence for both executable paths,
+directory/event physical traces, fixed normative coverage and threshold policy,
+the work listed in the normative kill-gate report, and written review of that
+decision.
