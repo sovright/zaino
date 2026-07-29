@@ -742,7 +742,7 @@ fn run_timing_inspect_ledger(args: QualificationTimingInspectLedgerArgs) -> Runn
         |(sequence, digest)| format!("{sequence}:{digest}"),
     );
     println!(
-        "timing_ledger=valid,manifest_blake2s256:{},cells:{},started:{},terminal:{},positive:{},negative:{},started_error:{},dangling:{},head:{},externally_witnessed:{},all_cells_terminal:{},all_cells_declared_positive:{},can_clear_gate2:false",
+        "timing_ledger=valid,manifest_blake2s256:{},cells:{},started:{},terminal:{},positive:{},negative:{},started_error:{},dangling:{},head:{},externally_witnessed:{},all_cells_terminal:{},wall_clock_matrix_recomputed_positive:{},can_clear_gate2:false",
         summary.manifest_blake2s256(),
         summary.cell_count(),
         summary.started_cells(),
@@ -754,7 +754,7 @@ fn run_timing_inspect_ledger(args: QualificationTimingInspectLedgerArgs) -> Runn
         head,
         summary.externally_witnessed(),
         summary.all_cells_terminal(),
-        summary.all_cells_declared_positive(),
+        summary.wall_clock_matrix_recomputed_positive(),
     );
     Ok(())
 }

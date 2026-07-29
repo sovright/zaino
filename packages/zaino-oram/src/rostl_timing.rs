@@ -79,7 +79,8 @@ impl fmt::Display for RostlTimingError {
 impl std::error::Error for RostlTimingError {}
 
 /// Scheduler contention conservatively bracketed around measured insertions.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RostlTimingSchedulerSummary {
     measurements: usize,
     timed_wall_nanos: u64,
@@ -153,7 +154,7 @@ pub fn run_rostl_insert_timing_mode(
             plan.total_pairs(),
         )?;
         let pairs = crate::timing_experiment::run(plan, &mut probe)?;
-        let scheduler = summarize_scheduler(&pairs)?;
+        let scheduler = summarize_rostl_timing_scheduler(&pairs)?;
         Ok(RostlTimingRun { pairs, scheduler })
     }
 
@@ -164,8 +165,14 @@ pub fn run_rostl_insert_timing_mode(
     }
 }
 
-#[cfg(feature = "rostl-experimental")]
-fn summarize_scheduler(pairs: &[Pair]) -> Result<RostlTimingSchedulerSummary, RostlTimingError> {
+/// Recomputes scheduler-contention evidence from retained timing pairs.
+///
+/// This pure replay path does not invoke the native timing probe. It rejects
+/// empty inputs, missing per-arm scheduler counters, zero-duration
+/// measurements, and arithmetic overflow.
+pub fn summarize_rostl_timing_scheduler(
+    pairs: &[Pair],
+) -> Result<RostlTimingSchedulerSummary, RostlTimingError> {
     let mut measurements = 0usize;
     let mut timed_wall_nanos = 0u64;
     let mut cpu_time_nanos = 0u64;
@@ -235,11 +242,15 @@ pub fn validate_rostl_timing_shape(
     }
 }
 
-#[cfg(all(test, feature = "rostl-experimental"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::timing_equivalence::{ArmMeasurement, PairOrder, TimedSchedulerDelta};
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
     use crate::{TimingSeed, MINIMUM_PAIRS};
 
     #[test]
@@ -255,7 +266,11 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
     #[test]
     fn forced_modes_emit_complete_labelled_pairs_for_both_record_kinds(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -334,8 +349,9 @@ mod tests {
             runqueue_wait_nanos: 40,
             timeslices: 2,
         };
-        let summary = summarize_scheduler(&[measured_pair(PairOrder::HitFirst, quiet, noisy)])
-            .expect("scheduler deltas are valid");
+        let summary =
+            summarize_rostl_timing_scheduler(&[measured_pair(PairOrder::HitFirst, quiet, noisy)])
+                .expect("scheduler deltas are valid");
 
         assert_eq!(summary.aggregate_runqueue_wait_ratio, 0.25);
         assert_eq!(summary.maximum_measurement_runqueue_wait_ratio, 0.40);
@@ -344,9 +360,48 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_summary_round_trips_through_json() -> Result<(), serde_json::Error> {
+        let delta = TimedSchedulerDelta {
+            cpu_time_nanos: 90,
+            runqueue_wait_nanos: 10,
+            timeslices: 1,
+        };
+        let summary =
+            summarize_rostl_timing_scheduler(&[measured_pair(PairOrder::HitFirst, delta, delta)])
+                .expect("scheduler deltas are valid");
+        let encoded = serde_json::to_string(&summary)?;
+
+        assert_eq!(
+            serde_json::from_str::<RostlTimingSchedulerSummary>(&encoded)?,
+            summary
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_summary_rejects_unknown_fields() -> Result<(), serde_json::Error> {
+        let delta = TimedSchedulerDelta {
+            cpu_time_nanos: 90,
+            runqueue_wait_nanos: 10,
+            timeslices: 1,
+        };
+        let summary =
+            summarize_rostl_timing_scheduler(&[measured_pair(PairOrder::HitFirst, delta, delta)])
+                .expect("scheduler deltas are valid");
+        let mut encoded = serde_json::to_value(summary)?;
+        let Some(object) = encoded.as_object_mut() else {
+            panic!("scheduler summary must serialize as an object");
+        };
+        object.insert("extra".to_owned(), serde_json::Value::Bool(true));
+
+        assert!(serde_json::from_value::<RostlTimingSchedulerSummary>(encoded).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn scheduler_summary_rejects_pairs_without_timed_counters() {
         assert_eq!(
-            summarize_scheduler(&[Pair::new(100, 100, PairOrder::HitFirst)]),
+            summarize_rostl_timing_scheduler(&[Pair::new(100, 100, PairOrder::HitFirst)]),
             Err(RostlTimingError::SchedulerStats)
         );
     }

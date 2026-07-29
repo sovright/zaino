@@ -11,6 +11,14 @@ use std::{
 
 use blake2::{Blake2s256, Digest};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use zaino_oram::expected_timing_pair_orders;
+use zaino_oram::{
+    evaluate_timing_equivalence, single_allowed_cpu, summarize_rostl_timing_scheduler,
+    timing_pair_orders_match_plan, EquivalenceBounds, EquivalenceReport, ExperimentPlan, Pair,
+    QuiescencePolicy, RostlTimingMode, RostlTimingRecordKind, RostlTimingSchedulerSummary,
+    TimingSeed, MINIMUM_PAIRS,
+};
 
 use crate::{
     corpus_artifact::{
@@ -20,13 +28,16 @@ use crate::{
         ArtifactFile,
     },
     timing_contract::{
-        derive_seed, EvidenceIntent, DIRECTORY_REPORT_SEED_DOMAIN, DIRECTORY_SCHEDULE_SEED_DOMAIN,
-        EVENT_REPORT_SEED_DOMAIN, EVENT_SCHEDULE_SEED_DOMAIN, TARGET_PROJECTION_MODEL,
+        derive_seed, occupancy_window, table_set_relation, timed_operation_model, EvidenceIntent,
+        DIRECTORY_RECORD_MODEL, DIRECTORY_REPORT_SEED_DOMAIN, DIRECTORY_SCHEDULE_SEED_DOMAIN,
+        EVENT_RECORD_MODEL, EVENT_REPORT_SEED_DOMAIN, EVENT_SCHEDULE_SEED_DOMAIN, LABEL_ASSIGNMENT,
+        ORDER_BLOCKING, STATE_CONTROL, STATISTICAL_SCOPE, TARGET_PROJECTION_MODEL,
         TIMING_EVIDENCE_SCHEMA,
     },
     timing_driver::{
-        parse_cpus_allowed_list, parse_scheduler_stats_control, prepare_timing_run,
-        start_and_execute_timing_run, PreparedTimingRun, StartedExecution, TimingRunInputs,
+        evaluate_environment_admission, parse_cpus_allowed_list, parse_scheduler_stats_control,
+        prepare_timing_run, start_and_execute_timing_run, EnvironmentAdmission,
+        EnvironmentSnapshot, PreparedTimingRun, StartedExecution, TimingRunInputs,
     },
 };
 
@@ -36,13 +47,15 @@ use super::manifest::{
     TimingManifestRecordBindingV1, TimingManifestVerifyInputs,
 };
 
-const ATTEMPT_SCHEMA: &str = "zaino-oram-gate2-attempt-v1";
+const ATTEMPT_SCHEMA: &str = "zaino-oram-gate2-attempt-v2";
 const CPU_ENVIRONMENT_SCHEMA: &str = "zaino-oram-gate2-cpu-environment-v1";
 const ATTEMPT_ID_DOMAIN: &[u8] = b"zaino-oram-gate2-attempt-id-v1";
 const RECORD_JSON: &str = "record.json";
 const TIMING_V3_JSON: &str = "timing-v3.json";
 const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TIMING_V3_BYTES: usize = 512 * 1024 * 1024;
+const MAX_TIMING_V3_FIXED_BYTES: usize = 1024 * 1024;
+const MAX_TIMING_V3_BYTES_PER_PAIR: usize = 4096;
 const MAX_CONTROL_BYTES: usize = 4 * 1024 * 1024;
 const LINK_NAME_WIDTH: usize = 20;
 const NUMACTL_PATH: &str = "/usr/bin/numactl";
@@ -146,7 +159,7 @@ pub(crate) struct TimingLedgerSummary {
     head: Option<HeadV1>,
     externally_witnessed: bool,
     all_cells_terminal: bool,
-    all_cells_declared_positive: bool,
+    wall_clock_matrix_recomputed_positive: bool,
 }
 
 impl TimingLedgerSummary {
@@ -196,8 +209,8 @@ impl TimingLedgerSummary {
         self.all_cells_terminal
     }
 
-    pub(crate) const fn all_cells_declared_positive(&self) -> bool {
-        self.all_cells_declared_positive
+    pub(crate) const fn wall_clock_matrix_recomputed_positive(&self) -> bool {
+        self.wall_clock_matrix_recomputed_positive
     }
 }
 
@@ -220,7 +233,7 @@ type HeadV1 = PreviousLinkV1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AttemptLimitationsV1 {
+struct AttemptLimitationsV2 {
     self_reported: bool,
     temporally_attested: bool,
     external_head_witness_in_record: bool,
@@ -230,7 +243,7 @@ struct AttemptLimitationsV1 {
     can_clear_gate2: bool,
 }
 
-impl AttemptLimitationsV1 {
+impl AttemptLimitationsV2 {
     const fn fixed() -> Self {
         Self {
             self_reported: true,
@@ -238,7 +251,7 @@ impl AttemptLimitationsV1 {
             external_head_witness_in_record: false,
             detects_retained_interior_omission: true,
             detects_unwitnessed_suffix_or_root_deletion: false,
-            raw_outcome_independently_recomputed: false,
+            raw_outcome_independently_recomputed: true,
             can_clear_gate2: false,
         }
     }
@@ -391,6 +404,7 @@ struct CompletionPayloadV1 {
 enum StartedErrorStageV1 {
     TimingExecution,
     PostExecutionEnvironmentCapture,
+    RawEvidenceEvaluation,
     PriorProcessInterrupted,
 }
 
@@ -415,7 +429,7 @@ enum AttemptStateV1 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AttemptRecordV1 {
+struct AttemptRecordV2 {
     schema: String,
     execution_runner_version: String,
     record_writer_version: String,
@@ -424,12 +438,12 @@ struct AttemptRecordV1 {
     attempt_id_blake2s256: String,
     manifest: TimingManifestRecordBindingV1,
     cell: TimingExecutionCellV1,
-    limitations: AttemptLimitationsV1,
+    limitations: AttemptLimitationsV2,
     #[serde(flatten)]
     state: AttemptStateV1,
 }
 
-impl AttemptRecordV1 {
+impl AttemptRecordV2 {
     fn new(
         sequence: u64,
         previous: Option<PreviousLinkV1>,
@@ -447,7 +461,7 @@ impl AttemptRecordV1 {
             attempt_id_blake2s256: attempt_id(manifest, cell),
             manifest: manifest.clone(),
             cell: cell.clone(),
-            limitations: AttemptLimitationsV1::fixed(),
+            limitations: AttemptLimitationsV2::fixed(),
             state,
         };
         record.validate_common(manifest, cell)?;
@@ -465,7 +479,7 @@ impl AttemptRecordV1 {
             || self.manifest != *manifest
             || self.cell != *cell
             || self.attempt_id_blake2s256 != attempt_id(manifest, cell)
-            || self.limitations != AttemptLimitationsV1::fixed()
+            || self.limitations != AttemptLimitationsV2::fixed()
         {
             return Err(TimingAttemptError::InvalidLedger {
                 reason: "attempt record identity or fixed contract mismatch",
@@ -526,7 +540,7 @@ impl AttemptRecordV1 {
 }
 
 struct StartedToken {
-    record: AttemptRecordV1,
+    record: AttemptRecordV2,
     digest: String,
 }
 
@@ -541,6 +555,7 @@ struct LoadedLedger {
     started_error_cells: usize,
     dangling: Option<StartedToken>,
     baseline_environment: Option<CpuEnvironmentV1>,
+    raw_outcomes_recomputed: bool,
 }
 
 impl LoadedLedger {
@@ -569,7 +584,8 @@ impl LoadedLedger {
             head: self.head.clone(),
             externally_witnessed,
             all_cells_terminal,
-            all_cells_declared_positive: all_cells_terminal
+            wall_clock_matrix_recomputed_positive: self.raw_outcomes_recomputed
+                && all_cells_terminal
                 && self.positive_cells == manifest.cells().len(),
         }
     }
@@ -589,7 +605,7 @@ pub(crate) fn run_timing_attempt(
     )?;
     let ledger_dir = open_artifact_directory(&inputs.ledger_dir)?;
     lock_artifact_directory_exclusive(&ledger_dir)?;
-    let ledger = load_ledger(&ledger_dir, &manifest)?;
+    let ledger = load_ledger_for_resume(&ledger_dir, &manifest)?;
     if ledger.dangling.is_some() {
         return Err(TimingAttemptError::DanglingStarted);
     }
@@ -613,7 +629,7 @@ pub(crate) fn run_timing_attempt(
     {
         return Err(TimingAttemptError::CrossCellEnvironmentMismatch);
     }
-    let started_record = AttemptRecordV1::new(
+    let started_record = AttemptRecordV2::new(
         ledger.next_sequence,
         ledger.head,
         manifest.record_binding(),
@@ -648,9 +664,52 @@ pub(crate) fn run_timing_attempt(
                     });
                 }
             };
+            let recomputed_declared = match validate_raw_timing_v3(
+                &raw_v3_bytes,
+                cell.inputs(),
+                runner_version,
+                &environment_before,
+                &environment_after,
+            ) {
+                Ok(recomputed) if recomputed == raw_outcome => {
+                    recomputed.declared_wall_clock_criteria_satisfied()
+                }
+                Ok(_) => {
+                    let source = TimingAttemptError::InvalidLedger {
+                        reason: "timing driver outcome differs from independent raw evaluation",
+                    };
+                    let summary = append_started_error(
+                        &ledger_dir,
+                        &manifest,
+                        &cell,
+                        started,
+                        StartedErrorStageV1::RawEvidenceEvaluation,
+                        "raw_evidence_outcome_mismatch",
+                        runner_version,
+                    )?;
+                    return Ok(TimingAttemptOutcome::ExecutionError {
+                        summary,
+                        source: Box::new(source),
+                    });
+                }
+                Err(source) => {
+                    let summary = append_started_error(
+                        &ledger_dir,
+                        &manifest,
+                        &cell,
+                        started,
+                        StartedErrorStageV1::RawEvidenceEvaluation,
+                        "raw_evidence_evaluation_failed",
+                        runner_version,
+                    )?;
+                    return Ok(TimingAttemptOutcome::ExecutionError {
+                        summary,
+                        source: Box::new(source),
+                    });
+                }
+            };
             let controls_stable = environment_before.stable_controls_equal(&environment_after);
-            let overall_attempt_admitted =
-                raw_outcome.declared_wall_clock_criteria_satisfied() && controls_stable;
+            let overall_attempt_admitted = recomputed_declared && controls_stable;
             let raw_binding = RawTimingBindingV1 {
                 file: TIMING_V3_JSON.to_owned(),
                 blake2s256: artifact_blake2s256_hex(&raw_v3_bytes),
@@ -659,8 +718,7 @@ pub(crate) fn run_timing_attempt(
                         reason: "raw timing evidence size does not fit u64",
                     }
                 })?,
-                raw_declared_wall_clock_criteria_satisfied: raw_outcome
-                    .declared_wall_clock_criteria_satisfied(),
+                raw_declared_wall_clock_criteria_satisfied: recomputed_declared,
                 overall_attempt_admitted,
             };
             let payload = CompletionPayloadV1 {
@@ -770,7 +828,7 @@ fn seal_admitted_dangling_timing_attempt(
 ) -> Result<TimingAttemptSummary, TimingAttemptError> {
     let ledger_dir = open_artifact_directory(ledger_path)?;
     lock_artifact_directory_exclusive(&ledger_dir)?;
-    let ledger = load_ledger(&ledger_dir, manifest)?;
+    let ledger = load_ledger_for_resume(&ledger_dir, manifest)?;
     let started = ledger
         .dangling
         .ok_or(TimingAttemptError::NoDanglingStarted)?;
@@ -824,7 +882,7 @@ fn terminal_record(
     started: &StartedToken,
     state: AttemptStateV1,
     runner_version: &str,
-) -> Result<AttemptRecordV1, TimingAttemptError> {
+) -> Result<AttemptRecordV2, TimingAttemptError> {
     let sequence =
         started
             .record
@@ -833,7 +891,7 @@ fn terminal_record(
             .ok_or(TimingAttemptError::InvalidLedger {
                 reason: "attempt link sequence overflow",
             })?;
-    AttemptRecordV1::new(
+    AttemptRecordV2::new(
         sequence,
         Some(PreviousLinkV1 {
             sequence: started.record.sequence,
@@ -859,9 +917,30 @@ fn summary_from_terminal(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawReplayMode {
+    BindingOnly,
+    Recompute,
+}
+
 fn load_ledger(
     ledger_dir: &ArtifactDirectory,
     manifest: &AdmittedTimingManifest,
+) -> Result<LoadedLedger, TimingAttemptError> {
+    load_ledger_with_mode(ledger_dir, manifest, RawReplayMode::Recompute)
+}
+
+fn load_ledger_for_resume(
+    ledger_dir: &ArtifactDirectory,
+    manifest: &AdmittedTimingManifest,
+) -> Result<LoadedLedger, TimingAttemptError> {
+    load_ledger_with_mode(ledger_dir, manifest, RawReplayMode::BindingOnly)
+}
+
+fn load_ledger_with_mode(
+    ledger_dir: &ArtifactDirectory,
+    manifest: &AdmittedTimingManifest,
+    raw_replay_mode: RawReplayMode,
 ) -> Result<LoadedLedger, TimingAttemptError> {
     let names = artifact_directory_entry_names(ledger_dir)?;
     let mut link_names = Vec::new();
@@ -901,7 +980,7 @@ fn load_ledger(
         }
         let directory = open_artifact_child_directory(ledger_dir, name.as_os_str())?;
         let record_bytes = read_artifact_file(&directory, RECORD_JSON, MAX_RECORD_BYTES)?;
-        let record: AttemptRecordV1 = serde_json::from_slice(&record_bytes)?;
+        let record: AttemptRecordV2 = serde_json::from_slice(&record_bytes)?;
         if record.canonical_bytes()? != record_bytes || record.sequence != next_sequence {
             return Err(TimingAttemptError::InvalidLedger {
                 reason: "attempt record JSON or link sequence is noncanonical",
@@ -969,9 +1048,12 @@ fn load_ledger(
                         reason: "completed attempt runner version differs from its started record",
                     });
                 }
-                let raw_bytes =
-                    read_artifact_file(&directory, TIMING_V3_JSON, MAX_TIMING_V3_BYTES)?;
-                validate_raw_binding(&record, payload, &raw_bytes, &started)?;
+                let raw_bytes = read_artifact_file(
+                    &directory,
+                    TIMING_V3_JSON,
+                    maximum_timing_v3_bytes(record.cell.inputs())?,
+                )?;
+                validate_raw_binding(&record, payload, &raw_bytes, &started, raw_replay_mode)?;
                 next_cell_ordinal =
                     next_cell_ordinal
                         .checked_add(1)
@@ -1058,11 +1140,12 @@ fn load_ledger(
         started_error_cells,
         dangling,
         baseline_environment,
+        raw_outcomes_recomputed: raw_replay_mode == RawReplayMode::Recompute,
     })
 }
 
 fn validate_terminal_start_binding(
-    terminal: &AttemptRecordV1,
+    terminal: &AttemptRecordV2,
     started_record_blake2s256: &str,
     started: &StartedToken,
 ) -> Result<(), TimingAttemptError> {
@@ -1082,10 +1165,11 @@ fn validate_terminal_start_binding(
 }
 
 fn validate_raw_binding(
-    record: &AttemptRecordV1,
+    record: &AttemptRecordV2,
     payload: &CompletionPayloadV1,
     raw_bytes: &[u8],
     started: &StartedToken,
+    raw_replay_mode: RawReplayMode,
 ) -> Result<(), TimingAttemptError> {
     let raw_size =
         u64::try_from(raw_bytes.len()).map_err(|_| TimingAttemptError::InvalidLedger {
@@ -1109,11 +1193,17 @@ fn validate_raw_binding(
             reason: "retained raw timing evidence digest, size, or controls binding mismatch",
         });
     }
-    let declared = validate_raw_timing_v3(
-        raw_bytes,
-        record.cell.inputs(),
-        &started.record.execution_runner_version,
-    )?;
+    let declared = match raw_replay_mode {
+        RawReplayMode::BindingOnly => payload.raw.raw_declared_wall_clock_criteria_satisfied,
+        RawReplayMode::Recompute => validate_raw_timing_v3(
+            raw_bytes,
+            record.cell.inputs(),
+            &started.record.execution_runner_version,
+            before,
+            &payload.cpu_environment_after,
+        )?
+        .declared_wall_clock_criteria_satisfied(),
+    };
     if declared != payload.raw.raw_declared_wall_clock_criteria_satisfied
         || payload.raw.overall_attempt_admitted != (declared && payload.controls_stable)
     {
@@ -1138,10 +1228,13 @@ fn validate_raw_binding(
 
 fn append_record(
     ledger_dir: &ArtifactDirectory,
-    record: AttemptRecordV1,
+    record: AttemptRecordV2,
     raw_v3_bytes: Option<&[u8]>,
 ) -> Result<StartedToken, TimingAttemptError> {
     let record_bytes = record.canonical_bytes()?;
+    let raw_read_limit = raw_v3_bytes
+        .map(|_| maximum_timing_v3_bytes(record.cell.inputs()))
+        .transpose()?;
     let mut files = vec![ArtifactFile::new(RECORD_JSON, record_bytes.clone())];
     if let Some(raw_v3_bytes) = raw_v3_bytes {
         files.push(ArtifactFile::new(TIMING_V3_JSON, raw_v3_bytes.to_vec()));
@@ -1159,8 +1252,8 @@ fn append_record(
                 reason: "staged attempt record differs after read-back",
             });
         }
-        if let Some(expected_raw) = raw_v3_bytes {
-            if read_artifact_file(stage, TIMING_V3_JSON, MAX_TIMING_V3_BYTES)? != expected_raw {
+        if let (Some(expected_raw), Some(raw_read_limit)) = (raw_v3_bytes, raw_read_limit) {
+            if read_artifact_file(stage, TIMING_V3_JSON, raw_read_limit)? != expected_raw {
                 return Err(ArtifactError::InvalidArtifact {
                     reason: "staged raw timing evidence differs after read-back",
                 });
@@ -1174,230 +1267,327 @@ fn append_record(
     })
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTimingEvidenceV3 {
+    schema: String,
+    runner_version: String,
+    platform_os: String,
+    platform_arch: String,
+    mode: RostlTimingMode,
+    evidence_intent: EvidenceIntent,
+    minimum_qualification_pairs: usize,
+    wall_clock_only: bool,
+    physical_trace_complete: bool,
+    oram_state_seed_bound: bool,
+    serial_independence_established: bool,
+    statistical_scope: String,
+    target_projection_model: String,
+    target_projection_model_implemented: bool,
+    timed_operation_model: String,
+    cover_insertions_per_table_per_pair: usize,
+    cover_physical_order: [usize; 2],
+    table_set_relation: String,
+    can_clear_gate2: bool,
+    policy: QuiescencePolicy,
+    before: EnvironmentSnapshot,
+    between_records: EnvironmentSnapshot,
+    after: EnvironmentSnapshot,
+    max_runqueue_wait_ratio: f64,
+    before_quiescence_admitted: bool,
+    between_records_quiescence_admitted: bool,
+    after_quiescence_admitted: bool,
+    affinity_stable: bool,
+    scheduler_stats_stayed_enabled: bool,
+    directory_scheduler_admitted: bool,
+    event_scheduler_admitted: bool,
+    environment_admitted: bool,
+    directory: RawRecordEvidenceV3,
+    event: RawRecordEvidenceV3,
+    declared_wall_clock_criteria_satisfied: bool,
+}
+
+impl RawTimingEvidenceV3 {
+    const fn reported_admission(&self) -> EnvironmentAdmission {
+        EnvironmentAdmission {
+            before_quiescence_admitted: self.before_quiescence_admitted,
+            between_records_quiescence_admitted: self.between_records_quiescence_admitted,
+            after_quiescence_admitted: self.after_quiescence_admitted,
+            affinity_stable: self.affinity_stable,
+            scheduler_stats_stayed_enabled: self.scheduler_stats_stayed_enabled,
+            directory_scheduler_admitted: self.directory_scheduler_admitted,
+            event_scheduler_admitted: self.event_scheduler_admitted,
+            environment_admitted: self.environment_admitted,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRecordEvidenceV3 {
+    kind: RostlTimingRecordKind,
+    capacity: usize,
+    initial_occupancy: usize,
+    measured_start_occupancy: usize,
+    measured_last_pre_occupancy: usize,
+    final_occupancy: usize,
+    growth_per_pair: usize,
+    table_count: usize,
+    state_control: String,
+    label_assignment: String,
+    order_blocking: String,
+    record_model: String,
+    plan: ExperimentPlan,
+    report_seed: TimingSeed,
+    raw_pairs: Vec<Pair>,
+    report: EquivalenceReport,
+    timed_scheduler: RostlTimingSchedulerSummary,
+    scheduler_admitted: bool,
+}
+
 fn validate_raw_timing_v3(
     bytes: &[u8],
     inputs: &TimingRunInputs,
     expected_runner_version: &str,
-) -> Result<bool, TimingAttemptError> {
-    if bytes.last().copied() != Some(b'\n') {
+    cpu_environment_before: &CpuEnvironmentV1,
+    cpu_environment_after: &CpuEnvironmentV1,
+) -> Result<crate::timing_driver::RunOutcome, TimingAttemptError> {
+    if bytes.len() > maximum_timing_v3_bytes(inputs)? || bytes.last().copied() != Some(b'\n') {
         return Err(TimingAttemptError::InvalidLedger {
-            reason: "raw timing-v3 evidence lacks its required trailing newline",
+            reason: "raw timing-v3 evidence exceeds its cell bound or lacks a trailing newline",
         });
     }
-    let value: serde_json::Value = serde_json::from_slice(bytes)?;
-    expect_json(
-        &value,
-        &["schema"],
-        serde_json::json!(TIMING_EVIDENCE_SCHEMA),
-    )?;
-    expect_json(
-        &value,
-        &["runner_version"],
-        serde_json::json!(expected_runner_version),
-    )?;
-    expect_json(&value, &["platform_os"], serde_json::json!("linux"))?;
-    expect_json(&value, &["platform_arch"], serde_json::json!("x86_64"))?;
-    expect_json(&value, &["mode"], serde_json::to_value(inputs.mode())?)?;
-    expect_json(
-        &value,
-        &["evidence_intent"],
-        serde_json::to_value(EvidenceIntent::QualificationCandidate)?,
-    )?;
-    expect_json(&value, &["wall_clock_only"], serde_json::json!(true))?;
-    expect_json(
-        &value,
-        &["physical_trace_complete"],
-        serde_json::json!(false),
-    )?;
-    expect_json(&value, &["oram_state_seed_bound"], serde_json::json!(false))?;
-    expect_json(
-        &value,
-        &["serial_independence_established"],
-        serde_json::json!(false),
-    )?;
-    expect_json(
-        &value,
-        &["target_projection_model"],
-        serde_json::json!(TARGET_PROJECTION_MODEL),
-    )?;
-    expect_json(
-        &value,
-        &["target_projection_model_implemented"],
-        serde_json::json!(false),
-    )?;
-    expect_json(&value, &["can_clear_gate2"], serde_json::json!(false))?;
-    expect_json(
-        &value,
-        &["policy", "max_load_average_1m"],
-        serde_json::json!(inputs.max_load_average_1m()),
-    )?;
-    expect_json(
-        &value,
-        &["policy", "max_competing_processes"],
-        serde_json::json!(inputs.max_competing_processes()),
-    )?;
-    expect_json(
-        &value,
-        &["max_runqueue_wait_ratio"],
-        serde_json::json!(inputs.max_runqueue_wait_ratio()),
-    )?;
-    validate_raw_record(
-        &value,
-        "directory",
-        inputs.directory_capacity(),
-        inputs.directory_initial_occupancy(),
-        inputs,
-        DIRECTORY_SCHEDULE_SEED_DOMAIN,
-        DIRECTORY_REPORT_SEED_DOMAIN,
-    )?;
-    validate_raw_record(
-        &value,
-        "event",
-        inputs.event_capacity(),
-        inputs.event_initial_occupancy(),
-        inputs,
-        EVENT_SCHEDULE_SEED_DOMAIN,
-        EVENT_REPORT_SEED_DOMAIN,
-    )?;
-    let declared = json_path(&value, &["declared_wall_clock_criteria_satisfied"])?
-        .as_bool()
-        .ok_or(TimingAttemptError::InvalidLedger {
-            reason: "raw timing-v3 completion flag is not boolean",
-        })?;
-    let environment_admitted = required_bool(&value, &["environment_admitted"])?;
-    let directory_bounds_satisfied =
-        required_bool(&value, &["directory", "report", "bounds_satisfied"])?;
-    let event_bounds_satisfied = required_bool(&value, &["event", "report", "bounds_satisfied"])?;
-    if declared != (environment_admitted && directory_bounds_satisfied && event_bounds_satisfied) {
-        return Err(TimingAttemptError::InvalidLedger {
-            reason: "raw timing-v3 completion flag is internally inconsistent",
-        });
-    }
-    if required_bool(&value, &["directory_scheduler_admitted"])?
-        != required_bool(&value, &["directory", "scheduler_admitted"])?
-        || required_bool(&value, &["event_scheduler_admitted"])?
-            != required_bool(&value, &["event", "scheduler_admitted"])?
+    let evidence: RawTimingEvidenceV3 = serde_json::from_slice(bytes)?;
+    let expected_policy = QuiescencePolicy::new(
+        inputs.max_load_average_1m(),
+        inputs.max_competing_processes(),
+    );
+    if evidence.schema != TIMING_EVIDENCE_SCHEMA
+        || evidence.runner_version != expected_runner_version
+        || evidence.platform_os != "linux"
+        || evidence.platform_arch != "x86_64"
+        || evidence.mode != inputs.mode()
+        || evidence.evidence_intent != EvidenceIntent::QualificationCandidate
+        || evidence.minimum_qualification_pairs != MINIMUM_PAIRS
+        || !evidence.wall_clock_only
+        || evidence.physical_trace_complete
+        || evidence.oram_state_seed_bound
+        || evidence.serial_independence_established
+        || evidence.statistical_scope != STATISTICAL_SCOPE
+        || evidence.target_projection_model != TARGET_PROJECTION_MODEL
+        || evidence.target_projection_model_implemented
+        || evidence.timed_operation_model != timed_operation_model(inputs.mode())
+        || evidence.cover_insertions_per_table_per_pair != 1
+        || evidence.cover_physical_order != [0, 1]
+        || evidence.table_set_relation != table_set_relation(inputs.mode())
+        || evidence.can_clear_gate2
+        || evidence.policy != expected_policy
+        || evidence.max_runqueue_wait_ratio != inputs.max_runqueue_wait_ratio()
     {
         return Err(TimingAttemptError::InvalidLedger {
-            reason: "raw timing-v3 scheduler admission is internally inconsistent",
+            reason: "raw timing-v3 fixed contract differs from its manifest cell",
         });
     }
-    Ok(declared)
+    let directory = validate_raw_record(
+        &evidence.directory,
+        RawRecordContract::directory(inputs),
+        inputs,
+    )?;
+    let event = validate_raw_record(&evidence.event, RawRecordContract::event(inputs), inputs)?;
+    validate_raw_environment_binding(
+        &evidence.before,
+        &evidence.between_records,
+        &evidence.after,
+        cpu_environment_before,
+        cpu_environment_after,
+    )?;
+    let pinned_cpu = cpu_environment_before.selected_cpu;
+    let recomputed_admission = evaluate_environment_admission(
+        &evidence.policy,
+        pinned_cpu,
+        &evidence.before,
+        &evidence.between_records,
+        &evidence.after,
+        directory.scheduler_admitted,
+        event.scheduler_admitted,
+    );
+    if evidence.reported_admission() != recomputed_admission {
+        return Err(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 environment admission differs from independent evaluation",
+        });
+    }
+    let declared = recomputed_admission.environment_admitted
+        && directory.bounds_satisfied
+        && event.bounds_satisfied;
+    if evidence.declared_wall_clock_criteria_satisfied != declared {
+        return Err(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 completion differs from independent evaluation",
+        });
+    }
+    Ok(crate::timing_driver::RunOutcome {
+        evidence_intent: evidence.evidence_intent,
+        environment_admitted: recomputed_admission.environment_admitted,
+        declared_wall_clock_criteria_satisfied: declared,
+    })
+}
+
+fn maximum_timing_v3_bytes(inputs: &TimingRunInputs) -> Result<usize, TimingAttemptError> {
+    inputs
+        .pairs()
+        .checked_mul(MAX_TIMING_V3_BYTES_PER_PAIR)
+        .and_then(|pair_bytes| pair_bytes.checked_add(MAX_TIMING_V3_FIXED_BYTES))
+        .map(|cell_bound| cell_bound.min(MAX_TIMING_V3_BYTES))
+        .ok_or(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 byte bound overflows",
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RawRecordContract {
+    kind: RostlTimingRecordKind,
+    capacity: usize,
+    initial_occupancy: usize,
+    record_model: &'static str,
+    schedule_seed_domain: u64,
+    report_seed_domain: u64,
+}
+
+impl RawRecordContract {
+    const fn directory(inputs: &TimingRunInputs) -> Self {
+        Self {
+            kind: RostlTimingRecordKind::Directory,
+            capacity: inputs.directory_capacity(),
+            initial_occupancy: inputs.directory_initial_occupancy(),
+            record_model: DIRECTORY_RECORD_MODEL,
+            schedule_seed_domain: DIRECTORY_SCHEDULE_SEED_DOMAIN,
+            report_seed_domain: DIRECTORY_REPORT_SEED_DOMAIN,
+        }
+    }
+
+    const fn event(inputs: &TimingRunInputs) -> Self {
+        Self {
+            kind: RostlTimingRecordKind::Event,
+            capacity: inputs.event_capacity(),
+            initial_occupancy: inputs.event_initial_occupancy(),
+            record_model: EVENT_RECORD_MODEL,
+            schedule_seed_domain: EVENT_SCHEDULE_SEED_DOMAIN,
+            report_seed_domain: EVENT_REPORT_SEED_DOMAIN,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RawRecordVerification {
+    bounds_satisfied: bool,
+    scheduler_admitted: bool,
 }
 
 fn validate_raw_record(
-    value: &serde_json::Value,
-    name: &'static str,
-    capacity: usize,
-    initial_occupancy: usize,
+    record: &RawRecordEvidenceV3,
+    contract: RawRecordContract,
     inputs: &TimingRunInputs,
-    schedule_seed_domain: u64,
-    report_seed_domain: u64,
-) -> Result<(), TimingAttemptError> {
-    expect_json(value, &[name, "capacity"], serde_json::json!(capacity))?;
-    expect_json(
-        value,
-        &[name, "initial_occupancy"],
-        serde_json::json!(initial_occupancy),
-    )?;
-    expect_json(
-        value,
-        &[name, "plan", "pairs"],
-        serde_json::json!(inputs.pairs()),
-    )?;
-    expect_json(
-        value,
-        &[name, "plan", "warmup_pairs"],
-        serde_json::json!(inputs.warmup_pairs()),
-    )?;
-    let total_pairs = inputs.pairs().checked_add(inputs.warmup_pairs()).ok_or(
+) -> Result<RawRecordVerification, TimingAttemptError> {
+    let plan = ExperimentPlan::new(
+        inputs.pairs(),
+        inputs.warmup_pairs(),
+        TimingSeed::new(derive_seed(inputs.seed(), contract.schedule_seed_domain)),
+    )
+    .map_err(|_| TimingAttemptError::InvalidLedger {
+        reason: "raw timing-v3 manifest plan cannot be evaluated",
+    })?;
+    let occupancy = occupancy_window(contract.initial_occupancy, &plan).map_err(|_| {
         TimingAttemptError::InvalidLedger {
-            reason: "raw timing-v3 pair count overflows",
-        },
-    )?;
-    expect_json(
-        value,
-        &[name, "plan", "total_pairs"],
-        serde_json::json!(total_pairs),
-    )?;
-    expect_json(
-        value,
-        &[name, "plan", "seed"],
-        serde_json::json!(derive_seed(inputs.seed(), schedule_seed_domain)),
-    )?;
-    expect_json(
-        value,
-        &[name, "report_seed"],
-        serde_json::json!(derive_seed(inputs.seed(), report_seed_domain)),
-    )?;
-    expect_json(
-        value,
-        &[name, "report", "pairs"],
-        serde_json::json!(inputs.pairs()),
-    )?;
-    expect_json(
-        value,
-        &[name, "report", "mean_equivalence_bound_nanos"],
-        serde_json::json!(inputs.mean_bound_nanos()),
-    )?;
-    expect_json(
-        value,
-        &[name, "report", "cdf_distance_bound"],
-        serde_json::json!(inputs.cdf_distance_bound()),
-    )?;
-    expect_json(
-        value,
-        &[name, "report", "seed"],
-        serde_json::json!(derive_seed(inputs.seed(), report_seed_domain)),
-    )?;
-    let pairs = json_path(value, &[name, "raw_pairs"])?.as_array().ok_or(
-        TimingAttemptError::InvalidLedger {
-            reason: "raw timing-v3 pairs field is not an array",
-        },
-    )?;
-    if pairs.len() != inputs.pairs() {
+            reason: "raw timing-v3 occupancy window cannot be evaluated",
+        }
+    })?;
+    let report_seed = TimingSeed::new(derive_seed(inputs.seed(), contract.report_seed_domain));
+    if record.kind != contract.kind
+        || record.capacity != contract.capacity
+        || record.initial_occupancy != occupancy.initial
+        || record.measured_start_occupancy != occupancy.measured_start
+        || record.measured_last_pre_occupancy != occupancy.measured_last_pre
+        || record.final_occupancy != occupancy.final_occupancy
+        || record.growth_per_pair != 1
+        || record.table_count != 2
+        || record.state_control != STATE_CONTROL
+        || record.label_assignment != LABEL_ASSIGNMENT
+        || record.order_blocking != ORDER_BLOCKING
+        || record.record_model != contract.record_model
+        || record.plan != plan
+        || record.report_seed != report_seed
+    {
+        return Err(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 record contract differs from its manifest cell",
+        });
+    }
+    if record.raw_pairs.len() != inputs.pairs() {
         return Err(TimingAttemptError::InvalidLedger {
             reason: "raw timing-v3 pair count does not match the manifest cell",
         });
     }
-    Ok(())
+    if !timing_pair_orders_match_plan(&plan, &record.raw_pairs) {
+        return Err(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 pair order differs from the predeclared seeded schedule",
+        });
+    }
+    let bounds = EquivalenceBounds::new(inputs.mean_bound_nanos(), inputs.cdf_distance_bound())
+        .map_err(|_| TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 manifest bounds cannot be evaluated",
+        })?;
+    let recomputed_report = evaluate_timing_equivalence(&record.raw_pairs, bounds, report_seed);
+    if record.report != recomputed_report {
+        return Err(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 report differs from independent sample evaluation",
+        });
+    }
+    let recomputed_scheduler =
+        summarize_rostl_timing_scheduler(&record.raw_pairs).map_err(|_| {
+            TimingAttemptError::InvalidLedger {
+                reason: "raw timing-v3 scheduler samples cannot be evaluated",
+            }
+        })?;
+    if record.timed_scheduler != recomputed_scheduler {
+        return Err(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 scheduler summary differs from independent sample evaluation",
+        });
+    }
+    let scheduler_admitted = recomputed_scheduler.admits(inputs.max_runqueue_wait_ratio());
+    if record.scheduler_admitted != scheduler_admitted {
+        return Err(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 scheduler admission differs from independent evaluation",
+        });
+    }
+    Ok(RawRecordVerification {
+        bounds_satisfied: recomputed_report.bounds_satisfied(),
+        scheduler_admitted,
+    })
 }
 
-fn expect_json(
-    value: &serde_json::Value,
-    path: &[&str],
-    expected: serde_json::Value,
+fn validate_raw_environment_binding(
+    before: &EnvironmentSnapshot,
+    between_records: &EnvironmentSnapshot,
+    after: &EnvironmentSnapshot,
+    cpu_environment_before: &CpuEnvironmentV1,
+    cpu_environment_after: &CpuEnvironmentV1,
 ) -> Result<(), TimingAttemptError> {
-    if json_path(value, path)? == &expected {
-        Ok(())
-    } else {
-        Err(TimingAttemptError::InvalidLedger {
-            reason: "raw timing-v3 field does not match its manifest cell",
-        })
+    let selected_cpu = cpu_environment_before.selected_cpu;
+    let every_snapshot_is_singly_pinned = [before, between_records, after].iter().all(|snapshot| {
+        snapshot.allowed_cpu == Some(selected_cpu)
+            && single_allowed_cpu(&snapshot.cpus_allowed_list) == Some(selected_cpu)
+    });
+    if !every_snapshot_is_singly_pinned
+        || before.allowed_cpu != Some(cpu_environment_before.selected_cpu)
+        || before.cpus_allowed_list != cpu_environment_before.cpus_allowed_list
+        || before.scheduler_stats_enabled != cpu_environment_before.scheduler_stats_enabled
+        || after.allowed_cpu != Some(cpu_environment_after.selected_cpu)
+        || after.cpus_allowed_list != cpu_environment_after.cpus_allowed_list
+        || after.scheduler_stats_enabled != cpu_environment_after.scheduler_stats_enabled
+    {
+        return Err(TimingAttemptError::InvalidLedger {
+            reason: "raw timing-v3 environment snapshots differ from attempt CPU bindings",
+        });
     }
-}
-
-fn json_path<'a>(
-    value: &'a serde_json::Value,
-    path: &[&str],
-) -> Result<&'a serde_json::Value, TimingAttemptError> {
-    let mut current = value;
-    for component in path {
-        current = current
-            .get(component)
-            .ok_or(TimingAttemptError::InvalidLedger {
-                reason: "raw timing-v3 evidence is missing a required field",
-            })?;
-    }
-    Ok(current)
-}
-
-fn required_bool(value: &serde_json::Value, path: &[&str]) -> Result<bool, TimingAttemptError> {
-    json_path(value, path)?
-        .as_bool()
-        .ok_or(TimingAttemptError::InvalidLedger {
-            reason: "raw timing-v3 required boolean field is invalid",
-        })
+    Ok(())
 }
 
 fn attempt_id(manifest: &TimingManifestRecordBindingV1, cell: &TimingExecutionCellV1) -> String {
@@ -1914,7 +2104,8 @@ impl From<serde_json::Error> for TimingAttemptError {
 mod tests {
     use super::*;
     use crate::gate2::manifest::{
-        test_admitted_timing_manifest, test_admitted_timing_manifest_with_runner,
+        test_admitted_timing_manifest, test_admitted_timing_manifest_with_pairs,
+        test_admitted_timing_manifest_with_runner,
     };
     use std::error::Error;
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -2015,7 +2206,7 @@ mod tests {
             .ok_or(TimingAttemptError::InvalidLedger {
                 reason: "test cell ordinal is outside the manifest",
             })?;
-        let record = AttemptRecordV1::new(
+        let record = AttemptRecordV2::new(
             sequence,
             previous,
             manifest.record_binding(),
@@ -2049,7 +2240,7 @@ mod tests {
         failure_stage: StartedErrorStageV1,
         error_code: &str,
         runner_version: &str,
-    ) -> Result<AttemptRecordV1, TimingAttemptError> {
+    ) -> Result<AttemptRecordV2, TimingAttemptError> {
         let cell = started.record.cell.clone();
         terminal_record(
             manifest,
@@ -2088,7 +2279,7 @@ mod tests {
         terminal_runner_version: &str,
         raw_runner_version: &str,
         declared: bool,
-    ) -> Result<(AttemptRecordV1, Vec<u8>), TimingAttemptError> {
+    ) -> Result<(AttemptRecordV2, Vec<u8>), TimingAttemptError> {
         let cell = started.record.cell.clone();
         let raw_bytes = raw_v3_bytes(cell.inputs(), declared, raw_runner_version)?;
         let raw = RawTimingBindingV1 {
@@ -2121,32 +2312,18 @@ mod tests {
         inputs: &TimingRunInputs,
         declared: bool,
         runner_version: &str,
-    ) -> Result<Vec<u8>, serde_json::Error> {
-        let record = |capacity: usize,
-                      initial_occupancy: usize,
-                      schedule_domain: u64,
-                      report_domain: u64| {
-            serde_json::json!({
-                "capacity": capacity,
-                "initial_occupancy": initial_occupancy,
-                "plan": {
-                    "pairs": inputs.pairs(),
-                    "warmup_pairs": inputs.warmup_pairs(),
-                    "total_pairs": inputs.pairs() + inputs.warmup_pairs(),
-                    "seed": derive_seed(inputs.seed(), schedule_domain),
-                },
-                "report_seed": derive_seed(inputs.seed(), report_domain),
-                "raw_pairs": vec![serde_json::json!({}); inputs.pairs()],
-                "report": {
-                    "pairs": inputs.pairs(),
-                    "mean_equivalence_bound_nanos": inputs.mean_bound_nanos(),
-                    "cdf_distance_bound": inputs.cdf_distance_bound(),
-                    "bounds_satisfied": declared,
-                    "seed": derive_seed(inputs.seed(), report_domain),
-                },
-                "scheduler_admitted": true,
-            })
-        };
+    ) -> Result<Vec<u8>, TimingAttemptError> {
+        let (directory, directory_bounds_satisfied) =
+            raw_record_value(inputs, RawRecordContract::directory(inputs), declared)?;
+        let (event, event_bounds_satisfied) =
+            raw_record_value(inputs, RawRecordContract::event(inputs), declared)?;
+        let recomputed_declared = directory_bounds_satisfied && event_bounds_satisfied;
+        if recomputed_declared != declared {
+            return Err(TimingAttemptError::InvalidLedger {
+                reason: "test timing samples cannot represent the requested outcome",
+            });
+        }
+        let snapshot = raw_environment_snapshot();
         let value = serde_json::json!({
             "schema": TIMING_EVIDENCE_SCHEMA,
             "runner_version": runner_version,
@@ -2154,38 +2331,179 @@ mod tests {
             "platform_arch": "x86_64",
             "mode": inputs.mode(),
             "evidence_intent": EvidenceIntent::QualificationCandidate,
+            "minimum_qualification_pairs": MINIMUM_PAIRS,
             "wall_clock_only": true,
             "physical_trace_complete": false,
             "oram_state_seed_bound": false,
             "serial_independence_established": false,
+            "statistical_scope": STATISTICAL_SCOPE,
             "target_projection_model": TARGET_PROJECTION_MODEL,
             "target_projection_model_implemented": false,
+            "timed_operation_model": timed_operation_model(inputs.mode()),
+            "cover_insertions_per_table_per_pair": 1,
+            "cover_physical_order": [0, 1],
+            "table_set_relation": table_set_relation(inputs.mode()),
             "can_clear_gate2": false,
             "policy": {
                 "max_load_average_1m": inputs.max_load_average_1m(),
                 "max_competing_processes": inputs.max_competing_processes(),
             },
             "max_runqueue_wait_ratio": inputs.max_runqueue_wait_ratio(),
+            "before": snapshot,
+            "between_records": raw_environment_snapshot(),
+            "after": raw_environment_snapshot(),
+            "before_quiescence_admitted": true,
+            "between_records_quiescence_admitted": true,
+            "after_quiescence_admitted": true,
+            "affinity_stable": true,
+            "scheduler_stats_stayed_enabled": true,
             "environment_admitted": true,
             "directory_scheduler_admitted": true,
             "event_scheduler_admitted": true,
-            "directory": record(
-                inputs.directory_capacity(),
-                inputs.directory_initial_occupancy(),
-                DIRECTORY_SCHEDULE_SEED_DOMAIN,
-                DIRECTORY_REPORT_SEED_DOMAIN,
-            ),
-            "event": record(
-                inputs.event_capacity(),
-                inputs.event_initial_occupancy(),
-                EVENT_SCHEDULE_SEED_DOMAIN,
-                EVENT_REPORT_SEED_DOMAIN,
-            ),
+            "directory": directory,
+            "event": event,
             "declared_wall_clock_criteria_satisfied": declared,
         });
         let mut bytes = serde_json::to_vec_pretty(&value)?;
         bytes.push(b'\n');
         Ok(bytes)
+    }
+
+    fn raw_record_value(
+        inputs: &TimingRunInputs,
+        contract: RawRecordContract,
+        should_meet_bounds: bool,
+    ) -> Result<(serde_json::Value, bool), TimingAttemptError> {
+        let plan = ExperimentPlan::new(
+            inputs.pairs(),
+            inputs.warmup_pairs(),
+            TimingSeed::new(derive_seed(inputs.seed(), contract.schedule_seed_domain)),
+        )
+        .map_err(|_| TimingAttemptError::InvalidLedger {
+            reason: "test timing plan is invalid",
+        })?;
+        let occupancy = occupancy_window(contract.initial_occupancy, &plan).map_err(|_| {
+            TimingAttemptError::InvalidLedger {
+                reason: "test timing occupancy window is invalid",
+            }
+        })?;
+        let pairs = raw_pairs(&plan, should_meet_bounds)?;
+        let bounds = EquivalenceBounds::new(inputs.mean_bound_nanos(), inputs.cdf_distance_bound())
+            .map_err(|_| TimingAttemptError::InvalidLedger {
+                reason: "test timing bounds are invalid",
+            })?;
+        let report_seed = TimingSeed::new(derive_seed(inputs.seed(), contract.report_seed_domain));
+        let report = evaluate_timing_equivalence(&pairs, bounds, report_seed);
+        let bounds_satisfied = report.bounds_satisfied();
+        let timed_scheduler = summarize_rostl_timing_scheduler(&pairs).map_err(|_| {
+            TimingAttemptError::InvalidLedger {
+                reason: "test timing scheduler samples are invalid",
+            }
+        })?;
+        Ok((
+            serde_json::json!({
+                "kind": contract.kind,
+                "capacity": contract.capacity,
+                "initial_occupancy": contract.initial_occupancy,
+                "measured_start_occupancy": occupancy.measured_start,
+                "measured_last_pre_occupancy": occupancy.measured_last_pre,
+                "final_occupancy": occupancy.final_occupancy,
+                "growth_per_pair": 1,
+                "table_count": 2,
+                "state_control": STATE_CONTROL,
+                "label_assignment": LABEL_ASSIGNMENT,
+                "order_blocking": ORDER_BLOCKING,
+                "record_model": contract.record_model,
+                "plan": plan,
+                "report_seed": report_seed,
+                "raw_pairs": pairs,
+                "report": report,
+                "timed_scheduler": timed_scheduler,
+                "scheduler_admitted": true,
+            }),
+            bounds_satisfied,
+        ))
+    }
+
+    fn raw_pairs(
+        plan: &ExperimentPlan,
+        should_meet_bounds: bool,
+    ) -> Result<Vec<Pair>, TimingAttemptError> {
+        let hit_nanos = if should_meet_bounds { 100 } else { 10_000 };
+        expected_timing_pair_orders(plan)
+            .into_iter()
+            .map(|order| {
+                serde_json::from_value(serde_json::json!({
+                    "hit_nanos": hit_nanos,
+                    "miss_nanos": 100,
+                    "order": order,
+                    "hit_scheduler": {
+                        "cpu_time_nanos": 90,
+                        "runqueue_wait_nanos": 0,
+                        "timeslices": 1,
+                    },
+                    "miss_scheduler": {
+                        "cpu_time_nanos": 90,
+                        "runqueue_wait_nanos": 0,
+                        "timeslices": 1,
+                    },
+                }))
+                .map_err(TimingAttemptError::from)
+            })
+            .collect()
+    }
+
+    fn raw_environment_snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "cpus_allowed_list": "7",
+            "allowed_cpu": 7,
+            "quiescence": {
+                "load_average_1m": 0.0,
+                "competing_processes": 0,
+            },
+            "scheduler_stats_enabled": true,
+        })
+    }
+
+    fn encode_raw_value(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+        let mut bytes = serde_json::to_vec_pretty(value)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn recompute_raw_record_analysis(
+        value: &mut serde_json::Value,
+        name: &str,
+        inputs: &TimingRunInputs,
+        report_seed_domain: u64,
+    ) -> TestResult<bool> {
+        let pairs: Vec<Pair> = serde_json::from_value(value[name]["raw_pairs"].clone())?;
+        let bounds =
+            EquivalenceBounds::new(inputs.mean_bound_nanos(), inputs.cdf_distance_bound())?;
+        let report_seed = TimingSeed::new(derive_seed(inputs.seed(), report_seed_domain));
+        value[name]["report"] =
+            serde_json::to_value(evaluate_timing_equivalence(&pairs, bounds, report_seed))?;
+        let scheduler = summarize_rostl_timing_scheduler(&pairs)?;
+        let scheduler_admitted = scheduler.admits(inputs.max_runqueue_wait_ratio());
+        value[name]["timed_scheduler"] = serde_json::to_value(scheduler)?;
+        value[name]["scheduler_admitted"] = serde_json::json!(scheduler_admitted);
+        Ok(scheduler_admitted)
+    }
+
+    fn validate_test_raw_value(
+        value: &serde_json::Value,
+        inputs: &TimingRunInputs,
+        runner_version: &str,
+    ) -> Result<crate::timing_driver::RunOutcome, TimingAttemptError> {
+        let bytes = encode_raw_value(value)?;
+        let cpu_environment = environment();
+        validate_raw_timing_v3(
+            &bytes,
+            inputs,
+            runner_version,
+            &cpu_environment,
+            &cpu_environment,
+        )
     }
 
     type MalformedLedgerBuilder =
@@ -2220,7 +2538,7 @@ mod tests {
                 reason: "test manifest has no first cell",
             })?;
         let raw_bytes = raw_v3_bytes(cell.inputs(), false, "test-runner")?;
-        let record = AttemptRecordV1::new(
+        let record = AttemptRecordV2::new(
             0,
             None,
             manifest.record_binding(),
@@ -2367,7 +2685,7 @@ mod tests {
         let ledger = load_ledger(&directory, &manifest)?;
         let summary = ledger.summary(&manifest, false);
         assert!(summary.all_cells_terminal());
-        assert!(!summary.all_cells_declared_positive());
+        assert!(!summary.wall_clock_matrix_recomputed_positive());
         assert_eq!(summary.positive_cells(), 0);
         assert_eq!(summary.negative_cells(), 0);
         assert_eq!(summary.started_error_cells(), 1);
@@ -2396,14 +2714,14 @@ mod tests {
             started,
             "archived-runner",
             "archived-runner",
-            true,
+            false,
         )?;
 
         let ledger = load_ledger(&directory, &manifest)?;
         let summary = ledger.summary(&manifest, false);
         assert!(summary.all_cells_terminal());
-        assert!(summary.all_cells_declared_positive());
-        assert_eq!(summary.positive_cells(), 1);
+        assert!(!summary.wall_clock_matrix_recomputed_positive());
+        assert_eq!(summary.negative_cells(), 1);
         Ok(())
     }
 
@@ -2413,7 +2731,7 @@ mod tests {
         let path = parent.path().join("ledger");
         fs::create_dir(&path)?;
         let directory = open_artifact_directory(&path)?;
-        let manifest = test_admitted_timing_manifest(2);
+        let manifest = test_admitted_timing_manifest_with_pairs(2, 500, 1.0);
         let started_zero = append_started(&directory, &manifest, 0, 0, None)?;
         let terminal_zero = append_completed(
             &directory,
@@ -2444,7 +2762,7 @@ mod tests {
 
         let summary = load_ledger(&directory, &manifest)?.summary(&manifest, false);
         assert!(summary.all_cells_terminal());
-        assert!(!summary.all_cells_declared_positive());
+        assert!(!summary.wall_clock_matrix_recomputed_positive());
         assert_eq!(summary.positive_cells(), 1);
         assert_eq!(summary.negative_cells(), 1);
         assert_eq!(summary.started_error_cells(), 0);
@@ -2472,7 +2790,7 @@ mod tests {
             &started,
             "archived-runner",
             "archived-runner",
-            true,
+            false,
         )?;
         terminal.record_writer_version = "newer-runner".to_owned();
         let _terminal = append_record(&directory, terminal, Some(&raw_bytes))?;
@@ -2495,7 +2813,7 @@ mod tests {
             started,
             "test-runner",
             "test-runner",
-            true,
+            false,
         )?;
         let raw_path = path
             .join(link_name(terminal.record.sequence))
@@ -2662,7 +2980,7 @@ mod tests {
         assert_eq!(ledger.started_error_cells, 1);
         let terminal_directory =
             open_artifact_child_directory(&directory, OsStr::new(&link_name(1)))?;
-        let terminal: AttemptRecordV1 = serde_json::from_slice(&read_artifact_file(
+        let terminal: AttemptRecordV2 = serde_json::from_slice(&read_artifact_file(
             &terminal_directory,
             RECORD_JSON,
             MAX_RECORD_BYTES,
@@ -2729,15 +3047,192 @@ mod tests {
             .first()
             .ok_or_else(|| io::Error::other("test manifest has no timing cell"))?
             .inputs();
-        let bytes = raw_v3_bytes(inputs, true, "archived-runner")?;
-        assert!(validate_raw_timing_v3(&bytes, inputs, "archived-runner")?);
+        let bytes = raw_v3_bytes(inputs, false, "archived-runner")?;
+        let cpu_environment = environment();
+        assert!(!validate_raw_timing_v3(
+            &bytes,
+            inputs,
+            "archived-runner",
+            &cpu_environment,
+            &cpu_environment,
+        )?
+        .declared_wall_clock_criteria_satisfied());
 
         let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
         value["mode"] = serde_json::json!("forced_miss");
         let mut tampered = serde_json::to_vec_pretty(&value)?;
         tampered.push(b'\n');
-        assert!(validate_raw_timing_v3(&tampered, inputs, "archived-runner").is_err());
-        assert!(validate_raw_timing_v3(&bytes, inputs, "newer-inspector").is_err());
+        assert!(validate_raw_timing_v3(
+            &tampered,
+            inputs,
+            "archived-runner",
+            &cpu_environment,
+            &cpu_environment,
+        )
+        .is_err());
+        assert!(validate_raw_timing_v3(
+            &bytes,
+            inputs,
+            "newer-inspector",
+            &cpu_environment,
+            &cpu_environment,
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_v3_recomputation_accepts_scheduler_and_quiescence_negative_outcomes() -> TestResult {
+        let manifest = test_admitted_timing_manifest_with_pairs(1, 500, 1.0);
+        let inputs = manifest
+            .cells()
+            .first()
+            .ok_or_else(|| io::Error::other("test manifest has no timing cell"))?
+            .inputs();
+        let positive_bytes = raw_v3_bytes(inputs, true, "test-runner")?;
+        let positive: serde_json::Value = serde_json::from_slice(&positive_bytes)?;
+
+        let mut scheduler_negative = positive.clone();
+        scheduler_negative["directory"]["raw_pairs"][0]["hit_scheduler"]["runqueue_wait_nanos"] =
+            serde_json::json!(100);
+        assert!(!recompute_raw_record_analysis(
+            &mut scheduler_negative,
+            "directory",
+            inputs,
+            DIRECTORY_REPORT_SEED_DOMAIN,
+        )?);
+        scheduler_negative["directory_scheduler_admitted"] = serde_json::json!(false);
+        scheduler_negative["environment_admitted"] = serde_json::json!(false);
+        scheduler_negative["declared_wall_clock_criteria_satisfied"] = serde_json::json!(false);
+        let scheduler_outcome =
+            validate_test_raw_value(&scheduler_negative, inputs, "test-runner")?;
+        assert!(!scheduler_outcome.environment_admitted());
+        assert!(!scheduler_outcome.declared_wall_clock_criteria_satisfied());
+
+        let mut quiescence_negative = positive;
+        quiescence_negative["after"]["quiescence"]["load_average_1m"] = serde_json::json!(2.0);
+        quiescence_negative["after_quiescence_admitted"] = serde_json::json!(false);
+        quiescence_negative["environment_admitted"] = serde_json::json!(false);
+        quiescence_negative["declared_wall_clock_criteria_satisfied"] = serde_json::json!(false);
+        let quiescence_outcome =
+            validate_test_raw_value(&quiescence_negative, inputs, "test-runner")?;
+        assert!(!quiescence_outcome.environment_admitted());
+        assert!(!quiescence_outcome.declared_wall_clock_criteria_satisfied());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_v3_recomputation_rejects_independent_outcome_tampering() -> TestResult {
+        let manifest = test_admitted_timing_manifest(1);
+        let inputs = manifest
+            .cells()
+            .first()
+            .ok_or_else(|| io::Error::other("test manifest has no timing cell"))?
+            .inputs();
+        let bytes = raw_v3_bytes(inputs, false, "test-runner")?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        let mut duration = value.clone();
+        duration["directory"]["raw_pairs"][0]["hit_nanos"] = serde_json::json!(9_999);
+        let mut report = value.clone();
+        report["directory"]["report"]["mean_difference_nanos"] = serde_json::json!(1.0);
+        let mut scheduler = value.clone();
+        scheduler["directory"]["timed_scheduler"]["measurements"] = serde_json::json!(1);
+        let mut admission = value.clone();
+        admission["before_quiescence_admitted"] = serde_json::json!(false);
+        let mut declared = value;
+        declared["declared_wall_clock_criteria_satisfied"] = serde_json::json!(true);
+
+        for tampered in [duration, report, scheduler, admission, declared] {
+            assert!(validate_test_raw_value(&tampered, inputs, "test-runner").is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_v3_rejects_schedule_affinity_and_schema_forgery() -> TestResult {
+        let manifest = test_admitted_timing_manifest(1);
+        let inputs = manifest
+            .cells()
+            .first()
+            .ok_or_else(|| io::Error::other("test manifest has no timing cell"))?
+            .inputs();
+        let bytes = raw_v3_bytes(inputs, false, "test-runner")?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+        let mut schedule = value.clone();
+        schedule["directory"]["raw_pairs"][0]["order"] =
+            if schedule["directory"]["raw_pairs"][0]["order"] == "hit_first" {
+                serde_json::json!("miss_first")
+            } else {
+                serde_json::json!("hit_first")
+            };
+        let _ = recompute_raw_record_analysis(
+            &mut schedule,
+            "directory",
+            inputs,
+            DIRECTORY_REPORT_SEED_DOMAIN,
+        )?;
+        assert!(validate_test_raw_value(&schedule, inputs, "test-runner").is_err());
+
+        let mut affinity = value.clone();
+        affinity["between_records"]["cpus_allowed_list"] = serde_json::json!("0-7");
+        assert!(validate_test_raw_value(&affinity, inputs, "test-runner").is_err());
+
+        let mut unknown_top_level = value.clone();
+        unknown_top_level["unrecognized"] = serde_json::json!(true);
+        assert!(validate_test_raw_value(&unknown_top_level, inputs, "test-runner").is_err());
+
+        let mut unknown_pair = value;
+        unknown_pair["directory"]["raw_pairs"][0]["unrecognized"] = serde_json::json!(true);
+        assert!(validate_test_raw_value(&unknown_pair, inputs, "test-runner").is_err());
+
+        let raw_text = String::from_utf8(bytes)?;
+        let duplicate_schema =
+            raw_text.replacen("{\n", "{\n  \"schema\": \"zaino-oram-timing-v3\",\n", 1);
+        let cpu_environment = environment();
+        assert!(validate_raw_timing_v3(
+            duplicate_schema.as_bytes(),
+            inputs,
+            "test-runner",
+            &cpu_environment,
+            &cpu_environment,
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn coherently_rebound_forged_positive_is_rejected_on_replay() -> TestResult {
+        let parent = tempfile::tempdir()?;
+        let path = parent.path().join("ledger");
+        fs::create_dir(&path)?;
+        let directory = open_artifact_directory(&path)?;
+        let manifest = test_admitted_timing_manifest(1);
+        let started = append_started(&directory, &manifest, 0, 0, None)?;
+        let (mut terminal, raw_bytes) =
+            completed_record_and_raw(&manifest, &started, "test-runner", "test-runner", false)?;
+        let mut value: serde_json::Value = serde_json::from_slice(&raw_bytes)?;
+        value["directory"]["report"]["bounds_satisfied"] = serde_json::json!(true);
+        value["event"]["report"]["bounds_satisfied"] = serde_json::json!(true);
+        value["declared_wall_clock_criteria_satisfied"] = serde_json::json!(true);
+        let forged_raw = encode_raw_value(&value)?;
+        let payload = match &terminal.state {
+            AttemptStateV1::CompletedNegative(payload) => payload.clone(),
+            _ => return Err(io::Error::other("test terminal is not negative").into()),
+        };
+        let mut forged_payload = payload;
+        forged_payload.raw.blake2s256 = artifact_blake2s256_hex(&forged_raw);
+        forged_payload.raw.size_bytes =
+            u64::try_from(forged_raw.len()).map_err(|_| io::Error::other("raw size overflow"))?;
+        forged_payload
+            .raw
+            .raw_declared_wall_clock_criteria_satisfied = true;
+        forged_payload.raw.overall_attempt_admitted = true;
+        terminal.state = AttemptStateV1::CompletedPositive(forged_payload);
+        let _terminal = append_record(&directory, terminal, Some(&forged_raw))?;
+
+        assert!(load_ledger(&directory, &manifest).is_err());
         Ok(())
     }
 

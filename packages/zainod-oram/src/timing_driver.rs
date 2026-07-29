@@ -276,7 +276,8 @@ fn start_then_execute<C, T, E, R>(
     })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EnvironmentSnapshot {
     pub(crate) cpus_allowed_list: String,
     pub(crate) allowed_cpu: Option<u32>,
@@ -306,7 +307,8 @@ pub(crate) struct RecordEvidence {
     pub(crate) scheduler_admitted: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EnvironmentAdmission {
     pub(crate) before_quiescence_admitted: bool,
     pub(crate) between_records_quiescence_admitted: bool,
@@ -585,7 +587,7 @@ fn validate_start_environment(
     Ok(())
 }
 
-pub(crate) fn evaluate_environment_admission(
+pub(super) fn evaluate_environment_admission(
     policy: &QuiescencePolicy,
     pinned_cpu: u32,
     before: &EnvironmentSnapshot,
