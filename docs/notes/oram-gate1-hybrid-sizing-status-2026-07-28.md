@@ -80,6 +80,10 @@ capture exactly.
 After local and native-CI verification, run this command against the retained
 Mainnet indexed source at the capture checkpoint when the shared builder is
 available for non-timing work. Use the source-bound result to decide whether
-the live-base/chunked-delta shape has a practical fixed profile. Only an
-accepted shape should advance to backend expansion, target-TDX RSS,
-fixed-query-work, rebuild/RTO, and failure-bound qualification.
+the live-base/chunked-delta shape has a practical fixed profile. Interpret the
+result under the pre-registered
+[hybrid-profile selection policy](oram-gate1-hybrid-profile-selection-policy-2026-07-29.md);
+the sizing result alone can name only a provisional logical finalist. Only an
+accepted qualification candidate should advance to backend expansion,
+target-TDX RSS, fixed-query-work, rebuild/RTO, and failure-bound
+qualification.
