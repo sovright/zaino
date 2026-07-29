@@ -92,6 +92,14 @@ trait FixedUniqueInsertAccess<T> {
     fn write_or_insert_and_remap(&mut self, key: usize, value: T) -> bool;
 }
 
+/// Exact-upsert access wrappers are forced into the inspected symbol while the
+/// already-qualified unique-insert wrappers retain their measured codegen.
+trait FixedExactUpsertAccess<T> {
+    fn exact_read_and_remap(&mut self, key: usize, value: &mut T) -> bool;
+
+    fn exact_write_or_insert_and_remap(&mut self, key: usize, value: T) -> bool;
+}
+
 /// Decides from public state alone whether an insertion may be attempted.
 ///
 /// This runs before the first access and deliberately cannot observe the
@@ -276,16 +284,16 @@ fn fixed_exact_upsert<T, A>(
 ) -> ExactUpsertCommit
 where
     T: Cmov + Copy + Default + Pod,
-    A: FixedUniqueInsertAccess<T>,
+    A: FixedExactUpsertAccess<T>,
 {
     let mut prior = T::default();
-    let found_before = access.read_and_remap(key, &mut prior);
+    let found_before = access.exact_read_and_remap(key, &mut prior);
     let prior_matches = fixed_width_pod_eq(&prior, &request.expected_prior);
 
     let write_replacement = !found_before | (request.expected_present & prior_matches);
     let mut selected = prior;
     selected.cmov(&request.replacement, write_replacement);
-    let found_after = access.write_or_insert_and_remap(key, selected);
+    let found_after = access.exact_write_or_insert_and_remap(key, selected);
 
     ExactUpsertCommit {
         found_before,
@@ -487,19 +495,37 @@ impl<T> FixedUniqueInsertAccess<T> for RostlTable<T>
 where
     T: Cmov + Pod + Default + Clone + fmt::Debug,
 {
-    /// Kept inside each inspected fixed-access symbol so the codegen gate does
-    /// not move protected access control flow behind an uninspected direct
-    /// call.
-    #[inline(always)]
     fn read_and_remap(&mut self, key: usize, value: &mut T) -> bool {
         let new_position = self.sample_new_position();
         let old_position = self.position_map.access_position(key, new_position);
         self.oram.read(old_position, new_position, key, value)
     }
 
-    /// See [`Self::read_and_remap`].
-    #[inline(always)]
     fn write_or_insert_and_remap(&mut self, key: usize, value: T) -> bool {
+        let new_position = self.sample_new_position();
+        let old_position = self.position_map.access_position(key, new_position);
+        self.oram
+            .write_or_insert(old_position, new_position, key, value)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl<T> FixedExactUpsertAccess<T> for RostlTable<T>
+where
+    T: Cmov + Pod + Default + Clone + fmt::Debug,
+{
+    // These two small bodies intentionally mirror `FixedUniqueInsertAccess`.
+    // A shared function cannot carry exact-upsert-only `inline(always)`
+    // semantics without also changing the qualified unique-insert symbol.
+    #[inline(always)]
+    fn exact_read_and_remap(&mut self, key: usize, value: &mut T) -> bool {
+        let new_position = self.sample_new_position();
+        let old_position = self.position_map.access_position(key, new_position);
+        self.oram.read(old_position, new_position, key, value)
+    }
+
+    #[inline(always)]
+    fn exact_write_or_insert_and_remap(&mut self, key: usize, value: T) -> bool {
         let new_position = self.sample_new_position();
         let old_position = self.position_map.access_position(key, new_position);
         self.oram
@@ -1220,6 +1246,16 @@ mod tests {
             let found = self.record.is_some();
             self.record = Some(value);
             self.forced_write_result.unwrap_or(found)
+        }
+    }
+
+    impl FixedExactUpsertAccess<u64> for FakeAccess {
+        fn exact_read_and_remap(&mut self, key: usize, value: &mut u64) -> bool {
+            self.read_and_remap(key, value)
+        }
+
+        fn exact_write_or_insert_and_remap(&mut self, key: usize, value: u64) -> bool {
+            self.write_or_insert_and_remap(key, value)
         }
     }
 
