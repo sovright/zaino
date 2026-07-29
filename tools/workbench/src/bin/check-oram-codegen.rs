@@ -72,9 +72,20 @@ const FIXED_EXACT_UPSERT_SYMBOL: &str =
 const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h6b3ca648fa0c8fb8E";
 const CIRCUIT_READ_RAW_SYMBOL: &str =
     "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h7476e1361c793b48E";
+const CIRCUIT_EVENT_READ_RAW_SYMBOL: &str =
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h66f54b80c4c5a7dbE";
 const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
     "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h4d06f976a0b09474E";
+const CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h0bc0fd51e177f34aE";
 const UNWIND_DYNAMIC_SYMBOL: &str = "_Unwind_Resume@GCC_3.0";
+
+const RANDOM_RANGE_RAW_SYMBOLS: &[&str] = &[RANDOM_RANGE_RAW_SYMBOL];
+const CIRCUIT_READ_RAW_SYMBOLS: &[&str] = &[CIRCUIT_READ_RAW_SYMBOL, CIRCUIT_EVENT_READ_RAW_SYMBOL];
+const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOLS: &[&str] = &[
+    CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL,
+    CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL,
+];
 
 /// Both record monomorphizations must be present: the 38-byte directory record
 /// and the 82-byte event record. Finding fewer means the build did not select
@@ -258,12 +269,12 @@ impl ExactDirectCallTarget {
         }
     }
 
-    const fn raw_symbol(self) -> Option<&'static str> {
+    const fn raw_symbols(self) -> &'static [&'static str] {
         match self {
-            Self::RandomRange => Some(RANDOM_RANGE_RAW_SYMBOL),
-            Self::CircuitRead => Some(CIRCUIT_READ_RAW_SYMBOL),
-            Self::CircuitWriteOrInsert => Some(CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL),
-            Self::UnwindResume => None,
+            Self::RandomRange => RANDOM_RANGE_RAW_SYMBOLS,
+            Self::CircuitRead => CIRCUIT_READ_RAW_SYMBOLS,
+            Self::CircuitWriteOrInsert => CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOLS,
+            Self::UnwindResume => &[],
         }
     }
 
@@ -734,26 +745,25 @@ fn parse_exact_direct_call_symbols(
         ExactDirectCallTarget::CircuitRead,
         ExactDirectCallTarget::CircuitWriteOrInsert,
     ] {
-        let raw_symbol = target
-            .raw_symbol()
-            .ok_or_else(|| vec!["internal direct-call identity error".to_string()])?;
-        let addresses = text_symbols
-            .iter()
-            .filter_map(|(address, names)| {
-                names
-                    .iter()
-                    .any(|name| name == raw_symbol)
-                    .then_some(*address)
-            })
-            .collect::<Vec<_>>();
-        let [address] = addresses.as_slice() else {
-            return Err(vec![format!(
-                "expected exactly one defined raw text identity `{raw_symbol}`; \
-                 found {}",
-                addresses.len()
-            )]);
-        };
-        insert_exact_direct_target(&mut resolved, *address, target)?;
+        for raw_symbol in target.raw_symbols() {
+            let addresses = text_symbols
+                .iter()
+                .filter_map(|(address, names)| {
+                    names
+                        .iter()
+                        .any(|name| name == raw_symbol)
+                        .then_some(*address)
+                })
+                .collect::<Vec<_>>();
+            let [address] = addresses.as_slice() else {
+                return Err(vec![format!(
+                    "expected exactly one defined raw text identity `{raw_symbol}`; \
+                     found {}",
+                    addresses.len()
+                )]);
+            };
+            insert_exact_direct_target(&mut resolved, *address, target)?;
+        }
     }
     let unwind = parse_unwind_plt_address(unwind_listing, relocations)?;
     insert_exact_direct_target(&mut resolved, unwind, ExactDirectCallTarget::UnwindResume)?;
@@ -1841,26 +1851,23 @@ fn exact_record_loop_motif(instructions: &[Instruction], branch_index: usize) ->
     if motif.iter().any(Instruction::has_prefix) {
         return None;
     }
-    let (allowance, source, prior, output, bound, padding_operands) =
-        match motif[6].operands.as_str() {
-            "$0x26,%rcx" => (
-                Allowance::DirectoryRecordLoop,
-                "0x27(%r15,%rcx,1),%edx",
-                "0x70(%rsp,%rcx,1),%esi",
-                "%sil,0x70(%rsp,%rcx,1)",
-                "$0x26,%rcx",
-                "0x0(%rax)",
-            ),
-            "$0x52,%rcx" => (
-                Allowance::EventRecordLoop,
-                "0x53(%r13,%rcx,1),%edx",
-                "0x90(%rsp,%rcx,1),%esi",
-                "%sil,0x90(%rsp,%rcx,1)",
-                "$0x52,%rcx",
-                "0x0(%rax,%rax,1)",
-            ),
-            _ => return None,
-        };
+    let (allowance, source, prior, output, bound) = match motif[6].operands.as_str() {
+        "$0x26,%rcx" => (
+            Allowance::DirectoryRecordLoop,
+            "0x27(%rbp,%rcx,1),%edx",
+            "0x70(%rsp,%rcx,1),%esi",
+            "%sil,0x70(%rsp,%rcx,1)",
+            "$0x26,%rcx",
+        ),
+        "$0x52,%rcx" => (
+            Allowance::EventRecordLoop,
+            "0x53(%r13,%rcx,1),%edx",
+            "0x90(%rsp,%rcx,1),%esi",
+            "%sil,0x90(%rsp,%rcx,1)",
+            "$0x52,%rcx",
+        ),
+        _ => return None,
+    };
     let expected = [
         ("movzbl", source),
         ("movzbl", prior),
@@ -1890,9 +1897,8 @@ fn exact_record_loop_motif(instructions: &[Instruction], branch_index: usize) ->
         || zero_index.has_prefix()
         || zero_index.mnemonic != "xor"
         || zero_index.operands != "%ecx,%ecx"
-        || padding.has_prefix()
-        || padding.mnemonic != "nopl"
-        || padding.operands != padding_operands
+        || padding.mnemonic != "data16 data16 data16 cs nopw"
+        || padding.operands != "0x0(%rax,%rax,1)"
     {
         return None;
     }
@@ -1995,11 +2001,11 @@ or %cl,%bpl
 sete %al
 mov %r12b,0x7(%rsp)
 xor $0x1,%r12b
-movzbl (%r13),%r15d
+movzbl 0x0(%r13),%r15d
 and %r15b,%al
 or %r12b,%al
 movzwl 0x80(%rsp),%ecx
-movw %cx,0xe0(%rsp)
+mov %cx,0xe0(%rsp)
 movdqa %xmm0,0xd0(%rsp)
 movdqa %xmm4,0xc0(%rsp)
 movdqa %xmm3,0xb0(%rsp)
@@ -2009,14 +2015,14 @@ movdqa %xmm1,0x90(%rsp)
 
 const DIRECTORY_EQUALITY_REDUCTION: &str = "\
 mov %al,0xd(%rsp)
-movzbl 0x1(%r15),%eax
-movzbl 0x2(%r15),%ecx
-movzbl 0x3(%r15),%edx
-movzbl 0x4(%r15),%esi
-movzbl 0x5(%r15),%edi
+movzbl 0x1(%rbp),%eax
+movzbl 0x2(%rbp),%ecx
+movzbl 0x3(%rbp),%edx
+movzbl 0x4(%rbp),%esi
+movzbl 0x5(%rbp),%edi
 xor 0x21(%rsp),%cl
 xor 0x20(%rsp),%al
-movzbl 0x6(%r15),%r8d
+movzbl 0x6(%rbp),%r8d
 or %cl,%al
 xor 0x22(%rsp),%dl
 xor 0x23(%rsp),%sil
@@ -2028,7 +2034,7 @@ or %sil,%dil
 or %dil,%r8b
 sete 0xe(%rsp)
 movdqu 0x26(%rsp),%xmm0
-movdqu 0x7(%r15),%xmm1
+movdqu 0x7(%rbp),%xmm1
 pcmpeqb %xmm0,%xmm1
 pmovmskb %xmm1,%ebx
 test %bx,%bx
@@ -2048,26 +2054,26 @@ shr $0x9,%esi
 mov %ebx,%edx
 shr $0x8,%edx
 test %bl,%bl
-sets %bpl
+sets %r15b
 mov %ebx,%r11d
 mov %ebx,%r12d
 mov %ebx,%r14d
 mov %ebx,%eax
 mov %ebx,%r13d
-shr %r13b
+shr $1,%r13b
 and %bl,%r13b
 shr $0x6,%bl
 shr $0x5,%r11b
 and %bl,%r11b
-and %bpl,%r11b
+and %r15b,%r11b
 shr $0x3,%r14b
 shr $0x2,%al
 and %r14b,%al
-movzbl (%r15),%ebx
+movzbl 0x0(%rbp),%ebx
 movdqu 0x36(%rsp),%xmm0
-movdqu 0x17(%r15),%xmm1
+movdqu 0x17(%rbp),%xmm1
 pcmpeqb %xmm0,%xmm1
-pmovmskb %xmm1,%ebp
+pmovmskb %xmm1,%r15d
 shr $0x4,%r12b
 and %r12b,%al
 and 0xe(%rsp),%r13b
@@ -2080,55 +2086,55 @@ and %r8b,%sil
 and %dil,%sil
 and %r11b,%sil
 and 0xf(%rsp),%cl
-and %bpl,%cl
-mov %ebp,%eax
-shr %al
+and %r15b,%cl
+mov %r15d,%eax
+shr $1,%al
 and %cl,%al
-mov %ebp,%ecx
+mov %r15d,%ecx
 shr $0x2,%cl
 and %al,%cl
 and %sil,%cl
-mov %ebp,%eax
+mov %r15d,%eax
 shr $0x3,%al
-mov %ebp,%edx
+mov %r15d,%edx
 shr $0x4,%dl
 and %al,%dl
-mov %ebp,%eax
+mov %r15d,%eax
 shr $0x5,%al
 and %dl,%al
-mov %ebp,%edx
+mov %r15d,%edx
 shr $0x6,%dl
 and %al,%dl
-mov %ebp,%eax
+mov %r15d,%eax
 shr $0x8,%eax
-mov %ebp,%esi
+mov %r15d,%esi
 shr $0x7,%sil
 and %dl,%sil
 and %al,%sil
-mov %ebp,%eax
+mov %r15d,%eax
 shr $0x9,%eax
 and %sil,%al
 and %cl,%al
-mov %ebp,%ecx
+mov %r15d,%ecx
 shr $0xa,%ecx
-mov %ebp,%edx
+mov %r15d,%edx
 shr $0xb,%edx
 and %cl,%dl
-mov %ebp,%ecx
+mov %r15d,%ecx
 shr $0xc,%ecx
 and %dl,%cl
-mov %ebp,%edx
+mov %r15d,%edx
 shr $0xd,%edx
 and %cl,%dl
-mov %ebp,%ecx
+mov %r15d,%ecx
 shr $0xe,%ecx
 and %dl,%cl
-shr $0xf,%ebp
-and %cl,%bpl
-and %al,%bpl
+shr $0xf,%r15d
+and %cl,%r15b
+and %al,%r15b
 movzbl 0xd(%rsp),%r14d
 xor $0x1,%r14b
-mov %ebp,%eax
+mov %r15d,%eax
 mov %ebx,%r12d
 and %bl,%al
 or %r14b,%al
@@ -2519,7 +2525,12 @@ mod tests {
         TextSymbols::from([
             (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
             (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
+            (0x611, vec![CIRCUIT_EVENT_READ_RAW_SYMBOL.to_string()]),
             (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),
+            (
+                0x621,
+                vec![CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()],
+            ),
         ])
     }
 
@@ -3050,10 +3061,21 @@ mod tests {
             ExactDirectCallSymbols::from([
                 (0x600, ExactDirectCallTarget::RandomRange),
                 (0x610, ExactDirectCallTarget::CircuitRead),
+                (0x611, ExactDirectCallTarget::CircuitRead),
                 (0x620, ExactDirectCallTarget::CircuitWriteOrInsert),
+                (0x621, ExactDirectCallTarget::CircuitWriteOrInsert),
                 (0x700, ExactDirectCallTarget::UnwindResume),
             ])
         );
+
+        for missing in [0x600, 0x610, 0x611, 0x620, 0x621] {
+            let mut incomplete = symbols.clone();
+            incomplete.remove(&missing);
+            assert!(
+                parse_exact_direct_call_symbols(&incomplete, &relocations, UNWIND_PLT).is_err(),
+                "missing exact direct-call identity at {missing:x} passed"
+            );
+        }
 
         let mut colliding = symbols.clone();
         colliding
@@ -3070,7 +3092,12 @@ mod tests {
             (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
             (0x601, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
             (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
+            (0x611, vec![CIRCUIT_EVENT_READ_RAW_SYMBOL.to_string()]),
             (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),
+            (
+                0x621,
+                vec![CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()],
+            ),
         ]);
         assert!(
             parse_exact_direct_call_symbols(&duplicated, &relocations, UNWIND_PLT).is_err(),
@@ -3499,8 +3526,8 @@ mod tests {
         let directory = "\
   f0:\tmovzbl %al,%eax
   f3:\txor %ecx,%ecx
-  f5:\tnopl 0x0(%rax)
-  100:\tmovzbl 0x27(%r15,%rcx,1),%edx
+  f5:\tdata16 data16 data16 cs nopw 0x0(%rax,%rax,1)
+  100:\tmovzbl 0x27(%rbp,%rcx,1),%edx
   105:\tmovzbl 0x70(%rsp,%rcx,1),%esi
   10a:\ttest %rax,%rax
   10d:\tcmovne %edx,%esi
@@ -3512,7 +3539,7 @@ mod tests {
         let event = "\
   f0:\tmovzbl %al,%eax
   f3:\txor %ecx,%ecx
-  f5:\tnopl 0x0(%rax,%rax,1)
+  f5:\tdata16 data16 data16 cs nopw 0x0(%rax,%rax,1)
   100:\tmovzbl 0x53(%r13,%rcx,1),%edx
   105:\tmovzbl 0x90(%rsp,%rcx,1),%esi
   10a:\ttest %rax,%rax
@@ -3538,9 +3565,9 @@ mod tests {
         }
 
         for changed in [
-            directory.replace("0x27(%r15", "0x28(%r15"),
+            directory.replace("0x27(%rbp", "0x28(%rbp"),
             directory.replace("%sil,0x70", "%dl,0x70"),
-            directory.replace("nopl 0x0(%rax)", "nopl 0x0(%rax,%rax,1)"),
+            directory.replace("data16 data16 data16 cs nopw", "data16 data16 cs nopw"),
             event.replace("$0x52,%rcx", "$0x26,%rcx"),
             event.replace("0x90(%rsp", "0x80(%rsp"),
         ] {
@@ -3578,9 +3605,9 @@ mod tests {
         let mut mutated_operand = exact.clone();
         let input = mutated_operand
             .iter_mut()
-            .find(|instruction| instruction.operands == "0x17(%r15),%xmm1")
+            .find(|instruction| instruction.operands == "0x17(%rbp),%xmm1")
             .expect("fixture contains second SIMD input");
-        input.operands = "0x18(%r15),%xmm1".to_string();
+        input.operands = "0x18(%rbp),%xmm1".to_string();
         assert!(!directory_equality_reduction(&mutated_operand));
 
         let mut extra_approved_instruction = exact.clone();
