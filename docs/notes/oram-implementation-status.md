@@ -16,6 +16,8 @@
   [2026-07-27 mainnet insertion-bound log](oram-gate1-mainnet-insertion-bound-log-2026-07-27.md).
 - Gate 1 live-base/chunked-delta sizing work log:
   [2026-07-28 work log](oram-gate1-hybrid-sizing-status-2026-07-28.md).
+- Completed Gate 1 Mainnet hybrid-sizing result:
+  [2026-07-29 result and provisional logical finalist](oram-gate1-hybrid-sizing-result-2026-07-29.md).
 
 This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
