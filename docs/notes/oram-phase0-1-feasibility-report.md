@@ -15,8 +15,16 @@
   `d35d158a9826c75a4ec1c31932c29b43cf4c7163`. The
   [dated capture log](oram-phase0-mainnet-capture-log-2026-07-26.md) records
   exact inputs, runtime counters, aggregates, digests, and limitations. Gate 1
-  remains open because growth, insertion/failure bounds, backend calibration,
-  and target-TDX RSS/no-swap headroom are unmeasured.
+  remains open because growth, an accepted insertion/failure bound, backend
+  calibration, and target-TDX RSS/no-swap headroom are unresolved.
+- Gate 1 insertion update (2026-07-27): the exact current 1x-capacity,
+  four-probe profile produced a typed NO-GO against a zero-bps sampled failure
+  budget under all eight fixed deterministic schedules. The
+  [dated insertion-bound log](oram-gate1-mainnet-insertion-bound-log-2026-07-27.md)
+  records the artifact, runtime counters, digests, trial outcomes, and
+  limitations. This is exact-profile deterministic negative evidence, not a
+  probability distribution, probabilistic bound, worst-case guarantee, or
+  closure of Gate 1.
 - Evaluated fresh-worker rebuild code head:
   `feat/oram-source-bound-cold-rebuild` at
   `15f60d3014428e04e7a42779c9a8c2c7cc7a583d`, stacked on recovery evidence
@@ -103,8 +111,10 @@
 **Current decision: NO-GO for private-server integration, deployment, or any
 mainnet/host-oblivious privacy claim.**
 
-Technical Gate 1 remains incomplete on growth, backend calibration,
-insertion/failure bounds, and measured target-TDX RSS. Technical Gate 2 remains
+Technical Gate 1 now has a deterministic sampled NO-GO for the exact current
+1x-capacity, four-probe profile, but remains incomplete on a remediated design
+or accepted alternative-profile evidence, growth, an accepted failure bound,
+backend calibration, and measured target-TDX RSS. Technical Gate 2 remains
 failed on the compiled secret-dependent branch.
 
 **Offline implementation and research that answers or remediates the technical
@@ -173,8 +183,11 @@ remain closed until the technical Phase 0 blockers in this report have
 measured, reviewable results and the decision is revisited.
 
 The completed full-Mainnet capture clears the corpus-availability part of
-Gate 1, but does not change this decision. Its two offline models are logical
-necessary-condition checks, not measured ORAM or target-TDX capacity results.
+Gate 1, and the separate insertion-bound artifact rejects the exact current
+1x-capacity, four-probe profile under all eight fixed schedules at a zero-bps
+sampled budget. Neither result changes this decision. The two offline sizing
+models remain logical necessary-condition checks, and the insertion result is
+not a probabilistic bound or measured ORAM/target-TDX capacity result.
 
 ## Evidence boundary
 
@@ -702,7 +715,7 @@ The following statements are **not** established by that evidence:
 | Mainnet counts/distributions and growth | Partial | The artifact reports 9,193,009 distinct standard addresses, 351,872,272 lifetime standard-address events, 27,500,704 live standard UTXOs, 73,552 live nonstandard outputs, and a 3,360,022-event hot tail. No approved growth horizon or annual growth input exists | Approve and model a defensible growth horizon, including a potentially worsening hot-address tail |
 | Exact candidate record | Partial pass | 72-byte event, 38-byte directory, and 82-byte one-event page byte-array records; named conversions; canonical dummies; standard-event validation; `Pod`/`Cmov`; generic native Linux CI constructs separate real 38/82-byte backend monomorphizations and exercises both | Measure the target-capacity profile on the selected CPU/TDX platform |
 | Fixed-probe table layout | Partial real integration | Canonical standard-address key vectors, one-generation keyed directory/event probes, power-of-two capacity/admission checks, full-array placement/duplicate/dummy/owner validation, opaque insert preparation, a complete bounded-history preflight, and a bounded worker with no raw storage bypass. A private offline owner validates exact projection/layout identity and admission limits before composing the coordinator and worker; generic native Linux CI runs 8/16-entry typed stores and the worker-owned exact executor | Add authenticated generation ownership and crash-safe commit/rebuild; select measured capacities/probe counts and trace the backend on target hardware |
-| Full-capacity logical sizing | Partial pass | Strict current-corpus capacities are 16,777,216 directory and 536,870,912 event entries. The compiled-record logical allocation is 46,875,541,504 bytes and the hot tail forces 13,440,092 logical accesses per request. Validated 88/176 GiB models report logical fit with 30% reserved headroom, but also `insertion_bound = false`, `backend_calibrated = false`, `rss_measured = false`, and zero growth | Add approved growth and insertion/failure bounds; calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and working set; measure the accepted target-TDX profile |
+| Full-capacity logical sizing | Partial pass; adjacent current-profile NO-GO | Strict current-corpus capacities are 16,777,216 directory and 536,870,912 event entries. The compiled-record logical allocation is 46,875,541,504 bytes and the hot tail forces 13,440,092 logical accesses per request. Validated 88/176 GiB models report logical fit with 30% reserved headroom, but correctly retain `insertion_bound = false`, `backend_calibrated = false`, `rss_measured = false`, and zero growth. A separate source-bound artifact rejects the exact current 1x/four-probe profile under every fixed schedule; it does not amend the sizing bundles | Test a remediated insertion design or explicit alternative profiles; add approved growth and an accepted failure bound; calibrate the actual ORAM tree, recursive maps, stash, allocator, initialization peak, and working set; measure the accepted target-TDX profile |
 | Compiler pin | Pass for the current ORAM release procedure | Repository pins Rust 1.96.0; the receipt fixes the Linux-musl release profile, feature set, Rust flags, and source-date epoch | Independently pin and verify the complete builder image, LLVM behavior, and native-tool closure |
 | Release artifact identity/repeatability | Partial generic-builder pass | At exact head `a7172384`, two rootless-Podman no-cache builds matched and the published binary/receipt pair passed final verification; the receipt binds local source and build inputs plus binary identity | Repeat on an independent builder, add trusted CI and signed/attested provenance, and keep physical-trace, mainnet, target-CPU, and TDX gates separate |
 | CPU/target/TDX pin | Partial target-class gate | An Ubuntu 24.04 x86_64 CI lane with immutable action pins executes the real adapter; the hosted image, CPU generation, TDX instance, firmware/TCB, DOIT, and memory remain unset | Select CPU generations, exact target/release flags, TDX instance, firmware/TCB policy, DOIT policy, and memory limit |
@@ -712,15 +725,17 @@ The following statements are **not** established by that evidence:
 | Memory/RSS gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` samples process-wide `VmRSS` before spawn, after spawn, after warmup, and after the measured phase, plus process-lifetime `VmHWM`, on Linux x86_64. The HWM includes driver/runtime memory predating the run. This is whole-process generic-builder evidence, not backend-only memory or intended-TDX headroom | Measure peak RSS, initialization pressure, page faults, and swapping on intended TDX hardware with at least 30% headroom |
 | Latency/stash/queue gate | Partial builder instrumentation; target gate missing | `BuilderFoundationV1` records synchronous typed-worker call latency and mixed-phase wall-clock completion rates with a single caller and queue capacity one. Synthetic input preparation and verification are outside command latency but inside the phase wall; per-class rates are not isolated throughput. It also records clean-shutdown lifecycle/queue counters, while queue contention is unmeasured and stash/physical access is backend-unobservable | Record target-hardware latency distribution, sustained QPS, stash pressure, loaded queue depth, update contention, and failure behavior |
 | Assembly/compiler-preservation experiment | Static release disassembly: FAIL | At exact evidence source `3a84280c`, both 38-byte and 82-byte insertion monomorphizations branch on the private hit/miss result before reconverging for the second ORAM access | Remediate the branch, rerun exact-source static review, then obtain dynamic instruction/memory/page/timing traces on a suitable host |
-| Failure probability | Missing | No long-run or analytical bound | Address [`rostl` issue #24](https://github.com/obliviouslabs/rostl/issues/24) and document node-year risk |
+| Failure probability | Narrow deterministic NO-GO; bound missing | Eight fixed schedules all fail the exact current 1x/four-probe profile at a zero-bps sampled budget. The schedules are not a probability distribution, and no long-run or analytical bound follows | Address [`rostl` issue #24](https://github.com/obliviouslabs/rostl/issues/24), test the accepted replacement profile, and document node-year risk |
 | Typed capacity/stash/queue failure | Partial | Local validation is typed; the research worker has nonblocking bounded admission, a typed identifier-free `QueueFull`, no fallback, and terminal backend/panic latching. `SmokeV1` checks the per-address limit. Separate `FullMapSaturationV1` workers reach the directory and event admission bounds independently, fail closed on the next append, and latch terminal state. `BuilderFoundationV1` reaches both source-sized admission limits in one healthy run and requires a clean stopped snapshot, but its single caller does not load the queue and the backend exposes no stash telemetry | Replace panic-based upstream boundaries, type stash exhaustion, and prove capacity/stash/queue behavior under native target load |
 | Persistence/recovery/RTO | Partial public-rebuild, private outer-commit, replay-journal, and module-private coordinator foundations; production gate blocked | Fixed authenticated public manifests, exact digest-bound external freshness transitions, deterministic crash-boundary tests, and fresh-worker genesis replay establish a fail-closed public publication/rebuild contract. A separate private fixed-width snapshot commits stable security identity plus opaque serving/component digests locally before an injected exact witness. The local replay journal reconstructs the exact committed prefix from fixed-size context-sealed records. Profile v6 keeps entry v2 (`ZORJENT2`) unchanged and selects current v3 (`ZORJCUR3`); all record widths remain fixed. Entry v2 persists each real continuation's opaque replay key and nonzero ceiling expiry-bucket ordinal. Current v3 persists a `u64` watermark whose zero sentinel means no classified bucket and whose nonzero value records the inclusive highest fully expired continuation expiry bucket for future maintenance classification. The raw recorded value is not authority. Lower proposals reject; equal returns typed `NoAdvance` without a write, receipt, or outer sequence advance; greater durably advances replay-current without appending entries or changing claim sets/counts. Query replay and maintenance mint distinct move-only receipts before the module-private coordinator applies replay-current -> outer-local -> witness ordering. Hard witness rejection fresh-opens as `WitnessLocalMismatch`; witness advance-then-error can reconcile. Profile v6 requires fresh provisioning and neither migrates nor dual-accepts profile-v5/current-v2 or earlier state. The surface has no non-test caller or trusted-time/epoch/profile grant; runtime wiring or visibility widening first requires a live epoch/profile/currentness-bound move-only grant. There is no request expiry, deletion, count reduction, compaction, reclamation, bounded retention, or garbage-collection execution; capacity remains lifetime cumulative. It remains runtime-unwired, single-writer without a lock, and protected only by a test fixture. The three advancement steps are ordered but not one atomic transaction. No production witness/key/nonce owner, nonce/time journal, qualified integrated replay, composite ORAM-state commit, full-corpus result, controlled-cache result, or full-service RTO exists | Supply the production trusted-time and retirement authority plus a live epoch/profile/currentness-bound grant, complete replay/snapshot/witness ownership under the production freshness protocol, add nonce/time roots, and preserve the explicit no-deletion/no-reclamation boundary until a separately reviewed retention protocol exists; then either implement authenticated atomic ORAM persistence or run a controlled target-hardware rebuild and publish an accepted full-service RTO |
 | Go/no-go stakeholder acceptance | Missing | No accepted numeric profile or client contract | Security, operator, and client teams approve the exact leakage budget |
 
-Phase 0 does not pass. Mainnet capacity, hardware memory, physical behavior,
-and recovery remain independent technical blockers; satisfying only one does
-not open the server gate. Licensing remains separate pre-distribution due
-diligence and does not block technical-gate remediation or backend-fork work.
+Phase 0 does not pass. The current sampled insertion profile is NO-GO, while
+accepted replacement capacity/failure evidence, hardware memory, physical
+behavior, and recovery remain independent technical blockers; satisfying only
+one does not open the server gate. Licensing remains separate pre-distribution
+due diligence and does not block technical-gate remediation or backend-fork
+work.
 
 ### Phase 1 — deterministic contract
 
@@ -840,7 +855,7 @@ behavior, target CPU features, or TDX isolation.
 |---|---|---|---|---|
 | Zaino baseline | `c94ae247de7286fd3337e313559bb3d62bdcbd5d` | Authoritative fork base | Root Apache-2.0 license file | Recorded |
 | `zaino-oram` | Local `0.1.0`, `publish = false` | Research model and candidate adapter | Workspace Apache-2.0 | Research only |
-| `zainod-oram` | Local `0.1.0`, `publish = false` | Listener-free one-shot mainnet corpus capture and fully offline logical sizing with atomic artifact publication, plus read-only sizing-input validation | Workspace Apache-2.0 | Offline research only |
+| `zainod-oram` | Local `0.1.0`, `publish = false` | Listener-free one-shot mainnet corpus capture, offline logical sizing, read-only sizing validation, and source-bound insertion-budget qualification with atomic artifact publication | Workspace Apache-2.0 | Offline research only |
 | `zaino-state` | Local/version `0.3.1`, optional, no default features | Indexed-block corpus adapter | Workspace Apache-2.0 | Enabled only by `corpus-zaino` |
 | `bytemuck` | `1.25.1`, derive/min-const-generics | Exact `Pod` record proof | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
 | `bytemuck_derive` | `1.11.0` | Derive transitive | Manifest: `Zlib OR Apache-2.0 OR MIT` | No identified direct blocker |
@@ -864,8 +879,8 @@ dependency closure; adopting or copying it would trigger a separate review.
 
 ## Verification evidence
 
-Commands below were run through 2026-07-15 against the evaluated worktree or
-the explicitly named predecessor head.
+Commands and remote runs below were recorded through 2026-07-27 against the
+evaluated worktree or the explicitly named predecessor head.
 
 | Command | Result | Interpretation |
 |---|---|---|
@@ -875,6 +890,7 @@ the explicitly named predecessor head.
 | `cargo nextest --version` | `cargo-nextest 0.9.140` | Repository-native test runner installed for the single workspace |
 | [`ORAM - Native Linux` run 29224873175, job 86736864252](https://github.com/sovright/zaino/actions/runs/29224873175/job/86736864252) environment | Ubuntu 24.04 x86_64, Rust 1.96.0, cargo-nextest 0.9.140; pass in 20m02s for capture parent head `bd4554bf` | Immutable action pins, locked dependency resolution, and exact tool versions establish a repeatable generic native CI gate; the hosted image is not a reproducible release, target-CPU, or TDX build |
 | Dedicated native builder environment | Ubuntu 24.04 x86_64, Linux `6.17.0-1020-gcp`, Intel family 6/model 85 under KVM, 16 vCPU/62 GiB, Rust 1.96.0, cargo-nextest 0.9.140 | Records the cache-preserving developer gate used for the load-foundation and full-map-saturation snapshots; it is neither GitHub CI nor release/TDX attestation evidence |
+| `zainod-oram qualification insertion-bound --profile current-four-probe-v1 ... --failure-budget-bps 0` at exact source `a4c55992` | Replayed checkpoint 3,425,046 and published a read-back-validated typed NO-GO before the documented status-1 exit. All eight fixed schedules exhausted both table lanes; canonical report BLAKE2s-256 is `2577a0e26d0ab024b269fa793f561e5bd068d968fa68d3399ce9d0aa343bf4c9` | Exact-corpus deterministic negative evidence for the current 1x/four-probe profile only. It is unsigned, self-reported, source-cache-uncontrolled evidence and establishes no probability distribution, accepted failure bound, target-hardware/TDX result, or mainnet readiness |
 | `shasum -a 256 packages/zaino-oram/src/zaino_corpus.rs packages/zainod-oram/src/corpus_artifact.rs packages/zainod-oram/src/main.rs` | `faf8b488ca25234e9a803d955f751a821d639dca405cf7b80c8000c98e443fd9`, `5c2e9790e8905fef42cf0eb5df349515d147e8d234df0f83918d769c6b0ca12e`, `5edeba5532780a0660e2cd2641900dda8dd8fb56ad6c7b2b76a732eb8dc202c2` | The three changed Rust sources matched the builder byte-for-byte before the final native gates; later evidence-only edits do not alter them |
 | `sha256sum packages/zaino-oram/src/{lib.rs,stress_qualification.rs,full_map_saturation.rs} packages/zainod-oram/src/{main.rs,full_map_saturation_artifact.rs}` | `4293c61182de046a78bfd8b7acbfc22267c4227bfda3c76ac7bf12d454ee3675`, `61a6adf1f585f9038b59f15bc28f7db51f6b971d23e009d9f0fab63aa6687fe9`, `1f923a323e9372d6eb1ec64939ea9b07673a47dab35709094387d07c4e4fe280`, `616b3144d3cdb01b040ef45574a6a517117c40517686186415c8047f82277915`, `8ced4a39f7cfcdbca80766224cb242035f1fb37299c1879b88cf4312c26fd760` | All five full-map-saturation Rust sources matched the builder byte-for-byte before the final native Clippy and nextest gates |
 | `cargo clippy -p zaino-oram --all-features --all-targets --no-deps --locked -- -D warnings -D clippy::unwrap_used` | Pass in capture-head native Linux CI | The complete capture-head all-feature/all-target ORAM graph is warning-free on the supported OS/architecture with the pinned compiler |
@@ -1039,14 +1055,22 @@ They also explicitly report `insertion_bound = false`,
 `backend_calibrated = false`, and `rss_measured = false`, with zero growth
 horizon and annual growth.
 
+The separate source-bound insertion-budget run used the 176 GiB sizing lineage
+but did not amend that model. It replayed the exact current corpus through the
+1x-capacity, four-probe profile under eight fixed deterministic schedules. All
+eight schedules exhausted both table lanes, yielding a typed NO-GO against the
+zero-bps sampled budget. The checked-in artifact and exact claim boundary are
+in the
+[dated insertion-bound log](oram-gate1-mainnet-insertion-bound-log-2026-07-27.md).
+
 Therefore `fits_modeled_memory` and `fits_modeled_constraints` remain logical
-model results only. They are not the 30%-RSS go/no-go result. The model does
-not calculate the pinned backend's actual tree blocks, recursive map levels,
-stash, initialization temporaries, allocator overhead, or runtime working set;
-admission fit is not a bound on insertion success or collision probability.
-Approved growth must also consider a worsening hot-address tail rather than
-only proportionally scaling existing histogram buckets. The exact operational
-evidence is in the
+model results only. They are not the 30%-RSS go/no-go result, and the separate
+sampled NO-GO is not a probabilistic or worst-case insertion bound. The model
+does not calculate the pinned backend's actual tree blocks, recursive map
+levels, stash, initialization temporaries, allocator overhead, or runtime
+working set. Approved growth must also consider a worsening hot-address tail
+rather than only proportionally scaling existing histogram buckets. The exact
+capture evidence is in the
 [dated capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
 
 ## RSS, benchmark, stash, and queue blockers
@@ -1099,8 +1123,8 @@ evidence still includes:
    host swapping on the intended TDX instance;
 5. at least 30% measured RSS headroom at target capacity;
 6. stash and position-map pressure plus typed capacity/queue/stash failures;
-7. long-run failure evidence and a documented probability bound rather than an
-   assumption.
+7. long-run failure evidence and a documented probability bound beyond the
+   current eight-schedule deterministic NO-GO.
 
 The typed `rostl` tables and business-command worker remain intentionally
 unsuitable for such a claim. The stores are volatile, do not implement the
@@ -1235,9 +1259,11 @@ must not exist, or must remain unready in a later offline prototype.
 Work that answers or remediates a technical Phase 0 gate may continue under
 accurate experimental labeling. The priorities are:
 
-1. apply approved growth and backend-calibration inputs to the completed
-   explicit-checkpoint Mainnet capture, define insertion/failure bounds, and
-   obtain target-TDX RSS/no-swap measurements with at least 30% headroom;
+1. replace or broaden the current-profile eight-schedule NO-GO with a
+   remediated insertion design or explicit alternative-profile evidence, apply
+   approved growth and backend-calibration inputs to the completed
+   explicit-checkpoint Mainnet capture, establish an accepted failure bound,
+   and obtain target-TDX RSS/no-swap measurements with at least 30% headroom;
 2. remediate the exact-source secret-dependent branch, then rerun static
    disassembly and dynamic instruction/memory/page/timing qualification;
 3. size and review a Sovright-owned fork or select a replacement,
@@ -1256,9 +1282,11 @@ technical slice freeze.
 Authorization to resume the frozen later research slices requires all of the
 following, not a subset:
 
-- a reproducible full-mainnet aggregate report at a public checkpoint, approved
-  growth and backend-calibration inputs, and measured target-TDX capacity with
-  at least 30% RSS headroom and no swapping;
+- a reproducible full-mainnet aggregate report at a public checkpoint, an
+  accepted insertion design and failure-bound result beyond the current
+  exact-profile sampled NO-GO, approved growth and backend-calibration inputs,
+  and measured target-TDX capacity with at least 30% RSS headroom and no
+  swapping;
 - remediated secret-dependent release codegen followed by passing static and
   dynamic physical-trace review;
 - an accepted fork or replacement decision that owns recovery, failure bounds,

@@ -9,8 +9,8 @@ use zaino_oram::{
 
 use crate::corpus_artifact::{
     artifact_blake2s256_hex, publish_verified_derived_artifact, read_artifact_file,
-    validate_derived_source_lineage, ArtifactDirectory, ArtifactError, ArtifactFile, BackendKind,
-    SnapshotMode, ValidatedCapture, ValidatedSizing,
+    validate_derived_source_lineage, ArtifactDirectory, ArtifactError, ArtifactFile,
+    PreverifiedSourceSnapshotV1, ValidatedCapture, ValidatedSizing,
 };
 
 const COLD_REBUILD_SCHEMA: &str = "zaino-oram-typed-worker-cold-rebuild-v1";
@@ -21,7 +21,6 @@ const PROVENANCE_JSON: &str = "provenance.json";
 const MAX_COLD_REBUILD_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COLD_REBUILD_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVENANCE_JSON_BYTES: usize = 64 * 1024;
-const SOURCE_CACHE_MODE: &str = "uncontrolled";
 
 fn ensure_supported_execution_target() -> Result<(), ArtifactError> {
     if is_supported_execution_target(std::env::consts::OS, std::env::consts::ARCH) {
@@ -39,59 +38,12 @@ fn is_supported_execution_target(target_os: &str, target_arch: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ColdRebuildSourceSnapshotV1 {
-    backend_kind: BackendKind,
-    snapshot_mode: SnapshotMode,
-    serviceable_height: u32,
-    verified_checkpoint_height: u32,
-    verified_checkpoint_hash: String,
-    checkpoint_preverified_before_allocation: bool,
-    source_cache_mode: String,
-}
-
-impl ColdRebuildSourceSnapshotV1 {
-    pub(super) fn new_verified(
-        backend_kind: BackendKind,
-        serviceable_height: u32,
-        measurement: &MainnetCorpusMeasurement,
-    ) -> Result<Self, ArtifactError> {
-        let source = Self {
-            backend_kind,
-            snapshot_mode: SnapshotMode::NonFinalizedState,
-            serviceable_height,
-            verified_checkpoint_height: measurement.checkpoint().height(),
-            verified_checkpoint_hash: measurement.checkpoint().hash().to_owned(),
-            checkpoint_preverified_before_allocation: true,
-            source_cache_mode: SOURCE_CACHE_MODE.to_owned(),
-        };
-        source.validate(measurement)?;
-        Ok(source)
-    }
-
-    fn validate(&self, measurement: &MainnetCorpusMeasurement) -> Result<(), ArtifactError> {
-        if self.snapshot_mode != SnapshotMode::NonFinalizedState
-            || self.serviceable_height < self.verified_checkpoint_height
-            || self.verified_checkpoint_height != measurement.checkpoint().height()
-            || self.verified_checkpoint_hash != measurement.checkpoint().hash()
-            || !self.checkpoint_preverified_before_allocation
-            || self.source_cache_mode != SOURCE_CACHE_MODE
-        {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker cold-rebuild source snapshot evidence is invalid",
-            });
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ColdRebuildArtifactV1 {
     schema: String,
     measurement_blake2s256: String,
     qualification_blake2s256: String,
     declared_rebuild_budget_seconds: u64,
-    source_snapshot: ColdRebuildSourceSnapshotV1,
+    source_snapshot: PreverifiedSourceSnapshotV1,
     cold_rebuild: TypedWorkerColdRebuildReport,
 }
 
@@ -103,7 +55,7 @@ impl ColdRebuildArtifactV1 {
         measurement_blake2s256: &str,
         qualification_blake2s256: &str,
         declared_rebuild_budget: Duration,
-        source_snapshot: &ColdRebuildSourceSnapshotV1,
+        source_snapshot: &PreverifiedSourceSnapshotV1,
     ) -> Result<Self, ArtifactError> {
         let declared_rebuild_budget_seconds = exact_nonzero_seconds(declared_rebuild_budget)?;
         source_snapshot.validate(measurement)?;
@@ -132,7 +84,7 @@ impl ColdRebuildArtifactV1 {
         measurement_blake2s256: &str,
         qualification_blake2s256: &str,
         declared_rebuild_budget: Duration,
-        source_snapshot: &ColdRebuildSourceSnapshotV1,
+        source_snapshot: &PreverifiedSourceSnapshotV1,
     ) -> Result<(), ArtifactError> {
         if self.schema != COLD_REBUILD_SCHEMA
             || self.measurement_blake2s256 != measurement_blake2s256
@@ -253,7 +205,7 @@ pub(super) fn publish_cold_rebuild(
     sizing: &ValidatedSizing,
     cold_rebuild: &TypedWorkerColdRebuildReport,
     declared_rebuild_budget: Duration,
-    source_snapshot: &ColdRebuildSourceSnapshotV1,
+    source_snapshot: &PreverifiedSourceSnapshotV1,
     runner_version: &str,
 ) -> Result<(), ArtifactError> {
     validate_derived_source_lineage(capture, sizing)?;
@@ -299,7 +251,7 @@ fn validate_staged_cold_rebuild(
     capture: &ValidatedCapture,
     sizing: &ValidatedSizing,
     declared_rebuild_budget: Duration,
-    source_snapshot: &ColdRebuildSourceSnapshotV1,
+    source_snapshot: &PreverifiedSourceSnapshotV1,
     expected_artifact: &ColdRebuildArtifactV1,
     expected_provenance: &ColdRebuildProvenanceV1,
 ) -> Result<(), ArtifactError> {
@@ -345,13 +297,12 @@ fn validate_staged_cold_rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    use crate::corpus_artifact::typed_test_measurement;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     use crate::corpus_artifact::{
-        load_capture, load_sizing, publish_capture, publish_sizing, typed_test_measurement,
-        BackendKind, CaptureProvenance, SelectionMode, SnapshotMode,
+        load_capture, load_sizing, publish_capture, publish_sizing, CaptureProvenance,
+        SelectionMode, SnapshotMode,
     };
+    use crate::corpus_artifact::{typed_test_measurement, BackendKind};
     use std::error::Error;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     use std::{collections::BTreeSet, ffi::OsString, fs};
@@ -460,7 +411,7 @@ mod tests {
         let sizing_digest = "22".repeat(32);
         let declared_rebuild_budget = Duration::from_secs(60);
         let source_snapshot =
-            ColdRebuildSourceSnapshotV1::new_verified(BackendKind::Rpc, 0, &measurement)?;
+            PreverifiedSourceSnapshotV1::new_verified(BackendKind::Rpc, 0, &measurement)?;
         let report = typed_report(
             &measurement,
             &sizing,
@@ -550,8 +501,9 @@ mod tests {
             )
             .is_err());
 
-        let mut wrong_snapshot = artifact;
-        wrong_snapshot.source_snapshot.source_cache_mode = "cold".to_owned();
+        let mut wrong_snapshot_value = serde_json::to_value(artifact)?;
+        wrong_snapshot_value["source_snapshot"]["source_cache_mode"] = serde_json::json!("cold");
+        let wrong_snapshot: ColdRebuildArtifactV1 = serde_json::from_value(wrong_snapshot_value)?;
         assert!(wrong_snapshot
             .validate(
                 &measurement,
@@ -573,7 +525,7 @@ mod tests {
         let sizing_digest = "22".repeat(32);
         let declared_rebuild_budget = Duration::from_secs(60);
         let source_snapshot =
-            ColdRebuildSourceSnapshotV1::new_verified(BackendKind::Rpc, 0, &measurement)?;
+            PreverifiedSourceSnapshotV1::new_verified(BackendKind::Rpc, 0, &measurement)?;
         let report = typed_report(
             &measurement,
             &sizing,
@@ -626,7 +578,7 @@ mod tests {
         let sizing = load_sizing(&sizing_dir, &capture)?;
         let declared_rebuild_budget = Duration::from_secs(60);
         let source_snapshot =
-            ColdRebuildSourceSnapshotV1::new_verified(BackendKind::Rpc, 0, capture.measurement())?;
+            PreverifiedSourceSnapshotV1::new_verified(BackendKind::Rpc, 0, capture.measurement())?;
         let report = typed_report(
             capture.measurement(),
             sizing.qualification(),

@@ -15,7 +15,7 @@
 
 | Item | Current result | Consequence |
 | --- | --- | --- |
-| Full-mainnet corpus, hot tail, and 30% TDX RSS headroom | **IN PROGRESS** | The reproducible full capture and current-corpus logical sizing completed. Growth, insertion/failure bounds, backend calibration, and target-TDX RSS/no-swap qualification remain open. |
+| Full-mainnet corpus, hot tail, and 30% TDX RSS headroom | **IN PROGRESS; CURRENT PROFILE NO-GO** | Capture and logical sizing completed. The exact current 1x/four-probe profile failed a zero-bps sampled budget under all eight fixed schedules. Alternative designs, growth, an accepted failure bound, backend calibration, and target-TDX RSS/no-swap qualification remain open. |
 | Compiled `rostl` access-path obliviousness | **FAIL at the exact evidence source** | A secret hit/miss result directly controls conditional jumps even though both cases perform two logical ORAM accesses. The current path cannot make a host-obliviousness claim. |
 | Redistribution licensing | **TRACKED RELEASE CONCERN** | The selected `rostl` crates declare permissive SPDX metadata but the pinned repository contains no authoritative license/notice file. This is not a finding that the code is unlicensed and does not block technical-gate remediation or creation of a Sovright fork; resolve the evidence gap before external release. |
 | Use upstream versus own the ORAM library | **DECIDED: do not ship upstream unchanged** | A production path requires a Sovright-owned fork or replacement that owns compiler, recovery, and failure-bound work. License/notice evidence is a parallel release-readiness item. |
@@ -45,14 +45,31 @@ Both the 88 GiB and 176 GiB offline models report current-corpus logical fit
 with 30% reserved headroom. They also honestly report
 `insertion_bound = false`, `backend_calibrated = false`, and
 `rss_measured = false`, with zero growth horizon and zero annual growth.
-Therefore the necessary-condition corpus result passes, but Gate 1 remains
-**IN PROGRESS**. It still requires approved growth inputs, insertion/failure
-bounds, calibrated backend expansion, and target-TDX peak RSS with no swap and
+Those sizing bundles remain necessary-condition logical models.
+
+The separate source-bound insertion run at exact source `a4c55992` replayed all
+3,425,047 blocks and 351,872,272 standard-address events through the current
+1x-capacity, four-probe layout under eight fixed deterministic schedules. All
+eight schedules exhausted both the directory and event lanes, producing a
+10,000-bps sampled failure rate against a zero-bps budget. The runner
+atomically published and read-back validated the valid typed NO-GO artifact
+before returning status 1.
+
+This is negative evidence for that exact sampled profile, not a probability
+distribution, probabilistic failure bound, worst-case guarantee, or finding
+that ORAM is infeasible. No alternative capacity or probe profile, isolated
+single-table resize, or projected growth was tested. Gate 1 therefore remains
+**IN PROGRESS** and requires a remediated insertion design or explicit
+alternative-profile evidence, approved growth inputs, an accepted failure
+bound, calibrated backend expansion, and target-TDX peak RSS with no swap and
 at least 30% measured headroom.
 
 The exact build identities, runtime counters, artifact sizes, counts, digests,
 and sizing limitations are recorded in the
 [dated capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
+The insertion trial outcomes, resource counters, digests, and complete claim
+boundary are recorded separately in the
+[dated insertion-bound log](oram-gate1-mainnet-insertion-bound-log-2026-07-27.md).
 
 ## Gate 2: compiled access-path obliviousness
 
@@ -193,9 +210,11 @@ patches.
 
 ## Next allowed work
 
-1. Obtain approved growth and backend-calibration inputs, define the
-   insertion/failure bound, and measure peak RSS plus swap on the intended TDX
-   target with at least 30% headroom.
+1. Replace or broaden the current-profile sampled NO-GO with a remediated
+   insertion design or explicit alternative-profile evidence, obtain approved
+   growth and backend-calibration inputs, establish an accepted failure bound,
+   and measure peak RSS plus swap on the intended TDX target with at least 30%
+   headroom.
 2. Remediate the exact-source compiled branch finding, then rerun static and
    dynamic qualification.
 3. In parallel, ask the `rostl` rights holder for license confirmation and

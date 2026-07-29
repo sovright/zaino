@@ -10,6 +10,12 @@
   remains a tracked distribution-readiness concern, not a Phase 0 blocker.
 - Completed Gate 1 capture operation:
   [2026-07-26 mainnet capture log](oram-phase0-mainnet-capture-log-2026-07-26.md).
+- Gate 1 insertion-budget implementation work log:
+  [2026-07-27 work log](oram-gate1-insertion-budget-status-2026-07-27.md).
+- Completed current-profile Gate 1 insertion evidence:
+  [2026-07-27 mainnet insertion-bound log](oram-gate1-mainnet-insertion-bound-log-2026-07-27.md).
+- Gate 1 live-base/chunked-delta sizing work log:
+  [2026-07-28 work log](oram-gate1-hybrid-sizing-status-2026-07-28.md).
 
 This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
@@ -489,6 +495,31 @@ before the command returns failure. The slice therefore supplies source-bound
 fresh-worker replay plumbing and timing semantics, not controlled cold-cache,
 target-hardware, durable recovery, TDX, physical-trace, full-mainnet, or mainnet
 readiness evidence.
+
+The completed insertion-budget slice reuses the validated full-Mainnet
+capture/sizing lineage and a preverified fixed source snapshot, but analyzes
+only the current 1x-capacity, four-probe layout under eight fixed deterministic
+schedules and a zero-bps sampled failure budget. All eight schedules exhausted
+both table lanes. The runner atomically published and read-back validated its
+three-file typed NO-GO artifact before returning the documented unsuccessful
+status. This is exact-profile sampled negative evidence, not a probability
+distribution, probabilistic or worst-case bound, alternative-profile result,
+backend calibration, physical trace, target-hardware/TDX result, or mainnet
+readiness claim. Exact run context and the preserved artifact are in the
+[dated insertion-bound log](oram-gate1-mainnet-insertion-bound-log-2026-07-27.md).
+
+The hybrid-sizing slice adds a separate fixed-profile source-bound replay for a
+logically immutable live-UTXO base plus bounded append-only add/spend delta
+generations. It preserves created-versus-spent event kind, reconstructs the
+identifier-free final live-UTXO histogram, and computes base-page shapes for
+1, 8, and 16 entries plus genesis-aligned delta maxima for 288-, 1,152-, and
+8,064-block public intervals. Generation page totals sum individually rounded
+per-address requirements; they do not assume cross-address packing. This is
+model input only: it implements no serving store, generation switch, compactor,
+growth projection, backend calibration, RSS/TDX measurement, failure bound, or
+readiness claim. The bounded scope and next evidence step are recorded in the
+[dated hybrid-sizing work log](oram-gate1-hybrid-sizing-status-2026-07-28.md).
+
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
 claim. Per the Phase 0 stop rule, private-server work remains closed while the

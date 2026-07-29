@@ -1,0 +1,384 @@
+//! Atomic evidence artifacts for source-bound hybrid-sizing analysis.
+
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use zaino_oram::{MainnetCorpusMeasurement, SourceBoundHybridSizingReport};
+
+use crate::corpus_artifact::{
+    artifact_blake2s256_hex, publish_verified_derived_artifact, read_artifact_file,
+    validate_derived_source_lineage, ArtifactDirectory, ArtifactError, ArtifactFile,
+    PreverifiedSourceSnapshotV1, ValidatedCapture, ValidatedSizing,
+};
+
+const HYBRID_SIZING_SCHEMA: &str = "zaino-oram-source-bound-hybrid-sizing-v1";
+const HYBRID_SIZING_PROVENANCE_SCHEMA: &str = "zaino-oram-source-bound-hybrid-sizing-provenance-v1";
+const HYBRID_SIZING_JSON: &str = "hybrid-sizing.json";
+const HYBRID_SIZING_TEXT: &str = "hybrid-sizing.txt";
+const PROVENANCE_JSON: &str = "provenance.json";
+const MAX_HYBRID_SIZING_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HYBRID_SIZING_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROVENANCE_JSON_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HybridSizingArtifactV1 {
+    schema: String,
+    measurement_blake2s256: String,
+    qualification_blake2s256: String,
+    source_snapshot: PreverifiedSourceSnapshotV1,
+    hybrid_sizing: SourceBoundHybridSizingReport,
+}
+
+impl HybridSizingArtifactV1 {
+    fn new(
+        hybrid_sizing: &SourceBoundHybridSizingReport,
+        measurement: &MainnetCorpusMeasurement,
+        measurement_blake2s256: &str,
+        qualification_blake2s256: &str,
+        source_snapshot: &PreverifiedSourceSnapshotV1,
+    ) -> Result<Self, ArtifactError> {
+        source_snapshot.validate(measurement)?;
+        validate_hybrid_sizing(hybrid_sizing, measurement, measurement_blake2s256)?;
+        Ok(Self {
+            schema: HYBRID_SIZING_SCHEMA.to_owned(),
+            measurement_blake2s256: measurement_blake2s256.to_owned(),
+            qualification_blake2s256: qualification_blake2s256.to_owned(),
+            source_snapshot: source_snapshot.clone(),
+            hybrid_sizing: hybrid_sizing.clone(),
+        })
+    }
+
+    fn validate(
+        &self,
+        measurement: &MainnetCorpusMeasurement,
+        measurement_blake2s256: &str,
+        qualification_blake2s256: &str,
+        source_snapshot: &PreverifiedSourceSnapshotV1,
+    ) -> Result<(), ArtifactError> {
+        if self.schema != HYBRID_SIZING_SCHEMA
+            || self.measurement_blake2s256 != measurement_blake2s256
+            || self.qualification_blake2s256 != qualification_blake2s256
+            || self.source_snapshot != *source_snapshot
+        {
+            return Err(ArtifactError::InvalidArtifact {
+                reason: "hybrid-sizing schema or source lineage mismatch",
+            });
+        }
+        self.source_snapshot.validate(measurement)?;
+        validate_hybrid_sizing(&self.hybrid_sizing, measurement, measurement_blake2s256)
+    }
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>, ArtifactError> {
+        serde_json::to_vec(self).map_err(ArtifactError::Json)
+    }
+
+    fn digest(&self) -> Result<String, ArtifactError> {
+        Ok(artifact_blake2s256_hex(&self.canonical_bytes()?))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HybridSizingProvenanceV1 {
+    schema: String,
+    runner_version: String,
+    hybrid_sizing_blake2s256: String,
+}
+
+impl HybridSizingProvenanceV1 {
+    fn new(runner_version: &str, artifact: &HybridSizingArtifactV1) -> Result<Self, ArtifactError> {
+        if runner_version.is_empty() {
+            return Err(ArtifactError::InvalidArtifact {
+                reason: "runner version is empty",
+            });
+        }
+        Ok(Self {
+            schema: HYBRID_SIZING_PROVENANCE_SCHEMA.to_owned(),
+            runner_version: runner_version.to_owned(),
+            hybrid_sizing_blake2s256: artifact.digest()?,
+        })
+    }
+
+    fn validate(&self, artifact: &HybridSizingArtifactV1) -> Result<(), ArtifactError> {
+        if self.schema != HYBRID_SIZING_PROVENANCE_SCHEMA || self.runner_version.is_empty() {
+            return Err(ArtifactError::InvalidArtifact {
+                reason: "hybrid-sizing provenance is invalid",
+            });
+        }
+        if self.hybrid_sizing_blake2s256 != artifact.digest()? {
+            return Err(ArtifactError::InvalidArtifact {
+                reason: "hybrid-sizing digest mismatch",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_hybrid_sizing(
+    hybrid_sizing: &SourceBoundHybridSizingReport,
+    measurement: &MainnetCorpusMeasurement,
+    measurement_blake2s256: &str,
+) -> Result<(), ArtifactError> {
+    hybrid_sizing
+        .validate_against(measurement, measurement_blake2s256)
+        .map_err(|_| ArtifactError::InvalidArtifact {
+            reason: "hybrid-sizing report is invalid or source-unbound",
+        })
+}
+
+/// Publishes a complete, read-back-validated source-bound hybrid-sizing analysis.
+pub(super) fn publish_hybrid_sizing(
+    output_dir: &Path,
+    capture: &ValidatedCapture,
+    sizing: &ValidatedSizing,
+    hybrid_sizing: &SourceBoundHybridSizingReport,
+    source_snapshot: &PreverifiedSourceSnapshotV1,
+    runner_version: &str,
+) -> Result<(), ArtifactError> {
+    validate_derived_source_lineage(capture, sizing)?;
+    let artifact = HybridSizingArtifactV1::new(
+        hybrid_sizing,
+        capture.measurement(),
+        capture.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+        source_snapshot,
+    )?;
+    let provenance = HybridSizingProvenanceV1::new(runner_version, &artifact)?;
+    provenance.validate(&artifact)?;
+
+    let files = [
+        ArtifactFile::new(
+            HYBRID_SIZING_JSON,
+            serde_json::to_vec_pretty(&artifact).map_err(ArtifactError::Json)?,
+        ),
+        ArtifactFile::new(HYBRID_SIZING_TEXT, hybrid_sizing.to_string().into_bytes()),
+        ArtifactFile::new(
+            PROVENANCE_JSON,
+            serde_json::to_vec_pretty(&provenance).map_err(ArtifactError::Json)?,
+        ),
+    ];
+
+    publish_verified_derived_artifact(output_dir, capture, sizing, &files, |stage| {
+        validate_staged_hybrid_sizing(
+            stage,
+            capture,
+            sizing,
+            source_snapshot,
+            &artifact,
+            &provenance,
+        )
+    })
+}
+
+fn validate_staged_hybrid_sizing(
+    stage: &ArtifactDirectory,
+    capture: &ValidatedCapture,
+    sizing: &ValidatedSizing,
+    source_snapshot: &PreverifiedSourceSnapshotV1,
+    expected_artifact: &HybridSizingArtifactV1,
+    expected_provenance: &HybridSizingProvenanceV1,
+) -> Result<(), ArtifactError> {
+    let hybrid_sizing_json =
+        read_artifact_file(stage, HYBRID_SIZING_JSON, MAX_HYBRID_SIZING_JSON_BYTES)?;
+    let hybrid_sizing_text =
+        read_artifact_file(stage, HYBRID_SIZING_TEXT, MAX_HYBRID_SIZING_TEXT_BYTES)?;
+    let provenance_json = read_artifact_file(stage, PROVENANCE_JSON, MAX_PROVENANCE_JSON_BYTES)?;
+
+    let artifact: HybridSizingArtifactV1 =
+        serde_json::from_slice(&hybrid_sizing_json).map_err(ArtifactError::Json)?;
+    validate_derived_source_lineage(capture, sizing)?;
+    artifact.validate(
+        capture.measurement(),
+        capture.measurement_blake2s256(),
+        sizing.qualification_blake2s256(),
+        source_snapshot,
+    )?;
+    let provenance: HybridSizingProvenanceV1 =
+        serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
+    provenance.validate(&artifact)?;
+    if hybrid_sizing_text != artifact.hybrid_sizing.to_string().as_bytes() {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "hybrid-sizing text does not match the typed report",
+        });
+    }
+    if artifact != *expected_artifact {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "hybrid-sizing read-back differs from the computed report",
+        });
+    }
+    if provenance != *expected_provenance {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "hybrid-sizing provenance read-back differs from expected provenance",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::num::NonZeroU128;
+
+    use zaino_oram::{
+        MainnetCorpusScanner, SourceBoundHybridSizingProfile, SourceBoundHybridSizingSession,
+    };
+    use zaino_state::{
+        chain_index::types::EquihashSolution, BlockContext, BlockData, BlockHash, ChainWork,
+        CommitmentTreeData, CommitmentTreeRoots, CommitmentTreeSizes, CompactDifficulty,
+        CompactTxData, Height, IndexedBlock, OrchardCompactTx, SaplingCompactTx, ScriptType,
+        TransactionHash, TransparentCompactTx, TxInCompact, TxOutCompact,
+    };
+
+    use crate::corpus_artifact::BackendKind;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    struct HybridSizingFixture {
+        measurement: MainnetCorpusMeasurement,
+        measurement_digest: String,
+        qualification_digest: String,
+        source_snapshot: PreverifiedSourceSnapshotV1,
+        report: SourceBoundHybridSizingReport,
+    }
+
+    fn fixture_genesis(address_count: u8) -> TestResult<IndexedBlock> {
+        const MAINNET_GENESIS_DISPLAY_ORDER: [u8; 32] = [
+            0x00, 0x04, 0x0f, 0xe8, 0xec, 0x84, 0x71, 0x91, 0x1b, 0xaa, 0x1d, 0xb1, 0x26, 0x6e,
+            0xa1, 0x5d, 0xd0, 0x6b, 0x4a, 0x8a, 0x5c, 0x45, 0x38, 0x83, 0xc0, 0x00, 0xb0, 0x31,
+            0x97, 0x3d, 0xce, 0x08,
+        ];
+
+        let outputs = (0..address_count)
+            .map(|byte| {
+                TxOutCompact::new(u64::from(byte) + 1, [byte + 1; 20], ScriptType::P2PKH as u8)
+                    .ok_or_else(|| "known script class must construct a compact output".into())
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        let transaction = CompactTxData::new(
+            0,
+            TransactionHash([0x11; 32]),
+            TransparentCompactTx::new(vec![TxInCompact::null_prevout()], outputs),
+            SaplingCompactTx::new(None, Vec::new(), Vec::new()),
+            OrchardCompactTx::empty(),
+            OrchardCompactTx::empty(),
+        );
+        let context = BlockContext::new(
+            BlockHash::from_bytes_in_display_order(&MAINNET_GENESIS_DISPLAY_ORDER),
+            BlockHash([0; 32]),
+            ChainWork::new(NonZeroU128::new(1).ok_or("fixture chainwork must remain nonzero")?),
+            Height::try_from(0_u32)?,
+        );
+        let data = BlockData::new(
+            1,
+            0,
+            [0; 32],
+            [0; 32],
+            CompactDifficulty::try_from_bits(0x2007_ffff)?,
+            [0; 32],
+            EquihashSolution::Regtest([0; 36]),
+        );
+        let commitment_tree_data = CommitmentTreeData::new(
+            CommitmentTreeRoots::new([0; 32], [0; 32], None),
+            CommitmentTreeSizes::new(0, 0, 0),
+        );
+        Ok(IndexedBlock::new(
+            context,
+            data,
+            vec![transaction],
+            commitment_tree_data,
+        ))
+    }
+
+    fn fixture() -> TestResult<HybridSizingFixture> {
+        let block = fixture_genesis(3)?;
+        let mut scanner = MainnetCorpusScanner::new();
+        scanner.push(&block)?;
+        let measurement = scanner.finish()?;
+        let measurement_digest = "11".repeat(32);
+        let qualification_digest = "22".repeat(32);
+        let mut session = SourceBoundHybridSizingSession::start(
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1,
+            &measurement,
+            &measurement_digest,
+        )?;
+        session.push(&block)?;
+        let report = session.finish()?;
+        let source_snapshot =
+            PreverifiedSourceSnapshotV1::new_verified(BackendKind::Rpc, 0, &measurement)?;
+        Ok(HybridSizingFixture {
+            measurement,
+            measurement_digest,
+            qualification_digest,
+            source_snapshot,
+            report,
+        })
+    }
+
+    fn artifact(fixture: &HybridSizingFixture) -> Result<HybridSizingArtifactV1, ArtifactError> {
+        HybridSizingArtifactV1::new(
+            &fixture.report,
+            &fixture.measurement,
+            &fixture.measurement_digest,
+            &fixture.qualification_digest,
+            &fixture.source_snapshot,
+        )
+    }
+
+    #[test]
+    fn artifact_round_trips_and_rejects_lineage_and_unknown_fields() -> TestResult {
+        let fixture = fixture()?;
+        let artifact = artifact(&fixture)?;
+        let encoded = serde_json::to_value(&artifact)?;
+        let decoded: HybridSizingArtifactV1 = serde_json::from_value(encoded)?;
+        assert_eq!(decoded, artifact);
+        decoded.validate(
+            &fixture.measurement,
+            &fixture.measurement_digest,
+            &fixture.qualification_digest,
+            &fixture.source_snapshot,
+        )?;
+
+        let mut wrong_lineage = artifact.clone();
+        wrong_lineage.measurement_blake2s256 = "33".repeat(32);
+        assert!(wrong_lineage
+            .validate(
+                &fixture.measurement,
+                &fixture.measurement_digest,
+                &fixture.qualification_digest,
+                &fixture.source_snapshot,
+            )
+            .is_err());
+
+        let mut wrong_sizing_lineage = artifact.clone();
+        wrong_sizing_lineage.qualification_blake2s256 = "44".repeat(32);
+        assert!(wrong_sizing_lineage
+            .validate(
+                &fixture.measurement,
+                &fixture.measurement_digest,
+                &fixture.qualification_digest,
+                &fixture.source_snapshot,
+            )
+            .is_err());
+
+        let mut unknown_field = serde_json::to_value(&artifact)?;
+        unknown_field["operator_note"] = serde_json::json!("not schema-bound");
+        assert!(serde_json::from_value::<HybridSizingArtifactV1>(unknown_field).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_binds_the_complete_artifact() -> TestResult {
+        let fixture = fixture()?;
+        let artifact = artifact(&fixture)?;
+        let provenance = HybridSizingProvenanceV1::new("test-runner", &artifact)?;
+        provenance.validate(&artifact)?;
+
+        let mut changed_artifact = artifact;
+        changed_artifact.measurement_blake2s256 = "44".repeat(32);
+        assert!(provenance.validate(&changed_artifact).is_err());
+        assert!(HybridSizingProvenanceV1::new("", &changed_artifact).is_err());
+        Ok(())
+    }
+}
