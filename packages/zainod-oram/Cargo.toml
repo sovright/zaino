@@ -9,6 +9,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "zainod-oram-timing"
+path = "src/bin/zainod-oram-timing.rs"
+required-features = ["typed-qualification"]
+
 [features]
 default = []
 private-service = [
@@ -32,6 +37,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 tar = { version = "0.4.46", default-features = false }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tonic = { workspace = true, optional = true }
 tonic-prost = { version = "0.14", optional = true }
@@ -39,9 +45,6 @@ zaino-common = { version = "0.2.0", path = "../zaino-common" }
 zaino-oram = { version = "0.1.0", path = "../zaino-oram", features = ["corpus-zaino"] }
 zaino-state = { version = "0.3.1", path = "../zaino-state", default-features = false }
 zainod = { version = "0.4.3-ironwood.1", path = "../zainod" }
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }

@@ -16,6 +16,7 @@ on:
       - 'packages/zaino-state/**'
       - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
+      - 'tools/workbench/**'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
@@ -30,6 +31,7 @@ on:
       - 'packages/zaino-state/**'
       - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
+      - 'tools/workbench/**'
 
 permissions:
   contents: read
@@ -87,3 +89,20 @@ jobs:
         run: >-
           cargo nextest run -p zainod-oram --all-features --locked
           --no-tests fail --status-level fail
+
+      # Phase 0 kill-gate 2: the ORAM insertion path must keep matching the
+      # reviewed structural codegen profile. This is a fail-closed regression
+      # check over the release binary, not semantic taint analysis.
+      - name: Build the typed-qualification runner for codegen inspection
+        run: cargo build -p zainod-oram --all-features --locked --release
+
+      - name: Verify binutils are available
+        run: |
+          nm --version | head -1
+          objdump --version | head -1
+
+      - name: Check the ORAM access-path codegen profile
+        run: >-
+          cargo run --locked --release
+          --manifest-path tools/workbench/Cargo.toml
+          --bin check-oram-codegen -- target/release/zainod-oram
