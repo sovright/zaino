@@ -18,6 +18,8 @@ use rustix::fs::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::corpus_artifact::artifact_blake2s256_hex;
+
 const RECEIPT_SCHEMA: &str = "zaino-oram-release-receipt-v1";
 const PRODUCT: &str = "zainod-oram";
 const BINARY_NAME: &str = "zainod-oram";
@@ -55,6 +57,49 @@ pub(super) struct ReleaseReceiptInputs {
     pub(super) binary: PathBuf,
     pub(super) reproducible_binary: PathBuf,
     pub(super) output: PathBuf,
+}
+
+/// Canonical release receipt verified against the currently running executable.
+pub(super) struct VerifiedReleaseReceipt {
+    canonical_bytes: Vec<u8>,
+    metadata: ReleaseReceiptMetadata,
+}
+
+/// Fields a canonical receipt binds independently of executable admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReleaseReceiptMetadata {
+    receipt_blake2s256: String,
+    source_revision: String,
+    binary_sha256: String,
+    binary_size_bytes: u64,
+}
+
+impl VerifiedReleaseReceipt {
+    pub(super) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub(super) const fn metadata(&self) -> &ReleaseReceiptMetadata {
+        &self.metadata
+    }
+}
+
+impl ReleaseReceiptMetadata {
+    pub(super) fn receipt_blake2s256(&self) -> &str {
+        &self.receipt_blake2s256
+    }
+
+    pub(super) fn source_revision(&self) -> &str {
+        &self.source_revision
+    }
+
+    pub(super) fn binary_sha256(&self) -> &str {
+        &self.binary_sha256
+    }
+
+    pub(super) const fn binary_size_bytes(&self) -> u64 {
+        self.binary_size_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,13 +343,52 @@ fn create_release_receipt_for_creator(
 
 /// Checks local receipt integrity and running-executable identity only.
 pub(super) fn verify_release_receipt(path: &Path) -> Result<(), ReleaseReceiptError> {
+    verify_release_receipt_binding(path).map(|_| ())
+}
+
+/// Checks the receipt and returns the exact canonical bytes and executable binding.
+pub(super) fn verify_release_receipt_binding(
+    path: &Path,
+) -> Result<VerifiedReleaseReceipt, ReleaseReceiptError> {
     if !current_build_supports_executable_identity() {
         return Err(ReleaseReceiptError::UnsupportedExecutableIdentityBuild);
     }
-    let receipt = load_release_receipt(path)?;
     let executable = open_running_executable()?;
     let digest = hash_opened_file(executable, FileRole::RunningExecutable)?;
-    verify_executable_identity(&receipt, &digest)
+    verify_release_receipt_for_executable(path, &digest)
+}
+
+fn verify_release_receipt_for_executable(
+    path: &Path,
+    executable: &OpenedDigest,
+) -> Result<VerifiedReleaseReceipt, ReleaseReceiptError> {
+    let (receipt, canonical_bytes) = load_release_receipt_with_bytes(path)?;
+    verify_executable_identity(&receipt, executable)?;
+    let metadata = release_receipt_metadata(&receipt, &canonical_bytes);
+    Ok(VerifiedReleaseReceipt {
+        canonical_bytes,
+        metadata,
+    })
+}
+
+/// Parses and validates exact canonical receipt bytes without admitting an executable.
+pub(super) fn release_receipt_metadata_from_canonical_bytes(
+    bytes: &[u8],
+) -> Result<ReleaseReceiptMetadata, ReleaseReceiptError> {
+    let receipt = load_receipt_from_bytes(bytes)?;
+    Ok(release_receipt_metadata(&receipt, bytes))
+}
+
+fn release_receipt_metadata(
+    receipt: &ReleaseReceiptV1,
+    canonical_bytes: &[u8],
+) -> ReleaseReceiptMetadata {
+    ReleaseReceiptMetadata {
+        receipt_blake2s256: artifact_blake2s256_hex(canonical_bytes),
+        source_revision: receipt.source_revision.clone(),
+        binary_sha256: receipt.binary_sha256.clone(),
+        binary_size_bytes: receipt.binary_size_bytes,
+    }
 }
 
 fn current_build_supports_executable_identity() -> bool {
@@ -791,19 +875,46 @@ fn validate_embedded_input<R: Read>(
 }
 
 fn load_release_receipt(path: &Path) -> Result<ReleaseReceiptV1, ReleaseReceiptError> {
+    load_release_receipt_with_bytes(path).map(|(receipt, _)| receipt)
+}
+
+fn load_release_receipt_with_bytes(
+    path: &Path,
+) -> Result<(ReleaseReceiptV1, Vec<u8>), ReleaseReceiptError> {
     let file = open_regular_path(path, FileRole::Receipt)?;
-    load_receipt_from_file(file)
+    let bytes = read_opened_file(file, FileRole::Receipt)?.bytes;
+    let receipt = load_receipt_from_bytes(&bytes)?;
+    Ok((receipt, bytes))
 }
 
 fn load_receipt_from_file(file: File) -> Result<ReleaseReceiptV1, ReleaseReceiptError> {
     let bytes = read_opened_file(file, FileRole::Receipt)?.bytes;
+    load_receipt_from_bytes(&bytes)
+}
+
+fn load_receipt_from_bytes(bytes: &[u8]) -> Result<ReleaseReceiptV1, ReleaseReceiptError> {
     let receipt: ReleaseReceiptV1 =
-        serde_json::from_slice(&bytes).map_err(ReleaseReceiptError::Json)?;
+        serde_json::from_slice(bytes).map_err(ReleaseReceiptError::Json)?;
     receipt.validate()?;
     if receipt.canonical_bytes()? != bytes {
         return Err(ReleaseReceiptError::NonCanonicalJson);
     }
     Ok(receipt)
+}
+
+#[cfg(test)]
+pub(super) fn canonical_test_release_receipt() -> Result<Vec<u8>, ReleaseReceiptError> {
+    let digest = "1".repeat(SHA256_HEX_BYTES);
+    ReleaseReceiptV1::new(
+        "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        digest.clone(),
+        digest.clone(),
+        digest.clone(),
+        digest.clone(),
+        digest,
+        1_024,
+    )?
+    .canonical_bytes()
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -1730,6 +1841,42 @@ mod tests {
             verify_executable_identity(&receipt, &wrong_digest),
             Err(ReleaseReceiptError::RunningExecutableMismatch)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn verified_receipt_binding_returns_the_exact_validated_bytes() -> TestResult {
+        let fixture = Fixture::new()?;
+        fixture.create("receipt.json")?;
+        let receipt_path = fixture.temp.path().join("receipt.json");
+        let expected_bytes = fs::read(&receipt_path)?;
+        let expected_receipt = load_release_receipt(&receipt_path)?;
+
+        let verified = verify_release_receipt_for_executable(&receipt_path, &fixture.creator()?)?;
+
+        assert_eq!(verified.canonical_bytes(), expected_bytes);
+        let metadata = verified.metadata();
+        assert_eq!(
+            metadata.receipt_blake2s256(),
+            artifact_blake2s256_hex(&expected_bytes)
+        );
+        assert_eq!(metadata.source_revision(), expected_receipt.source_revision);
+        assert_eq!(metadata.binary_sha256(), expected_receipt.binary_sha256);
+        assert_eq!(
+            metadata.binary_size_bytes(),
+            expected_receipt.binary_size_bytes
+        );
+        let wrong_executable = OpenedDigest {
+            sha256: "2".repeat(SHA256_HEX_BYTES),
+            ..fixture.creator()?
+        };
+        assert!(matches!(
+            verify_release_receipt_for_executable(&receipt_path, &wrong_executable),
+            Err(ReleaseReceiptError::RunningExecutableMismatch)
+        ));
+
+        fs::write(&receipt_path, b"replaced after verification")?;
+        assert_eq!(verified.canonical_bytes(), expected_bytes);
         Ok(())
     }
 

@@ -19,6 +19,22 @@ pub enum RostlTimingRecordKind {
     Event,
 }
 
+/// Which insertion operation each scheduled timing label executes.
+///
+/// [`Self::HitMiss`] measures the real hit/miss distinction. The forced modes
+/// are null controls: the scheduler still emits balanced hit and miss labels,
+/// but both labels execute the same insertion outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RostlTimingMode {
+    /// Execute the operation named by each scheduled label.
+    HitMiss,
+    /// Execute a duplicate-key insertion for both scheduled labels.
+    ForcedHit,
+    /// Execute a missing-key insertion for both scheduled labels.
+    ForcedMiss,
+}
+
 /// Why the native insertion timing probe could not run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RostlTimingError {
@@ -32,6 +48,9 @@ pub enum RostlTimingError {
     SchedulerStats,
     /// The timed insertion returned an outcome inconsistent with its arm.
     WrongOutcome,
+    /// The long-lived probe did not observe exactly one hit and one miss label
+    /// before a pair boundary, or its matched-state invariant drifted.
+    PairState,
 }
 
 impl fmt::Display for RostlTimingError {
@@ -50,6 +69,9 @@ impl fmt::Display for RostlTimingError {
             Self::WrongOutcome => {
                 formatter.write_str("rostl timing probe observed an unexpected insertion outcome")
             }
+            Self::PairState => {
+                formatter.write_str("rostl timing probe pair-state invariant failed")
+            }
         }
     }
 }
@@ -57,7 +79,8 @@ impl fmt::Display for RostlTimingError {
 impl std::error::Error for RostlTimingError {}
 
 /// Scheduler contention conservatively bracketed around measured insertions.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RostlTimingSchedulerSummary {
     measurements: usize,
     timed_wall_nanos: u64,
@@ -92,7 +115,7 @@ impl RostlTimingRun {
     }
 }
 
-/// Runs one record kind against fresh equal-occupancy tables.
+/// Runs one record kind against long-lived, logically matched tables.
 ///
 /// The caller owns platform controls: it must check CPU affinity and machine
 /// quiescence immediately before and after this call.
@@ -102,23 +125,54 @@ pub fn run_rostl_insert_timing(
     occupancy: usize,
     plan: &ExperimentPlan,
 ) -> Result<RostlTimingRun, RostlTimingError> {
+    run_rostl_insert_timing_mode(kind, RostlTimingMode::HitMiss, capacity, occupancy, plan)
+}
+
+/// Runs one record kind in a selected real or null-control timing mode.
+///
+/// Pair fields retain their scheduled hit/miss labels in every mode. In a
+/// forced mode those labels do not describe the executed insertion outcome;
+/// both labels execute the operation selected by `mode`.
+///
+/// The caller owns platform controls: it must check CPU affinity and machine
+/// quiescence immediately before and after this call.
+pub fn run_rostl_insert_timing_mode(
+    kind: RostlTimingRecordKind,
+    mode: RostlTimingMode,
+    capacity: usize,
+    occupancy: usize,
+    plan: &ExperimentPlan,
+) -> Result<RostlTimingRun, RostlTimingError> {
     #[cfg(feature = "rostl-experimental")]
     {
-        let mut probe = crate::layout::rostl_insert_timing_probe(kind, capacity, occupancy)?;
+        validate_rostl_timing_shape(kind, capacity, occupancy, plan)?;
+        let mut probe = crate::layout::rostl_insert_timing_probe(
+            kind,
+            mode,
+            capacity,
+            occupancy,
+            plan.total_pairs(),
+        )?;
         let pairs = crate::timing_experiment::run(plan, &mut probe)?;
-        let scheduler = summarize_scheduler(&pairs)?;
+        let scheduler = summarize_rostl_timing_scheduler(&pairs)?;
         Ok(RostlTimingRun { pairs, scheduler })
     }
 
     #[cfg(not(feature = "rostl-experimental"))]
     {
-        let _ = (kind, capacity, occupancy, plan);
+        let _ = (kind, mode, capacity, occupancy, plan);
         Err(RostlTimingError::UnsupportedPlatform)
     }
 }
 
-#[cfg(feature = "rostl-experimental")]
-fn summarize_scheduler(pairs: &[Pair]) -> Result<RostlTimingSchedulerSummary, RostlTimingError> {
+/// Recomputes scheduler-contention evidence from retained timing pairs.
+///
+/// This pure replay path does not invoke the native timing probe. It rejects
+/// empty inputs, missing per-arm scheduler counters, zero-duration
+/// measurements, and arithmetic overflow.
+pub fn summarize_rostl_timing_scheduler(
+    pairs: &[Pair],
+) -> Result<RostlTimingSchedulerSummary, RostlTimingError> {
     let mut measurements = 0usize;
     let mut timed_wall_nanos = 0u64;
     let mut cpu_time_nanos = 0u64;
@@ -173,23 +227,171 @@ pub fn validate_rostl_timing_shape(
     kind: RostlTimingRecordKind,
     capacity: usize,
     occupancy: usize,
+    plan: &ExperimentPlan,
 ) -> Result<(), RostlTimingError> {
     #[cfg(feature = "rostl-experimental")]
     {
-        crate::layout::rostl_insert_timing_probe(kind, capacity, occupancy).map(|_| ())
+        let _ = kind;
+        crate::layout::validate_rostl_insert_timing_shape(capacity, occupancy, plan.total_pairs())
     }
 
     #[cfg(not(feature = "rostl-experimental"))]
     {
-        let _ = (kind, capacity, occupancy);
+        let _ = (kind, capacity, occupancy, plan);
         Err(RostlTimingError::UnsupportedPlatform)
     }
 }
 
-#[cfg(all(test, feature = "rostl-experimental"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::timing_equivalence::{ArmMeasurement, PairOrder, TimedSchedulerDelta};
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    use crate::{EquivalenceBounds, TimingSeed, MINIMUM_PAIRS};
+
+    #[test]
+    fn timing_modes_use_stable_snake_case_names() -> Result<(), serde_json::Error> {
+        for (mode, encoded) in [
+            (RostlTimingMode::HitMiss, "\"hit_miss\""),
+            (RostlTimingMode::ForcedHit, "\"forced_hit\""),
+            (RostlTimingMode::ForcedMiss, "\"forced_miss\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode)?, encoded);
+            assert_eq!(serde_json::from_str::<RostlTimingMode>(encoded)?, mode);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn forced_modes_emit_complete_labelled_pairs_for_both_record_kinds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let plan = ExperimentPlan::new(MINIMUM_PAIRS, 1, TimingSeed::new(0xfeed_cafe))?;
+
+        for kind in [
+            RostlTimingRecordKind::Directory,
+            RostlTimingRecordKind::Event,
+        ] {
+            for mode in [RostlTimingMode::ForcedHit, RostlTimingMode::ForcedMiss] {
+                let run = run_rostl_insert_timing_mode(kind, mode, 1_024, 7, &plan)?;
+                let (pairs, _) = run.into_parts();
+                assert_eq!(pairs.len(), MINIMUM_PAIRS);
+
+                let encoded = serde_json::to_value(&pairs)?;
+                let Some(encoded_pairs) = encoded.as_array() else {
+                    panic!("timing pairs must serialize as an array");
+                };
+                let hit_first = encoded_pairs
+                    .iter()
+                    .filter(|pair| pair["order"] == "hit_first")
+                    .count();
+                let miss_first = encoded_pairs
+                    .iter()
+                    .filter(|pair| pair["order"] == "miss_first")
+                    .count();
+
+                assert_eq!(hit_first, MINIMUM_PAIRS / 2);
+                assert_eq!(miss_first, MINIMUM_PAIRS / 2);
+                assert!(encoded_pairs.iter().all(|pair| {
+                    pair["hit_nanos"].as_u64().is_some()
+                        && pair["miss_nanos"].as_u64().is_some()
+                        && pair["hit_scheduler"].is_object()
+                        && pair["miss_scheduler"].is_object()
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs both identical-operation controls through the production timing
+    /// entry point and rejects gross label-dependent harness separation.
+    ///
+    /// Scheduled labels still select the matched physical table and retain the
+    /// normal AB/BA lifecycle. The forced mode changes only the executed
+    /// insertion outcome, so both labels perform the same logical operation.
+    ///
+    /// Ignored by default: it performs two full 500-pair schedules and must run
+    /// only on a pinned, quiescent Linux host.
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    #[ignore = "long-running calibration; run explicitly on a quiescent host"]
+    fn production_forced_modes_stay_within_null_control_bounds(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // With 500 balanced pairs, the order-conditioned contrasts have only
+        // 250 samples per arm and a roughly 0.23 distribution-free confidence
+        // floor. The CDF bound leaves about 0.17 empirical-distance headroom:
+        // wide enough for a stable smoke control, but still able to reject
+        // gross symmetric shape separation that AUC can miss.
+        const MEAN_BOUND_NANOS: f64 = 1_000.0;
+        const CDF_DISTANCE_BOUND: f64 = 0.40;
+        const AUC_DEVIATION_BOUND: f64 = 0.10;
+
+        let seed = TimingSeed::new(20_260_728);
+        let plan = ExperimentPlan::new(500, 50, seed)?;
+        let bounds = EquivalenceBounds::new(MEAN_BOUND_NANOS, CDF_DISTANCE_BOUND)?;
+
+        for mode in [RostlTimingMode::ForcedMiss, RostlTimingMode::ForcedHit] {
+            let run = run_rostl_insert_timing_mode(
+                RostlTimingRecordKind::Directory,
+                mode,
+                1_024,
+                256,
+                &plan,
+            )?;
+            let (pairs, _) = run.into_parts();
+            let report = crate::timing_equivalence::evaluate(&pairs, bounds, seed);
+
+            println!(
+                "null control mode={mode:?} auc={:.4} cdf={:.4} \
+                 cdf_upper_95={:.4} mean={:.1}ns p={:.4}",
+                report.classifier_auc(),
+                report.empirical_cdf_distance(),
+                report.cdf_distance_upper_95(),
+                report.mean_difference_nanos(),
+                report.permutation_p_value(),
+            );
+
+            assert!(
+                report.bounds_satisfied(),
+                "null control mode {mode:?} exceeded the predeclared mean or \
+                 distribution bound: {report:?}"
+            );
+
+            let auc_deviation = (report.classifier_auc() - 0.5).abs();
+            assert!(
+                auc_deviation < AUC_DEVIATION_BOUND,
+                "null control mode {mode:?} has AUC deviation \
+                 {auc_deviation:.4}; rank separation remains uninterpretable"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn long_lived_probe_requires_pair_growth_headroom() {
+        let plan = ExperimentPlan::new(3, 2, TimingSeed::new(7)).expect("valid pilot plan");
+
+        assert_eq!(
+            validate_rostl_timing_shape(RostlTimingRecordKind::Directory, 8, 3, &plan),
+            Err(RostlTimingError::InvalidShape)
+        );
+        assert!(
+            validate_rostl_timing_shape(RostlTimingRecordKind::Directory, 16, 3, &plan).is_ok()
+        );
+    }
 
     fn measured_pair(
         order: PairOrder,
@@ -215,8 +417,9 @@ mod tests {
             runqueue_wait_nanos: 40,
             timeslices: 2,
         };
-        let summary = summarize_scheduler(&[measured_pair(PairOrder::HitFirst, quiet, noisy)])
-            .expect("scheduler deltas are valid");
+        let summary =
+            summarize_rostl_timing_scheduler(&[measured_pair(PairOrder::HitFirst, quiet, noisy)])
+                .expect("scheduler deltas are valid");
 
         assert_eq!(summary.aggregate_runqueue_wait_ratio, 0.25);
         assert_eq!(summary.maximum_measurement_runqueue_wait_ratio, 0.40);
@@ -225,9 +428,48 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_summary_round_trips_through_json() -> Result<(), serde_json::Error> {
+        let delta = TimedSchedulerDelta {
+            cpu_time_nanos: 90,
+            runqueue_wait_nanos: 10,
+            timeslices: 1,
+        };
+        let summary =
+            summarize_rostl_timing_scheduler(&[measured_pair(PairOrder::HitFirst, delta, delta)])
+                .expect("scheduler deltas are valid");
+        let encoded = serde_json::to_string(&summary)?;
+
+        assert_eq!(
+            serde_json::from_str::<RostlTimingSchedulerSummary>(&encoded)?,
+            summary
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_summary_rejects_unknown_fields() -> Result<(), serde_json::Error> {
+        let delta = TimedSchedulerDelta {
+            cpu_time_nanos: 90,
+            runqueue_wait_nanos: 10,
+            timeslices: 1,
+        };
+        let summary =
+            summarize_rostl_timing_scheduler(&[measured_pair(PairOrder::HitFirst, delta, delta)])
+                .expect("scheduler deltas are valid");
+        let mut encoded = serde_json::to_value(summary)?;
+        let Some(object) = encoded.as_object_mut() else {
+            panic!("scheduler summary must serialize as an object");
+        };
+        object.insert("extra".to_owned(), serde_json::Value::Bool(true));
+
+        assert!(serde_json::from_value::<RostlTimingSchedulerSummary>(encoded).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn scheduler_summary_rejects_pairs_without_timed_counters() {
         assert_eq!(
-            summarize_scheduler(&[Pair::new(100, 100, PairOrder::HitFirst)]),
+            summarize_rostl_timing_scheduler(&[Pair::new(100, 100, PairOrder::HitFirst)]),
             Err(RostlTimingError::SchedulerStats)
         );
     }

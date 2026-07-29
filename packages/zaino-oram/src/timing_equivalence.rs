@@ -1,19 +1,20 @@
 //! Paired-timing equivalence statistics for access-path qualification.
 //!
 //! Phase 0 kill-gate 2 requires that a host observer cannot distinguish a hit
-//! from a miss on the ORAM insertion path. Static codegen evidence shows the
-//! secret reaches no branch; this module supplies the *dynamic* half — the
+//! from a miss on the ORAM insertion path. Static codegen evidence must test
+//! whether the secret reaches a branch; this module supplies the wall-clock
 //! statistics for a paired experiment that tries, and should fail, to tell the
-//! two apart by wall-clock time.
+//! two apart.
 //!
 //! Everything here is pure and deterministic given a seed, so a published
 //! result can be recomputed exactly from its recorded inputs. That is a
 //! requirement for evidence, not a convenience: a qualification number nobody
 //! can reproduce is not evidence.
 //!
-//! The experiment driver that produces [`Pair`]s — fresh equal-occupancy
-//! tables, CPU pinning, warm-up, randomised AB/BA ordering — is separate and
-//! platform-specific. This module never measures anything itself.
+//! The platform-specific experiment driver that produces [`Pair`]s owns state
+//! control, CPU pinning, warm-up, and randomised AB/BA ordering. This module
+//! never measures anything itself and does not assume that sequential pairs
+//! are statistically independent.
 //!
 //! # Reading the result
 //!
@@ -59,6 +60,7 @@ pub enum PairOrder {
 
 /// Scheduler-counter deltas bracketing one timed insertion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TimedSchedulerDelta {
     pub(crate) cpu_time_nanos: u64,
     pub(crate) runqueue_wait_nanos: u64,
@@ -91,6 +93,7 @@ impl ArmMeasurement {
 /// One paired observation: the same insertion performed against a present and
 /// an absent record, under identical occupancy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pair {
     hit_nanos: u64,
     miss_nanos: u64,
@@ -137,12 +140,17 @@ impl Pair {
         }
     }
 
+    pub(crate) const fn order(&self) -> PairOrder {
+        self.order
+    }
+
     fn difference(self) -> f64 {
         self.hit_nanos as f64 - self.miss_nanos as f64
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContrastReport {
     hit_samples: usize,
     miss_samples: usize,
@@ -223,6 +231,7 @@ impl Seed {
 
 /// The outcome of one paired equivalence experiment.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EquivalenceReport {
     pairs: usize,
     mean_difference_nanos: f64,
@@ -672,6 +681,48 @@ mod tests {
             PairOrder::MissFirst
         };
         Pair::new(hit_nanos, miss_nanos, order)
+    }
+
+    #[test]
+    fn pair_evidence_rejects_unknown_outer_and_scheduler_fields() {
+        assert!(
+            serde_json::from_str::<Pair>(
+                r#"{"hit_nanos":10,"miss_nanos":10,"order":"hit_first","hit_scheduler":null,"miss_scheduler":null,"extra":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Pair>(
+                r#"{"hit_nanos":10,"miss_nanos":10,"order":"hit_first","hit_scheduler":{"cpu_time_nanos":9,"runqueue_wait_nanos":1,"timeslices":1,"extra":true},"miss_scheduler":null}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn equivalence_report_rejects_unknown_outer_and_contrast_fields(
+    ) -> Result<(), serde_json::Error> {
+        let pairs: Vec<Pair> = (0..MINIMUM_PAIRS)
+            .map(|index| pair(index, 1_000, 1_000))
+            .collect();
+        let report = evaluate(&pairs, bounds(50.0, 0.24), Seed::new(7));
+        let mut outer = serde_json::to_value(report)?;
+        let Some(outer_object) = outer.as_object_mut() else {
+            panic!("equivalence report must serialize as an object");
+        };
+        outer_object.insert("extra".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<EquivalenceReport>(outer).is_err());
+
+        let mut nested = serde_json::to_value(report)?;
+        let Some(hit_first) = nested
+            .get_mut("hit_first")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            panic!("hit-first contrast must serialize as an object");
+        };
+        hit_first.insert("extra".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<EquivalenceReport>(nested).is_err());
+        Ok(())
     }
 
     /// Two constant, identical timings must produce an exactly zero difference,

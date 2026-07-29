@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     error::Error,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt, fs,
     fs::File,
     io::{self, Read, Write},
@@ -16,8 +16,8 @@ use std::{os::fd::OwnedFd, os::unix::ffi::OsStringExt};
 use blake2::{Blake2s256, Digest};
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 use rustix::fs::{
-    fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, Dir, Mode, OFlags,
-    RenameFlags,
+    flock, fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, Dir,
+    FlockOperation, Mode, OFlags, RenameFlags,
 };
 use serde::{Deserialize, Serialize};
 use zaino_oram::{MainnetCorpusError, MainnetCorpusMeasurement, MainnetSizingQualification};
@@ -486,6 +486,43 @@ pub(super) fn publish_verified_artifact(
     publish_verified_directory(output_dir, files, PublishFailpoint::None, validate)
 }
 
+/// Publishes one immutable child artifact relative to an already-opened parent.
+#[cfg(all(
+    feature = "typed-qualification",
+    any(target_vendor = "apple", target_os = "linux")
+))]
+pub(super) fn publish_verified_child_artifact(
+    parent: &ArtifactDirectory,
+    output_name: &OsStr,
+    files: &[ArtifactFile],
+    validate: impl FnOnce(&ArtifactDirectory) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    validate_relative_component(output_name)?;
+    let output = ArtifactOutput {
+        parent: ArtifactDirectory {
+            fd: rustix::io::dup(&parent.fd).map_err(|source| ArtifactError::Io {
+                operation: "duplicate artifact parent directory handle",
+                source: source.into(),
+            })?,
+        },
+        name: output_name.to_owned(),
+    };
+    publish_verified_output(&output, files, PublishFailpoint::None, validate)
+}
+
+#[cfg(all(
+    feature = "typed-qualification",
+    not(any(target_vendor = "apple", target_os = "linux"))
+))]
+pub(super) fn publish_verified_child_artifact(
+    _parent: &ArtifactDirectory,
+    _output_name: &OsStr,
+    _files: &[ArtifactFile],
+    _validate: impl FnOnce(&ArtifactDirectory) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    Err(ArtifactError::UnsupportedPlatform)
+}
+
 /// Publishes a derived artifact outside both validated source directories.
 #[cfg(feature = "typed-qualification")]
 pub(super) fn publish_verified_derived_artifact(
@@ -745,7 +782,9 @@ fn open_artifact_output(output_dir: &Path) -> Result<ArtifactOutput, ArtifactErr
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-fn open_artifact_directory(directory: &Path) -> Result<ArtifactDirectory, ArtifactError> {
+pub(super) fn open_artifact_directory(
+    directory: &Path,
+) -> Result<ArtifactDirectory, ArtifactError> {
     let fd = open(
         directory,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -759,8 +798,81 @@ fn open_artifact_directory(directory: &Path) -> Result<ArtifactDirectory, Artifa
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-fn open_artifact_directory(_directory: &Path) -> Result<ArtifactDirectory, ArtifactError> {
+pub(super) fn open_artifact_directory(
+    _directory: &Path,
+) -> Result<ArtifactDirectory, ArtifactError> {
     Err(ArtifactError::UnsupportedPlatform)
+}
+
+/// Holds a nonblocking exclusive lock on an opened artifact directory.
+#[cfg(all(
+    feature = "typed-qualification",
+    any(target_vendor = "apple", target_os = "linux")
+))]
+pub(super) fn lock_artifact_directory_exclusive(
+    directory: &ArtifactDirectory,
+) -> Result<(), ArtifactError> {
+    flock(&directory.fd, FlockOperation::NonBlockingLockExclusive).map_err(|source| {
+        ArtifactError::Io {
+            operation: "lock artifact directory for exclusive append",
+            source: source.into(),
+        }
+    })
+}
+
+#[cfg(all(
+    feature = "typed-qualification",
+    not(any(target_vendor = "apple", target_os = "linux"))
+))]
+pub(super) fn lock_artifact_directory_exclusive(
+    _directory: &ArtifactDirectory,
+) -> Result<(), ArtifactError> {
+    Err(ArtifactError::UnsupportedPlatform)
+}
+
+/// Opens one descriptor-relative child directory without following links.
+#[cfg(all(
+    feature = "typed-qualification",
+    any(target_vendor = "apple", target_os = "linux")
+))]
+pub(super) fn open_artifact_child_directory(
+    parent: &ArtifactDirectory,
+    name: &OsStr,
+) -> Result<ArtifactDirectory, ArtifactError> {
+    validate_relative_component(name)?;
+    let fd = openat(
+        &parent.fd,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| ArtifactError::Io {
+        operation: "open artifact child directory without following links",
+        source: source.into(),
+    })?;
+    Ok(ArtifactDirectory { fd })
+}
+
+#[cfg(all(
+    feature = "typed-qualification",
+    not(any(target_vendor = "apple", target_os = "linux"))
+))]
+pub(super) fn open_artifact_child_directory(
+    _parent: &ArtifactDirectory,
+    _name: &OsStr,
+) -> Result<ArtifactDirectory, ArtifactError> {
+    Err(ArtifactError::UnsupportedPlatform)
+}
+
+fn validate_relative_component(name: &OsStr) -> Result<(), ArtifactError> {
+    let path = Path::new(name);
+    if name.is_empty() || path.file_name() != Some(name) {
+        Err(ArtifactError::InvalidArtifact {
+            reason: "artifact child name must be one relative path component",
+        })
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -832,6 +944,20 @@ fn validate_file_set(
     directory: &ArtifactDirectory,
     expected: &BTreeSet<OsString>,
 ) -> Result<(), ArtifactError> {
+    let actual = read_directory_names(directory)?;
+    if actual == *expected {
+        Ok(())
+    } else {
+        Err(ArtifactError::InvalidArtifact {
+            reason: "artifact directory does not contain exactly the required files",
+        })
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn read_directory_names(
+    directory: &ArtifactDirectory,
+) -> Result<BTreeSet<OsString>, ArtifactError> {
     let entries = Dir::read_from(&directory.fd).map_err(|source| ArtifactError::Io {
         operation: "open artifact directory stream",
         source: source.into(),
@@ -847,19 +973,13 @@ fn validate_file_set(
             continue;
         }
         let name = OsString::from_vec(name.to_vec());
-        if !expected.contains(&name) || !actual.insert(name) {
+        if !actual.insert(name) {
             return Err(ArtifactError::InvalidArtifact {
-                reason: "artifact directory does not contain exactly the required files",
+                reason: "artifact directory contains duplicate entry names",
             });
         }
     }
-    if actual == *expected {
-        Ok(())
-    } else {
-        Err(ArtifactError::InvalidArtifact {
-            reason: "artifact directory does not contain exactly the required files",
-        })
-    }
+    Ok(actual)
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
@@ -867,6 +987,27 @@ fn validate_file_set(
     _directory: &ArtifactDirectory,
     _expected: &BTreeSet<OsString>,
 ) -> Result<(), ArtifactError> {
+    Err(ArtifactError::UnsupportedPlatform)
+}
+
+/// Lists descriptor-relative artifact entry names without following children.
+#[cfg(all(
+    feature = "typed-qualification",
+    any(target_vendor = "apple", target_os = "linux")
+))]
+pub(super) fn artifact_directory_entry_names(
+    directory: &ArtifactDirectory,
+) -> Result<BTreeSet<OsString>, ArtifactError> {
+    read_directory_names(directory)
+}
+
+#[cfg(all(
+    feature = "typed-qualification",
+    not(any(target_vendor = "apple", target_os = "linux"))
+))]
+pub(super) fn artifact_directory_entry_names(
+    _directory: &ArtifactDirectory,
+) -> Result<BTreeSet<OsString>, ArtifactError> {
     Err(ArtifactError::UnsupportedPlatform)
 }
 
@@ -1225,6 +1366,20 @@ pub(super) fn read_artifact_file(
     maximum_bytes: usize,
 ) -> Result<Vec<u8>, ArtifactError> {
     read_file(directory, name, maximum_bytes)
+}
+
+/// Requires an opened artifact directory to contain exactly the named files.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn validate_artifact_file_set(
+    directory: &ArtifactDirectory,
+    names: &[&'static str],
+) -> Result<(), ArtifactError> {
+    let files: Vec<_> = names
+        .iter()
+        .map(|name| ArtifactFile::new(name, Vec::new()))
+        .collect();
+    let expected = validate_file_names(&files)?;
+    validate_file_set(directory, &expected)
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
