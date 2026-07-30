@@ -42,6 +42,30 @@ pub fn git(args: &[&str]) -> Result<String, Vec<String>> {
     String::from_utf8(output.stdout).map_err(|e| vec![format!("git output not utf-8: {e}")])
 }
 
+/// Run a command that must succeed silently on stderr and return UTF-8 stdout.
+pub fn command(program: &str, args: &[&str]) -> Result<String, Vec<String>> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| vec![format!("failed to run {program}: {error}")])?;
+    if !output.status.success() {
+        return Err(vec![format!(
+            "`{program} {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )]);
+    }
+    if !output.stderr.is_empty() {
+        return Err(vec![format!(
+            "`{program} {}` wrote to stderr despite succeeding: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )]);
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| vec![format!("{program} output is not valid UTF-8: {error}")])
+}
+
 /// Repository root via `git rev-parse --show-toplevel`.
 pub fn repo_root() -> Result<PathBuf, Vec<String>> {
     Ok(PathBuf::from(

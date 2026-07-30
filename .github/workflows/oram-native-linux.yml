@@ -113,3 +113,10 @@ jobs:
           --manifest-path tools/workbench/Cargo.toml
           --bin check-oram-codegen --
           --profile fixed-exact-upsert target/release/zainod-oram
+
+      - name: Check the fixed-page transform codegen profile
+        run: >-
+          cargo run --locked --release
+          --manifest-path tools/workbench/Cargo.toml
+          --bin check-oram-page-codegen --
+          target/release/zainod-oram
