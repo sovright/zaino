@@ -146,6 +146,9 @@ pub fn run_rostl_insert_timing_mode(
     #[cfg(feature = "rostl-experimental")]
     {
         validate_rostl_timing_shape(kind, capacity, occupancy, plan)?;
+        // Retains addresses during setup only; no page transform is executed.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        crate::records::retain_fixed_page_append_codegen();
         let mut probe = crate::layout::rostl_insert_timing_probe(
             kind,
             mode,

@@ -56,8 +56,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::Command;
-use workbench::run;
+use workbench::{command as tool, run};
 
 /// The original access-path function whose body must match the approved
 /// profile. These constants remain the default so the historical one-argument
@@ -2424,28 +2423,6 @@ fn legacy_mnemonic(value: &str) -> bool {
 
 /// Runs a binutils tool, turning a missing tool or non-zero exit into a
 /// diagnostic rather than a silent pass.
-fn tool(program: &str, args: &[&str]) -> Result<String, Vec<String>> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| vec![format!("failed to run {program}: {e}")])?;
-    if !output.status.success() {
-        return Err(vec![format!(
-            "`{program} {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )]);
-    }
-    if !output.stderr.is_empty() {
-        return Err(vec![format!(
-            "`{program} {}` wrote to stderr despite succeeding: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )]);
-    }
-    String::from_utf8(output.stdout).map_err(|e| vec![format!("{program} output not utf-8: {e}")])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
