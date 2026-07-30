@@ -2,6 +2,8 @@ use std::{fmt, num::NonZeroU64};
 
 #[cfg(feature = "corpus-zaino")]
 use blake2::{Blake2s256, Digest};
+#[cfg(feature = "rostl-experimental")]
+use rostl_primitives::traits::Cmov;
 
 /// Byte length of an address-derived ORAM key.
 pub(super) const ADDRESS_KEY_BYTES: usize = 32;
@@ -1231,6 +1233,18 @@ struct PersistentFixedUtxoPage([u8; PERSISTENT_FIXED_UTXO_PAGE_BYTES]);
 const _: [(); PERSISTENT_FIXED_UTXO_PAGE_BYTES] =
     [(); std::mem::size_of::<PersistentFixedUtxoPage>()];
 
+fn encode_fixed_page_identity(
+    identity: &FixedUtxoPageIdentity,
+) -> [u8; PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES - 4] {
+    let mut bytes = [0; PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES - 4];
+    bytes[..ADDRESS_KEY_BYTES].copy_from_slice(identity.address_key().as_bytes());
+    bytes[32..40].copy_from_slice(&identity.generation().to_le_bytes());
+    bytes[40..44].copy_from_slice(&identity.page_ordinal().to_le_bytes());
+    bytes[44..48].copy_from_slice(&identity.lower_height().to_le_bytes());
+    bytes[48..52].copy_from_slice(&identity.upper_height().to_le_bytes());
+    bytes
+}
+
 impl PersistentFixedUtxoPage {
     /// Encodes a validated page outside the protected serving/update path.
     ///
@@ -1246,11 +1260,8 @@ impl PersistentFixedUtxoPage {
         bytes[2] = src.occupied_entries;
 
         if let Some(identity) = src.identity() {
-            bytes[4..36].copy_from_slice(identity.address_key().as_bytes());
-            bytes[36..44].copy_from_slice(&identity.generation().to_le_bytes());
-            bytes[44..48].copy_from_slice(&identity.page_ordinal().to_le_bytes());
-            bytes[48..52].copy_from_slice(&identity.lower_height().to_le_bytes());
-            bytes[52..56].copy_from_slice(&identity.upper_height().to_le_bytes());
+            bytes[4..PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES]
+                .copy_from_slice(&encode_fixed_page_identity(identity));
         }
         for (slot, event) in src
             .entries()
@@ -1516,6 +1527,380 @@ impl rostl_primitives::traits::Cmov for PersistentSpendUtxoPage16 {
     fn cxchg(&mut self, other: &mut Self, choice: bool) {
         cxchg_pod_bytes(self, other, choice);
     }
+}
+
+/// Trusted, canonical inputs to one future protected page append.
+///
+/// This is constructed only from the public canonical projection stream,
+/// outside the protected transform. It deliberately carries no prior page,
+/// occupancy snapshot, or expected bytes. The transform must derive all of
+/// those from the value returned by the protected read.
+#[cfg(feature = "rostl-experimental")]
+#[derive(Clone, Copy)]
+struct FixedPageAppendRequest {
+    identity: [u8; PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES - 4],
+    event: PersistentUtxoEvent,
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl FixedPageAppendRequest {
+    fn new_offline(
+        kind: FixedUtxoPageKind,
+        identity: FixedUtxoPageIdentity,
+        event: UtxoEvent,
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        FixedUtxoPage::real(kind, identity, &[event], derive_owner_key)?;
+        Ok(Self {
+            identity: encode_fixed_page_identity(&identity),
+            event: PersistentUtxoEvent::from_business(&event),
+        })
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl fmt::Debug for FixedPageAppendRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FixedPageAppendRequest { ..REDACTED.. }")
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[derive(Clone, Copy)]
+struct BasePageAppendRequest(FixedPageAppendRequest);
+
+#[cfg(feature = "rostl-experimental")]
+impl BasePageAppendRequest {
+    fn new_offline(
+        identity: FixedUtxoPageIdentity,
+        event: UtxoEvent,
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        FixedPageAppendRequest::new_offline(
+            FixedUtxoPageKind::Base,
+            identity,
+            event,
+            derive_owner_key,
+        )
+        .map(Self)
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[derive(Clone, Copy)]
+struct AddPageAppendRequest(FixedPageAppendRequest);
+
+#[cfg(feature = "rostl-experimental")]
+impl AddPageAppendRequest {
+    fn new_offline(
+        identity: FixedUtxoPageIdentity,
+        event: UtxoEvent,
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        FixedPageAppendRequest::new_offline(
+            FixedUtxoPageKind::Add,
+            identity,
+            event,
+            derive_owner_key,
+        )
+        .map(Self)
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[derive(Clone, Copy)]
+struct SpendPageAppendRequest(FixedPageAppendRequest);
+
+#[cfg(feature = "rostl-experimental")]
+impl SpendPageAppendRequest {
+    fn new_offline(
+        identity: FixedUtxoPageIdentity,
+        event: UtxoEvent,
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        FixedPageAppendRequest::new_offline(
+            FixedUtxoPageKind::Spend,
+            identity,
+            event,
+            derive_owner_key,
+        )
+        .map(Self)
+    }
+}
+
+/// Raw result of one fixed-work page transition.
+///
+/// `valid` is secret-derived and must not select whether the future protected
+/// write occurs. The two-access owner will always write `replacement`, then
+/// classify this bit and fail the generation closed after the full schedule.
+/// A found count-zero value is deliberately invalid: canonical dummy pages are
+/// cover/padding records, never the stored value of a real logical page key.
+/// Only an ORAM-level miss may create that logical page.
+#[cfg(feature = "rostl-experimental")]
+#[derive(Clone, Copy)]
+struct FixedPageAppendTransition<T> {
+    replacement: T,
+    valid: bool,
+}
+
+/// Appends to a base page with one fixed 16-slot schedule.
+///
+/// `#[inline(never)]` keeps this exact record-class transform available for the
+/// subsequent release-codegen gate. This slice provides portable functional
+/// evidence only and does not wire the transform into an ORAM access.
+#[cfg(feature = "rostl-experimental")]
+#[inline(never)]
+fn fixed_base_page_append(
+    prior: PersistentBaseUtxoPage16,
+    found: bool,
+    request: BasePageAppendRequest,
+) -> FixedPageAppendTransition<PersistentBaseUtxoPage16> {
+    let transition = fixed_page_append(
+        prior.0,
+        found,
+        request.0,
+        FixedUtxoPageKind::Base.to_byte(),
+        UtxoEventKind::Created.to_byte(),
+        UTXO_EVENT_FLAG_MINED,
+    );
+    FixedPageAppendTransition {
+        replacement: PersistentBaseUtxoPage16(transition.replacement),
+        valid: transition.valid,
+    }
+}
+
+/// Appends to an add page with one fixed 16-slot schedule.
+#[cfg(feature = "rostl-experimental")]
+#[inline(never)]
+fn fixed_add_page_append(
+    prior: PersistentAddUtxoPage16,
+    found: bool,
+    request: AddPageAppendRequest,
+) -> FixedPageAppendTransition<PersistentAddUtxoPage16> {
+    let transition = fixed_page_append(
+        prior.0,
+        found,
+        request.0,
+        FixedUtxoPageKind::Add.to_byte(),
+        UtxoEventKind::Created.to_byte(),
+        UTXO_EVENT_FLAG_MINED,
+    );
+    FixedPageAppendTransition {
+        replacement: PersistentAddUtxoPage16(transition.replacement),
+        valid: transition.valid,
+    }
+}
+
+/// Appends to a spend page with one fixed 16-slot schedule.
+#[cfg(feature = "rostl-experimental")]
+#[inline(never)]
+fn fixed_spend_page_append(
+    prior: PersistentSpendUtxoPage16,
+    found: bool,
+    request: SpendPageAppendRequest,
+) -> FixedPageAppendTransition<PersistentSpendUtxoPage16> {
+    let transition = fixed_page_append(
+        prior.0,
+        found,
+        request.0,
+        FixedUtxoPageKind::Spend.to_byte(),
+        UtxoEventKind::Spent.to_byte(),
+        UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT,
+    );
+    FixedPageAppendTransition {
+        replacement: PersistentSpendUtxoPage16(transition.replacement),
+        valid: transition.valid,
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[allow(clippy::needless_bitwise_bool)]
+#[inline(always)]
+fn fixed_page_append(
+    prior: PersistentFixedUtxoPage,
+    found: bool,
+    request: FixedPageAppendRequest,
+    expected_page_kind: u8,
+    expected_event_kind: u8,
+    expected_event_flags: u8,
+) -> FixedPageAppendTransition<PersistentFixedUtxoPage> {
+    let mut dummy = PersistentFixedUtxoPage::default();
+    dummy.0[0] = FIXED_UTXO_PAGE_FORMAT_VERSION;
+    dummy.0[1] = expected_page_kind;
+
+    let mut candidate = prior;
+    candidate.cmov(&dummy, !found);
+    let occupied_before = candidate.0[2];
+
+    for (candidate_byte, identity_byte) in candidate.0[4..PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES]
+        .iter_mut()
+        .zip(request.identity.iter())
+    {
+        candidate_byte.cmov(identity_byte, !found);
+    }
+    for slot in 0..FIXED_UTXO_PAGE_ENTRIES {
+        let selected = occupied_before == slot as u8;
+        let start = PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + (slot * PERSISTENT_UTXO_EVENT_BYTES);
+        for byte in 0..PERSISTENT_UTXO_EVENT_BYTES {
+            candidate.0[start + byte].cmov(&request.event.0[byte], selected);
+        }
+    }
+    candidate.0[2] = occupied_before.wrapping_add(1);
+
+    let source_was_real_or_missing = !found | (occupied_before != 0);
+    let valid = source_was_real_or_missing
+        & fixed_page_candidate_is_valid(
+            &candidate.0,
+            &request,
+            expected_page_kind,
+            expected_event_kind,
+            expected_event_flags,
+        );
+    let mut replacement = prior;
+    replacement.cmov(&candidate, valid);
+    FixedPageAppendTransition { replacement, valid }
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[allow(clippy::needless_bitwise_bool)]
+#[inline(always)]
+fn fixed_page_candidate_is_valid(
+    candidate: &[u8; PERSISTENT_FIXED_UTXO_PAGE_BYTES],
+    request: &FixedPageAppendRequest,
+    expected_page_kind: u8,
+    expected_event_kind: u8,
+    expected_event_flags: u8,
+) -> bool {
+    let occupied = candidate[2];
+    let request_script_class = request.event.0[2];
+    let mut valid = (candidate[0] == FIXED_UTXO_PAGE_FORMAT_VERSION)
+        & (candidate[1] == expected_page_kind)
+        & (occupied != 0)
+        & (occupied <= FIXED_UTXO_PAGE_ENTRIES as u8)
+        & (candidate[3] == 0)
+        & ((request_script_class == UtxoScriptClass::PayToPublicKeyHash.to_byte())
+            | (request_script_class == UtxoScriptClass::PayToScriptHash.to_byte()));
+
+    for (candidate_byte, identity_byte) in candidate[4..PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES]
+        .iter()
+        .zip(request.identity.iter())
+    {
+        valid &= candidate_byte == identity_byte;
+    }
+
+    let lower_height = fixed_page_u32(candidate, 48);
+    let upper_height = fixed_page_u32(candidate, 52);
+    let mut generation_nonzero = false;
+    for byte in &candidate[36..44] {
+        generation_nonzero |= *byte != 0;
+    }
+    valid &= generation_nonzero & (lower_height <= upper_height);
+    for slot in 0..FIXED_UTXO_PAGE_ENTRIES {
+        let slot_is_occupied = (slot as u8) < occupied;
+        let start = PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + (slot * PERSISTENT_UTXO_EVENT_BYTES);
+        let mut zero = true;
+        for byte in 0..PERSISTENT_UTXO_EVENT_BYTES {
+            zero &= candidate[start + byte] == 0;
+        }
+
+        let mut owner_matches = candidate[start + 2] == request_script_class;
+        for byte in 0..20 {
+            owner_matches &= candidate[start + 52 + byte] == request.event.0[52 + byte];
+        }
+        let height = fixed_page_u32(candidate, start + 48);
+        let event_is_valid = (candidate[start] == UTXO_EVENT_FORMAT_VERSION)
+            & (candidate[start + 1] == expected_event_kind)
+            & (candidate[start + 3] == expected_event_flags)
+            & owner_matches
+            & (height >= lower_height)
+            & (height <= upper_height);
+        valid &= slot_is_occupied | zero;
+        valid &= !slot_is_occupied | event_is_valid;
+    }
+
+    for current in 1..FIXED_UTXO_PAGE_ENTRIES {
+        let current_is_occupied = (current as u8) < occupied;
+        let previous_start =
+            PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + ((current - 1) * PERSISTENT_UTXO_EVENT_BYTES);
+        let current_start =
+            PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + (current * PERSISTENT_UTXO_EVENT_BYTES);
+        valid &= !current_is_occupied
+            | fixed_page_event_ordered(candidate, previous_start, current_start);
+    }
+
+    for left in 0..FIXED_UTXO_PAGE_ENTRIES {
+        let left_is_occupied = (left as u8) < occupied;
+        let left_start =
+            PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + (left * PERSISTENT_UTXO_EVENT_BYTES);
+        for right in (left + 1)..FIXED_UTXO_PAGE_ENTRIES {
+            let both_occupied = left_is_occupied & ((right as u8) < occupied);
+            let right_start =
+                PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + (right * PERSISTENT_UTXO_EVENT_BYTES);
+            valid &= !both_occupied | !fixed_page_same_outpoint(candidate, left_start, right_start);
+        }
+    }
+    valid
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[inline(always)]
+fn fixed_page_u32(bytes: &[u8; PERSISTENT_FIXED_UTXO_PAGE_BYTES], start: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[start],
+        bytes[start + 1],
+        bytes[start + 2],
+        bytes[start + 3],
+    ])
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[allow(clippy::needless_bitwise_bool)]
+#[inline(always)]
+fn fixed_page_event_ordered(
+    bytes: &[u8; PERSISTENT_FIXED_UTXO_PAGE_BYTES],
+    previous: usize,
+    current: usize,
+) -> bool {
+    let previous_height = fixed_page_u32(bytes, previous + 48);
+    let current_height = fixed_page_u32(bytes, current + 48);
+    let (txid_less, txid_equal) = fixed_page_txid_relation(bytes, previous + 4, current + 4);
+    (previous_height < current_height)
+        | ((previous_height == current_height)
+            & (txid_less
+                | (txid_equal
+                    & (fixed_page_u32(bytes, previous + 36)
+                        <= fixed_page_u32(bytes, current + 36)))))
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[allow(clippy::needless_bitwise_bool)]
+#[inline(always)]
+fn fixed_page_txid_relation(
+    bytes: &[u8; PERSISTENT_FIXED_UTXO_PAGE_BYTES],
+    left: usize,
+    right: usize,
+) -> (bool, bool) {
+    let mut less = false;
+    let mut equal = true;
+    for byte in 0..TXID_BYTES {
+        less |= equal & (bytes[left + byte] < bytes[right + byte]);
+        equal &= bytes[left + byte] == bytes[right + byte];
+    }
+    (less, equal)
+}
+
+#[cfg(feature = "rostl-experimental")]
+#[inline(always)]
+fn fixed_page_same_outpoint(
+    bytes: &[u8; PERSISTENT_FIXED_UTXO_PAGE_BYTES],
+    left: usize,
+    right: usize,
+) -> bool {
+    let mut equal = fixed_page_u32(bytes, left + 36) == fixed_page_u32(bytes, right + 36);
+    for byte in 0..TXID_BYTES {
+        equal &= bytes[left + 4 + byte] == bytes[right + 4 + byte];
+    }
+    equal
 }
 
 /// Invalid bytes in one selected fixed hybrid page.
@@ -2313,6 +2698,68 @@ mod tests {
                 [0x92; 20],
             )
         })
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    fn persistent_fixed_page(
+        kind: FixedUtxoPageKind,
+        identity: FixedUtxoPageIdentity,
+        entries: &[UtxoEvent],
+    ) -> Result<PersistentFixedUtxoPage, FixedUtxoPageError> {
+        FixedUtxoPage::real(kind, identity, entries, &fixed_page_owner_key)
+            .map(|page| PersistentFixedUtxoPage::from_business_offline(&page))
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    fn fixed_page_append_for_kind(
+        kind: FixedUtxoPageKind,
+        prior: PersistentFixedUtxoPage,
+        found: bool,
+        identity: FixedUtxoPageIdentity,
+        event: UtxoEvent,
+    ) -> Result<FixedPageAppendTransition<PersistentFixedUtxoPage>, FixedUtxoPageError> {
+        let request =
+            FixedPageAppendRequest::new_offline(kind, identity, event, &fixed_page_owner_key)?;
+        let (expected_event_kind, expected_event_flags) = match kind {
+            FixedUtxoPageKind::Base | FixedUtxoPageKind::Add => {
+                (UtxoEventKind::Created.to_byte(), UTXO_EVENT_FLAG_MINED)
+            }
+            FixedUtxoPageKind::Spend => (
+                UtxoEventKind::Spent.to_byte(),
+                UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT,
+            ),
+        };
+        Ok(fixed_page_append(
+            prior,
+            found,
+            request,
+            kind.to_byte(),
+            expected_event_kind,
+            expected_event_flags,
+        ))
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    fn assert_invalid_fixed_page_append_preserves(
+        kind: FixedUtxoPageKind,
+        prior: PersistentFixedUtxoPage,
+        identity: FixedUtxoPageIdentity,
+        event: UtxoEvent,
+    ) -> Result<(), FixedUtxoPageError> {
+        let transition = fixed_page_append_for_kind(kind, prior, true, identity, event)?;
+        assert!(!transition.valid);
+        assert_eq!(transition.replacement, prior);
+        Ok(())
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    fn mutate_persistent_fixed_page(
+        prior: PersistentFixedUtxoPage,
+        mutation: impl FnOnce(&mut [u8; PERSISTENT_FIXED_UTXO_PAGE_BYTES]),
+    ) -> PersistentFixedUtxoPage {
+        let mut bytes = prior.0;
+        mutation(&mut bytes);
+        PersistentFixedUtxoPage(bytes)
     }
 
     fn created_event(
@@ -3178,6 +3625,387 @@ mod tests {
             ),
             "PersistentSpendUtxoPage16([REDACTED])"
         );
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn fixed_page_append_wrappers_build_canonical_pages_on_miss(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+
+        let base_request =
+            BasePageAppendRequest::new_offline(identity, created[0], &fixed_page_owner_key)?;
+        let base = fixed_base_page_append(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(
+                [0xa5; PERSISTENT_FIXED_UTXO_PAGE_BYTES],
+            )),
+            false,
+            base_request,
+        );
+        let expected_base = BaseUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)?;
+        assert!(base.valid);
+        assert_eq!(
+            base.replacement,
+            PersistentBaseUtxoPage16::from_business_offline(&expected_base)
+        );
+        assert_eq!(
+            base.replacement
+                .into_business_offline(identity, &fixed_page_owner_key)?,
+            expected_base
+        );
+
+        let add_request =
+            AddPageAppendRequest::new_offline(identity, created[0], &fixed_page_owner_key)?;
+        let add = fixed_add_page_append(
+            PersistentAddUtxoPage16(PersistentFixedUtxoPage(
+                [0x5a; PERSISTENT_FIXED_UTXO_PAGE_BYTES],
+            )),
+            false,
+            add_request,
+        );
+        let expected_add = AddUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)?;
+        assert!(add.valid);
+        assert_eq!(
+            add.replacement,
+            PersistentAddUtxoPage16::from_business_offline(&expected_add)
+        );
+        assert_eq!(
+            add.replacement
+                .into_business_offline(identity, &fixed_page_owner_key)?,
+            expected_add
+        );
+
+        let spend_request =
+            SpendPageAppendRequest::new_offline(identity, spent[0], &fixed_page_owner_key)?;
+        let spend = fixed_spend_page_append(
+            PersistentSpendUtxoPage16(PersistentFixedUtxoPage(
+                [0x3c; PERSISTENT_FIXED_UTXO_PAGE_BYTES],
+            )),
+            false,
+            spend_request,
+        );
+        let expected_spend = SpendUtxoPage16::real(identity, &spent[..1], &fixed_page_owner_key)?;
+        assert!(spend.valid);
+        assert_eq!(
+            spend.replacement,
+            PersistentSpendUtxoPage16::from_business_offline(&expected_spend)
+        );
+        assert_eq!(
+            spend
+                .replacement
+                .into_business_offline(identity, &fixed_page_owner_key)?,
+            expected_spend
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn fixed_page_append_accepts_every_nonfull_occupancy_for_each_page_class(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+
+        for (kind, entries) in [
+            (FixedUtxoPageKind::Base, created),
+            (FixedUtxoPageKind::Add, created),
+            (FixedUtxoPageKind::Spend, spent),
+        ] {
+            for occupied in 0..FIXED_UTXO_PAGE_ENTRIES {
+                let found = occupied != 0;
+                let prior = if found {
+                    persistent_fixed_page(kind, identity, &entries[..occupied])?
+                } else {
+                    PersistentFixedUtxoPage([0xc3; PERSISTENT_FIXED_UTXO_PAGE_BYTES])
+                };
+                let transition =
+                    fixed_page_append_for_kind(kind, prior, found, identity, entries[occupied])?;
+                let expected = FixedUtxoPage::real(
+                    kind,
+                    identity,
+                    &entries[..=occupied],
+                    &fixed_page_owner_key,
+                )?;
+                let expected_persistent = PersistentFixedUtxoPage::from_business_offline(&expected);
+
+                assert!(transition.valid);
+                assert_eq!(transition.replacement, expected_persistent);
+                assert_eq!(
+                    transition.replacement.into_business_offline(
+                        kind,
+                        identity,
+                        &fixed_page_owner_key
+                    )?,
+                    expected
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn fixed_page_append_rejects_full_duplicate_out_of_order_and_dummy_sources(
+    ) -> Result<(), FixedUtxoPageError> {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+
+        let full = persistent_fixed_page(FixedUtxoPageKind::Base, identity, &created)?;
+        let after_full = UtxoEvent::created(
+            [0xff; TXID_BYTES],
+            16,
+            60_000,
+            115,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0x92; 20],
+        );
+        assert_invalid_fixed_page_append_preserves(
+            FixedUtxoPageKind::Base,
+            full,
+            identity,
+            after_full,
+        )?;
+
+        let one = persistent_fixed_page(FixedUtxoPageKind::Base, identity, &created[..1])?;
+        assert_invalid_fixed_page_append_preserves(
+            FixedUtxoPageKind::Base,
+            one,
+            identity,
+            created[0],
+        )?;
+
+        let later_only = persistent_fixed_page(FixedUtxoPageKind::Base, identity, &created[1..2])?;
+        assert_invalid_fixed_page_append_preserves(
+            FixedUtxoPageKind::Base,
+            later_only,
+            identity,
+            created[0],
+        )?;
+
+        let dummy = PersistentFixedUtxoPage::from_business_offline(&FixedUtxoPage::dummy(
+            FixedUtxoPageKind::Base,
+        ));
+        assert_invalid_fixed_page_append_preserves(
+            FixedUtxoPageKind::Base,
+            dummy,
+            identity,
+            created[0],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn fixed_page_append_rejects_and_preserves_every_malformed_prior_class(
+    ) -> Result<(), FixedUtxoPageError> {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let prior = persistent_fixed_page(FixedUtxoPageKind::Base, identity, &created[..2])?;
+        let first_event = PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES;
+        let second_event = first_event + PERSISTENT_UTXO_EVENT_BYTES;
+        let fourth_event = first_event + (3 * PERSISTENT_UTXO_EVENT_BYTES);
+
+        let corruptions = [
+            mutate_persistent_fixed_page(prior, |bytes| bytes[0] = 2),
+            mutate_persistent_fixed_page(prior, |bytes| {
+                bytes[1] = FixedUtxoPageKind::Add.to_byte();
+            }),
+            mutate_persistent_fixed_page(prior, |bytes| {
+                bytes[2] = (FIXED_UTXO_PAGE_ENTRIES + 1) as u8;
+            }),
+            mutate_persistent_fixed_page(prior, |bytes| bytes[3] = 1),
+            mutate_persistent_fixed_page(prior, |bytes| bytes[4] ^= 1),
+            mutate_persistent_fixed_page(prior, |bytes| bytes[first_event] = 2),
+            mutate_persistent_fixed_page(prior, |bytes| {
+                bytes[first_event + 1] = UtxoEventKind::Spent.to_byte();
+            }),
+            mutate_persistent_fixed_page(prior, |bytes| bytes[first_event + 3] = 0),
+            mutate_persistent_fixed_page(prior, |bytes| bytes[first_event + 52] ^= 1),
+            mutate_persistent_fixed_page(prior, |bytes| {
+                bytes[first_event + 48..first_event + 52].copy_from_slice(&116_u32.to_le_bytes());
+            }),
+            mutate_persistent_fixed_page(prior, |bytes| bytes[fourth_event] = 1),
+            mutate_persistent_fixed_page(prior, |bytes| {
+                bytes[PERSISTENT_FIXED_UTXO_PAGE_BYTES - 1] = 1;
+            }),
+            mutate_persistent_fixed_page(prior, |bytes| {
+                bytes[first_event + 48..first_event + 52].copy_from_slice(&102_u32.to_le_bytes());
+            }),
+            mutate_persistent_fixed_page(prior, |bytes| {
+                let first_txid_and_index = bytes[first_event + 4..first_event + 40].to_owned();
+                bytes[second_event + 4..second_event + 40].copy_from_slice(&first_txid_and_index);
+            }),
+        ];
+
+        for corrupted in corruptions {
+            assert_invalid_fixed_page_append_preserves(
+                FixedUtxoPageKind::Base,
+                corrupted,
+                identity,
+                created[2],
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn fixed_page_append_request_boundary_rejects_uncanonical_inputs_and_redacts_debug() {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+
+        let mut wrong_owner = created[0];
+        wrong_owner.script_hash = [0x93; 20];
+        assert!(matches!(
+            BasePageAppendRequest::new_offline(identity, wrong_owner, &fixed_page_owner_key),
+            Err(FixedUtxoPageError::AddressKeyMismatch { index: 0 })
+        ));
+        assert!(matches!(
+            BasePageAppendRequest::new_offline(identity, spent[0], &fixed_page_owner_key),
+            Err(FixedUtxoPageError::WrongEventKind { index: 0, .. })
+        ));
+
+        let nonstandard = UtxoEvent::created(
+            [0x41; TXID_BYTES],
+            1,
+            50_000,
+            100,
+            UtxoScriptClass::NonStandard,
+            [0x42; 20],
+        );
+        assert!(matches!(
+            BasePageAppendRequest::new_offline(identity, nonstandard, &fixed_page_owner_key),
+            Err(FixedUtxoPageError::NonStandardEvent { index: 0 })
+        ));
+
+        let request =
+            BasePageAppendRequest::new_offline(identity, created[0], &fixed_page_owner_key)
+                .expect("fixture request is canonical");
+        assert_eq!(
+            format!("{:?}", request.0),
+            "FixedPageAppendRequest { ..REDACTED.. }"
+        );
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn fixed_page_append_revalidates_raw_request_identity_and_event_state(
+    ) -> Result<(), FixedUtxoPageError> {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let canonical = FixedPageAppendRequest::new_offline(
+            FixedUtxoPageKind::Base,
+            identity,
+            created[0],
+            &fixed_page_owner_key,
+        )?;
+        let prior = PersistentFixedUtxoPage([0x69; PERSISTENT_FIXED_UTXO_PAGE_BYTES]);
+
+        let mut zero_generation = canonical;
+        zero_generation.identity[32..40].fill(0);
+        let mut inverted_range = canonical;
+        inverted_range.identity[44..48].copy_from_slice(&116_u32.to_le_bytes());
+        inverted_range.identity[48..52].copy_from_slice(&115_u32.to_le_bytes());
+        let mut wrong_version = canonical;
+        wrong_version.event.0[0] = 2;
+        let mut wrong_class = canonical;
+        wrong_class.event.0[2] = UtxoScriptClass::NonStandard.to_byte();
+        let mut wrong_flags = canonical;
+        wrong_flags.event.0[3] = 0;
+
+        for request in [
+            zero_generation,
+            inverted_range,
+            wrong_version,
+            wrong_class,
+            wrong_flags,
+        ] {
+            let transition = fixed_page_append(
+                prior,
+                false,
+                request,
+                FixedUtxoPageKind::Base.to_byte(),
+                UtxoEventKind::Created.to_byte(),
+                UTXO_EVENT_FLAG_MINED,
+            );
+            assert!(!transition.valid);
+            assert_eq!(transition.replacement, prior);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn fixed_page_append_orders_equal_height_and_txid_by_numeric_output_index(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = fixed_page_identity(100, 115);
+        let first = UtxoEvent::created(
+            [0x55; TXID_BYTES],
+            7,
+            50_000,
+            100,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0x92; 20],
+        );
+        let prior = persistent_fixed_page(FixedUtxoPageKind::Base, identity, &[first])?;
+        let above = UtxoEvent::created(
+            [0x55; TXID_BYTES],
+            8,
+            50_001,
+            100,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0x92; 20],
+        );
+        let accepted =
+            fixed_page_append_for_kind(FixedUtxoPageKind::Base, prior, true, identity, above)?;
+        let expected = FixedUtxoPage::real(
+            FixedUtxoPageKind::Base,
+            identity,
+            &[first, above],
+            &fixed_page_owner_key,
+        )?;
+        assert!(accepted.valid);
+        assert_eq!(
+            accepted.replacement,
+            PersistentFixedUtxoPage::from_business_offline(&expected)
+        );
+
+        let below = UtxoEvent::created(
+            [0x55; TXID_BYTES],
+            6,
+            49_999,
+            100,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0x92; 20],
+        );
+        assert_invalid_fixed_page_append_preserves(
+            FixedUtxoPageKind::Base,
+            prior,
+            identity,
+            below,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    #[test]
+    fn fixed_spend_page_append_rejects_wrong_flags_in_a_found_page(
+    ) -> Result<(), FixedUtxoPageError> {
+        let identity = fixed_page_identity(100, 115);
+        let spent = spent_page_entries();
+        let page = SpendUtxoPage16::real(identity, &spent[..2], &fixed_page_owner_key)?;
+        let mut prior = PersistentSpendUtxoPage16::from_business_offline(&page);
+        (prior.0).0[PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + 3] = UTXO_EVENT_FLAG_MINED;
+        let request =
+            SpendPageAppendRequest::new_offline(identity, spent[2], &fixed_page_owner_key)?;
+        let transition = fixed_spend_page_append(prior, true, request);
+        assert!(!transition.valid);
+        assert_eq!(transition.replacement, prior);
+        Ok(())
     }
 
     #[test]
