@@ -1,5 +1,7 @@
 //! Atomic evidence artifacts for source-bound hybrid-sizing analysis.
 
+#[cfg(feature = "typed-qualification")]
+use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,8 @@ use crate::corpus_artifact::{
     validate_derived_source_lineage, ArtifactDirectory, ArtifactError, ArtifactFile,
     PreverifiedSourceSnapshotV1, ValidatedCapture, ValidatedSizing,
 };
+#[cfg(feature = "typed-qualification")]
+use crate::corpus_artifact::{open_artifact_directory, validate_artifact_file_set};
 
 const HYBRID_SIZING_SCHEMA: &str = "zaino-oram-source-bound-hybrid-sizing-v1";
 const HYBRID_SIZING_PROVENANCE_SCHEMA: &str = "zaino-oram-source-bound-hybrid-sizing-provenance-v1";
@@ -56,8 +60,8 @@ impl HybridSizingArtifactV1 {
         qualification_blake2s256: &str,
         source_snapshot: &PreverifiedSourceSnapshotV1,
     ) -> Result<(), ArtifactError> {
-        if self.schema != HYBRID_SIZING_SCHEMA
-            || self.measurement_blake2s256 != measurement_blake2s256
+        self.validate_retained()?;
+        if self.measurement_blake2s256 != measurement_blake2s256
             || self.qualification_blake2s256 != qualification_blake2s256
             || self.source_snapshot != *source_snapshot
         {
@@ -69,12 +73,50 @@ impl HybridSizingArtifactV1 {
         validate_hybrid_sizing(&self.hybrid_sizing, measurement, measurement_blake2s256)
     }
 
+    fn validate_retained(&self) -> Result<(), ArtifactError> {
+        self.hybrid_sizing
+            .validate()
+            .map_err(|_| ArtifactError::InvalidArtifact {
+                reason: "retained hybrid-sizing report is invalid",
+            })?;
+        let (checkpoint_height, checkpoint_hash) = self.hybrid_sizing.source_checkpoint();
+        self.source_snapshot
+            .validate_retained_checkpoint(checkpoint_height, checkpoint_hash)?;
+        if self.schema != HYBRID_SIZING_SCHEMA
+            || self.measurement_blake2s256 != self.hybrid_sizing.measurement_blake2s256()
+            || !is_blake2s256_hex(&self.qualification_blake2s256)
+        {
+            return Err(ArtifactError::InvalidArtifact {
+                reason: "retained hybrid-sizing schema or lineage is inconsistent",
+            });
+        }
+        Ok(())
+    }
+
     fn canonical_bytes(&self) -> Result<Vec<u8>, ArtifactError> {
         serde_json::to_vec(self).map_err(ArtifactError::Json)
     }
 
     fn digest(&self) -> Result<String, ArtifactError> {
         Ok(artifact_blake2s256_hex(&self.canonical_bytes()?))
+    }
+}
+
+/// A self-contained hybrid-sizing bundle checked against an external digest.
+#[cfg(feature = "typed-qualification")]
+pub(super) struct ValidatedHybridSizing {
+    report: SourceBoundHybridSizingReport,
+    hybrid_sizing_blake2s256: String,
+}
+
+#[cfg(feature = "typed-qualification")]
+impl ValidatedHybridSizing {
+    pub(super) const fn report(&self) -> &SourceBoundHybridSizingReport {
+        &self.report
+    }
+
+    pub(super) fn hybrid_sizing_blake2s256(&self) -> &str {
+        &self.hybrid_sizing_blake2s256
     }
 }
 
@@ -125,6 +167,38 @@ fn validate_hybrid_sizing(
         .map_err(|_| ArtifactError::InvalidArtifact {
             reason: "hybrid-sizing report is invalid or source-unbound",
         })
+}
+
+/// Loads an exact-file-set retained report and binds its typed artifact to an external digest.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn load_hybrid_sizing(
+    input_dir: &Path,
+    expected_hybrid_sizing_blake2s256: &str,
+) -> Result<ValidatedHybridSizing, ArtifactError> {
+    if !is_blake2s256_hex(expected_hybrid_sizing_blake2s256) {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "expected hybrid-sizing digest is invalid",
+        });
+    }
+    let source_directory = fs::canonicalize(input_dir).map_err(|source| ArtifactError::Io {
+        operation: "canonicalize retained hybrid-sizing directory",
+        source,
+    })?;
+    let directory = open_artifact_directory(&source_directory)?;
+    validate_artifact_file_set(
+        &directory,
+        &[HYBRID_SIZING_JSON, HYBRID_SIZING_TEXT, PROVENANCE_JSON],
+    )?;
+    let (artifact, provenance) = read_validated_hybrid_sizing_directory(&directory)?;
+    if provenance.hybrid_sizing_blake2s256 != expected_hybrid_sizing_blake2s256 {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "retained hybrid-sizing digest differs from external expectation",
+        });
+    }
+    Ok(ValidatedHybridSizing {
+        report: artifact.hybrid_sizing,
+        hybrid_sizing_blake2s256: provenance.hybrid_sizing_blake2s256,
+    })
 }
 
 /// Publishes a complete, read-back-validated source-bound hybrid-sizing analysis.
@@ -179,14 +253,7 @@ fn validate_staged_hybrid_sizing(
     expected_artifact: &HybridSizingArtifactV1,
     expected_provenance: &HybridSizingProvenanceV1,
 ) -> Result<(), ArtifactError> {
-    let hybrid_sizing_json =
-        read_artifact_file(stage, HYBRID_SIZING_JSON, MAX_HYBRID_SIZING_JSON_BYTES)?;
-    let hybrid_sizing_text =
-        read_artifact_file(stage, HYBRID_SIZING_TEXT, MAX_HYBRID_SIZING_TEXT_BYTES)?;
-    let provenance_json = read_artifact_file(stage, PROVENANCE_JSON, MAX_PROVENANCE_JSON_BYTES)?;
-
-    let artifact: HybridSizingArtifactV1 =
-        serde_json::from_slice(&hybrid_sizing_json).map_err(ArtifactError::Json)?;
+    let (artifact, provenance) = read_validated_hybrid_sizing_directory(stage)?;
     validate_derived_source_lineage(capture, sizing)?;
     artifact.validate(
         capture.measurement(),
@@ -194,14 +261,6 @@ fn validate_staged_hybrid_sizing(
         sizing.qualification_blake2s256(),
         source_snapshot,
     )?;
-    let provenance: HybridSizingProvenanceV1 =
-        serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
-    provenance.validate(&artifact)?;
-    if hybrid_sizing_text != artifact.hybrid_sizing.to_string().as_bytes() {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "hybrid-sizing text does not match the typed report",
-        });
-    }
     if artifact != *expected_artifact {
         return Err(ArtifactError::InvalidArtifact {
             reason: "hybrid-sizing read-back differs from the computed report",
@@ -213,6 +272,37 @@ fn validate_staged_hybrid_sizing(
         });
     }
     Ok(())
+}
+
+fn read_validated_hybrid_sizing_directory(
+    directory: &ArtifactDirectory,
+) -> Result<(HybridSizingArtifactV1, HybridSizingProvenanceV1), ArtifactError> {
+    let hybrid_sizing_json =
+        read_artifact_file(directory, HYBRID_SIZING_JSON, MAX_HYBRID_SIZING_JSON_BYTES)?;
+    let hybrid_sizing_text =
+        read_artifact_file(directory, HYBRID_SIZING_TEXT, MAX_HYBRID_SIZING_TEXT_BYTES)?;
+    let provenance_json =
+        read_artifact_file(directory, PROVENANCE_JSON, MAX_PROVENANCE_JSON_BYTES)?;
+
+    let artifact: HybridSizingArtifactV1 =
+        serde_json::from_slice(&hybrid_sizing_json).map_err(ArtifactError::Json)?;
+    artifact.validate_retained()?;
+    let provenance: HybridSizingProvenanceV1 =
+        serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
+    provenance.validate(&artifact)?;
+    if hybrid_sizing_text != artifact.hybrid_sizing.to_string().as_bytes() {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: "hybrid-sizing text does not match the typed report",
+        });
+    }
+    Ok((artifact, provenance))
+}
+
+fn is_blake2s256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -379,6 +469,41 @@ mod tests {
         changed_artifact.measurement_blake2s256 = "44".repeat(32);
         assert!(provenance.validate(&changed_artifact).is_err());
         assert!(HybridSizingProvenanceV1::new("", &changed_artifact).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn retained_loader_requires_exact_files_semantics_and_external_digest() -> TestResult {
+        let fixture = fixture()?;
+        let artifact = artifact(&fixture)?;
+        let provenance = HybridSizingProvenanceV1::new("test-runner", &artifact)?;
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join(HYBRID_SIZING_JSON),
+            serde_json::to_vec_pretty(&artifact)?,
+        )?;
+        fs::write(
+            directory.path().join(HYBRID_SIZING_TEXT),
+            artifact.hybrid_sizing.to_string(),
+        )?;
+        fs::write(
+            directory.path().join(PROVENANCE_JSON),
+            serde_json::to_vec_pretty(&provenance)?,
+        )?;
+
+        let loaded = load_hybrid_sizing(directory.path(), &provenance.hybrid_sizing_blake2s256)?;
+        assert_eq!(loaded.report(), &fixture.report);
+        assert_eq!(
+            loaded.hybrid_sizing_blake2s256(),
+            provenance.hybrid_sizing_blake2s256
+        );
+        assert!(load_hybrid_sizing(directory.path(), &"00".repeat(32)).is_err());
+
+        fs::write(directory.path().join("unexpected"), b"not admitted")?;
+        assert!(
+            load_hybrid_sizing(directory.path(), &provenance.hybrid_sizing_blake2s256).is_err()
+        );
         Ok(())
     }
 }

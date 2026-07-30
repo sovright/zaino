@@ -131,6 +131,25 @@ impl PreverifiedSourceSnapshotV1 {
         }
         Ok(())
     }
+
+    pub(super) fn validate_retained_checkpoint(
+        &self,
+        checkpoint_height: u32,
+        checkpoint_hash: &str,
+    ) -> Result<(), ArtifactError> {
+        if self.snapshot_mode != SnapshotMode::NonFinalizedState
+            || self.serviceable_height < checkpoint_height
+            || self.verified_checkpoint_height != checkpoint_height
+            || self.verified_checkpoint_hash != checkpoint_hash
+            || !self.checkpoint_preverified_before_allocation
+            || self.source_cache_mode != SOURCE_CACHE_MODE
+        {
+            return Err(ArtifactError::InvalidArtifact {
+                reason: "retained preverified source snapshot is internally inconsistent",
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

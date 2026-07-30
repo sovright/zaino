@@ -1397,7 +1397,7 @@ impl rostl_primitives::traits::Cmov for PersistentFixedUtxoPage {
     feature = "rostl-experimental",
     derive(bytemuck::Pod, bytemuck::Zeroable)
 )]
-struct PersistentBaseUtxoPage16(PersistentFixedUtxoPage);
+pub(super) struct PersistentBaseUtxoPage16(PersistentFixedUtxoPage);
 
 const _: [(); PERSISTENT_FIXED_UTXO_PAGE_BYTES] =
     [(); std::mem::size_of::<PersistentBaseUtxoPage16>()];
@@ -1442,7 +1442,7 @@ impl rostl_primitives::traits::Cmov for PersistentBaseUtxoPage16 {
     feature = "rostl-experimental",
     derive(bytemuck::Pod, bytemuck::Zeroable)
 )]
-struct PersistentAddUtxoPage16(PersistentFixedUtxoPage);
+pub(super) struct PersistentAddUtxoPage16(PersistentFixedUtxoPage);
 
 const _: [(); PERSISTENT_FIXED_UTXO_PAGE_BYTES] =
     [(); std::mem::size_of::<PersistentAddUtxoPage16>()];
@@ -1487,7 +1487,7 @@ impl rostl_primitives::traits::Cmov for PersistentAddUtxoPage16 {
     feature = "rostl-experimental",
     derive(bytemuck::Pod, bytemuck::Zeroable)
 )]
-struct PersistentSpendUtxoPage16(PersistentFixedUtxoPage);
+pub(super) struct PersistentSpendUtxoPage16(PersistentFixedUtxoPage);
 
 const _: [(); PERSISTENT_FIXED_UTXO_PAGE_BYTES] =
     [(); std::mem::size_of::<PersistentSpendUtxoPage16>()];

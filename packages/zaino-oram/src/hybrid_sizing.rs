@@ -12,6 +12,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use zaino_state::IndexedBlock;
 
+#[cfg(feature = "rostl-experimental")]
+use crate::fixed_page_capacity::{
+    SelectedFixedPageDemands, SELECTED_GENERATION_INTERVAL_BLOCKS, SELECTED_PAGE_ENTRIES,
+};
 use crate::{
     target_load::is_blake2s256_hex,
     zaino_corpus::{MainnetCorpusMeasurement, MainnetCorpusScanner},
@@ -215,6 +219,16 @@ pub struct SourceBoundHybridSizingReport {
 }
 
 impl SourceBoundHybridSizingReport {
+    /// Returns the source measurement digest retained by this report.
+    pub fn measurement_blake2s256(&self) -> &str {
+        &self.source.measurement_blake2s256
+    }
+
+    /// Returns the public checkpoint height and hash retained by this report.
+    pub fn source_checkpoint(&self) -> (u32, &str) {
+        (self.source.checkpoint_height, &self.source.checkpoint_hash)
+    }
+
     /// Revalidates the complete self-contained hybrid-sizing report.
     pub fn validate(&self) -> Result<(), SourceBoundHybridSizingError> {
         let expected_delta_events = self
@@ -288,6 +302,40 @@ impl SourceBoundHybridSizingReport {
             return Err(SourceBoundHybridSizingError::InvalidReport);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "rostl-experimental")]
+    pub(super) fn selected_fixed_page_demands(
+        &self,
+    ) -> Result<SelectedFixedPageDemands, SourceBoundHybridSizingError> {
+        self.validate()?;
+        let base = self
+            .base_page_candidates
+            .iter()
+            .find(|candidate| candidate.entries_per_page == SELECTED_PAGE_ENTRIES)
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        let interval = self
+            .rebuild_interval_reports
+            .iter()
+            .find(|report| report.interval_blocks == SELECTED_GENERATION_INTERVAL_BLOCKS)
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        let delta = interval
+            .page_candidates
+            .iter()
+            .find(|candidate| candidate.entries_per_page == SELECTED_PAGE_ENTRIES)
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        let fixed_page_reads = base
+            .maximum_pages_per_address
+            .checked_add(delta.max_per_address_add_pages)
+            .and_then(|reads| reads.checked_add(delta.max_per_address_spend_pages))
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+
+        Ok(SelectedFixedPageDemands {
+            base_pages: base.base_pages,
+            add_pages: delta.max_total_add_pages,
+            spend_pages: delta.max_total_spend_pages,
+            fixed_page_reads,
+        })
     }
 }
 
@@ -1501,6 +1549,29 @@ mod tests {
         assert!(decoded.rebuild_interval_reports.iter().all(|interval| {
             interval.generation_count == 1 && interval.trailing_partial_generation_blocks == 2
         }));
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn selected_tuple_drives_fixed_page_capacity_from_the_validated_report(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let report = source_report(&blocks, &measurement)?;
+        let lower_bound =
+            crate::fixed_page_capacity::derive_fixed_page_capacity_lower_bound(&report)?;
+
+        assert_eq!(lower_bound.fixed_page_reads(), 3);
+        assert_eq!(lower_bound.base().logical_records(), 1);
+        assert_eq!(lower_bound.base().rounded_capacity(), 2);
+        assert_eq!(lower_bound.add().logical_records(), 2);
+        assert_eq!(lower_bound.add().rounded_capacity(), 4);
+        assert_eq!(lower_bound.spend().logical_records(), 1);
+        assert_eq!(lower_bound.spend().rounded_capacity(), 4);
         Ok(())
     }
 

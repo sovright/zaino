@@ -145,3 +145,9 @@ failure, rebuild, service, and exact-path Gate 2 qualification.
 If any physical hard gate rejects this tuple, the policy does not silently
 fall back to another logical candidate. Gate 1 remains NO-GO until a complete
 candidate passes every hard gate.
+
+The first physical follow-up is recorded in the
+[fixed-page capacity lower-bound note](oram-gate1-fixed-page-capacity-lower-bound-2026-07-30.md).
+The three selected page tables require at least `20.507935 GiB` under the
+pinned Rostl geometry, before every excluded layout, growth, overlap, process,
+RSS, failure, and service component. This does not change the Gate 1 decision.
