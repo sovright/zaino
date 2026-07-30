@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, num::NonZeroU64};
 
 #[cfg(feature = "corpus-zaino")]
 use blake2::{Blake2s256, Digest};
@@ -26,12 +26,23 @@ const PERSISTENT_ADDRESS_DIRECTORY_BYTES: usize = 38;
 /// Exact byte width of one immutable one-event protected page.
 const PERSISTENT_ADDRESS_EVENT_PAGE_BYTES: usize = 82;
 
+/// Number of records in every selected hybrid base/add/spend page.
+const FIXED_UTXO_PAGE_ENTRIES: usize = 16;
+
+/// Exact byte width of the self-binding header on a fixed hybrid page.
+const PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES: usize = 56;
+
+/// Exact byte width of one selected hybrid base/add/spend page.
+const PERSISTENT_FIXED_UTXO_PAGE_BYTES: usize = PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES
+    + (FIXED_UTXO_PAGE_ENTRIES * PERSISTENT_UTXO_EVENT_BYTES);
+
 const UTXO_EVENT_FORMAT_VERSION: u8 = 1;
 const UTXO_EVENT_FLAG_MINED: u8 = 1 << 0;
 const UTXO_EVENT_FLAG_SPENT: u8 = 1 << 1;
 const UTXO_EVENT_KNOWN_FLAGS: u8 = UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT;
 const ADDRESS_CELL_FORMAT_VERSION: u8 = 1;
 const ADDRESS_CELL_FLAG_OCCUPIED: u8 = 1;
+const FIXED_UTXO_PAGE_FORMAT_VERSION: u8 = 1;
 #[cfg(feature = "corpus-zaino")]
 const PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN: &[u8] =
     b"zaino-oram-persistent-utxo-event-commitment-v1";
@@ -713,6 +724,896 @@ impl fmt::Display for PersistentUtxoEventError {
 
 impl std::error::Error for PersistentUtxoEventError {}
 
+/// Public table class encoded into every selected hybrid page.
+///
+/// Base and add pages contain created events; spend pages contain spent events.
+/// Keeping the class in the record prevents a page from being accepted in a
+/// different logical domain solely because its opaque ORAM key collides or is
+/// misrouted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedUtxoPageKind {
+    Base,
+    Add,
+    Spend,
+}
+
+impl FixedUtxoPageKind {
+    const fn to_byte(self) -> u8 {
+        match self {
+            Self::Base => 1,
+            Self::Add => 2,
+            Self::Spend => 3,
+        }
+    }
+
+    const fn expected_event_kind(self) -> UtxoEventKind {
+        match self {
+            Self::Base | Self::Add => UtxoEventKind::Created,
+            Self::Spend => UtxoEventKind::Spent,
+        }
+    }
+
+    const fn try_from_byte(value: u8) -> Result<Self, PersistentFixedUtxoPageError> {
+        match value {
+            1 => Ok(Self::Base),
+            2 => Ok(Self::Add),
+            3 => Ok(Self::Spend),
+            actual => Err(PersistentFixedUtxoPageError::InvalidPageKind { actual }),
+        }
+    }
+}
+
+/// Full logical identity repeated inside every selected hybrid page.
+///
+/// The address key binds the record to its logical owner. The generation and
+/// page ordinal separate the immutable base and active delta records selected
+/// by a future manifest. The inclusive height range binds the events summarized
+/// by the page. A topology layer must construct a profile-validated manifest
+/// identity and require an exact match on all fields before using a decoded
+/// real page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FixedUtxoPageIdentity {
+    address_key: AddressKey,
+    generation: NonZeroU64,
+    page_ordinal: u32,
+    lower_height: u32,
+    upper_height: u32,
+}
+
+impl FixedUtxoPageIdentity {
+    fn new(
+        address_key: AddressKey,
+        generation: u64,
+        page_ordinal: u32,
+        lower_height: u32,
+        upper_height: u32,
+    ) -> Result<Self, FixedUtxoPageIdentityError> {
+        if lower_height > upper_height {
+            return Err(FixedUtxoPageIdentityError::InvalidHeightRange {
+                lower: lower_height,
+                upper: upper_height,
+            });
+        }
+        Ok(Self {
+            address_key,
+            generation: NonZeroU64::new(generation)
+                .ok_or(FixedUtxoPageIdentityError::ZeroGeneration)?,
+            page_ordinal,
+            lower_height,
+            upper_height,
+        })
+    }
+
+    const fn address_key(&self) -> &AddressKey {
+        &self.address_key
+    }
+
+    const fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    const fn page_ordinal(&self) -> u32 {
+        self.page_ordinal
+    }
+
+    const fn lower_height(&self) -> u32 {
+        self.lower_height
+    }
+
+    const fn upper_height(&self) -> u32 {
+        self.upper_height
+    }
+
+    const fn contains_height(&self, height: u32) -> bool {
+        height >= self.lower_height && height <= self.upper_height
+    }
+}
+
+impl fmt::Debug for FixedUtxoPageIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FixedUtxoPageIdentity { ..REDACTED.. }")
+    }
+}
+
+/// A selected hybrid page identity is not usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedUtxoPageIdentityError {
+    ZeroGeneration,
+    InvalidHeightRange { lower: u32, upper: u32 },
+}
+
+impl fmt::Display for FixedUtxoPageIdentityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroGeneration => f.write_str("fixed UTXO page generation must be nonzero"),
+            Self::InvalidHeightRange { lower, upper } => write!(
+                f,
+                "fixed UTXO page height range is invalid: lower {lower}, upper {upper}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FixedUtxoPageIdentityError {}
+
+/// One fixed 16-entry page in the selected live-base plus add/spend design.
+///
+/// Real entries always form a prefix and padding is represented only by
+/// trailing `None` values. A canonical dummy has no identity or entries but
+/// retains its public page class. All real entries belong to one standard
+/// address, use canonical `(height, stored txid bytes, output index)` order,
+/// and have unique outpoints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FixedUtxoPage {
+    kind: FixedUtxoPageKind,
+    identity: Option<FixedUtxoPageIdentity>,
+    occupied_entries: u8,
+    entries: [Option<UtxoEvent>; FIXED_UTXO_PAGE_ENTRIES],
+}
+
+impl FixedUtxoPage {
+    const fn dummy(kind: FixedUtxoPageKind) -> Self {
+        Self {
+            kind,
+            identity: None,
+            occupied_entries: 0,
+            entries: [None; FIXED_UTXO_PAGE_ENTRIES],
+        }
+    }
+
+    fn real(
+        kind: FixedUtxoPageKind,
+        identity: FixedUtxoPageIdentity,
+        entries: &[UtxoEvent],
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        if entries.is_empty() {
+            return Err(FixedUtxoPageError::EmptyRealPage);
+        }
+        if entries.len() > FIXED_UTXO_PAGE_ENTRIES {
+            return Err(FixedUtxoPageError::TooManyEntries {
+                actual: entries.len(),
+                capacity: FIXED_UTXO_PAGE_ENTRIES,
+            });
+        }
+
+        let mut fixed_entries = [None; FIXED_UTXO_PAGE_ENTRIES];
+        for (destination, entry) in fixed_entries.iter_mut().zip(entries.iter().copied()) {
+            *destination = Some(entry);
+        }
+        Self::from_fixed_entries(
+            kind,
+            identity,
+            entries.len() as u8,
+            fixed_entries,
+            derive_owner_key,
+        )
+    }
+
+    fn from_fixed_entries(
+        kind: FixedUtxoPageKind,
+        identity: FixedUtxoPageIdentity,
+        occupied_entries: u8,
+        entries: [Option<UtxoEvent>; FIXED_UTXO_PAGE_ENTRIES],
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        validate_fixed_utxo_page_entries(
+            kind,
+            &identity,
+            usize::from(occupied_entries),
+            &entries,
+            derive_owner_key,
+        )?;
+        Ok(Self {
+            kind,
+            identity: Some(identity),
+            occupied_entries,
+            entries,
+        })
+    }
+
+    const fn kind(&self) -> FixedUtxoPageKind {
+        self.kind
+    }
+
+    const fn identity(&self) -> Option<&FixedUtxoPageIdentity> {
+        self.identity.as_ref()
+    }
+
+    const fn occupied_entries(&self) -> usize {
+        self.occupied_entries as usize
+    }
+
+    const fn entries(&self) -> &[Option<UtxoEvent>; FIXED_UTXO_PAGE_ENTRIES] {
+        &self.entries
+    }
+
+    const fn is_dummy(&self) -> bool {
+        self.occupied_entries == 0
+    }
+}
+
+impl fmt::Debug for FixedUtxoPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FixedUtxoPage { ..REDACTED.. }")
+    }
+}
+
+fn validate_fixed_utxo_page_entries(
+    kind: FixedUtxoPageKind,
+    identity: &FixedUtxoPageIdentity,
+    occupied_entries: usize,
+    entries: &[Option<UtxoEvent>; FIXED_UTXO_PAGE_ENTRIES],
+    derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+) -> Result<(), FixedUtxoPageError> {
+    if occupied_entries == 0 {
+        return Err(FixedUtxoPageError::EmptyRealPage);
+    }
+    if occupied_entries > FIXED_UTXO_PAGE_ENTRIES {
+        return Err(FixedUtxoPageError::TooManyEntries {
+            actual: occupied_entries,
+            capacity: FIXED_UTXO_PAGE_ENTRIES,
+        });
+    }
+
+    let expected_kind = kind.expected_event_kind();
+    let mut owner = None;
+    let mut previous_order = None;
+
+    for (index, entry) in entries.iter().take(occupied_entries).enumerate() {
+        let event = entry
+            .as_ref()
+            .ok_or(FixedUtxoPageError::MissingEntry { index })?;
+        if event.kind() != expected_kind {
+            return Err(FixedUtxoPageError::WrongEventKind {
+                index,
+                expected: expected_kind.to_byte(),
+                actual: event.kind().to_byte(),
+            });
+        }
+        if !is_standard_address_event(event) {
+            return Err(FixedUtxoPageError::NonStandardEvent { index });
+        }
+
+        let event_owner = (event.script_class(), *event.script_hash());
+        if owner.is_some_and(|owner| owner != event_owner) {
+            return Err(FixedUtxoPageError::MixedAddress { index });
+        }
+        owner = Some(event_owner);
+
+        let order = (event.height(), event.txid(), event.output_index());
+        if previous_order.is_some_and(|previous| order < previous) {
+            return Err(FixedUtxoPageError::NoncanonicalOrder { index });
+        }
+        if !identity.contains_height(event.height()) {
+            return Err(FixedUtxoPageError::HeightOutOfRange { index });
+        }
+        previous_order = Some(order);
+
+        if entries[..index]
+            .iter()
+            .flatten()
+            .any(|prior| prior.has_same_outpoint(event))
+        {
+            return Err(FixedUtxoPageError::DuplicateOutpoint { index });
+        }
+    }
+
+    if let Some(index) = entries
+        .iter()
+        .enumerate()
+        .skip(occupied_entries)
+        .find_map(|(index, entry)| entry.is_some().then_some(index))
+    {
+        return Err(FixedUtxoPageError::NoncanonicalPadding { index });
+    }
+    let owner = owner.ok_or(FixedUtxoPageError::EmptyRealPage)?;
+    if derive_owner_key(owner.0, owner.1) != *identity.address_key() {
+        return Err(FixedUtxoPageError::AddressKeyMismatch { index: 0 });
+    }
+    Ok(())
+}
+
+/// A business record cannot enter a fixed hybrid page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedUtxoPageError {
+    EmptyRealPage,
+    TooManyEntries {
+        actual: usize,
+        capacity: usize,
+    },
+    MissingEntry {
+        index: usize,
+    },
+    NoncanonicalPadding {
+        index: usize,
+    },
+    WrongEventKind {
+        index: usize,
+        expected: u8,
+        actual: u8,
+    },
+    NonStandardEvent {
+        index: usize,
+    },
+    MixedAddress {
+        index: usize,
+    },
+    AddressKeyMismatch {
+        index: usize,
+    },
+    NoncanonicalOrder {
+        index: usize,
+    },
+    HeightOutOfRange {
+        index: usize,
+    },
+    DuplicateOutpoint {
+        index: usize,
+    },
+}
+
+impl fmt::Display for FixedUtxoPageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyRealPage => f.write_str("fixed UTXO page must contain at least one entry"),
+            Self::TooManyEntries { actual, capacity } => write!(
+                f,
+                "fixed UTXO page contains {actual} entries but its capacity is {capacity}"
+            ),
+            Self::MissingEntry { index } => {
+                write!(f, "fixed UTXO page is missing occupied entry {index}")
+            }
+            Self::NoncanonicalPadding { index } => {
+                write!(
+                    f,
+                    "fixed UTXO page has a real entry in padding slot {index}"
+                )
+            }
+            Self::WrongEventKind {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "fixed UTXO page entry {index} has kind {actual}, expected {expected}"
+            ),
+            Self::NonStandardEvent { index } => {
+                write!(f, "fixed UTXO page entry {index} is nonstandard")
+            }
+            Self::MixedAddress { index } => {
+                write!(
+                    f,
+                    "fixed UTXO page entry {index} belongs to another address"
+                )
+            }
+            Self::AddressKeyMismatch { index } => write!(
+                f,
+                "fixed UTXO page entry {index} does not derive its page address key"
+            ),
+            Self::NoncanonicalOrder { index } => write!(
+                f,
+                "fixed UTXO page entry {index} is below its predecessor in canonical order"
+            ),
+            Self::HeightOutOfRange { index } => {
+                write!(
+                    f,
+                    "fixed UTXO page entry {index} is outside its height range"
+                )
+            }
+            Self::DuplicateOutpoint { index } => {
+                write!(f, "fixed UTXO page entry {index} repeats an outpoint")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FixedUtxoPageError {}
+
+/// One immutable 16-entry live-UTXO base page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BaseUtxoPage16(FixedUtxoPage);
+
+impl BaseUtxoPage16 {
+    const fn dummy() -> Self {
+        Self(FixedUtxoPage::dummy(FixedUtxoPageKind::Base))
+    }
+
+    fn real(
+        identity: FixedUtxoPageIdentity,
+        entries: &[UtxoEvent],
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        FixedUtxoPage::real(FixedUtxoPageKind::Base, identity, entries, derive_owner_key).map(Self)
+    }
+}
+
+impl fmt::Debug for BaseUtxoPage16 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BaseUtxoPage16 { ..REDACTED.. }")
+    }
+}
+
+/// One mutable 16-entry created-event delta page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AddUtxoPage16(FixedUtxoPage);
+
+impl AddUtxoPage16 {
+    const fn dummy() -> Self {
+        Self(FixedUtxoPage::dummy(FixedUtxoPageKind::Add))
+    }
+
+    fn real(
+        identity: FixedUtxoPageIdentity,
+        entries: &[UtxoEvent],
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        FixedUtxoPage::real(FixedUtxoPageKind::Add, identity, entries, derive_owner_key).map(Self)
+    }
+}
+
+impl fmt::Debug for AddUtxoPage16 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AddUtxoPage16 { ..REDACTED.. }")
+    }
+}
+
+/// One mutable 16-entry spent-event delta page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SpendUtxoPage16(FixedUtxoPage);
+
+impl SpendUtxoPage16 {
+    const fn dummy() -> Self {
+        Self(FixedUtxoPage::dummy(FixedUtxoPageKind::Spend))
+    }
+
+    fn real(
+        identity: FixedUtxoPageIdentity,
+        entries: &[UtxoEvent],
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<Self, FixedUtxoPageError> {
+        FixedUtxoPage::real(
+            FixedUtxoPageKind::Spend,
+            identity,
+            entries,
+            derive_owner_key,
+        )
+        .map(Self)
+    }
+}
+
+impl fmt::Debug for SpendUtxoPage16 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SpendUtxoPage16 { ..REDACTED.. }")
+    }
+}
+
+/// Exact storage representation shared by the selected base/add/spend tables.
+///
+/// Bytes `0..56` are a versioned self-binding header:
+///
+/// - format version, page class, occupied-prefix length, reserved zero byte;
+/// - full 32-byte address key;
+/// - nonzero generation and page ordinal, little endian; and
+/// - inclusive lower and upper heights, little endian.
+///
+/// The remaining bytes are exactly sixteen 72-byte event slots. Unoccupied
+/// slots are all zero. `Default` remains invalid scratch storage so a missed
+/// backend read cannot be mistaken for a canonical dummy.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rostl-experimental",
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+struct PersistentFixedUtxoPage([u8; PERSISTENT_FIXED_UTXO_PAGE_BYTES]);
+
+const _: [(); PERSISTENT_FIXED_UTXO_PAGE_BYTES] =
+    [(); std::mem::size_of::<PersistentFixedUtxoPage>()];
+
+impl PersistentFixedUtxoPage {
+    /// Encodes a validated page outside the protected serving/update path.
+    ///
+    /// The `_offline` suffix intentionally narrows the repository's canonical
+    /// `from_business` name: this variable-work encoder branches on dummy state
+    /// and occupancy, so using the shorter name could invite it into a
+    /// protected transform. No protected page encode/decode/edit API exists in
+    /// this records-only slice.
+    fn from_business_offline(src: &FixedUtxoPage) -> Self {
+        let mut bytes = [0; PERSISTENT_FIXED_UTXO_PAGE_BYTES];
+        bytes[0] = FIXED_UTXO_PAGE_FORMAT_VERSION;
+        bytes[1] = src.kind().to_byte();
+        bytes[2] = src.occupied_entries;
+
+        if let Some(identity) = src.identity() {
+            bytes[4..36].copy_from_slice(identity.address_key().as_bytes());
+            bytes[36..44].copy_from_slice(&identity.generation().to_le_bytes());
+            bytes[44..48].copy_from_slice(&identity.page_ordinal().to_le_bytes());
+            bytes[48..52].copy_from_slice(&identity.lower_height().to_le_bytes());
+            bytes[52..56].copy_from_slice(&identity.upper_height().to_le_bytes());
+        }
+        for (slot, event) in src
+            .entries()
+            .iter()
+            .take(src.occupied_entries())
+            .flatten()
+            .enumerate()
+        {
+            let start =
+                PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + (slot * PERSISTENT_UTXO_EVENT_BYTES);
+            bytes[start..start + PERSISTENT_UTXO_EVENT_BYTES]
+                .copy_from_slice(&PersistentUtxoEvent::from_business(event).0);
+        }
+        Self(bytes)
+    }
+
+    /// Validates bytes outside the protected serving/update path.
+    ///
+    /// This decoder intentionally reports precise corruption errors and is
+    /// therefore variable-work. Protected reads and mutations must retain this
+    /// value as opaque bytes and use a separately audited fixed-work transform
+    /// that processes all sixteen slots. Every real header must match the
+    /// already profile-validated manifest identity; a canonical dummy has no
+    /// stored identity and may satisfy any expected logical page.
+    fn into_business_offline(
+        self,
+        expected_kind: FixedUtxoPageKind,
+        expected_identity: FixedUtxoPageIdentity,
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<FixedUtxoPage, PersistentFixedUtxoPageError> {
+        if self.0[0] != FIXED_UTXO_PAGE_FORMAT_VERSION {
+            return Err(PersistentFixedUtxoPageError::UnsupportedVersion { actual: self.0[0] });
+        }
+        let kind = FixedUtxoPageKind::try_from_byte(self.0[1])?;
+        if kind != expected_kind {
+            return Err(PersistentFixedUtxoPageError::WrongPageKind {
+                expected: expected_kind.to_byte(),
+                actual: kind.to_byte(),
+            });
+        }
+        let occupied_entries = usize::from(self.0[2]);
+        if self.0[3] != 0 {
+            return Err(PersistentFixedUtxoPageError::NonzeroReservedByte { actual: self.0[3] });
+        }
+        if occupied_entries > FIXED_UTXO_PAGE_ENTRIES {
+            return Err(PersistentFixedUtxoPageError::OccupancyOutOfRange {
+                actual: self.0[2],
+                capacity: FIXED_UTXO_PAGE_ENTRIES as u8,
+            });
+        }
+        if occupied_entries == 0 {
+            if self.0[3..].iter().any(|byte| *byte != 0) {
+                return Err(PersistentFixedUtxoPageError::NoncanonicalDummy);
+            }
+            return Ok(FixedUtxoPage::dummy(kind));
+        }
+
+        let mut address_key = [0; ADDRESS_KEY_BYTES];
+        address_key.copy_from_slice(&self.0[4..36]);
+        let mut generation = [0; 8];
+        generation.copy_from_slice(&self.0[36..44]);
+        let mut page_ordinal = [0; 4];
+        page_ordinal.copy_from_slice(&self.0[44..48]);
+        let mut lower_height = [0; 4];
+        lower_height.copy_from_slice(&self.0[48..52]);
+        let mut upper_height = [0; 4];
+        upper_height.copy_from_slice(&self.0[52..56]);
+        let identity = FixedUtxoPageIdentity::new(
+            AddressKey::new(address_key),
+            u64::from_le_bytes(generation),
+            u32::from_le_bytes(page_ordinal),
+            u32::from_le_bytes(lower_height),
+            u32::from_le_bytes(upper_height),
+        )
+        .map_err(PersistentFixedUtxoPageError::InvalidIdentity)?;
+        if identity != expected_identity {
+            return Err(PersistentFixedUtxoPageError::UnexpectedIdentity);
+        }
+
+        let mut entries = [None; FIXED_UTXO_PAGE_ENTRIES];
+        for (slot, destination) in entries.iter_mut().take(occupied_entries).enumerate() {
+            let start =
+                PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + (slot * PERSISTENT_UTXO_EVENT_BYTES);
+            let mut event = [0; PERSISTENT_UTXO_EVENT_BYTES];
+            event.copy_from_slice(&self.0[start..start + PERSISTENT_UTXO_EVENT_BYTES]);
+            *destination = Some(
+                PersistentUtxoEvent(event)
+                    .into_business()
+                    .map_err(|error| PersistentFixedUtxoPageError::InvalidEvent {
+                        index: slot,
+                        error,
+                    })?,
+            );
+        }
+        let padding_start = PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES
+            + (occupied_entries * PERSISTENT_UTXO_EVENT_BYTES);
+        if self.0[padding_start..].iter().any(|byte| *byte != 0) {
+            return Err(PersistentFixedUtxoPageError::NoncanonicalPadding);
+        }
+
+        FixedUtxoPage::from_fixed_entries(kind, identity, self.0[2], entries, derive_owner_key)
+            .map_err(PersistentFixedUtxoPageError::InvalidPage)
+    }
+}
+
+impl Default for PersistentFixedUtxoPage {
+    fn default() -> Self {
+        Self([0; PERSISTENT_FIXED_UTXO_PAGE_BYTES])
+    }
+}
+
+impl fmt::Debug for PersistentFixedUtxoPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PersistentFixedUtxoPage([REDACTED])")
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl rostl_primitives::traits::Cmov for PersistentFixedUtxoPage {
+    fn cmov(&mut self, other: &Self, choice: bool) {
+        cmov_pod_bytes(self, other, choice);
+    }
+
+    fn cxchg(&mut self, other: &mut Self, choice: bool) {
+        cxchg_pod_bytes(self, other, choice);
+    }
+}
+
+/// Exact 1,208-byte storage representation of [`BaseUtxoPage16`].
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rostl-experimental",
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+struct PersistentBaseUtxoPage16(PersistentFixedUtxoPage);
+
+const _: [(); PERSISTENT_FIXED_UTXO_PAGE_BYTES] =
+    [(); std::mem::size_of::<PersistentBaseUtxoPage16>()];
+
+impl PersistentBaseUtxoPage16 {
+    fn from_business_offline(src: &BaseUtxoPage16) -> Self {
+        Self(PersistentFixedUtxoPage::from_business_offline(&src.0))
+    }
+
+    fn into_business_offline(
+        self,
+        expected_identity: FixedUtxoPageIdentity,
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<BaseUtxoPage16, PersistentFixedUtxoPageError> {
+        self.0
+            .into_business_offline(FixedUtxoPageKind::Base, expected_identity, derive_owner_key)
+            .map(BaseUtxoPage16)
+    }
+}
+
+impl fmt::Debug for PersistentBaseUtxoPage16 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PersistentBaseUtxoPage16([REDACTED])")
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl rostl_primitives::traits::Cmov for PersistentBaseUtxoPage16 {
+    fn cmov(&mut self, other: &Self, choice: bool) {
+        cmov_pod_bytes(self, other, choice);
+    }
+
+    fn cxchg(&mut self, other: &mut Self, choice: bool) {
+        cxchg_pod_bytes(self, other, choice);
+    }
+}
+
+/// Exact 1,208-byte storage representation of [`AddUtxoPage16`].
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rostl-experimental",
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+struct PersistentAddUtxoPage16(PersistentFixedUtxoPage);
+
+const _: [(); PERSISTENT_FIXED_UTXO_PAGE_BYTES] =
+    [(); std::mem::size_of::<PersistentAddUtxoPage16>()];
+
+impl PersistentAddUtxoPage16 {
+    fn from_business_offline(src: &AddUtxoPage16) -> Self {
+        Self(PersistentFixedUtxoPage::from_business_offline(&src.0))
+    }
+
+    fn into_business_offline(
+        self,
+        expected_identity: FixedUtxoPageIdentity,
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<AddUtxoPage16, PersistentFixedUtxoPageError> {
+        self.0
+            .into_business_offline(FixedUtxoPageKind::Add, expected_identity, derive_owner_key)
+            .map(AddUtxoPage16)
+    }
+}
+
+impl fmt::Debug for PersistentAddUtxoPage16 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PersistentAddUtxoPage16([REDACTED])")
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl rostl_primitives::traits::Cmov for PersistentAddUtxoPage16 {
+    fn cmov(&mut self, other: &Self, choice: bool) {
+        cmov_pod_bytes(self, other, choice);
+    }
+
+    fn cxchg(&mut self, other: &mut Self, choice: bool) {
+        cxchg_pod_bytes(self, other, choice);
+    }
+}
+
+/// Exact 1,208-byte storage representation of [`SpendUtxoPage16`].
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rostl-experimental",
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
+struct PersistentSpendUtxoPage16(PersistentFixedUtxoPage);
+
+const _: [(); PERSISTENT_FIXED_UTXO_PAGE_BYTES] =
+    [(); std::mem::size_of::<PersistentSpendUtxoPage16>()];
+
+impl PersistentSpendUtxoPage16 {
+    fn from_business_offline(src: &SpendUtxoPage16) -> Self {
+        Self(PersistentFixedUtxoPage::from_business_offline(&src.0))
+    }
+
+    fn into_business_offline(
+        self,
+        expected_identity: FixedUtxoPageIdentity,
+        derive_owner_key: &impl Fn(UtxoScriptClass, [u8; 20]) -> AddressKey,
+    ) -> Result<SpendUtxoPage16, PersistentFixedUtxoPageError> {
+        self.0
+            .into_business_offline(
+                FixedUtxoPageKind::Spend,
+                expected_identity,
+                derive_owner_key,
+            )
+            .map(SpendUtxoPage16)
+    }
+}
+
+impl fmt::Debug for PersistentSpendUtxoPage16 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PersistentSpendUtxoPage16([REDACTED])")
+    }
+}
+
+#[cfg(feature = "rostl-experimental")]
+impl rostl_primitives::traits::Cmov for PersistentSpendUtxoPage16 {
+    fn cmov(&mut self, other: &Self, choice: bool) {
+        cmov_pod_bytes(self, other, choice);
+    }
+
+    fn cxchg(&mut self, other: &mut Self, choice: bool) {
+        cxchg_pod_bytes(self, other, choice);
+    }
+}
+
+/// Invalid bytes in one selected fixed hybrid page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistentFixedUtxoPageError {
+    UnsupportedVersion {
+        actual: u8,
+    },
+    InvalidPageKind {
+        actual: u8,
+    },
+    WrongPageKind {
+        expected: u8,
+        actual: u8,
+    },
+    NonzeroReservedByte {
+        actual: u8,
+    },
+    OccupancyOutOfRange {
+        actual: u8,
+        capacity: u8,
+    },
+    NoncanonicalDummy,
+    InvalidIdentity(FixedUtxoPageIdentityError),
+    UnexpectedIdentity,
+    InvalidEvent {
+        index: usize,
+        error: PersistentUtxoEventError,
+    },
+    NoncanonicalPadding,
+    InvalidPage(FixedUtxoPageError),
+}
+
+impl fmt::Display for PersistentFixedUtxoPageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedVersion { actual } => {
+                write!(f, "unsupported persistent fixed UTXO page version {actual}")
+            }
+            Self::InvalidPageKind { actual } => {
+                write!(f, "invalid persistent fixed UTXO page kind {actual}")
+            }
+            Self::WrongPageKind { expected, actual } => write!(
+                f,
+                "persistent fixed UTXO page kind {actual} does not match table kind {expected}"
+            ),
+            Self::NonzeroReservedByte { actual } => write!(
+                f,
+                "persistent fixed UTXO page reserved byte is nonzero: {actual}"
+            ),
+            Self::OccupancyOutOfRange { actual, capacity } => write!(
+                f,
+                "persistent fixed UTXO page occupancy {actual} exceeds {capacity}"
+            ),
+            Self::NoncanonicalDummy => {
+                f.write_str("persistent fixed UTXO page dummy has nonzero payload")
+            }
+            Self::InvalidIdentity(error) => {
+                write!(f, "persistent fixed UTXO page identity is invalid: {error}")
+            }
+            Self::UnexpectedIdentity => {
+                f.write_str("persistent fixed UTXO page identity does not match its manifest")
+            }
+            Self::InvalidEvent { index, error } => write!(
+                f,
+                "persistent fixed UTXO page entry {index} is invalid: {error}"
+            ),
+            Self::NoncanonicalPadding => {
+                f.write_str("persistent fixed UTXO page has nonzero padding")
+            }
+            Self::InvalidPage(error) => {
+                write!(
+                    f,
+                    "persistent fixed UTXO page semantics are invalid: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PersistentFixedUtxoPageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidIdentity(error) => Some(error),
+            Self::InvalidEvent { error, .. } => Some(error),
+            Self::InvalidPage(error) => Some(error),
+            Self::UnsupportedVersion { .. }
+            | Self::InvalidPageKind { .. }
+            | Self::WrongPageKind { .. }
+            | Self::NonzeroReservedByte { .. }
+            | Self::OccupancyOutOfRange { .. }
+            | Self::NoncanonicalDummy
+            | Self::UnexpectedIdentity
+            | Self::NoncanonicalPadding => None,
+        }
+    }
+}
+
 /// One immutable cell in a future protected address directory.
 ///
 /// The stored slot is self-described identity, never a truncated address
@@ -1360,6 +2261,60 @@ mod tests {
         )
     }
 
+    fn fixed_page_owner_key(script_class: UtxoScriptClass, script_hash: [u8; 20]) -> AddressKey {
+        use crate::layout::{
+            derive_standard_address_key, LayoutNetwork, StandardAddress, StandardScriptKind,
+        };
+
+        let script_kind = match script_class {
+            UtxoScriptClass::PayToPublicKeyHash => StandardScriptKind::PayToPublicKeyHash,
+            UtxoScriptClass::PayToScriptHash => StandardScriptKind::PayToScriptHash,
+            UtxoScriptClass::NonStandard => return AddressKey::new([0; ADDRESS_KEY_BYTES]),
+        };
+        derive_standard_address_key(
+            LayoutNetwork::Regtest,
+            7,
+            StandardAddress::new(script_kind, script_hash),
+        )
+    }
+
+    fn fixed_page_identity(lower_height: u32, upper_height: u32) -> FixedUtxoPageIdentity {
+        FixedUtxoPageIdentity::new(
+            fixed_page_owner_key(UtxoScriptClass::PayToPublicKeyHash, [0x92; 20]),
+            0x0102_0304_0506_0708,
+            0x1112_1314,
+            lower_height,
+            upper_height,
+        )
+        .expect("fixture generation is nonzero and its height range is ordered")
+    }
+
+    fn created_page_entries() -> [UtxoEvent; FIXED_UTXO_PAGE_ENTRIES] {
+        std::array::from_fn(|index| {
+            UtxoEvent::created(
+                [(index + 1) as u8; TXID_BYTES],
+                index as u32,
+                50_000 + index as u64,
+                100 + index as u32,
+                UtxoScriptClass::PayToPublicKeyHash,
+                [0x92; 20],
+            )
+        })
+    }
+
+    fn spent_page_entries() -> [UtxoEvent; FIXED_UTXO_PAGE_ENTRIES] {
+        std::array::from_fn(|index| {
+            UtxoEvent::spent(
+                [(index + 1) as u8; TXID_BYTES],
+                index as u32,
+                50_000 + index as u64,
+                100 + index as u32,
+                UtxoScriptClass::PayToPublicKeyHash,
+                [0x92; 20],
+            )
+        })
+    }
+
     fn created_event(
         txid_byte: u8,
         output_index: u32,
@@ -1686,6 +2641,546 @@ mod tests {
     }
 
     #[test]
+    fn fixed_page_records_have_exact_width_and_golden_header_offsets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+        let base = BaseUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)?;
+        let add = AddUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)?;
+        let spend = SpendUtxoPage16::real(identity, &spent[..1], &fixed_page_owner_key)?;
+        let persistent_base = PersistentBaseUtxoPage16::from_business_offline(&base);
+        let persistent_add = PersistentAddUtxoPage16::from_business_offline(&add);
+        let persistent_spend = PersistentSpendUtxoPage16::from_business_offline(&spend);
+
+        for width in [
+            std::mem::size_of_val(&persistent_base),
+            std::mem::size_of_val(&persistent_add),
+            std::mem::size_of_val(&persistent_spend),
+        ] {
+            assert_eq!(width, PERSISTENT_FIXED_UTXO_PAGE_BYTES);
+            assert_eq!(width, 1_208);
+        }
+
+        let base_bytes = &(persistent_base.0).0;
+        assert_eq!(base_bytes[0], FIXED_UTXO_PAGE_FORMAT_VERSION);
+        assert_eq!(base_bytes[1], FixedUtxoPageKind::Base.to_byte());
+        assert_eq!(base_bytes[2], 1);
+        assert_eq!(base_bytes[3], 0);
+        assert_eq!(&base_bytes[4..36], identity.address_key().as_bytes());
+        assert_eq!(
+            &base_bytes[36..44],
+            &0x0102_0304_0506_0708_u64.to_le_bytes()
+        );
+        assert_eq!(&base_bytes[44..48], &0x1112_1314_u32.to_le_bytes());
+        assert_eq!(&base_bytes[48..52], &100_u32.to_le_bytes());
+        assert_eq!(&base_bytes[52..56], &115_u32.to_le_bytes());
+        assert_eq!(
+            &base_bytes[56..128],
+            &PersistentUtxoEvent::from_business(&created[0]).0
+        );
+        assert!(base_bytes[128..].iter().all(|byte| *byte == 0));
+        assert_eq!((persistent_add.0).0[1], FixedUtxoPageKind::Add.to_byte());
+        assert_eq!(
+            (persistent_spend.0).0[1],
+            FixedUtxoPageKind::Spend.to_byte()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_page_records_round_trip_one_full_and_dummy_pages(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+        let base = BaseUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)?;
+        let add = AddUtxoPage16::real(identity, &created, &fixed_page_owner_key)?;
+        let spend = SpendUtxoPage16::real(identity, &spent, &fixed_page_owner_key)?;
+
+        assert_eq!(
+            PersistentBaseUtxoPage16::from_business_offline(&base)
+                .into_business_offline(identity, &fixed_page_owner_key)?,
+            base
+        );
+        assert_eq!(
+            PersistentAddUtxoPage16::from_business_offline(&add)
+                .into_business_offline(identity, &fixed_page_owner_key)?,
+            add
+        );
+        assert_eq!(
+            PersistentSpendUtxoPage16::from_business_offline(&spend)
+                .into_business_offline(identity, &fixed_page_owner_key)?,
+            spend
+        );
+
+        let base_dummy = BaseUtxoPage16::dummy();
+        let add_dummy = AddUtxoPage16::dummy();
+        let spend_dummy = SpendUtxoPage16::dummy();
+        assert!(PersistentBaseUtxoPage16::from_business_offline(&base_dummy)
+            .into_business_offline(identity, &fixed_page_owner_key)?
+            .0
+            .is_dummy());
+        assert!(PersistentAddUtxoPage16::from_business_offline(&add_dummy)
+            .into_business_offline(identity, &fixed_page_owner_key)?
+            .0
+            .is_dummy());
+        assert!(
+            PersistentSpendUtxoPage16::from_business_offline(&spend_dummy)
+                .into_business_offline(identity, &fixed_page_owner_key)?
+                .0
+                .is_dummy()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_page_canonical_dummy_is_distinct_from_default_scratch() {
+        let identity = fixed_page_identity(100, 115);
+        let dummy = PersistentBaseUtxoPage16::from_business_offline(&BaseUtxoPage16::dummy());
+        assert_eq!((dummy.0).0[0], FIXED_UTXO_PAGE_FORMAT_VERSION);
+        assert_eq!((dummy.0).0[1], FixedUtxoPageKind::Base.to_byte());
+        assert!((dummy.0).0[2..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            PersistentBaseUtxoPage16::default()
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::UnsupportedVersion { actual: 0 })
+        );
+        assert_eq!(
+            PersistentAddUtxoPage16::default()
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::UnsupportedVersion { actual: 0 })
+        );
+        assert_eq!(
+            PersistentSpendUtxoPage16::default()
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::UnsupportedVersion { actual: 0 })
+        );
+    }
+
+    #[test]
+    fn fixed_page_identity_rejects_zero_generation_and_inverted_range() {
+        let key = AddressKey::new([0x91; ADDRESS_KEY_BYTES]);
+        assert_eq!(
+            FixedUtxoPageIdentity::new(key, 0, 1, 100, 115),
+            Err(FixedUtxoPageIdentityError::ZeroGeneration)
+        );
+        assert_eq!(
+            FixedUtxoPageIdentity::new(key, 1, 1, 116, 115),
+            Err(FixedUtxoPageIdentityError::InvalidHeightRange {
+                lower: 116,
+                upper: 115,
+            })
+        );
+    }
+
+    #[test]
+    fn fixed_page_requires_canonical_owner_key_and_total_event_order(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = fixed_page_identity(100, 115);
+        let mut created = created_page_entries();
+
+        let wrong_identity =
+            FixedUtxoPageIdentity::new(AddressKey::new([0xa5; 32]), 1, 0, 100, 115)?;
+        assert_eq!(
+            BaseUtxoPage16::real(wrong_identity, &created[..1], &fixed_page_owner_key),
+            Err(FixedUtxoPageError::AddressKeyMismatch { index: 0 })
+        );
+
+        created[1].height = created[0].height;
+        assert!(BaseUtxoPage16::real(identity, &created[..2], &fixed_page_owner_key).is_ok());
+        assert_eq!(
+            BaseUtxoPage16::real(identity, &[created[1], created[0]], &fixed_page_owner_key,),
+            Err(FixedUtxoPageError::NoncanonicalOrder { index: 1 })
+        );
+
+        let first_output = created[0];
+        let mut second_output = first_output;
+        second_output.output_index += 1;
+        assert!(BaseUtxoPage16::real(
+            identity,
+            &[first_output, second_output],
+            &fixed_page_owner_key,
+        )
+        .is_ok());
+        assert_eq!(
+            BaseUtxoPage16::real(
+                identity,
+                &[second_output, first_output],
+                &fixed_page_owner_key,
+            ),
+            Err(FixedUtxoPageError::NoncanonicalOrder { index: 1 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_page_offline_decode_requires_exact_manifest_identity(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let page = BaseUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)?;
+        let persistent = PersistentBaseUtxoPage16::from_business_offline(&page);
+
+        let unexpected_identities = [
+            FixedUtxoPageIdentity::new(
+                AddressKey::new([0xa5; 32]),
+                identity.generation(),
+                identity.page_ordinal(),
+                identity.lower_height(),
+                identity.upper_height(),
+            )?,
+            FixedUtxoPageIdentity::new(
+                *identity.address_key(),
+                identity.generation() + 1,
+                identity.page_ordinal(),
+                identity.lower_height(),
+                identity.upper_height(),
+            )?,
+            FixedUtxoPageIdentity::new(
+                *identity.address_key(),
+                identity.generation(),
+                identity.page_ordinal() + 1,
+                identity.lower_height(),
+                identity.upper_height(),
+            )?,
+            FixedUtxoPageIdentity::new(
+                *identity.address_key(),
+                identity.generation(),
+                identity.page_ordinal(),
+                identity.lower_height() - 1,
+                identity.upper_height(),
+            )?,
+            FixedUtxoPageIdentity::new(
+                *identity.address_key(),
+                identity.generation(),
+                identity.page_ordinal(),
+                identity.lower_height(),
+                identity.upper_height() + 1,
+            )?,
+        ];
+        for unexpected in unexpected_identities {
+            assert_eq!(
+                persistent.into_business_offline(unexpected, &fixed_page_owner_key),
+                Err(PersistentFixedUtxoPageError::UnexpectedIdentity)
+            );
+        }
+
+        let dummy = PersistentBaseUtxoPage16::from_business_offline(&BaseUtxoPage16::dummy());
+        assert!(dummy
+            .into_business_offline(unexpected_identities[0], &fixed_page_owner_key)?
+            .0
+            .is_dummy());
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_page_persistent_header_revalidates_every_field(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let created = created_page_entries();
+        let identity = fixed_page_identity(100, 115);
+        let page = BaseUtxoPage16::real(identity, &created, &fixed_page_owner_key)?;
+        let valid = (PersistentBaseUtxoPage16::from_business_offline(&page).0).0;
+
+        let mut wrong_version = valid;
+        wrong_version[0] = 2;
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(wrong_version))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::UnsupportedVersion { actual: 2 })
+        );
+
+        let mut invalid_kind = valid;
+        invalid_kind[1] = 4;
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(invalid_kind))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidPageKind { actual: 4 })
+        );
+
+        let mut wrong_kind = valid;
+        wrong_kind[1] = FixedUtxoPageKind::Add.to_byte();
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(wrong_kind))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::WrongPageKind {
+                expected: FixedUtxoPageKind::Base.to_byte(),
+                actual: FixedUtxoPageKind::Add.to_byte(),
+            })
+        );
+
+        let mut nonzero_reserved = valid;
+        nonzero_reserved[3] = 1;
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(nonzero_reserved))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::NonzeroReservedByte { actual: 1 })
+        );
+
+        let mut invalid_count = valid;
+        invalid_count[2] = (FIXED_UTXO_PAGE_ENTRIES + 1) as u8;
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(invalid_count))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::OccupancyOutOfRange {
+                actual: (FIXED_UTXO_PAGE_ENTRIES + 1) as u8,
+                capacity: FIXED_UTXO_PAGE_ENTRIES as u8,
+            })
+        );
+
+        let mut zero_generation = valid;
+        zero_generation[36..44].fill(0);
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(zero_generation))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidIdentity(
+                FixedUtxoPageIdentityError::ZeroGeneration
+            ))
+        );
+
+        let mut inverted_range = valid;
+        inverted_range[48..52].copy_from_slice(&116_u32.to_le_bytes());
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(inverted_range))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidIdentity(
+                FixedUtxoPageIdentityError::InvalidHeightRange {
+                    lower: 116,
+                    upper: 115,
+                }
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_page_persistent_boundary_rejects_every_nonzero_padding_byte(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let identity = fixed_page_identity(100, 115);
+        let dummy = (PersistentBaseUtxoPage16::from_business_offline(&BaseUtxoPage16::dummy()).0).0;
+        for index in 4..PERSISTENT_FIXED_UTXO_PAGE_BYTES {
+            let mut noncanonical = dummy;
+            noncanonical[index] = 1;
+            assert_eq!(
+                PersistentBaseUtxoPage16(PersistentFixedUtxoPage(noncanonical))
+                    .into_business_offline(identity, &fixed_page_owner_key),
+                Err(PersistentFixedUtxoPageError::NoncanonicalDummy)
+            );
+        }
+
+        let created = created_page_entries();
+        let page = BaseUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)?;
+        let valid = (PersistentBaseUtxoPage16::from_business_offline(&page).0).0;
+        let padding_start = PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + PERSISTENT_UTXO_EVENT_BYTES;
+        for index in padding_start..PERSISTENT_FIXED_UTXO_PAGE_BYTES {
+            let mut noncanonical = valid;
+            noncanonical[index] = 1;
+            assert_eq!(
+                PersistentBaseUtxoPage16(PersistentFixedUtxoPage(noncanonical))
+                    .into_business_offline(identity, &fixed_page_owner_key),
+                Err(PersistentFixedUtxoPageError::NoncanonicalPadding)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_page_persistent_boundary_revalidates_nested_event_and_page_semantics(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+        let identity = fixed_page_identity(100, 115);
+        let page = BaseUtxoPage16::real(identity, &created[..2], &fixed_page_owner_key)?;
+        let valid = (PersistentBaseUtxoPage16::from_business_offline(&page).0).0;
+
+        let mut invalid_event = valid;
+        invalid_event[PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES] = 2;
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(invalid_event))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidEvent {
+                index: 0,
+                error: PersistentUtxoEventError::UnsupportedVersion { actual: 2 },
+            })
+        );
+
+        let mut wrong_event_kind = valid;
+        wrong_event_kind[PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES
+            ..PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + PERSISTENT_UTXO_EVENT_BYTES]
+            .copy_from_slice(&PersistentUtxoEvent::from_business(&spent[0]).0);
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(wrong_event_kind))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidPage(
+                FixedUtxoPageError::WrongEventKind {
+                    index: 0,
+                    expected: UtxoEventKind::Created.to_byte(),
+                    actual: UtxoEventKind::Spent.to_byte(),
+                }
+            ))
+        );
+
+        let mut mixed_owner = created[1];
+        mixed_owner.script_hash = [0x93; 20];
+        let second_start = PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + PERSISTENT_UTXO_EVENT_BYTES;
+        let mut mixed_page = valid;
+        mixed_page[second_start..second_start + PERSISTENT_UTXO_EVENT_BYTES]
+            .copy_from_slice(&PersistentUtxoEvent::from_business(&mixed_owner).0);
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(mixed_page))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidPage(
+                FixedUtxoPageError::MixedAddress { index: 1 }
+            ))
+        );
+
+        let mut wrong_owner_key = valid;
+        for slot in 0..2 {
+            let script_hash_start =
+                PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + (slot * PERSISTENT_UTXO_EVENT_BYTES) + 52;
+            wrong_owner_key[script_hash_start..script_hash_start + 20].fill(0x93);
+        }
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(wrong_owner_key))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidPage(
+                FixedUtxoPageError::AddressKeyMismatch { index: 0 }
+            ))
+        );
+
+        let mut out_of_range = valid;
+        out_of_range[PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + 48
+            ..PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + 52]
+            .copy_from_slice(&116_u32.to_le_bytes());
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(out_of_range))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidPage(
+                FixedUtxoPageError::HeightOutOfRange { index: 0 }
+            ))
+        );
+
+        let mut duplicate = valid;
+        let first_event = valid[PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES
+            ..PERSISTENT_FIXED_UTXO_PAGE_HEADER_BYTES + PERSISTENT_UTXO_EVENT_BYTES]
+            .to_owned();
+        duplicate[second_start..second_start + PERSISTENT_UTXO_EVENT_BYTES]
+            .copy_from_slice(&first_event);
+        assert_eq!(
+            PersistentBaseUtxoPage16(PersistentFixedUtxoPage(duplicate))
+                .into_business_offline(identity, &fixed_page_owner_key),
+            Err(PersistentFixedUtxoPageError::InvalidPage(
+                FixedUtxoPageError::DuplicateOutpoint { index: 1 }
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_page_business_boundary_rejects_invalid_entry_sets() {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+
+        assert_eq!(
+            BaseUtxoPage16::real(identity, &[], &fixed_page_owner_key),
+            Err(FixedUtxoPageError::EmptyRealPage)
+        );
+        assert_eq!(
+            BaseUtxoPage16::real(
+                identity,
+                &[created[0]; FIXED_UTXO_PAGE_ENTRIES + 1],
+                &fixed_page_owner_key,
+            ),
+            Err(FixedUtxoPageError::TooManyEntries {
+                actual: FIXED_UTXO_PAGE_ENTRIES + 1,
+                capacity: FIXED_UTXO_PAGE_ENTRIES,
+            })
+        );
+        assert_eq!(
+            BaseUtxoPage16::real(identity, &spent[..1], &fixed_page_owner_key),
+            Err(FixedUtxoPageError::WrongEventKind {
+                index: 0,
+                expected: UtxoEventKind::Created.to_byte(),
+                actual: UtxoEventKind::Spent.to_byte(),
+            })
+        );
+
+        let mut nonstandard = created[0];
+        nonstandard.script_class = UtxoScriptClass::NonStandard;
+        assert_eq!(
+            BaseUtxoPage16::real(identity, &[nonstandard], &fixed_page_owner_key),
+            Err(FixedUtxoPageError::NonStandardEvent { index: 0 })
+        );
+
+        let mut another_owner = created[1];
+        another_owner.script_hash = [0x93; 20];
+        assert_eq!(
+            BaseUtxoPage16::real(
+                identity,
+                &[created[0], another_owner],
+                &fixed_page_owner_key,
+            ),
+            Err(FixedUtxoPageError::MixedAddress { index: 1 })
+        );
+
+        let mut out_of_range = created[0];
+        out_of_range.height = 99;
+        assert_eq!(
+            BaseUtxoPage16::real(identity, &[out_of_range], &fixed_page_owner_key),
+            Err(FixedUtxoPageError::HeightOutOfRange { index: 0 })
+        );
+
+        assert_eq!(
+            BaseUtxoPage16::real(identity, &[created[1], created[0]], &fixed_page_owner_key,),
+            Err(FixedUtxoPageError::NoncanonicalOrder { index: 1 })
+        );
+        assert_eq!(
+            BaseUtxoPage16::real(identity, &[created[0], created[0]], &fixed_page_owner_key,),
+            Err(FixedUtxoPageError::DuplicateOutpoint { index: 1 })
+        );
+    }
+
+    #[test]
+    fn fixed_page_debug_surfaces_are_redacted() {
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+        let base = BaseUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)
+            .expect("fixture page is canonical");
+        let add = AddUtxoPage16::real(identity, &created[..1], &fixed_page_owner_key)
+            .expect("fixture page is canonical");
+        let spend = SpendUtxoPage16::real(identity, &spent[..1], &fixed_page_owner_key)
+            .expect("fixture page is canonical");
+
+        assert_eq!(
+            format!("{identity:?}"),
+            "FixedUtxoPageIdentity { ..REDACTED.. }"
+        );
+        assert_eq!(format!("{base:?}"), "BaseUtxoPage16 { ..REDACTED.. }");
+        assert_eq!(format!("{add:?}"), "AddUtxoPage16 { ..REDACTED.. }");
+        assert_eq!(format!("{spend:?}"), "SpendUtxoPage16 { ..REDACTED.. }");
+        assert_eq!(
+            format!(
+                "{:?}",
+                PersistentBaseUtxoPage16::from_business_offline(&base)
+            ),
+            "PersistentBaseUtxoPage16([REDACTED])"
+        );
+        assert_eq!(
+            format!("{:?}", PersistentAddUtxoPage16::from_business_offline(&add)),
+            "PersistentAddUtxoPage16([REDACTED])"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                PersistentSpendUtxoPage16::from_business_offline(&spend)
+            ),
+            "PersistentSpendUtxoPage16([REDACTED])"
+        );
+    }
+
+    #[test]
     fn address_directory_round_trips_real_and_canonical_dummy_cells(
     ) -> Result<(), PersistentAddressDirectoryError> {
         let dummy = AddressDirectory::dummy();
@@ -1899,6 +3394,30 @@ mod tests {
         assert_semantics(
             PersistentUtxoEvent::from_business(&sample_created_event()),
             PersistentUtxoEvent::from_business(&sample_spent_event()),
+        );
+        let identity = fixed_page_identity(100, 115);
+        let created = created_page_entries();
+        let spent = spent_page_entries();
+        assert_semantics(
+            PersistentBaseUtxoPage16::from_business_offline(&BaseUtxoPage16::dummy()),
+            PersistentBaseUtxoPage16::from_business_offline(
+                &BaseUtxoPage16::real(identity, &created, &fixed_page_owner_key)
+                    .expect("fixture base page is canonical"),
+            ),
+        );
+        assert_semantics(
+            PersistentAddUtxoPage16::from_business_offline(&AddUtxoPage16::dummy()),
+            PersistentAddUtxoPage16::from_business_offline(
+                &AddUtxoPage16::real(identity, &created, &fixed_page_owner_key)
+                    .expect("fixture add page is canonical"),
+            ),
+        );
+        assert_semantics(
+            PersistentSpendUtxoPage16::from_business_offline(&SpendUtxoPage16::dummy()),
+            PersistentSpendUtxoPage16::from_business_offline(
+                &SpendUtxoPage16::real(identity, &spent, &fixed_page_owner_key)
+                    .expect("fixture spend page is canonical"),
+            ),
         );
         assert_semantics(
             PersistentAddressDirectory::from_business(&AddressDirectory::dummy()),
