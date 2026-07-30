@@ -16,12 +16,11 @@ use rostl_oram::circuit_oram::{Block, Bucket, CircuitORAM, S, Z};
 use rostl_primitives::traits::Cmov;
 
 use crate::{
-    hybrid_sizing::SourceBoundHybridSizingReport,
+    hybrid_sizing::{
+        SourceBoundHybridSizingReport, SELECTED_GENERATION_INTERVAL_BLOCKS, SELECTED_PAGE_ENTRIES,
+    },
     records::{PersistentAddUtxoPage16, PersistentBaseUtxoPage16, PersistentSpendUtxoPage16},
 };
-
-pub(super) const SELECTED_PAGE_ENTRIES: u64 = 16;
-pub(super) const SELECTED_GENERATION_INTERVAL_BLOCKS: u32 = 288;
 
 const ROSTL_REVISION: &str = "8c3a12d2febf17b024f2e949428b3bc526d74172";
 const IMMUTABLE_BASE_SPARE_RECORDS: u64 = 1;

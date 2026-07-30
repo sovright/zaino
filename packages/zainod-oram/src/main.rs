@@ -537,6 +537,9 @@ enum HybridSizingProfileArg {
     /// Exact source replay measuring live-UTXO base and delta demand.
     #[value(name = "live-utxo-base-delta-v1")]
     LiveUtxoBaseDeltaV1,
+    /// V1 replay plus the fixed source-bound growth profile.
+    #[value(name = "live-utxo-base-delta-growth-v2")]
+    LiveUtxoBaseDeltaGrowthV2,
 }
 
 #[derive(Debug, Args)]
@@ -1080,6 +1083,9 @@ async fn run_hybrid_sizing(args: QualificationHybridSizingArgs) -> RunnerResult<
     let profile = match args.profile {
         HybridSizingProfileArg::LiveUtxoBaseDeltaV1 => {
             SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1
+        }
+        HybridSizingProfileArg::LiveUtxoBaseDeltaGrowthV2 => {
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2
         }
     };
     let source_backend = backend_kind(config.backend);
@@ -2837,6 +2843,14 @@ mod tests {
         assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
         assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-hybrid-sizing"));
         assert_eq!(args.progress_interval.get(), 5_000);
+
+        let mut growth_profile = valid_hybrid_sizing_args();
+        growth_profile[4] = "live-utxo-base-delta-growth-v2";
+        let growth_args = parsed_hybrid_sizing(Cli::try_parse_from(growth_profile)?);
+        assert_eq!(
+            growth_args.profile,
+            HybridSizingProfileArg::LiveUtxoBaseDeltaGrowthV2
+        );
 
         for required in [
             "--profile",

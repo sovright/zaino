@@ -13,9 +13,7 @@ use serde::{Deserialize, Serialize};
 use zaino_state::IndexedBlock;
 
 #[cfg(feature = "rostl-experimental")]
-use crate::fixed_page_capacity::{
-    SelectedFixedPageDemands, SELECTED_GENERATION_INTERVAL_BLOCKS, SELECTED_PAGE_ENTRIES,
-};
+use crate::fixed_page_capacity::SelectedFixedPageDemands;
 use crate::{
     target_load::is_blake2s256_hex,
     zaino_corpus::{MainnetCorpusMeasurement, MainnetCorpusScanner},
@@ -25,6 +23,20 @@ const SCENARIO: &str = "source-bound-hybrid-sizing-v1";
 const PAGE_CANDIDATES: [u64; 3] = [1, 8, 16];
 const REBUILD_INTERVALS: [u32; 3] = [288, 1_152, 8_064];
 const EMPTY_POSITION: u32 = u32::MAX;
+pub(super) const SELECTED_PAGE_ENTRIES: u64 = 16;
+pub(super) const SELECTED_GENERATION_INTERVAL_BLOCKS: u32 = 288;
+const MAINNET_BLOSSOM_ACTIVATION_HEIGHT: u64 = 653_600;
+const TARGET_BLOCK_SECONDS: u64 = 75;
+const GROWTH_WINDOW_DAYS: u64 = 365;
+const GROWTH_WINDOW_BLOCKS: u64 = GROWTH_WINDOW_DAYS * 24 * 60 * 60 / TARGET_BLOCK_SECONDS;
+const GROWTH_OBSERVATION_WINDOWS: usize = 5;
+const GROWTH_PROJECTION_WINDOWS: u16 = 3;
+const GROWTH_V2_MEASUREMENT_BLAKE2S256: &str =
+    "aba46f64da0113d9b0e93209ab4a8a98626d6d5bc7973444c8bf766a1922b127";
+const GROWTH_V2_CHECKPOINT_HEIGHT: u32 = 3_425_046;
+const GROWTH_V2_CHECKPOINT_HASH: &str =
+    "0000000000a1014e9564513f1d5e5ddaba027c032857a236ca3178e9a8983ad4";
+const GROWTH_V2_EXPECTED_BLOCKS: u64 = 3_425_047;
 
 /// Fixed source-bound hybrid-sizing profile selected by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +44,8 @@ const EMPTY_POSITION: u32 = u32::MAX;
 pub enum SourceBoundHybridSizingProfile {
     /// Final live-UTXO base plus genesis-aligned separate add/spend deltas.
     LiveUtxoBaseDeltaV1,
+    /// V1 sizing plus fixed-window source-bound growth evidence.
+    LiveUtxoBaseDeltaGrowthV2,
 }
 
 impl SourceBoundHybridSizingProfile {
@@ -39,6 +53,7 @@ impl SourceBoundHybridSizingProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LiveUtxoBaseDeltaV1 => "live-utxo-base-delta-v1",
+            Self::LiveUtxoBaseDeltaGrowthV2 => "live-utxo-base-delta-growth-v2",
         }
     }
 }
@@ -77,6 +92,13 @@ impl SourceBinding {
         is_blake2s256_hex(&self.measurement_blake2s256)
             && is_blake2s256_hex(&self.checkpoint_hash)
             && self.expected_blocks == u64::from(self.checkpoint_height) + 1
+    }
+
+    fn is_growth_v2_source(&self) -> bool {
+        self.measurement_blake2s256 == GROWTH_V2_MEASUREMENT_BLAKE2S256
+            && self.checkpoint_height == GROWTH_V2_CHECKPOINT_HEIGHT
+            && self.checkpoint_hash == GROWTH_V2_CHECKPOINT_HASH
+            && self.expected_blocks == GROWTH_V2_EXPECTED_BLOCKS
     }
 }
 
@@ -177,7 +199,7 @@ struct EvidenceScope {
     mainnet_ready: bool,
 }
 
-const EVIDENCE_SCOPE: EvidenceScope = EvidenceScope {
+const EVIDENCE_SCOPE_V1: EvidenceScope = EvidenceScope {
     mainnet_genesis_and_chain_continuity_validated: true,
     source_measurement_recomputed_and_matched: true,
     exact_kind_preserving_standard_delta_order_replayed: true,
@@ -195,6 +217,111 @@ const EVIDENCE_SCOPE: EvidenceScope = EvidenceScope {
     tdx_qualified: false,
     mainnet_ready: false,
 };
+
+const EVIDENCE_SCOPE_V2: EvidenceScope = EvidenceScope {
+    projected_growth_analyzed: true,
+    ..EVIDENCE_SCOPE_V1
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrowthStateSnapshot {
+    applied_blocks: u64,
+    distinct_standard_addresses: u64,
+    live_standard_utxos: u64,
+    base_pages: u64,
+    maximum_live_utxos_per_address: u64,
+    maximum_base_pages_per_address: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrowthDeltaWindow {
+    start_applied_blocks: u64,
+    end_applied_blocks: u64,
+    generation_count: u64,
+    max_total_add_events: u64,
+    max_total_spend_events: u64,
+    max_total_delta_events: u64,
+    max_per_address_add_events: u64,
+    max_per_address_spend_events: u64,
+    max_per_address_delta_events: u64,
+    max_total_add_pages: u64,
+    max_total_spend_pages: u64,
+    max_total_separate_pages: u64,
+    max_per_address_add_pages: u64,
+    max_per_address_spend_pages: u64,
+    max_per_address_separate_pages: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrowthAnnualIncrement {
+    distinct_standard_addresses: u64,
+    live_standard_utxos: u64,
+    base_pages: u64,
+    maximum_live_utxos_per_address: u64,
+    max_total_add_pages: u64,
+    max_total_spend_pages: u64,
+    max_per_address_add_pages: u64,
+    max_per_address_spend_pages: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrowthProjection {
+    horizon_windows: u16,
+    horizon_blocks: u64,
+    qualification_expiry_height: u32,
+    capacity_horizon_end_height: u32,
+    distinct_standard_addresses: u64,
+    live_standard_utxos: u64,
+    base_pages: u64,
+    maximum_live_utxos_per_address: u64,
+    maximum_base_pages_per_address: u64,
+    max_total_add_pages: u64,
+    max_total_spend_pages: u64,
+    max_per_address_add_pages: u64,
+    max_per_address_spend_pages: u64,
+    fixed_page_reads: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalGrowthEvidence {
+    target_block_seconds: u64,
+    window_days: u64,
+    window_blocks: u64,
+    observation_windows: u16,
+    aligned_start_applied_blocks: u64,
+    aligned_end_applied_blocks: u64,
+    checkpoint_trailing_blocks: u32,
+    state_snapshots: Vec<GrowthStateSnapshot>,
+    delta_windows: Vec<GrowthDeltaWindow>,
+    trailing_partial_generation: Option<GrowthDeltaWindow>,
+    maximum_positive_annual_increment: GrowthAnnualIncrement,
+    projection: GrowthProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedSizingDemands {
+    base_pages: u64,
+    add_pages: u64,
+    spend_pages: u64,
+    maximum_live_utxos_per_address: u64,
+    maximum_base_pages_per_address: u64,
+    max_per_address_add_pages: u64,
+    max_per_address_spend_pages: u64,
+}
+
+impl SelectedSizingDemands {
+    fn fixed_page_reads(self) -> Result<u64, SourceBoundHybridSizingError> {
+        self.maximum_base_pages_per_address
+            .checked_add(self.max_per_address_add_pages)
+            .and_then(|reads| reads.checked_add(self.max_per_address_spend_pages))
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)
+    }
+}
 
 /// Aggregate-only exact-source hybrid logical-sizing evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +342,8 @@ pub struct SourceBoundHybridSizingReport {
     live_utxo_histogram: Vec<LiveUtxoBucket>,
     base_page_candidates: Vec<BasePageCandidateReport>,
     rebuild_interval_reports: Vec<RebuildIntervalReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    historical_growth: Option<HistoricalGrowthEvidence>,
     evidence_scope: EvidenceScope,
 }
 
@@ -239,9 +368,14 @@ impl SourceBoundHybridSizingReport {
             .created_standard_events
             .checked_sub(self.spent_standard_events)
             .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        let expected_evidence_scope = match self.profile {
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1 => EVIDENCE_SCOPE_V1,
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2 => EVIDENCE_SCOPE_V2,
+        };
         if self.scenario != SCENARIO
-            || self.profile != SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1
             || !self.source.validate()
+            || self.profile == SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2
+                && !self.source.is_growth_v2_source()
             || self.page_candidates != PAGE_CANDIDATES
             || self.rebuild_intervals != REBUILD_INTERVALS
             || self.applied_blocks != self.source.expected_blocks
@@ -252,7 +386,7 @@ impl SourceBoundHybridSizingReport {
             || self.maximum_live_standard_utxos > self.created_standard_events
             || self.base_page_candidates.len() != PAGE_CANDIDATES.len()
             || self.rebuild_interval_reports.len() != REBUILD_INTERVALS.len()
-            || self.evidence_scope != EVIDENCE_SCOPE
+            || self.evidence_scope != expected_evidence_scope
         {
             return Err(SourceBoundHybridSizingError::InvalidReport);
         }
@@ -278,6 +412,22 @@ impl SourceBoundHybridSizingReport {
             {
                 return Err(SourceBoundHybridSizingError::InvalidReport);
             }
+        }
+        let selected = self.selected_sizing_demands_unvalidated()?;
+        let selected_interval = select_rebuild_interval(&self.rebuild_interval_reports)?;
+        match (&self.profile, &self.historical_growth) {
+            (SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1, None) => {}
+            (
+                SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2,
+                Some(historical_growth),
+            ) => historical_growth.validate(
+                self.source.expected_blocks,
+                self.distinct_standard_addresses,
+                self.final_live_standard_utxos,
+                selected,
+                selected_interval,
+            )?,
+            _ => return Err(SourceBoundHybridSizingError::InvalidReport),
         }
         Ok(())
     }
@@ -309,33 +459,80 @@ impl SourceBoundHybridSizingReport {
         &self,
     ) -> Result<SelectedFixedPageDemands, SourceBoundHybridSizingError> {
         self.validate()?;
-        let base = self
-            .base_page_candidates
-            .iter()
-            .find(|candidate| candidate.entries_per_page == SELECTED_PAGE_ENTRIES)
-            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
-        let interval = self
-            .rebuild_interval_reports
-            .iter()
-            .find(|report| report.interval_blocks == SELECTED_GENERATION_INTERVAL_BLOCKS)
-            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
-        let delta = interval
-            .page_candidates
-            .iter()
-            .find(|candidate| candidate.entries_per_page == SELECTED_PAGE_ENTRIES)
-            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
-        let fixed_page_reads = base
-            .maximum_pages_per_address
-            .checked_add(delta.max_per_address_add_pages)
-            .and_then(|reads| reads.checked_add(delta.max_per_address_spend_pages))
-            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
-
+        let current = self.selected_sizing_demands_unvalidated()?;
+        let selected =
+            select_capacity_demands(self.profile, current, self.historical_growth.as_ref())?;
         Ok(SelectedFixedPageDemands {
-            base_pages: base.base_pages,
-            add_pages: delta.max_total_add_pages,
-            spend_pages: delta.max_total_spend_pages,
-            fixed_page_reads,
+            base_pages: selected.base_pages,
+            add_pages: selected.add_pages,
+            spend_pages: selected.spend_pages,
+            fixed_page_reads: selected.fixed_page_reads()?,
         })
+    }
+
+    fn selected_sizing_demands_unvalidated(
+        &self,
+    ) -> Result<SelectedSizingDemands, SourceBoundHybridSizingError> {
+        select_sizing_demands(
+            &self.live_utxo_histogram,
+            &self.base_page_candidates,
+            &self.rebuild_interval_reports,
+        )
+    }
+}
+
+fn select_sizing_demands(
+    live_utxo_histogram: &[LiveUtxoBucket],
+    base_page_candidates: &[BasePageCandidateReport],
+    rebuild_interval_reports: &[RebuildIntervalReport],
+) -> Result<SelectedSizingDemands, SourceBoundHybridSizingError> {
+    let base = base_page_candidates
+        .iter()
+        .find(|candidate| candidate.entries_per_page == SELECTED_PAGE_ENTRIES)
+        .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+    let interval = select_rebuild_interval(rebuild_interval_reports)?;
+    let delta = interval
+        .page_candidates
+        .iter()
+        .find(|candidate| candidate.entries_per_page == SELECTED_PAGE_ENTRIES)
+        .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+    let maximum_live_utxos_per_address = live_utxo_histogram
+        .last()
+        .map(|bucket| bucket.live_utxos)
+        .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+
+    Ok(SelectedSizingDemands {
+        base_pages: base.base_pages,
+        add_pages: delta.max_total_add_pages,
+        spend_pages: delta.max_total_spend_pages,
+        maximum_live_utxos_per_address,
+        maximum_base_pages_per_address: base.maximum_pages_per_address,
+        max_per_address_add_pages: delta.max_per_address_add_pages,
+        max_per_address_spend_pages: delta.max_per_address_spend_pages,
+    })
+}
+
+fn select_rebuild_interval(
+    rebuild_interval_reports: &[RebuildIntervalReport],
+) -> Result<&RebuildIntervalReport, SourceBoundHybridSizingError> {
+    rebuild_interval_reports
+        .iter()
+        .find(|report| report.interval_blocks == SELECTED_GENERATION_INTERVAL_BLOCKS)
+        .ok_or(SourceBoundHybridSizingError::InvalidReport)
+}
+
+#[cfg(any(feature = "rostl-experimental", test))]
+fn select_capacity_demands(
+    profile: SourceBoundHybridSizingProfile,
+    current: SelectedSizingDemands,
+    historical_growth: Option<&HistoricalGrowthEvidence>,
+) -> Result<SelectedSizingDemands, SourceBoundHybridSizingError> {
+    match (profile, historical_growth) {
+        (SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1, None) => Ok(current),
+        (SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2, Some(historical_growth)) => {
+            Ok(historical_growth.projection.selected_sizing_demands())
+        }
+        _ => Err(SourceBoundHybridSizingError::InvalidReport),
     }
 }
 
@@ -414,11 +611,106 @@ impl fmt::Display for SourceBoundHybridSizingReport {
                 )?;
             }
         }
-        write!(
-            f,
-            "nonclaims=projected-growth,oram-layout-selection,insertion-failure-bound,probabilistic-failure-bound,worst-case-bound,individual-generation-publication,physical-oram-trace,backend-calibration,rss,latency,stash,recovery,target-hardware,tdx,mainnet-readiness"
-        )
+        if let Some(growth) = &self.historical_growth {
+            writeln!(
+                f,
+                "growth_policy=target_block_seconds:{},window_days:{},window_blocks:{},observation_windows:{},projection_windows:{},aligned_start_applied_blocks:{},aligned_end_applied_blocks:{},checkpoint_trailing_blocks:{}",
+                growth.target_block_seconds,
+                growth.window_days,
+                growth.window_blocks,
+                growth.observation_windows,
+                growth.projection.horizon_windows,
+                growth.aligned_start_applied_blocks,
+                growth.aligned_end_applied_blocks,
+                growth.checkpoint_trailing_blocks,
+            )?;
+            for snapshot in &growth.state_snapshots {
+                writeln!(
+                    f,
+                    "growth_state=applied_blocks:{},distinct_standard_addresses:{},live_standard_utxos:{},base_pages:{},maximum_live_utxos_per_address:{},maximum_base_pages_per_address:{}",
+                    snapshot.applied_blocks,
+                    snapshot.distinct_standard_addresses,
+                    snapshot.live_standard_utxos,
+                    snapshot.base_pages,
+                    snapshot.maximum_live_utxos_per_address,
+                    snapshot.maximum_base_pages_per_address,
+                )?;
+            }
+            for window in &growth.delta_windows {
+                write_growth_delta(f, "growth_delta_window", *window)?;
+            }
+            if let Some(trailing) = growth.trailing_partial_generation {
+                write_growth_delta(f, "growth_trailing_generation", trailing)?;
+            }
+            let increment = growth.maximum_positive_annual_increment;
+            writeln!(
+                f,
+                "growth_increment=distinct_standard_addresses:{},live_standard_utxos:{},base_pages:{},maximum_live_utxos_per_address:{},max_total_add_pages:{},max_total_spend_pages:{},max_per_address_add_pages:{},max_per_address_spend_pages:{}",
+                increment.distinct_standard_addresses,
+                increment.live_standard_utxos,
+                increment.base_pages,
+                increment.maximum_live_utxos_per_address,
+                increment.max_total_add_pages,
+                increment.max_total_spend_pages,
+                increment.max_per_address_add_pages,
+                increment.max_per_address_spend_pages,
+            )?;
+            let projection = growth.projection;
+            writeln!(
+                f,
+                "growth_projection=horizon_windows:{},horizon_blocks:{},qualification_expiry_height:{},capacity_horizon_end_height:{},distinct_standard_addresses:{},live_standard_utxos:{},base_pages:{},maximum_live_utxos_per_address:{},maximum_base_pages_per_address:{},max_total_add_pages:{},max_total_spend_pages:{},max_per_address_add_pages:{},max_per_address_spend_pages:{},fixed_page_reads:{}",
+                projection.horizon_windows,
+                projection.horizon_blocks,
+                projection.qualification_expiry_height,
+                projection.capacity_horizon_end_height,
+                projection.distinct_standard_addresses,
+                projection.live_standard_utxos,
+                projection.base_pages,
+                projection.maximum_live_utxos_per_address,
+                projection.maximum_base_pages_per_address,
+                projection.max_total_add_pages,
+                projection.max_total_spend_pages,
+                projection.max_per_address_add_pages,
+                projection.max_per_address_spend_pages,
+                projection.fixed_page_reads,
+            )?;
+            write!(
+                f,
+                "nonclaims=growth-forecast,statistical-growth-bound,oram-layout-selection,insertion-failure-bound,probabilistic-failure-bound,worst-case-bound,individual-generation-publication,physical-oram-trace,backend-calibration,rss,latency,stash,recovery,target-hardware,tdx,mainnet-readiness"
+            )
+        } else {
+            write!(
+                f,
+                "nonclaims=projected-growth,oram-layout-selection,insertion-failure-bound,probabilistic-failure-bound,worst-case-bound,individual-generation-publication,physical-oram-trace,backend-calibration,rss,latency,stash,recovery,target-hardware,tdx,mainnet-readiness"
+            )
+        }
     }
+}
+
+fn write_growth_delta(
+    formatter: &mut fmt::Formatter<'_>,
+    label: &str,
+    window: GrowthDeltaWindow,
+) -> fmt::Result {
+    writeln!(
+        formatter,
+        "{label}=start_applied_blocks:{},end_applied_blocks:{},generations:{},max_total_add_events:{},max_total_spend_events:{},max_total_delta_events:{},max_per_address_add_events:{},max_per_address_spend_events:{},max_per_address_delta_events:{},max_total_add_pages:{},max_total_spend_pages:{},max_total_separate_pages:{},max_per_address_add_pages:{},max_per_address_spend_pages:{},max_per_address_separate_pages:{}",
+        window.start_applied_blocks,
+        window.end_applied_blocks,
+        window.generation_count,
+        window.max_total_add_events,
+        window.max_total_spend_events,
+        window.max_total_delta_events,
+        window.max_per_address_add_events,
+        window.max_per_address_spend_events,
+        window.max_per_address_delta_events,
+        window.max_total_add_pages,
+        window.max_total_spend_pages,
+        window.max_total_separate_pages,
+        window.max_per_address_add_pages,
+        window.max_per_address_spend_pages,
+        window.max_per_address_separate_pages,
+    )
 }
 
 /// Coarse identifier-free failure from source-bound hybrid sizing.
@@ -459,6 +751,7 @@ impl std::error::Error for SourceBoundHybridSizingError {}
 
 /// Incremental exact-source replay for hybrid logical-sizing evidence.
 pub struct SourceBoundHybridSizingSession {
+    profile: SourceBoundHybridSizingProfile,
     scanner: Option<MainnetCorpusScanner>,
     expected_measurement: MainnetCorpusMeasurement,
     source: SourceBinding,
@@ -471,6 +764,7 @@ pub struct SourceBoundHybridSizingSession {
     next_ordinals: Vec<u64>,
     live_utxos: Vec<u64>,
     intervals: Vec<RebuildIntervalAccumulator>,
+    historical_growth: Option<HistoricalGrowthAccumulator>,
     failed_closed: bool,
 }
 
@@ -481,10 +775,18 @@ impl SourceBoundHybridSizingSession {
         measurement: &MainnetCorpusMeasurement,
         measurement_blake2s256: &str,
     ) -> Result<Self, SourceBoundHybridSizingError> {
-        if profile != SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1 {
+        let source = SourceBinding::from_measurement(measurement, measurement_blake2s256)?;
+        if profile == SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2
+            && !source.is_growth_v2_source()
+        {
             return Err(SourceBoundHybridSizingError::InputRejected);
         }
-        let source = SourceBinding::from_measurement(measurement, measurement_blake2s256)?;
+        let historical_growth = match profile {
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1 => None,
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2 => Some(
+                HistoricalGrowthAccumulator::production(source.expected_blocks)?,
+            ),
+        };
         let mut intervals = Vec::new();
         intervals
             .try_reserve_exact(REBUILD_INTERVALS.len())
@@ -493,6 +795,7 @@ impl SourceBoundHybridSizingSession {
             intervals.push(RebuildIntervalAccumulator::new(interval)?);
         }
         Ok(Self {
+            profile,
             scanner: Some(MainnetCorpusScanner::new()),
             expected_measurement: measurement.clone(),
             source,
@@ -505,6 +808,7 @@ impl SourceBoundHybridSizingSession {
             next_ordinals: Vec::new(),
             live_utxos: Vec::new(),
             intervals,
+            historical_growth,
             failed_closed: false,
         })
     }
@@ -541,16 +845,35 @@ impl SourceBoundHybridSizingSession {
                 return Err(error);
             }
         }
+        let mut selected_generation = None;
         for interval in &mut self.intervals {
-            if let Err(error) = interval.finish_block() {
-                self.fail_closed();
-                return Err(error);
+            let generation = match interval.finish_block() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    self.fail_closed();
+                    return Err(error);
+                }
+            };
+            if interval.interval_blocks == SELECTED_GENERATION_INTERVAL_BLOCKS {
+                selected_generation = generation;
             }
         }
         self.applied_blocks = self
             .applied_blocks
             .checked_add(1)
             .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        if let Some(historical_growth) = &mut self.historical_growth {
+            if let Err(error) = historical_growth.observe(
+                self.applied_blocks,
+                self.distinct_standard_addresses,
+                self.current_live_standard_utxos,
+                &self.live_utxos,
+                selected_generation,
+            ) {
+                self.fail_closed();
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -595,16 +918,43 @@ impl SourceBoundHybridSizingSession {
         rebuild_interval_reports
             .try_reserve_exact(self.intervals.len())
             .map_err(|_| SourceBoundHybridSizingError::AllocationFailed)?;
+        let mut selected_trailing_generation = None;
         for interval in self.intervals {
-            rebuild_interval_reports.push(interval.finish()?);
+            let is_selected = interval.interval_blocks == SELECTED_GENERATION_INTERVAL_BLOCKS;
+            let (report, trailing_generation) = interval.finish_with_trailing()?;
+            if is_selected {
+                selected_trailing_generation = trailing_generation;
+            }
+            rebuild_interval_reports.push(report);
         }
         let delta_events = self
             .created_standard_events
             .checked_add(self.spent_standard_events)
             .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let selected = select_sizing_demands(
+            &live_utxo_histogram,
+            &base_page_candidates,
+            &rebuild_interval_reports,
+        )?;
+        let selected_interval = select_rebuild_interval(&rebuild_interval_reports)?;
+        let historical_growth = match self.historical_growth {
+            Some(historical_growth) => Some(historical_growth.finish(
+                self.source.expected_blocks,
+                self.distinct_standard_addresses,
+                self.current_live_standard_utxos,
+                selected,
+                selected_interval,
+                selected_trailing_generation,
+            )?),
+            None => None,
+        };
+        let evidence_scope = match self.profile {
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1 => EVIDENCE_SCOPE_V1,
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2 => EVIDENCE_SCOPE_V2,
+        };
         let report = SourceBoundHybridSizingReport {
             scenario: SCENARIO.to_owned(),
-            profile: SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1,
+            profile: self.profile,
             source: self.source,
             page_candidates: PAGE_CANDIDATES.to_vec(),
             rebuild_intervals: REBUILD_INTERVALS.to_vec(),
@@ -618,7 +968,8 @@ impl SourceBoundHybridSizingSession {
             live_utxo_histogram,
             base_page_candidates,
             rebuild_interval_reports,
-            evidence_scope: EVIDENCE_SCOPE,
+            historical_growth,
+            evidence_scope,
         };
         report.validate()?;
         Ok(report)
@@ -715,6 +1066,7 @@ impl SourceBoundHybridSizingSession {
         self.next_ordinals.clear();
         self.live_utxos.clear();
         self.intervals.clear();
+        self.historical_growth = None;
     }
 }
 
@@ -901,25 +1253,35 @@ impl RebuildIntervalAccumulator {
         self.tracker.record(address_index, is_created)
     }
 
-    fn finish_block(&mut self) -> Result<(), SourceBoundHybridSizingError> {
+    fn finish_block(&mut self) -> Result<Option<GenerationSummary>, SourceBoundHybridSizingError> {
         self.current_generation_blocks = self
             .current_generation_blocks
             .checked_add(1)
             .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
         if self.current_generation_blocks == self.interval_blocks {
-            self.finish_generation()?;
+            Ok(Some(self.finish_generation()?))
         } else if self.current_generation_blocks > self.interval_blocks {
-            return Err(SourceBoundHybridSizingError::AnalysisFailed);
+            Err(SourceBoundHybridSizingError::AnalysisFailed)
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 
-    fn finish(mut self) -> Result<RebuildIntervalReport, SourceBoundHybridSizingError> {
+    fn finish(self) -> Result<RebuildIntervalReport, SourceBoundHybridSizingError> {
+        self.finish_with_trailing().map(|(report, _)| report)
+    }
+
+    fn finish_with_trailing(
+        mut self,
+    ) -> Result<(RebuildIntervalReport, Option<GenerationSummary>), SourceBoundHybridSizingError>
+    {
         let trailing_partial_generation_blocks = self.current_generation_blocks;
-        if trailing_partial_generation_blocks > 0 {
-            self.finish_generation()?;
-        }
-        Ok(RebuildIntervalReport {
+        let trailing_partial_generation = if trailing_partial_generation_blocks > 0 {
+            Some(self.finish_generation()?)
+        } else {
+            None
+        };
+        let report = RebuildIntervalReport {
             interval_blocks: self.interval_blocks,
             generation_count: self.generation_count,
             trailing_partial_generation_blocks,
@@ -930,10 +1292,11 @@ impl RebuildIntervalAccumulator {
             max_per_address_spend_events: self.max_per_address_spend_events,
             max_per_address_delta_events: self.max_per_address_delta_events,
             page_candidates: self.page_candidates,
-        })
+        };
+        Ok((report, trailing_partial_generation))
     }
 
-    fn finish_generation(&mut self) -> Result<(), SourceBoundHybridSizingError> {
+    fn finish_generation(&mut self) -> Result<GenerationSummary, SourceBoundHybridSizingError> {
         let summary = self.tracker.summarize_and_clear()?;
         self.generation_count = self
             .generation_count
@@ -957,8 +1320,758 @@ impl RebuildIntervalAccumulator {
             candidate.update(page_summary);
         }
         self.current_generation_blocks = 0;
+        Ok(summary)
+    }
+}
+
+struct HistoricalGrowthAccumulator {
+    expected_blocks: u64,
+    aligned_start_applied_blocks: u64,
+    aligned_end_applied_blocks: u64,
+    checkpoint_trailing_blocks: u32,
+    state_snapshots: Vec<GrowthStateSnapshot>,
+    delta_windows: Vec<GrowthDeltaWindow>,
+}
+
+impl HistoricalGrowthAccumulator {
+    fn production(expected_blocks: u64) -> Result<Self, SourceBoundHybridSizingError> {
+        let interval = u64::from(SELECTED_GENERATION_INTERVAL_BLOCKS);
+        let aligned_end_applied_blocks = expected_blocks
+            .checked_sub(expected_blocks % interval)
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let observation_blocks = GROWTH_WINDOW_BLOCKS
+            .checked_mul(
+                u64::try_from(GROWTH_OBSERVATION_WINDOWS)
+                    .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?,
+            )
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let aligned_start_applied_blocks = aligned_end_applied_blocks
+            .checked_sub(observation_blocks)
+            .ok_or(SourceBoundHybridSizingError::InputRejected)?;
+        if aligned_start_applied_blocks < MAINNET_BLOSSOM_ACTIVATION_HEIGHT
+            || !GROWTH_WINDOW_BLOCKS.is_multiple_of(interval)
+        {
+            return Err(SourceBoundHybridSizingError::InputRejected);
+        }
+        let checkpoint_trailing_blocks = u32::try_from(
+            expected_blocks
+                .checked_sub(aligned_end_applied_blocks)
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?;
+
+        let mut state_snapshots = Vec::new();
+        state_snapshots
+            .try_reserve_exact(
+                GROWTH_OBSERVATION_WINDOWS
+                    .checked_add(1)
+                    .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?,
+            )
+            .map_err(|_| SourceBoundHybridSizingError::AllocationFailed)?;
+        let mut delta_windows = Vec::new();
+        delta_windows
+            .try_reserve_exact(GROWTH_OBSERVATION_WINDOWS)
+            .map_err(|_| SourceBoundHybridSizingError::AllocationFailed)?;
+        for index in 0..GROWTH_OBSERVATION_WINDOWS {
+            let offset = GROWTH_WINDOW_BLOCKS
+                .checked_mul(
+                    u64::try_from(index)
+                        .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?,
+                )
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+            let start_applied_blocks = aligned_start_applied_blocks
+                .checked_add(offset)
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+            let end_applied_blocks = start_applied_blocks
+                .checked_add(GROWTH_WINDOW_BLOCKS)
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+            delta_windows.push(GrowthDeltaWindow::empty(
+                start_applied_blocks,
+                end_applied_blocks,
+            ));
+        }
+
+        Ok(Self {
+            expected_blocks,
+            aligned_start_applied_blocks,
+            aligned_end_applied_blocks,
+            checkpoint_trailing_blocks,
+            state_snapshots,
+            delta_windows,
+        })
+    }
+
+    fn observe(
+        &mut self,
+        applied_blocks: u64,
+        distinct_standard_addresses: u64,
+        live_standard_utxos: u64,
+        live_utxos: &[u64],
+        selected_generation: Option<GenerationSummary>,
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        if applied_blocks > self.expected_blocks {
+            return Err(SourceBoundHybridSizingError::AnalysisFailed);
+        }
+        let interval = u64::from(SELECTED_GENERATION_INTERVAL_BLOCKS);
+        let on_generation_boundary = applied_blocks.is_multiple_of(interval);
+        if on_generation_boundary != selected_generation.is_some() {
+            return Err(SourceBoundHybridSizingError::AnalysisFailed);
+        }
+        if applied_blocks < self.aligned_start_applied_blocks
+            || applied_blocks > self.aligned_end_applied_blocks
+        {
+            return Ok(());
+        }
+
+        if applied_blocks > self.aligned_start_applied_blocks && on_generation_boundary {
+            let offset = applied_blocks
+                .checked_sub(self.aligned_start_applied_blocks)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+            let window_index = usize::try_from(offset / GROWTH_WINDOW_BLOCKS)
+                .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?;
+            let window = self
+                .delta_windows
+                .get_mut(window_index)
+                .ok_or(SourceBoundHybridSizingError::AnalysisFailed)?;
+            window
+                .update(selected_generation.ok_or(SourceBoundHybridSizingError::AnalysisFailed)?)?;
+        }
+
+        let since_start = applied_blocks
+            .checked_sub(self.aligned_start_applied_blocks)
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        if since_start % GROWTH_WINDOW_BLOCKS == 0 {
+            let snapshot = GrowthStateSnapshot::capture(
+                applied_blocks,
+                distinct_standard_addresses,
+                live_standard_utxos,
+                live_utxos,
+            )?;
+            if self
+                .state_snapshots
+                .last()
+                .is_some_and(|previous| previous.applied_blocks >= applied_blocks)
+            {
+                return Err(SourceBoundHybridSizingError::AnalysisFailed);
+            }
+            self.state_snapshots
+                .try_reserve(1)
+                .map_err(|_| SourceBoundHybridSizingError::AllocationFailed)?;
+            self.state_snapshots.push(snapshot);
+        }
         Ok(())
     }
+
+    fn finish(
+        self,
+        expected_blocks: u64,
+        distinct_standard_addresses: u64,
+        live_standard_utxos: u64,
+        current: SelectedSizingDemands,
+        full_history: &RebuildIntervalReport,
+        trailing_generation: Option<GenerationSummary>,
+    ) -> Result<HistoricalGrowthEvidence, SourceBoundHybridSizingError> {
+        if self.expected_blocks != expected_blocks {
+            return Err(SourceBoundHybridSizingError::AnalysisFailed);
+        }
+        let trailing_partial_generation =
+            match (self.checkpoint_trailing_blocks, trailing_generation) {
+                (0, None) => None,
+                (blocks, Some(generation)) if blocks > 0 => {
+                    let mut trailing = GrowthDeltaWindow::empty(
+                        self.aligned_end_applied_blocks,
+                        self.expected_blocks,
+                    );
+                    trailing.update(generation)?;
+                    Some(trailing)
+                }
+                _ => return Err(SourceBoundHybridSizingError::AnalysisFailed),
+            };
+        let maximum_positive_annual_increment =
+            GrowthAnnualIncrement::derive(&self.state_snapshots, &self.delta_windows)?;
+        let projection = GrowthProjection::derive(
+            expected_blocks,
+            distinct_standard_addresses,
+            live_standard_utxos,
+            current,
+            maximum_positive_annual_increment,
+        )?;
+        let evidence = HistoricalGrowthEvidence {
+            target_block_seconds: TARGET_BLOCK_SECONDS,
+            window_days: GROWTH_WINDOW_DAYS,
+            window_blocks: GROWTH_WINDOW_BLOCKS,
+            observation_windows: u16::try_from(GROWTH_OBSERVATION_WINDOWS)
+                .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?,
+            aligned_start_applied_blocks: self.aligned_start_applied_blocks,
+            aligned_end_applied_blocks: self.aligned_end_applied_blocks,
+            checkpoint_trailing_blocks: self.checkpoint_trailing_blocks,
+            state_snapshots: self.state_snapshots,
+            delta_windows: self.delta_windows,
+            trailing_partial_generation,
+            maximum_positive_annual_increment,
+            projection,
+        };
+        evidence.validate(
+            expected_blocks,
+            distinct_standard_addresses,
+            live_standard_utxos,
+            current,
+            full_history,
+        )?;
+        Ok(evidence)
+    }
+}
+
+impl GrowthStateSnapshot {
+    fn capture(
+        applied_blocks: u64,
+        distinct_standard_addresses: u64,
+        live_standard_utxos: u64,
+        live_utxos: &[u64],
+    ) -> Result<Self, SourceBoundHybridSizingError> {
+        if u64::try_from(live_utxos.len())
+            .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?
+            != distinct_standard_addresses
+        {
+            return Err(SourceBoundHybridSizingError::AnalysisFailed);
+        }
+        let mut recomputed_live = 0_u64;
+        let mut base_pages = 0_u64;
+        let mut maximum_live_utxos_per_address = 0_u64;
+        for live in live_utxos {
+            recomputed_live = recomputed_live
+                .checked_add(*live)
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+            base_pages = base_pages
+                .checked_add(ceil_div(*live, SELECTED_PAGE_ENTRIES)?)
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+            maximum_live_utxos_per_address = maximum_live_utxos_per_address.max(*live);
+        }
+        if recomputed_live != live_standard_utxos {
+            return Err(SourceBoundHybridSizingError::AnalysisFailed);
+        }
+        Ok(Self {
+            applied_blocks,
+            distinct_standard_addresses,
+            live_standard_utxos,
+            base_pages,
+            maximum_live_utxos_per_address,
+            maximum_base_pages_per_address: ceil_div(
+                maximum_live_utxos_per_address,
+                SELECTED_PAGE_ENTRIES,
+            )?,
+        })
+    }
+
+    fn validate(self) -> Result<(), SourceBoundHybridSizingError> {
+        let minimum_base_pages = ceil_div(self.live_standard_utxos, SELECTED_PAGE_ENTRIES)?;
+        if self.base_pages < minimum_base_pages
+            || self.base_pages > self.live_standard_utxos
+            || self.maximum_live_utxos_per_address > self.live_standard_utxos
+            || self.maximum_base_pages_per_address
+                != ceil_div(self.maximum_live_utxos_per_address, SELECTED_PAGE_ENTRIES)?
+            || self.maximum_base_pages_per_address > self.base_pages
+        {
+            return Err(SourceBoundHybridSizingError::InvalidReport);
+        }
+        Ok(())
+    }
+}
+
+impl GrowthDeltaWindow {
+    const fn empty(start_applied_blocks: u64, end_applied_blocks: u64) -> Self {
+        Self {
+            start_applied_blocks,
+            end_applied_blocks,
+            generation_count: 0,
+            max_total_add_events: 0,
+            max_total_spend_events: 0,
+            max_total_delta_events: 0,
+            max_per_address_add_events: 0,
+            max_per_address_spend_events: 0,
+            max_per_address_delta_events: 0,
+            max_total_add_pages: 0,
+            max_total_spend_pages: 0,
+            max_total_separate_pages: 0,
+            max_per_address_add_pages: 0,
+            max_per_address_spend_pages: 0,
+            max_per_address_separate_pages: 0,
+        }
+    }
+
+    fn update(
+        &mut self,
+        generation: GenerationSummary,
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let selected_index = PAGE_CANDIDATES
+            .iter()
+            .position(|entries| *entries == SELECTED_PAGE_ENTRIES)
+            .ok_or(SourceBoundHybridSizingError::AnalysisFailed)?;
+        let pages = generation
+            .page_candidates
+            .get(selected_index)
+            .copied()
+            .ok_or(SourceBoundHybridSizingError::AnalysisFailed)?;
+        self.generation_count = self
+            .generation_count
+            .checked_add(1)
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        self.max_total_add_events = self.max_total_add_events.max(generation.total_add_events);
+        self.max_total_spend_events = self
+            .max_total_spend_events
+            .max(generation.total_spend_events);
+        self.max_total_delta_events = self
+            .max_total_delta_events
+            .max(generation.total_delta_events);
+        self.max_per_address_add_events = self
+            .max_per_address_add_events
+            .max(generation.max_per_address_add_events);
+        self.max_per_address_spend_events = self
+            .max_per_address_spend_events
+            .max(generation.max_per_address_spend_events);
+        self.max_per_address_delta_events = self
+            .max_per_address_delta_events
+            .max(generation.max_per_address_delta_events);
+        self.max_total_add_pages = self.max_total_add_pages.max(pages.total_add_pages);
+        self.max_total_spend_pages = self.max_total_spend_pages.max(pages.total_spend_pages);
+        self.max_total_separate_pages = self
+            .max_total_separate_pages
+            .max(pages.total_separate_pages);
+        self.max_per_address_add_pages = self
+            .max_per_address_add_pages
+            .max(pages.max_per_address_add_pages);
+        self.max_per_address_spend_pages = self
+            .max_per_address_spend_pages
+            .max(pages.max_per_address_spend_pages);
+        self.max_per_address_separate_pages = self
+            .max_per_address_separate_pages
+            .max(pages.max_per_address_separate_pages);
+        Ok(())
+    }
+
+    fn validate(self, expected_generations: u64) -> Result<(), SourceBoundHybridSizingError> {
+        if self.end_applied_blocks
+            != self
+                .start_applied_blocks
+                .checked_add(GROWTH_WINDOW_BLOCKS)
+                .ok_or(SourceBoundHybridSizingError::InvalidReport)?
+            || self.generation_count != expected_generations
+        {
+            return Err(SourceBoundHybridSizingError::InvalidReport);
+        }
+        self.validate_maxima()
+    }
+
+    fn validate_trailing(
+        self,
+        expected_start: u64,
+        expected_end: u64,
+        expected_blocks: u32,
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        if expected_blocks == 0
+            || expected_blocks >= SELECTED_GENERATION_INTERVAL_BLOCKS
+            || self.start_applied_blocks != expected_start
+            || self.end_applied_blocks != expected_end
+            || self.generation_count != 1
+            || self
+                .end_applied_blocks
+                .checked_sub(self.start_applied_blocks)
+                .ok_or(SourceBoundHybridSizingError::InvalidReport)?
+                != u64::from(expected_blocks)
+        {
+            return Err(SourceBoundHybridSizingError::InvalidReport);
+        }
+        self.validate_maxima()
+    }
+
+    fn validate_maxima(self) -> Result<(), SourceBoundHybridSizingError> {
+        if self.max_per_address_add_events > self.max_total_add_events
+            || self.max_per_address_spend_events > self.max_total_spend_events
+            || self.max_per_address_delta_events > self.max_total_delta_events
+            || self.max_total_delta_events < self.max_total_add_events
+            || self.max_total_delta_events < self.max_total_spend_events
+            || self.max_total_delta_events
+                > self
+                    .max_total_add_events
+                    .checked_add(self.max_total_spend_events)
+                    .ok_or(SourceBoundHybridSizingError::InvalidReport)?
+            || self.max_per_address_delta_events < self.max_per_address_add_events
+            || self.max_per_address_delta_events < self.max_per_address_spend_events
+            || self.max_per_address_delta_events
+                > self
+                    .max_per_address_add_events
+                    .checked_add(self.max_per_address_spend_events)
+                    .ok_or(SourceBoundHybridSizingError::InvalidReport)?
+            || self.max_total_add_pages
+                < ceil_div(self.max_total_add_events, SELECTED_PAGE_ENTRIES)?
+            || self.max_total_spend_pages
+                < ceil_div(self.max_total_spend_events, SELECTED_PAGE_ENTRIES)?
+            || self.max_total_add_pages > self.max_total_add_events
+            || self.max_total_spend_pages > self.max_total_spend_events
+            || self.max_total_separate_pages < self.max_total_add_pages
+            || self.max_total_separate_pages < self.max_total_spend_pages
+            || self.max_total_separate_pages
+                > self
+                    .max_total_add_pages
+                    .checked_add(self.max_total_spend_pages)
+                    .ok_or(SourceBoundHybridSizingError::InvalidReport)?
+            || self.max_per_address_add_pages
+                != ceil_div(self.max_per_address_add_events, SELECTED_PAGE_ENTRIES)?
+            || self.max_per_address_spend_pages
+                != ceil_div(self.max_per_address_spend_events, SELECTED_PAGE_ENTRIES)?
+            || self.max_per_address_separate_pages < self.max_per_address_add_pages
+            || self.max_per_address_separate_pages < self.max_per_address_spend_pages
+            || self.max_per_address_separate_pages
+                > self
+                    .max_per_address_add_pages
+                    .checked_add(self.max_per_address_spend_pages)
+                    .ok_or(SourceBoundHybridSizingError::InvalidReport)?
+            || self.max_per_address_add_pages > self.max_total_add_pages
+            || self.max_per_address_spend_pages > self.max_total_spend_pages
+            || self.max_per_address_separate_pages > self.max_total_separate_pages
+        {
+            return Err(SourceBoundHybridSizingError::InvalidReport);
+        }
+        Ok(())
+    }
+
+    fn does_not_exceed(
+        self,
+        full_history: &RebuildIntervalReport,
+    ) -> Result<bool, SourceBoundHybridSizingError> {
+        let pages = full_history
+            .page_candidates
+            .iter()
+            .find(|candidate| candidate.entries_per_page == SELECTED_PAGE_ENTRIES)
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        Ok(
+            self.max_total_add_events <= full_history.max_total_add_events
+                && self.max_total_spend_events <= full_history.max_total_spend_events
+                && self.max_total_delta_events <= full_history.max_total_delta_events
+                && self.max_per_address_add_events <= full_history.max_per_address_add_events
+                && self.max_per_address_spend_events <= full_history.max_per_address_spend_events
+                && self.max_per_address_delta_events <= full_history.max_per_address_delta_events
+                && self.max_total_add_pages <= pages.max_total_add_pages
+                && self.max_total_spend_pages <= pages.max_total_spend_pages
+                && self.max_total_separate_pages <= pages.max_total_separate_pages
+                && self.max_per_address_add_pages <= pages.max_per_address_add_pages
+                && self.max_per_address_spend_pages <= pages.max_per_address_spend_pages
+                && self.max_per_address_separate_pages <= pages.max_per_address_separate_pages,
+        )
+    }
+}
+
+impl GrowthAnnualIncrement {
+    fn derive(
+        state_snapshots: &[GrowthStateSnapshot],
+        delta_windows: &[GrowthDeltaWindow],
+    ) -> Result<Self, SourceBoundHybridSizingError> {
+        if state_snapshots.len()
+            != GROWTH_OBSERVATION_WINDOWS
+                .checked_add(1)
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?
+            || delta_windows.len() != GROWTH_OBSERVATION_WINDOWS
+        {
+            return Err(SourceBoundHybridSizingError::InvalidReport);
+        }
+        let mut increment = Self {
+            distinct_standard_addresses: 0,
+            live_standard_utxos: 0,
+            base_pages: 0,
+            maximum_live_utxos_per_address: 0,
+            max_total_add_pages: 0,
+            max_total_spend_pages: 0,
+            max_per_address_add_pages: 0,
+            max_per_address_spend_pages: 0,
+        };
+        for pair in state_snapshots.windows(2) {
+            let earlier = pair[0];
+            let later = pair[1];
+            increment.distinct_standard_addresses = increment.distinct_standard_addresses.max(
+                later
+                    .distinct_standard_addresses
+                    .saturating_sub(earlier.distinct_standard_addresses),
+            );
+            increment.live_standard_utxos = increment.live_standard_utxos.max(
+                later
+                    .live_standard_utxos
+                    .saturating_sub(earlier.live_standard_utxos),
+            );
+            increment.base_pages = increment
+                .base_pages
+                .max(later.base_pages.saturating_sub(earlier.base_pages));
+            increment.maximum_live_utxos_per_address =
+                increment.maximum_live_utxos_per_address.max(
+                    later
+                        .maximum_live_utxos_per_address
+                        .saturating_sub(earlier.maximum_live_utxos_per_address),
+                );
+        }
+        for pair in delta_windows.windows(2) {
+            let earlier = pair[0];
+            let later = pair[1];
+            increment.max_total_add_pages = increment.max_total_add_pages.max(
+                later
+                    .max_total_add_pages
+                    .saturating_sub(earlier.max_total_add_pages),
+            );
+            increment.max_total_spend_pages = increment.max_total_spend_pages.max(
+                later
+                    .max_total_spend_pages
+                    .saturating_sub(earlier.max_total_spend_pages),
+            );
+            increment.max_per_address_add_pages = increment.max_per_address_add_pages.max(
+                later
+                    .max_per_address_add_pages
+                    .saturating_sub(earlier.max_per_address_add_pages),
+            );
+            increment.max_per_address_spend_pages = increment.max_per_address_spend_pages.max(
+                later
+                    .max_per_address_spend_pages
+                    .saturating_sub(earlier.max_per_address_spend_pages),
+            );
+        }
+        Ok(increment)
+    }
+}
+
+impl GrowthProjection {
+    fn derive(
+        expected_blocks: u64,
+        distinct_standard_addresses: u64,
+        live_standard_utxos: u64,
+        current: SelectedSizingDemands,
+        increment: GrowthAnnualIncrement,
+    ) -> Result<Self, SourceBoundHybridSizingError> {
+        let horizon = u64::from(GROWTH_PROJECTION_WINDOWS);
+        let horizon_blocks = GROWTH_WINDOW_BLOCKS
+            .checked_mul(horizon)
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let checkpoint_height = expected_blocks
+            .checked_sub(1)
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        let qualification_expiry_height = u32::try_from(
+            checkpoint_height
+                .checked_add(GROWTH_WINDOW_BLOCKS)
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let capacity_horizon_end_height = u32::try_from(
+            checkpoint_height
+                .checked_add(horizon_blocks)
+                .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let distinct_standard_addresses = checked_linear_projection(
+            distinct_standard_addresses,
+            increment.distinct_standard_addresses,
+            horizon,
+        )?;
+        let live_standard_utxos =
+            checked_linear_projection(live_standard_utxos, increment.live_standard_utxos, horizon)?;
+        let maximum_live_utxos_per_address = checked_linear_projection(
+            current.maximum_live_utxos_per_address,
+            increment.maximum_live_utxos_per_address,
+            horizon,
+        )?;
+        let maximum_base_pages_per_address =
+            ceil_div(maximum_live_utxos_per_address, SELECTED_PAGE_ENTRIES)?;
+        let linearly_projected_base_pages =
+            checked_linear_projection(current.base_pages, increment.base_pages, horizon)?;
+        let base_pages = linearly_projected_base_pages
+            .max(ceil_div(live_standard_utxos, SELECTED_PAGE_ENTRIES)?)
+            .max(maximum_base_pages_per_address);
+        let max_per_address_add_pages = checked_linear_projection(
+            current.max_per_address_add_pages,
+            increment.max_per_address_add_pages,
+            horizon,
+        )?;
+        let max_per_address_spend_pages = checked_linear_projection(
+            current.max_per_address_spend_pages,
+            increment.max_per_address_spend_pages,
+            horizon,
+        )?;
+        let max_total_add_pages =
+            checked_linear_projection(current.add_pages, increment.max_total_add_pages, horizon)?
+                .max(max_per_address_add_pages);
+        let max_total_spend_pages = checked_linear_projection(
+            current.spend_pages,
+            increment.max_total_spend_pages,
+            horizon,
+        )?
+        .max(max_per_address_spend_pages);
+        let fixed_page_reads = maximum_base_pages_per_address
+            .checked_add(max_per_address_add_pages)
+            .and_then(|reads| reads.checked_add(max_per_address_spend_pages))
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        Ok(Self {
+            horizon_windows: GROWTH_PROJECTION_WINDOWS,
+            horizon_blocks,
+            qualification_expiry_height,
+            capacity_horizon_end_height,
+            distinct_standard_addresses,
+            live_standard_utxos,
+            base_pages,
+            maximum_live_utxos_per_address,
+            maximum_base_pages_per_address,
+            max_total_add_pages,
+            max_total_spend_pages,
+            max_per_address_add_pages,
+            max_per_address_spend_pages,
+            fixed_page_reads,
+        })
+    }
+
+    #[cfg(any(feature = "rostl-experimental", test))]
+    const fn selected_sizing_demands(self) -> SelectedSizingDemands {
+        SelectedSizingDemands {
+            base_pages: self.base_pages,
+            add_pages: self.max_total_add_pages,
+            spend_pages: self.max_total_spend_pages,
+            maximum_live_utxos_per_address: self.maximum_live_utxos_per_address,
+            maximum_base_pages_per_address: self.maximum_base_pages_per_address,
+            max_per_address_add_pages: self.max_per_address_add_pages,
+            max_per_address_spend_pages: self.max_per_address_spend_pages,
+        }
+    }
+}
+
+impl HistoricalGrowthEvidence {
+    fn validate(
+        &self,
+        expected_blocks: u64,
+        distinct_standard_addresses: u64,
+        live_standard_utxos: u64,
+        current: SelectedSizingDemands,
+        full_history: &RebuildIntervalReport,
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let interval = u64::from(SELECTED_GENERATION_INTERVAL_BLOCKS);
+        let expected_aligned_end = expected_blocks
+            .checked_sub(expected_blocks % interval)
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        let expected_observation_blocks = GROWTH_WINDOW_BLOCKS
+            .checked_mul(
+                u64::try_from(GROWTH_OBSERVATION_WINDOWS)
+                    .map_err(|_| SourceBoundHybridSizingError::InvalidReport)?,
+            )
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        let expected_aligned_start = expected_aligned_end
+            .checked_sub(expected_observation_blocks)
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        let expected_trailing = u32::try_from(
+            expected_blocks
+                .checked_sub(expected_aligned_end)
+                .ok_or(SourceBoundHybridSizingError::InvalidReport)?,
+        )
+        .map_err(|_| SourceBoundHybridSizingError::InvalidReport)?;
+        if self.target_block_seconds != TARGET_BLOCK_SECONDS
+            || self.window_days != GROWTH_WINDOW_DAYS
+            || self.window_blocks != GROWTH_WINDOW_BLOCKS
+            || self.observation_windows
+                != u16::try_from(GROWTH_OBSERVATION_WINDOWS)
+                    .map_err(|_| SourceBoundHybridSizingError::InvalidReport)?
+            || self.aligned_start_applied_blocks != expected_aligned_start
+            || self.aligned_end_applied_blocks != expected_aligned_end
+            || self.checkpoint_trailing_blocks != expected_trailing
+            || expected_aligned_start < MAINNET_BLOSSOM_ACTIVATION_HEIGHT
+            || self.state_snapshots.len()
+                != GROWTH_OBSERVATION_WINDOWS
+                    .checked_add(1)
+                    .ok_or(SourceBoundHybridSizingError::InvalidReport)?
+            || self.delta_windows.len() != GROWTH_OBSERVATION_WINDOWS
+        {
+            return Err(SourceBoundHybridSizingError::InvalidReport);
+        }
+
+        for (index, snapshot) in self.state_snapshots.iter().copied().enumerate() {
+            let expected_applied_blocks = expected_aligned_start
+                .checked_add(
+                    GROWTH_WINDOW_BLOCKS
+                        .checked_mul(
+                            u64::try_from(index)
+                                .map_err(|_| SourceBoundHybridSizingError::InvalidReport)?,
+                        )
+                        .ok_or(SourceBoundHybridSizingError::InvalidReport)?,
+                )
+                .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+            if snapshot.applied_blocks != expected_applied_blocks
+                || index > 0
+                    && snapshot.distinct_standard_addresses
+                        < self.state_snapshots[index - 1].distinct_standard_addresses
+            {
+                return Err(SourceBoundHybridSizingError::InvalidReport);
+            }
+            snapshot.validate()?;
+        }
+        let last_snapshot = self
+            .state_snapshots
+            .last()
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        if last_snapshot.distinct_standard_addresses > distinct_standard_addresses {
+            return Err(SourceBoundHybridSizingError::InvalidReport);
+        }
+
+        let expected_generations = GROWTH_WINDOW_BLOCKS / interval;
+        for (index, window) in self.delta_windows.iter().copied().enumerate() {
+            let expected_start = expected_aligned_start
+                .checked_add(
+                    GROWTH_WINDOW_BLOCKS
+                        .checked_mul(
+                            u64::try_from(index)
+                                .map_err(|_| SourceBoundHybridSizingError::InvalidReport)?,
+                        )
+                        .ok_or(SourceBoundHybridSizingError::InvalidReport)?,
+                )
+                .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+            if window.start_applied_blocks != expected_start
+                || !window.does_not_exceed(full_history)?
+            {
+                return Err(SourceBoundHybridSizingError::InvalidReport);
+            }
+            window.validate(expected_generations)?;
+        }
+        match (
+            self.checkpoint_trailing_blocks,
+            self.trailing_partial_generation,
+        ) {
+            (0, None) => {}
+            (blocks, Some(trailing)) if blocks > 0 => {
+                trailing.validate_trailing(expected_aligned_end, expected_blocks, blocks)?;
+                if !trailing.does_not_exceed(full_history)? {
+                    return Err(SourceBoundHybridSizingError::InvalidReport);
+                }
+            }
+            _ => return Err(SourceBoundHybridSizingError::InvalidReport),
+        }
+
+        let expected_increment =
+            GrowthAnnualIncrement::derive(&self.state_snapshots, &self.delta_windows)?;
+        let expected_projection = GrowthProjection::derive(
+            expected_blocks,
+            distinct_standard_addresses,
+            live_standard_utxos,
+            current,
+            expected_increment,
+        )?;
+        if self.maximum_positive_annual_increment != expected_increment
+            || self.projection != expected_projection
+        {
+            return Err(SourceBoundHybridSizingError::InvalidReport);
+        }
+        Ok(())
+    }
+}
+
+fn checked_linear_projection(
+    current: u64,
+    increment: u64,
+    horizon: u64,
+) -> Result<u64, SourceBoundHybridSizingError> {
+    increment
+        .checked_mul(horizon)
+        .and_then(|growth| current.checked_add(growth))
+        .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)
 }
 
 struct SparseGenerationTracker {
@@ -1068,6 +2181,7 @@ struct GenerationEntry {
     spend_events: u64,
 }
 
+#[derive(Clone, Copy)]
 struct GenerationSummary {
     total_add_events: u64,
     total_spend_events: u64,
@@ -1409,13 +2523,13 @@ mod tests {
         }
         interval.record(1, true)?;
         interval.record(1, false)?;
-        interval.finish_block()?;
-        interval.finish_block()?;
+        let _ = interval.finish_block()?;
+        let _ = interval.finish_block()?;
 
         for _ in 0..8 {
             interval.record(0, false)?;
         }
-        interval.finish_block()?;
+        let _ = interval.finish_block()?;
         let report = interval.finish()?;
 
         assert_eq!(report.generation_count, 2);
@@ -1448,6 +2562,279 @@ mod tests {
         let second = tracker.summarize_and_clear()?;
         assert_eq!(second.total_spend_events, 1);
         assert_eq!(tracker.positions, vec![EMPTY_POSITION, EMPTY_POSITION]);
+        Ok(())
+    }
+
+    fn generation_with_events(
+        add_events: u64,
+        spend_events: u64,
+    ) -> Result<GenerationSummary, SourceBoundHybridSizingError> {
+        let mut summary = GenerationSummary::empty();
+        summary.record(GenerationEntry {
+            address_index: 0,
+            add_events,
+            spend_events,
+        })?;
+        Ok(summary)
+    }
+
+    #[test]
+    fn fixed_growth_profile_derives_and_revalidates_absolute_projection(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let observation_blocks = GROWTH_WINDOW_BLOCKS
+            .checked_mul(
+                u64::try_from(GROWTH_OBSERVATION_WINDOWS)
+                    .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?,
+            )
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let aligned_end = MAINNET_BLOSSOM_ACTIVATION_HEIGHT
+            .div_ceil(u64::from(SELECTED_GENERATION_INTERVAL_BLOCKS))
+            .checked_mul(u64::from(SELECTED_GENERATION_INTERVAL_BLOCKS))
+            .and_then(|start| start.checked_add(observation_blocks))
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let expected_blocks = aligned_end
+            .checked_add(151)
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        let mut accumulator = HistoricalGrowthAccumulator::production(expected_blocks)?;
+        let aligned_start = accumulator.aligned_start_applied_blocks;
+        let mut live_utxos = vec![16, 16];
+        accumulator.observe(
+            aligned_start,
+            2,
+            32,
+            &live_utxos,
+            Some(GenerationSummary::empty()),
+        )?;
+
+        let window_events = [(16, 16), (32, 16), (16, 32), (48, 16), (80, 48)];
+        let window_states = [
+            vec![32, 16, 1],
+            vec![16, 16, 1],
+            vec![64, 16, 1, 1],
+            vec![80, 16, 1, 1],
+            vec![80, 32, 1, 1, 1],
+        ];
+        let generations_per_window =
+            GROWTH_WINDOW_BLOCKS / u64::from(SELECTED_GENERATION_INTERVAL_BLOCKS);
+        for (window_index, ((add_events, spend_events), state)) in
+            window_events.into_iter().zip(window_states).enumerate()
+        {
+            for generation_index in 1..=generations_per_window {
+                let absolute_generation = u64::try_from(window_index)
+                    .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?
+                    .checked_mul(generations_per_window)
+                    .and_then(|offset| offset.checked_add(generation_index))
+                    .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+                let applied_blocks = aligned_start
+                    .checked_add(
+                        absolute_generation
+                            .checked_mul(u64::from(SELECTED_GENERATION_INTERVAL_BLOCKS))
+                            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?,
+                    )
+                    .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+                if generation_index == generations_per_window {
+                    live_utxos = state.clone();
+                }
+                let live_standard_utxos = live_utxos.iter().try_fold(0_u64, |total, live| {
+                    total
+                        .checked_add(*live)
+                        .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)
+                })?;
+                accumulator.observe(
+                    applied_blocks,
+                    u64::try_from(live_utxos.len())
+                        .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?,
+                    live_standard_utxos,
+                    &live_utxos,
+                    Some(generation_with_events(add_events, spend_events)?),
+                )?;
+            }
+        }
+
+        let current = SelectedSizingDemands {
+            base_pages: 11,
+            add_pages: 5,
+            spend_pages: 3,
+            maximum_live_utxos_per_address: 96,
+            maximum_base_pages_per_address: 6,
+            max_per_address_add_pages: 5,
+            max_per_address_spend_pages: 3,
+        };
+        let full_history = RebuildIntervalReport {
+            interval_blocks: SELECTED_GENERATION_INTERVAL_BLOCKS,
+            generation_count: observation_blocks / u64::from(SELECTED_GENERATION_INTERVAL_BLOCKS)
+                + 1,
+            trailing_partial_generation_blocks: 151,
+            max_total_add_events: 80,
+            max_total_spend_events: 48,
+            max_total_delta_events: 128,
+            max_per_address_add_events: 80,
+            max_per_address_spend_events: 48,
+            max_per_address_delta_events: 128,
+            page_candidates: vec![DeltaPageCandidateReport {
+                entries_per_page: SELECTED_PAGE_ENTRIES,
+                max_total_add_pages: 5,
+                max_total_spend_pages: 3,
+                max_total_separate_pages: 8,
+                max_per_address_add_pages: 5,
+                max_per_address_spend_pages: 3,
+                max_per_address_separate_pages: 8,
+            }],
+        };
+        let evidence = accumulator.finish(
+            expected_blocks,
+            5,
+            131,
+            current,
+            &full_history,
+            Some(generation_with_events(32, 16)?),
+        )?;
+        assert_eq!(
+            evidence.maximum_positive_annual_increment,
+            GrowthAnnualIncrement {
+                distinct_standard_addresses: 1,
+                live_standard_utxos: 49,
+                base_pages: 4,
+                maximum_live_utxos_per_address: 48,
+                max_total_add_pages: 2,
+                max_total_spend_pages: 2,
+                max_per_address_add_pages: 2,
+                max_per_address_spend_pages: 2,
+            }
+        );
+        assert_eq!(evidence.projection.distinct_standard_addresses, 8);
+        assert_eq!(evidence.projection.live_standard_utxos, 278);
+        assert_eq!(evidence.projection.base_pages, 23);
+        assert_eq!(evidence.projection.maximum_live_utxos_per_address, 240);
+        assert_eq!(evidence.projection.maximum_base_pages_per_address, 15);
+        assert_eq!(evidence.projection.max_total_add_pages, 11);
+        assert_eq!(evidence.projection.max_total_spend_pages, 9);
+        assert_eq!(evidence.projection.fixed_page_reads, 35);
+        assert_eq!(
+            evidence.projection.qualification_expiry_height,
+            u32::try_from(expected_blocks - 1 + GROWTH_WINDOW_BLOCKS)
+                .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?
+        );
+        assert_eq!(
+            evidence.projection.capacity_horizon_end_height,
+            u32::try_from(
+                expected_blocks - 1 + GROWTH_WINDOW_BLOCKS * u64::from(GROWTH_PROJECTION_WINDOWS)
+            )
+            .map_err(|_| SourceBoundHybridSizingError::ArithmeticOverflow)?
+        );
+        let trailing = evidence
+            .trailing_partial_generation
+            .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+        assert_eq!(trailing.start_applied_blocks, aligned_end);
+        assert_eq!(trailing.end_applied_blocks, expected_blocks);
+        assert_eq!(trailing.max_total_add_events, 32);
+        assert_eq!(trailing.max_total_spend_events, 16);
+        assert_eq!(
+            select_capacity_demands(
+                SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1,
+                current,
+                None,
+            )?,
+            current
+        );
+        let projected = select_capacity_demands(
+            SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2,
+            current,
+            Some(&evidence),
+        )?;
+        assert_eq!(projected.base_pages, 23);
+        assert_eq!(projected.add_pages, 11);
+        assert_eq!(projected.spend_pages, 9);
+        assert_eq!(projected.fixed_page_reads()?, 35);
+        evidence.validate(expected_blocks, 5, 131, current, &full_history)?;
+
+        let mut tampered = evidence.clone();
+        tampered.projection.base_pages = tampered
+            .projection
+            .base_pages
+            .checked_add(1)
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        assert_eq!(
+            tampered.validate(expected_blocks, 5, 131, current, &full_history),
+            Err(SourceBoundHybridSizingError::InvalidReport)
+        );
+
+        let mut impossible = evidence.clone();
+        impossible.delta_windows[0].max_per_address_add_events = impossible.delta_windows[0]
+            .max_total_add_events
+            .checked_add(1)
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+        assert_eq!(
+            impossible.validate(expected_blocks, 5, 131, current, &full_history),
+            Err(SourceBoundHybridSizingError::InvalidReport)
+        );
+
+        let mut above_full_history = evidence.clone();
+        above_full_history.delta_windows[0].max_total_add_pages = 6;
+        above_full_history.delta_windows[0].max_total_separate_pages = 6;
+        assert_eq!(
+            above_full_history.validate(expected_blocks, 5, 131, current, &full_history),
+            Err(SourceBoundHybridSizingError::InvalidReport)
+        );
+
+        let mut missing_trailing = evidence;
+        missing_trailing.trailing_partial_generation = None;
+        assert_eq!(
+            missing_trailing.validate(expected_blocks, 5, 131, current, &full_history),
+            Err(SourceBoundHybridSizingError::InvalidReport)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn growth_v2_source_and_window_boundaries_are_exactly_pinned(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let source = SourceBinding {
+            measurement_blake2s256: GROWTH_V2_MEASUREMENT_BLAKE2S256.to_owned(),
+            checkpoint_height: GROWTH_V2_CHECKPOINT_HEIGHT,
+            checkpoint_hash: GROWTH_V2_CHECKPOINT_HASH.to_owned(),
+            expected_blocks: GROWTH_V2_EXPECTED_BLOCKS,
+        };
+        assert!(source.validate());
+        assert!(source.is_growth_v2_source());
+
+        let accumulator = HistoricalGrowthAccumulator::production(GROWTH_V2_EXPECTED_BLOCKS)?;
+        assert_eq!(accumulator.aligned_start_applied_blocks, 1_322_496);
+        assert_eq!(accumulator.aligned_end_applied_blocks, 3_424_896);
+        assert_eq!(accumulator.checkpoint_trailing_blocks, 151);
+        assert_eq!(
+            accumulator
+                .delta_windows
+                .iter()
+                .map(|window| (window.start_applied_blocks, window.end_applied_blocks))
+                .collect::<Vec<_>>(),
+            vec![
+                (1_322_496, 1_742_976),
+                (1_742_976, 2_163_456),
+                (2_163_456, 2_583_936),
+                (2_583_936, 3_004_416),
+                (3_004_416, 3_424_896),
+            ]
+        );
+
+        let mut wrong_source = source;
+        wrong_source.measurement_blake2s256 = "11".repeat(32);
+        assert!(!wrong_source.is_growth_v2_source());
+        Ok(())
+    }
+
+    #[test]
+    fn growth_profile_rejects_a_source_without_five_complete_windows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_blocks, measurement) = source_fixture()?;
+        assert!(matches!(
+            SourceBoundHybridSizingSession::start(
+                SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaGrowthV2,
+                &measurement,
+                &"11".repeat(32),
+            ),
+            Err(SourceBoundHybridSizingError::InputRejected)
+        ));
         Ok(())
     }
 
@@ -1511,7 +2898,8 @@ mod tests {
             live_utxo_histogram: histogram,
             base_page_candidates,
             rebuild_interval_reports,
-            evidence_scope: EVIDENCE_SCOPE,
+            historical_growth: None,
+            evidence_scope: EVIDENCE_SCOPE_V1,
         };
         report.validate()?;
         report.evidence_scope.target_hardware_qualified = true;
@@ -1543,6 +2931,9 @@ mod tests {
         );
         report.validate_against(&measurement, &"11".repeat(32))?;
         let encoded = serde_json::to_vec(&report)?;
+        assert!(!encoded
+            .windows(b"historical_growth".len())
+            .any(|window| window == b"historical_growth"));
         let decoded: SourceBoundHybridSizingReport = serde_json::from_slice(&encoded)?;
         assert_eq!(decoded, report);
         decoded.validate_against(&measurement, &"11".repeat(32))?;
