@@ -21,10 +21,11 @@ use futures::{stream, StreamExt};
 use zaino_common::Network;
 #[cfg(feature = "typed-qualification")]
 use zaino_oram::{
-    run_typed_worker_full_map_saturation, run_typed_worker_qualification,
-    run_typed_worker_stress_qualification, run_typed_worker_target_load,
-    TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport, TypedWorkerColdRebuildSession,
-    TypedWorkerFullMapSaturationProfile, TypedWorkerStressProfile, TypedWorkerTargetLoadProfile,
+    derive_fixed_page_capacity_lower_bound, run_typed_worker_full_map_saturation,
+    run_typed_worker_qualification, run_typed_worker_stress_qualification,
+    run_typed_worker_target_load, TypedWorkerColdRebuildProfile, TypedWorkerColdRebuildReport,
+    TypedWorkerColdRebuildSession, TypedWorkerFullMapSaturationProfile, TypedWorkerStressProfile,
+    TypedWorkerTargetLoadProfile,
 };
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_oram::{
@@ -63,6 +64,8 @@ use crate::gate2::{
     TimingAttemptSealInputs, TimingAttemptSummary, TimingAttemptTerminalState,
     TimingManifestCreateInputs, TimingManifestInspectInputs, TimingManifestVerifyInputs,
 };
+#[cfg(feature = "typed-qualification")]
+use crate::hybrid_sizing_artifact::load_hybrid_sizing;
 use crate::hybrid_sizing_artifact::publish_hybrid_sizing;
 use crate::insertion_bound_artifact::publish_insertion_bound;
 #[cfg(feature = "typed-qualification")]
@@ -204,6 +207,9 @@ enum QualificationSubcommand {
     /// Rebuild a typed worker from a fixed canonical source snapshot.
     #[cfg(feature = "typed-qualification")]
     ColdRebuild(QualificationColdRebuildArgs),
+    /// Derive a pinned-Rostl retained-memory floor from an admitted hybrid bundle.
+    #[cfg(feature = "typed-qualification")]
+    FixedPageCapacity(QualificationFixedPageCapacityArgs),
     /// Create, inspect, and verify a Gate 2 timing matrix manifest.
     #[cfg(feature = "typed-qualification")]
     Timing(QualificationTimingCommand),
@@ -481,6 +487,18 @@ struct QualificationHybridSizingArgs {
 }
 
 #[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationFixedPageCapacityArgs {
+    /// Exact retained three-file hybrid-sizing directory to consume.
+    #[arg(long, value_name = "DIR")]
+    hybrid_sizing_dir: PathBuf,
+
+    /// Externally retained canonical hybrid-sizing BLAKE2s-256 digest.
+    #[arg(long)]
+    expected_hybrid_sizing_blake2s256: String,
+}
+
+#[cfg(feature = "typed-qualification")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StressQualificationProfileArg {
     /// Fixed smoke-level stress qualification profile.
@@ -717,6 +735,8 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::ColdRebuild(args) => run_cold_rebuild(args).await,
             #[cfg(feature = "typed-qualification")]
+            QualificationSubcommand::FixedPageCapacity(args) => run_fixed_page_capacity(args),
+            #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::Timing(command) => match command.command {
                 QualificationTimingSubcommand::Create(args) => run_timing_create_manifest(args),
                 QualificationTimingSubcommand::Inspect(args) => run_timing_inspect_manifest(args),
@@ -733,6 +753,21 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             QualificationSubcommand::HybridSizing(args) => run_hybrid_sizing(args).await,
         },
     }
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_fixed_page_capacity(args: QualificationFixedPageCapacityArgs) -> RunnerResult<()> {
+    let hybrid = load_hybrid_sizing(
+        &args.hybrid_sizing_dir,
+        &args.expected_hybrid_sizing_blake2s256,
+    )?;
+    let lower_bound = derive_fixed_page_capacity_lower_bound(hybrid.report())?;
+    println!(
+        "hybrid_sizing_blake2s256={}\n{}",
+        hybrid.hybrid_sizing_blake2s256(),
+        lower_bound
+    );
+    Ok(())
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -2164,6 +2199,19 @@ mod tests {
         ]
     }
 
+    #[cfg(feature = "typed-qualification")]
+    fn valid_fixed_page_capacity_args() -> [&'static str; 7] {
+        [
+            "zainod-oram",
+            "qualification",
+            "fixed-page-capacity",
+            "--hybrid-sizing-dir",
+            "/tmp/oram-hybrid-sizing",
+            "--expected-hybrid-sizing-blake2s256",
+            "2c44f5dcdf851a12053cd8e684c4f97f202f4ff88e49102ad6232b984a746828",
+        ]
+    }
+
     fn parsed_corpus(cli: Cli) -> CorpusCommand {
         match cli.command {
             Command::Corpus(command) => command,
@@ -2182,6 +2230,7 @@ mod tests {
                 | QualificationSubcommand::Stress(_)
                 | QualificationSubcommand::TargetLoad(_)
                 | QualificationSubcommand::ColdRebuild(_)
+                | QualificationSubcommand::FixedPageCapacity(_)
                 | QualificationSubcommand::Timing(_) => {
                     panic!("insertion-bound arguments parsed as another qualification command")
                 }
@@ -2204,6 +2253,7 @@ mod tests {
                 | QualificationSubcommand::Stress(_)
                 | QualificationSubcommand::TargetLoad(_)
                 | QualificationSubcommand::ColdRebuild(_)
+                | QualificationSubcommand::FixedPageCapacity(_)
                 | QualificationSubcommand::Timing(_)
                 | QualificationSubcommand::InsertionBound(_) => {
                     panic!("hybrid-sizing arguments parsed as another qualification command")
@@ -2242,6 +2292,9 @@ mod tests {
                 QualificationSubcommand::HybridSizing(_) => {
                     panic!("hybrid-sizing arguments parsed as stress")
                 }
+                QualificationSubcommand::FixedPageCapacity(_) => {
+                    panic!("fixed-page-capacity arguments parsed as stress")
+                }
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
             Command::Release(_) => panic!("stress arguments parsed as release"),
@@ -2272,6 +2325,9 @@ mod tests {
                 }
                 QualificationSubcommand::HybridSizing(_) => {
                     panic!("hybrid-sizing arguments parsed as fixed qualification")
+                }
+                QualificationSubcommand::FixedPageCapacity(_) => {
+                    panic!("fixed-page-capacity arguments parsed as fixed qualification")
                 }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
@@ -2620,7 +2676,8 @@ mod tests {
                 | QualificationSubcommand::ColdRebuild(_)
                 | QualificationSubcommand::Timing(_)
                 | QualificationSubcommand::InsertionBound(_)
-                | QualificationSubcommand::HybridSizing(_) => {
+                | QualificationSubcommand::HybridSizing(_)
+                | QualificationSubcommand::FixedPageCapacity(_) => {
                     panic!("target-load arguments parsed as another qualification command")
                 }
             },
@@ -2661,7 +2718,8 @@ mod tests {
                 | QualificationSubcommand::TargetLoad(_)
                 | QualificationSubcommand::Timing(_)
                 | QualificationSubcommand::InsertionBound(_)
-                | QualificationSubcommand::HybridSizing(_) => {
+                | QualificationSubcommand::HybridSizing(_)
+                | QualificationSubcommand::FixedPageCapacity(_) => {
                     panic!("cold-rebuild arguments parsed as another qualification command")
                 }
             },
@@ -2812,6 +2870,36 @@ mod tests {
             let mut command = valid_hybrid_sizing_args().to_vec();
             command.extend([rejected, value]);
             assert!(Cli::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn fixed_page_capacity_cli_requires_bundle_and_external_digest() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_fixed_page_capacity_args())?;
+        let args = match cli.command {
+            Command::Qualification(QualificationCommand {
+                command: QualificationSubcommand::FixedPageCapacity(args),
+            }) => args,
+            _ => panic!("fixed-page-capacity arguments parsed as another command"),
+        };
+        assert_eq!(
+            args.hybrid_sizing_dir,
+            PathBuf::from("/tmp/oram-hybrid-sizing")
+        );
+        assert_eq!(
+            args.expected_hybrid_sizing_blake2s256,
+            "2c44f5dcdf851a12053cd8e684c4f97f202f4ff88e49102ad6232b984a746828"
+        );
+
+        for required in ["--hybrid-sizing-dir", "--expected-hybrid-sizing-blake2s256"] {
+            let mut missing = valid_fixed_page_capacity_args().to_vec();
+            let Some(index) = missing.iter().position(|value| *value == required) else {
+                panic!("valid fixed-page-capacity fixture must contain {required}");
+            };
+            missing.drain(index..=index + 1);
+            assert!(Cli::try_parse_from(missing).is_err());
         }
         Ok(())
     }

@@ -1206,14 +1206,25 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     use crate::{
+        fixed_page_capacity::TARGET_ROSTL_TABLE_OBJECT_BYTES,
         layout::{
             DirectoryTableConfiguration, EventTableConfiguration, LayoutIdentity, LayoutNetwork,
             StandardAddress, StandardScriptKind,
         },
         records::{
-            AddressDirectory, AddressEventPage, AddressKey, UtxoEvent, UtxoScriptClass, TXID_BYTES,
+            AddressDirectory, AddressEventPage, AddressKey, PersistentBaseUtxoPage16, UtxoEvent,
+            UtxoScriptClass, TXID_BYTES,
         },
     };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn fixed_page_capacity_model_matches_linux_table_object_layout() {
+        assert_eq!(
+            u64::try_from(std::mem::size_of::<RostlTable<PersistentBaseUtxoPage16>>()),
+            Ok(TARGET_ROSTL_TABLE_OBJECT_BYTES)
+        );
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum AccessKind {

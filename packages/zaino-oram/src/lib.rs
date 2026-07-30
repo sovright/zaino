@@ -26,6 +26,8 @@ mod continuation_token;
 mod corpus;
 mod engine;
 mod envelope;
+#[cfg(all(feature = "corpus-zaino", feature = "rostl-experimental"))]
+mod fixed_page_capacity;
 #[cfg(feature = "corpus-zaino")]
 mod full_map_saturation;
 #[cfg(feature = "corpus-zaino")]
@@ -65,6 +67,11 @@ mod zaino_corpus;
 #[cfg(all(test, feature = "corpus-zaino"))]
 mod zaino_fixtures;
 
+#[cfg(all(feature = "corpus-zaino", feature = "rostl-experimental"))]
+pub use fixed_page_capacity::{
+    derive_fixed_page_capacity_lower_bound, FixedPageCapacityError, FixedPageCapacityLowerBound,
+    FixedPageTableCapacityLowerBound,
+};
 #[cfg(feature = "corpus-zaino")]
 pub use full_map_saturation::{
     run_typed_worker_full_map_saturation, TypedWorkerFullMapSaturationError,

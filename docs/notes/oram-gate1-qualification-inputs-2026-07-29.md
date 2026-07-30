@@ -136,7 +136,7 @@ logical finalist can become a qualification candidate:
 | --- | --- | --- |
 | target identity | exact CPU, guest memory, image, compiler flags, TDX/TCB and DOIT policy | proposed target only |
 | growth | horizon, start point, base/address/hot-tail model, delta peaks, overlap, and source-bound derivation | unset |
-| physical layout | exact tables and generations, keys, compiled record bytes, capacity/load/spare policy, recursive maps and stash | insertion direction only |
+| physical layout | exact tables and generations, keys, compiled record bytes, capacity/load/spare policy, recursive maps and stash | [three fixed-page tables have a source-bound 20.507935-GiB retained floor](oram-gate1-fixed-page-capacity-lower-bound-2026-07-30.md); directory, complete topology, growth and overlap remain unset |
 | fixed work | exact directory, base, delta, fold, NFS, response, cover, read, write, and upsert schedule | unset |
 | failure bound | accepted analytical node-year threshold plus empirical occupancy and adversarial workload | `10^9` empirical minimum only |
 | service SLO | latency, QPS, queue, overload, timeout, cancellation, and load definition | proposed latency/QPS/queue only |
