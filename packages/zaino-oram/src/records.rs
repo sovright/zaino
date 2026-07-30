@@ -1645,9 +1645,9 @@ struct FixedPageAppendTransition<T> {
 
 /// Appends to a base page with one fixed 16-slot schedule.
 ///
-/// `#[inline(never)]` keeps this exact record-class transform available for the
-/// subsequent release-codegen gate. This slice provides portable functional
-/// evidence only and does not wire the transform into an ORAM access.
+/// `#[inline(never)]` keeps this exact record-class transform addressable for
+/// `check-oram-page-codegen`. The transform remains pure and is not wired into
+/// an ORAM access.
 #[cfg(feature = "rostl-experimental")]
 #[inline(never)]
 fn fixed_base_page_append(
@@ -1711,6 +1711,36 @@ fn fixed_spend_page_append(
         replacement: PersistentSpendUtxoPage16(transition.replacement),
         valid: transition.valid,
     }
+}
+
+/// Retains the three fixed-page transforms for `check-oram-page-codegen`.
+///
+/// The opaque function-pointer tuple keeps each `#[inline(never)]` wrapper
+/// addressable in the linked timing binary without executing a transform. This
+/// is only a Linux release-codegen retention anchor; it does not wire the
+/// transforms into the ORAM backend.
+#[cfg(all(
+    feature = "rostl-experimental",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(super) fn retain_fixed_page_append_codegen() {
+    let base: fn(
+        PersistentBaseUtxoPage16,
+        bool,
+        BasePageAppendRequest,
+    ) -> FixedPageAppendTransition<PersistentBaseUtxoPage16> = fixed_base_page_append;
+    let add: fn(
+        PersistentAddUtxoPage16,
+        bool,
+        AddPageAppendRequest,
+    ) -> FixedPageAppendTransition<PersistentAddUtxoPage16> = fixed_add_page_append;
+    let spend: fn(
+        PersistentSpendUtxoPage16,
+        bool,
+        SpendPageAppendRequest,
+    ) -> FixedPageAppendTransition<PersistentSpendUtxoPage16> = fixed_spend_page_append;
+    std::hint::black_box((base, add, spend));
 }
 
 #[cfg(feature = "rostl-experimental")]
