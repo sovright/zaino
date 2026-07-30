@@ -474,6 +474,20 @@ mod tests {
 
     #[cfg(feature = "typed-qualification")]
     #[test]
+    fn committed_v1_bundle_remains_byte_and_digest_compatible() -> TestResult {
+        let retained = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/evidence/oram/gate1/hybrid-mainnet-2316644-h3425046-v1"
+        ));
+        let expected = "2c44f5dcdf851a12053cd8e684c4f97f202f4ff88e49102ad6232b984a746828";
+        let loaded = load_hybrid_sizing(retained, expected)?;
+
+        assert_eq!(loaded.hybrid_sizing_blake2s256(), expected);
+        Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
     fn retained_loader_requires_exact_files_semantics_and_external_digest() -> TestResult {
         let fixture = fixture()?;
         let artifact = artifact(&fixture)?;
