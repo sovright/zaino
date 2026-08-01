@@ -20,9 +20,9 @@ use crate::{
     canonical_chain::{CanonicalNetwork, PublicChainCheckpoint},
     checkpoint::{NoopProjectionCheckpointPublisher, ProjectionCheckpointPublisher},
     layout::{
-        shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQueueCapacity,
-        AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError, FixedProbeLayout,
-        LayoutNetwork,
+        shutdown_atomic_worker, spawn_qualification_worker, spawn_typed_rostl_worker,
+        AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+        FixedProbeLayout, LayoutNetwork, QualificationMemoryTable,
     },
     projection::{ProjectionCheckpointCoordinator, ProjectionConfig, ProjectionCoordinatorStatus},
 };
@@ -44,6 +44,33 @@ impl OfflineProjectionOwner<NoopProjectionCheckpointPublisher> {
             queue_capacity,
             NoopProjectionCheckpointPublisher,
         )
+    }
+
+    /// Build an owner on the in-memory qualification backend rather than the
+    /// ORAM one.
+    ///
+    /// The backend is chosen entirely through `UniqueTable`, so every layer
+    /// above it runs unchanged. This is the seam that lets work above the
+    /// table abstraction proceed while the upstream `rostl` obliviousness
+    /// audit is still open. It provides no obliviousness of its own and must
+    /// never back a deployment that claims any.
+    fn new_on_qualification_memory<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
+        projection: ProjectionConfig,
+        layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
+        directory_capacity: usize,
+        event_capacity: usize,
+        queue_capacity: usize,
+    ) -> Result<Self, ProjectionOwnerBuildError> {
+        validate_configuration(projection, &layout)?;
+        let queue_capacity = validated_queue_capacity(queue_capacity)
+            .map_err(|_| ProjectionOwnerBuildError::ConstructionFailed)?;
+        let directory = QualificationMemoryTable::try_new(directory_capacity)
+            .map_err(|_| ProjectionOwnerBuildError::ConstructionFailed)?;
+        let events = QualificationMemoryTable::try_new(event_capacity)
+            .map_err(|_| ProjectionOwnerBuildError::ConstructionFailed)?;
+        let worker = spawn_qualification_worker(layout, directory, events, queue_capacity)
+            .map_err(map_worker_build)?;
+        Ok(Self::from_worker(projection, worker))
     }
 
     fn from_worker(projection: ProjectionConfig, worker: AtomicWorker) -> Self {
@@ -700,6 +727,25 @@ mod tests {
         let target = target.ok_or("fixture chain must be nonempty")?;
         assert_eq!(owner.finish(target)?, target);
         Ok((owner, target))
+    }
+
+    /// The whole owner path -- apply, finish, shut down -- must run on the
+    /// non-ORAM qualification backend, so work above `UniqueTable` does not
+    /// wait on the upstream `rostl` obliviousness audit.
+    #[test]
+    fn memory_backed_owner_applies_a_finalized_chain_end_to_end() -> FixtureResult<()> {
+        let projection = compatible_projection_config()?;
+        let layout = compatible_layout()?;
+        let owner = OfflineProjectionOwner::new_on_qualification_memory(
+            projection,
+            layout,
+            usize::try_from(DIRECTORY_CAPACITY)?,
+            usize::try_from(EVENT_CAPACITY)?,
+            1,
+        )?;
+        let blocks = projection_chain()?;
+        run_owner_to_ready(owner, &blocks)?;
+        Ok(())
     }
 
     #[test]
