@@ -22,6 +22,18 @@
 //! from the measured one-event record, so this module reports its access count
 //! but refuses to price it without page-specific latency evidence.
 //!
+//! Two gaps separate `CompactedPages` from the fixed-page scheme now in the
+//! tree, and both make this model optimistic rather than conservative:
+//!
+//! 1. Page width is a caller-supplied parameter. Passing anything other than
+//!    [`SELECTED_PAGE_ENTRIES`] models a scheme that does not exist.
+//! 2. The selected scheme spreads pages across three independent tables
+//!    (base, add, spend), while this model charges page work against a single
+//!    event table. Real per-request work is therefore higher than reported
+//!    here by a factor this module does not attempt to derive.
+//!
+//! Treat the page numbers as a floor on the real schedule, never a budget.
+//!
 //! Latency observations come from the July 2026 GCP c3-standard-44 Gate 2
 //! session recorded by
 //! `docs/notes/oram-fixed-work-slo-consistency-2026-07-31.md` at commit
@@ -84,6 +96,19 @@ const MEASURED_EVENT_INSERTION_NS: [(u32, f64); 5] = [
 ];
 const MINIMUM_MEASURED_EXPONENT: f64 = 10.0;
 const MAXIMUM_MEASURED_EXPONENT: f64 = 14.0;
+
+/// Entries per page in the selected fixed-page scheme.
+///
+/// Mirrors `hybrid_sizing::SELECTED_PAGE_ENTRIES`, which cannot be imported
+/// here: `hybrid_sizing` is `corpus-zaino`-gated while this module stays
+/// available in the default build. The `corpus-zaino` test
+/// `mirrored_page_width_matches_the_selected_scheme` pins the two together so
+/// the mirror cannot drift unnoticed.
+///
+/// Note the selected scheme spreads pages across three independent tables
+/// (base, add, spend). This model charges page work against a single event
+/// table, so its page counts are a lower bound on the real topology.
+const SELECTED_PAGE_ENTRIES: u64 = 16;
 
 struct InsertionLatencyCurve {
     directory: TableInsertionLatencyCurve,
@@ -601,7 +626,8 @@ mod tests {
 
     #[test]
     fn compacted_schedule_scales_with_pages_not_events() -> Result<(), CostModelError> {
-        let events_per_page = NonZeroU64::new(64).expect("test page width is nonzero");
+        let events_per_page =
+            NonZeroU64::new(SELECTED_PAGE_ENTRIES).expect("selected page width is nonzero");
         let cap = NonZeroU64::new(5_000).expect("test cap is nonzero");
         let schedule = AccessSchedule::CompactedPages {
             events_per_page,
@@ -612,13 +638,26 @@ mod tests {
 
         assert_eq!(
             MAINNET_HOTTEST_EVENTS.div_ceil(events_per_page.get()),
-            52_501
+            210_002
         );
         assert_eq!(accesses.directory_accesses, 4);
         assert_eq!(accesses.event_accesses, 20_000);
         assert_eq!(accesses.total_accesses, 20_004);
-        assert_eq!(schedule.requests_to_complete(MAINNET_HOTTEST_EVENTS)?, 11);
+        assert_eq!(schedule.requests_to_complete(MAINNET_HOTTEST_EVENTS)?, 43);
         Ok(())
+    }
+
+    /// The model mirrors `SELECTED_PAGE_ENTRIES` because `hybrid_sizing` is
+    /// `corpus-zaino`-gated while this module must stay available in the
+    /// default build. Mirroring risks silent drift, so pin the two together
+    /// whenever the authoritative constant is actually compiled in.
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn mirrored_page_width_matches_the_selected_scheme() {
+        assert_eq!(
+            SELECTED_PAGE_ENTRIES,
+            crate::hybrid_sizing::SELECTED_PAGE_ENTRIES
+        );
     }
 
     #[test]
