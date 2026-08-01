@@ -11,10 +11,12 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 #![cfg_attr(
-    not(test),
+    any(not(test), not(feature = "corpus-zaino")),
     expect(
         dead_code,
-        reason = "foundation APIs stay private until the zainod-oram consumer lands"
+        reason = "foundation APIs stay private until the zainod-oram consumer lands; \
+                  without corpus-zaino the test build additionally leaves that \
+                  feature's exercised items unreached"
     )
 )]
 
