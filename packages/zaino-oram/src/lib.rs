@@ -24,6 +24,7 @@ mod canonical_chain;
 mod checkpoint;
 mod continuation_token;
 mod corpus;
+mod cost_model;
 mod engine;
 mod envelope;
 #[cfg(all(feature = "corpus-zaino", feature = "rostl-experimental"))]
