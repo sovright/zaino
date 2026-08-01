@@ -257,13 +257,8 @@ pub(crate) fn shutdown_atomic_worker(worker: AtomicWorker) -> Result<(), ()> {
     worker.shutdown().map(|_| ()).map_err(|_| ())
 }
 
-#[cfg(all(test, feature = "corpus-zaino"))]
-pub(super) fn spawn_atomic_worker_for_tests<
-    D,
-    E,
-    const DIRECTORY_PROBES: usize,
-    const EVENT_PROBES: usize,
->(
+#[cfg(feature = "corpus-zaino")]
+pub(super) fn spawn_atomic_worker<D, E, const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
     executor: ExclusiveTwoTableExecutor<D, E, DIRECTORY_PROBES, EVENT_PROBES>,
     queue_capacity: AtomicQueueCapacity,
 ) -> Result<AtomicWorker, AtomicWorkerBuildError>

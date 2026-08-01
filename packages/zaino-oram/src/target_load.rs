@@ -1782,7 +1782,7 @@ fn throughput_floor(count: u64, wall_ns: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::{
-        layout::{spawn_atomic_worker_for_tests, QualificationMemoryTable},
+        layout::{spawn_qualification_worker, QualificationMemoryTable},
         records::{PersistentAddressDirectory, PersistentAddressEventPage},
     };
 
@@ -1812,14 +1812,16 @@ mod tests {
 
     fn fake_worker(inputs: &TargetLoadInputs, plan: &TargetLoadPlan) -> TestResult<AtomicWorker> {
         let layout = build_target_layout(inputs.worker_shape, plan.layout_seed)?;
-        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::new(
+        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::try_new(
             usize::try_from(inputs.worker_shape.directory_capacity)?,
-        );
-        let events = QualificationMemoryTable::<PersistentAddressEventPage>::new(usize::try_from(
-            inputs.worker_shape.event_capacity,
-        )?);
+        )
+        .map_err(|_| "directory table allocation failed")?;
+        let events = QualificationMemoryTable::<PersistentAddressEventPage>::try_new(
+            usize::try_from(inputs.worker_shape.event_capacity)?,
+        )
+        .map_err(|_| "event table allocation failed")?;
         let queue_capacity = AtomicQueueCapacity::try_new(usize::try_from(QUEUE_CAPACITY)?)?;
-        Ok(spawn_atomic_worker_for_tests(
+        Ok(spawn_qualification_worker(
             layout,
             directory,
             events,

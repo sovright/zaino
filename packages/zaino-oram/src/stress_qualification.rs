@@ -1051,7 +1051,7 @@ const fn map_worker_build(error: AtomicWorkerBuildError) -> TypedWorkerStressQua
 mod tests {
     use super::*;
     use crate::{
-        layout::{spawn_atomic_worker_for_tests, QualificationMemoryTable},
+        layout::{spawn_qualification_worker, QualificationMemoryTable},
         records::{PersistentAddressDirectory, PersistentAddressEventPage},
     };
 
@@ -1063,14 +1063,16 @@ mod tests {
         seed: [u8; 32],
     ) -> TestResult<AtomicWorker> {
         let layout = build_stress_layout(shape, generation, seed)?;
-        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::new(
+        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::try_new(
             usize::try_from(shape.directory_capacity)?,
-        );
-        let events = QualificationMemoryTable::<PersistentAddressEventPage>::new(usize::try_from(
-            shape.event_capacity,
-        )?);
+        )
+        .map_err(|_| "directory table allocation failed")?;
+        let events = QualificationMemoryTable::<PersistentAddressEventPage>::try_new(
+            usize::try_from(shape.event_capacity)?,
+        )
+        .map_err(|_| "event table allocation failed")?;
         let queue_capacity = AtomicQueueCapacity::try_new(usize::try_from(shape.queue_capacity)?)?;
-        Ok(spawn_atomic_worker_for_tests(
+        Ok(spawn_qualification_worker(
             layout,
             directory,
             events,
