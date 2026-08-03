@@ -30,19 +30,11 @@ mod atomic_store;
 pub(crate) use atomic_store::{rostl_insert_timing_probe, validate_rostl_insert_timing_shape};
 #[cfg(feature = "corpus-zaino")]
 pub(super) use atomic_store::{
-    shutdown_atomic_worker, spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
-    AtomicQualificationAppendResult, AtomicQualificationCommandError, AtomicQualificationSnapshot,
-    AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
+    shutdown_atomic_worker, spawn_qualification_worker, spawn_typed_rostl_worker,
+    AtomicQualificationAppendDisposition, AtomicQualificationAppendResult,
+    AtomicQualificationCommandError, AtomicQualificationSnapshot, AtomicQueueCapacity,
+    AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError, QualificationMemoryTable,
 };
-#[cfg(feature = "corpus-zaino")]
-#[cfg_attr(
-    not(test),
-    expect(
-        unused_imports,
-        reason = "non-ORAM construction seam awaits its first production consumer"
-    )
-)]
-pub(super) use atomic_store::{spawn_qualification_worker, QualificationMemoryTable};
 #[cfg(all(test, feature = "corpus-zaino"))]
 pub(super) use atomic_store::{BackendFailure, UniqueTable};
 
