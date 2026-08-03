@@ -748,23 +748,25 @@ impl fmt::Display for AtomicStoreError {
 
 impl std::error::Error for AtomicStoreError {}
 
-#[cfg(all(test, feature = "corpus-zaino"))]
+#[cfg(feature = "corpus-zaino")]
 pub(crate) struct QualificationMemoryTable<T> {
     slots: Vec<Option<T>>,
     occupied: u64,
 }
 
-#[cfg(all(test, feature = "corpus-zaino"))]
+#[cfg(feature = "corpus-zaino")]
 impl<T> QualificationMemoryTable<T> {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            slots: std::iter::repeat_with(|| None).take(capacity).collect(),
-            occupied: 0,
-        }
+    pub(crate) fn try_new(capacity: usize) -> Result<Self, BackendFailure> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| BackendFailure)?;
+        slots.resize_with(capacity, || None);
+        Ok(Self { slots, occupied: 0 })
     }
 }
 
-#[cfg(all(test, feature = "corpus-zaino"))]
+#[cfg(feature = "corpus-zaino")]
 impl<T: Copy> UniqueTable<T> for QualificationMemoryTable<T> {
     fn capacity(&self) -> usize {
         self.slots.len()
@@ -783,14 +785,15 @@ impl<T: Copy> UniqueTable<T> for QualificationMemoryTable<T> {
         if slot.is_some() {
             return Err(BackendFailure);
         }
+        let next_occupied = self.occupied.checked_add(1).ok_or(BackendFailure)?;
         *slot = Some(value);
-        self.occupied = self.occupied.checked_add(1).ok_or(BackendFailure)?;
+        self.occupied = next_occupied;
         Ok(())
     }
 }
 
-#[cfg(all(test, feature = "corpus-zaino"))]
-pub(crate) fn spawn_atomic_worker_for_tests<
+#[cfg(feature = "corpus-zaino")]
+pub(crate) fn spawn_qualification_worker<
     D,
     E,
     const DIRECTORY_PROBES: usize,
@@ -807,7 +810,7 @@ where
 {
     let executor = ExclusiveTwoTableExecutor::new(layout, directory, events)
         .map_err(|_| AtomicWorkerBuildError::ConstructionFailed)?;
-    worker::spawn_atomic_worker_for_tests(executor, queue_capacity)
+    worker::spawn_atomic_worker(executor, queue_capacity)
 }
 
 #[cfg(test)]
@@ -1073,6 +1076,72 @@ mod tests {
         );
         assert_eq!(executor.directory.trace.borrow().len(), fixed_read_count());
         assert_eq!(executor.state, ExecutorState::Discarded);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn qualification_memory_table_rejects_unallocatable_capacity() {
+        assert!(matches!(
+            QualificationMemoryTable::<u8>::try_new(usize::MAX),
+            Err(BackendFailure)
+        ));
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn qualification_memory_table_rejects_invalid_writes_without_mutating_state() {
+        let mut table = QualificationMemoryTable::<u8>::try_new(1)
+            .expect("one-slot test table allocation succeeds");
+        table
+            .insert_unique(0, 7)
+            .expect("first in-range test insert succeeds");
+
+        assert_eq!(table.insert_unique(0, 8), Err(BackendFailure));
+        assert_eq!(table.insert_unique(1, 9), Err(BackendFailure));
+        assert_eq!(table.read(0), Ok(Some(7)));
+        assert_eq!(table.read(1), Err(BackendFailure));
+        assert_eq!(table.occupied_records(), Ok(1));
+
+        let mut overflow = QualificationMemoryTable {
+            slots: vec![None],
+            occupied: u64::MAX,
+        };
+        assert_eq!(overflow.insert_unique(0, 9), Err(BackendFailure));
+        assert_eq!(overflow.read(0), Ok(None));
+        assert_eq!(overflow.occupied_records(), Ok(u64::MAX));
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn memory_backed_worker_completes_append_read_and_shutdown(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let layout = layout(6, 12, 11)?;
+        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::try_new(8)
+            .map_err(|_| "directory table allocation failed")?;
+        let events = QualificationMemoryTable::<PersistentAddressEventPage>::try_new(16)
+            .map_err(|_| "event table allocation failed")?;
+        let worker = spawn_qualification_worker(
+            layout,
+            directory,
+            events,
+            AtomicQueueCapacity::try_new(1).map_err(|_| "queue capacity")?,
+        )
+        .map_err(|_| "spawn failed")?;
+        let owner = address(0x11);
+        let first = event(owner, 0x21);
+        let appended = worker
+            .qualification_append(owner, first)
+            .map_err(|_| "append failed")?;
+        assert_eq!(
+            appended.disposition,
+            AtomicQualificationAppendDisposition::Inserted
+        );
+        let history = worker
+            .qualification_read_history(owner)
+            .map_err(|_| "read failed")?;
+        assert_eq!(history[0], Some(first));
+        shutdown_atomic_worker(worker).map_err(|_| "shutdown failed")?;
         Ok(())
     }
 

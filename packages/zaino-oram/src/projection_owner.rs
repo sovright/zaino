@@ -315,7 +315,7 @@ mod tests {
             ProjectionManifestStore, ProjectionRestartPlan, PublishedProjectionManifest,
         },
         layout::{
-            derive_standard_address_key, spawn_atomic_worker_for_tests, BackendFailure,
+            derive_standard_address_key, spawn_qualification_worker, BackendFailure,
             DirectoryTableConfiguration, EventTableConfiguration, LayoutIdentity, StandardAddress,
             StandardScriptKind, UniqueTable,
         },
@@ -654,7 +654,7 @@ mod tests {
             fail_on_event_write,
         );
         let worker =
-            spawn_atomic_worker_for_tests(layout, directory, events, validated_queue_capacity(1)?)?;
+            spawn_qualification_worker(layout, directory, events, validated_queue_capacity(1)?)?;
         Ok((worker, directory_observation, event_observation))
     }
 

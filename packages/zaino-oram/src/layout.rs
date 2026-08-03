@@ -34,10 +34,17 @@ pub(super) use atomic_store::{
     AtomicQualificationAppendResult, AtomicQualificationCommandError, AtomicQualificationSnapshot,
     AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
+#[cfg(feature = "corpus-zaino")]
+#[cfg_attr(
+    not(test),
+    expect(
+        unused_imports,
+        reason = "non-ORAM construction seam awaits its first production consumer"
+    )
+)]
+pub(super) use atomic_store::{spawn_qualification_worker, QualificationMemoryTable};
 #[cfg(all(test, feature = "corpus-zaino"))]
-pub(super) use atomic_store::{
-    spawn_atomic_worker_for_tests, BackendFailure, QualificationMemoryTable, UniqueTable,
-};
+pub(super) use atomic_store::{BackendFailure, UniqueTable};
 
 const LAYOUT_FORMAT_VERSION: u8 = 1;
 const ADDRESS_KEY_DOMAIN: &[u8] = b"zaino-oram-address-key-v1";

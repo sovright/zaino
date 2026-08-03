@@ -780,7 +780,7 @@ const fn map_worker_build(error: AtomicWorkerBuildError) -> TypedWorkerFullMapSa
 mod tests {
     use super::*;
     use crate::{
-        layout::{spawn_atomic_worker_for_tests, QualificationMemoryTable},
+        layout::{spawn_qualification_worker, QualificationMemoryTable},
         records::{PersistentAddressDirectory, PersistentAddressEventPage},
     };
 
@@ -788,15 +788,17 @@ mod tests {
 
     fn fake_worker(spec: CaseSpec) -> TestResult<AtomicWorker> {
         let layout = build_saturation_layout(spec)?;
-        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::new(
+        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::try_new(
             usize::try_from(WORKER_SHAPE.directory_capacity)?,
-        );
-        let events = QualificationMemoryTable::<PersistentAddressEventPage>::new(usize::try_from(
-            WORKER_SHAPE.event_capacity,
-        )?);
+        )
+        .map_err(|_| "directory table allocation failed")?;
+        let events = QualificationMemoryTable::<PersistentAddressEventPage>::try_new(
+            usize::try_from(WORKER_SHAPE.event_capacity)?,
+        )
+        .map_err(|_| "event table allocation failed")?;
         let queue_capacity =
             AtomicQueueCapacity::try_new(usize::try_from(WORKER_SHAPE.queue_capacity)?)?;
-        Ok(spawn_atomic_worker_for_tests(
+        Ok(spawn_qualification_worker(
             layout,
             directory,
             events,
