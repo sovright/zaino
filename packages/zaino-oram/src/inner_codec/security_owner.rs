@@ -9,6 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use rand::TryRngCore as _;
+
 use crate::{
     continuation_token::{
         ContinuationInspection, ContinuationReplayGuard, ContinuationReplayOutcome,
@@ -522,6 +524,23 @@ pub(super) trait RoundClock {
     fn now_unix_seconds(&mut self) -> Result<u64, RoundMaterialUnavailable>;
 }
 
+/// Draws nonce bytes from the operating system generator.
+///
+/// `OsRng` is stateless and reseeds nothing in-process, so a round never
+/// depends on process-local generator state surviving a restart. A generator
+/// failure surfaces as [`RoundMaterialUnavailable`] and the round is refused;
+/// there is deliberately no fallback source, because silently degrading to a
+/// weaker generator is the failure mode this type exists to prevent.
+pub(super) struct OsEntropy;
+
+impl RoundEntropy for OsEntropy {
+    fn fill(&mut self, bytes: &mut [u8]) -> Result<(), RoundMaterialUnavailable> {
+        rand::rngs::OsRng
+            .try_fill_bytes(bytes)
+            .map_err(|_| RoundMaterialUnavailable)
+    }
+}
+
 /// Reads the host wall clock.
 ///
 /// A pre-epoch reading is refused rather than saturated: a clock that far wrong
@@ -695,6 +714,44 @@ mod tests {
         let identity = FixtureSecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
         let lease = ActiveSecurityLease::from_fixture(shape, identity, (), (), (), ());
         Ok(lease.security_epoch_tag.clone())
+    }
+
+    /// Sanity-checks that the OS generator is wired to real entropy rather than
+    /// a zeroed or constant buffer. Two draws matching, or either draw being
+    /// all-zero, would mean it is not.
+    #[test]
+    fn os_entropy_produces_varying_nonzero_draws() -> Result<(), Box<dyn std::error::Error>> {
+        let mut entropy = OsEntropy;
+        let mut first = [0_u8; ENVELOPE_NONCE_BYTES];
+        let mut second = [0_u8; ENVELOPE_NONCE_BYTES];
+
+        entropy
+            .fill(&mut first)
+            .map_err(|_| "OS entropy must be available")?;
+        entropy
+            .fill(&mut second)
+            .map_err(|_| "OS entropy must be available")?;
+
+        assert_ne!(first, [0_u8; ENVELOPE_NONCE_BYTES]);
+        assert_ne!(second, [0_u8; ENVELOPE_NONCE_BYTES]);
+        assert_ne!(first, second);
+        Ok(())
+    }
+
+    /// The production pairing must produce a usable round end to end.
+    #[test]
+    fn os_backed_source_produces_a_distinct_nonce_round() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(OsEntropy, SystemRoundClock);
+
+        let material = source
+            .next_round_material(&tag)
+            .map_err(|_| "OS-backed round must succeed")?;
+
+        assert_ne!(material.response_nonce(), material.token_nonce());
+        assert!(material.now_unix_seconds() > 1_700_000_000);
+        Ok(())
     }
 
     /// Sanity-checks that the system clock is wired to a real clock: any
