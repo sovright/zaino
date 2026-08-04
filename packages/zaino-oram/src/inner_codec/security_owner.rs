@@ -504,6 +504,119 @@ pub(super) fn xchacha20_fixture_security_lease<
     )
 }
 
+/// Fills a buffer with unpredictable bytes for one round's nonces.
+///
+/// Injected rather than called directly so nonce handling is testable: a real
+/// generator cannot be made to fail, repeat, or collide on demand, and those
+/// are exactly the paths that must fail closed.
+pub(super) trait RoundEntropy {
+    fn fill(&mut self, bytes: &mut [u8]) -> Result<(), RoundMaterialUnavailable>;
+}
+
+/// Observes wall-clock time in Unix seconds.
+///
+/// This is a host observation, not a trusted time authority; see the module
+/// header. Injected for the same reason as [`RoundEntropy`] — a real clock
+/// cannot be made to fail or run backwards on demand.
+pub(super) trait RoundClock {
+    fn now_unix_seconds(&mut self) -> Result<u64, RoundMaterialUnavailable>;
+}
+
+/// Reads the host wall clock.
+///
+/// A pre-epoch reading is refused rather than saturated: a clock that far wrong
+/// is not an observation worth binding a round to.
+pub(super) struct SystemRoundClock;
+
+impl RoundClock for SystemRoundClock {
+    fn now_unix_seconds(&mut self) -> Result<u64, RoundMaterialUnavailable> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .map_err(|_| RoundMaterialUnavailable)
+    }
+}
+
+/// Round material drawn from an entropy source and a host clock.
+///
+/// Supplies the two per-round nonces from `E` and the time observation from
+/// `C`, binding both to the caller's security epoch. Every failure path returns
+/// [`RoundMaterialUnavailable`] and yields no material.
+///
+/// What this does establish: nonces come from the injected generator rather
+/// than a counter, the two nonces in a round are distinct, and an observed
+/// clock that moves backwards is refused.
+///
+/// What it still does not establish, per the module header: trusted time,
+/// durable nonce persistence across restarts, rollback resistance beyond the
+/// in-process observation below, or key custody.
+pub(super) struct OwnedRoundMaterialSource<E, C> {
+    entropy: E,
+    clock: C,
+    last_observed_seconds: Option<u64>,
+}
+
+impl<E, C> OwnedRoundMaterialSource<E, C> {
+    pub(super) const fn new(entropy: E, clock: C) -> Self {
+        Self {
+            entropy,
+            clock,
+            last_observed_seconds: None,
+        }
+    }
+}
+
+impl<E, C> RoundMaterialSource for OwnedRoundMaterialSource<E, C>
+where
+    E: RoundEntropy,
+    C: RoundClock,
+{
+    fn next_round_material(
+        &mut self,
+        security_epoch: &SecurityEpochTag,
+    ) -> Result<RoundMaterial, RoundMaterialUnavailable> {
+        let now_unix_seconds = self.clock.now_unix_seconds()?;
+        // A repeated second is ordinary; a decrease is not. Accepting a
+        // backwards jump would let an already-retired reservation window be
+        // observed again, so refuse rather than trust the host clock.
+        if self
+            .last_observed_seconds
+            .is_some_and(|last| now_unix_seconds < last)
+        {
+            return Err(RoundMaterialUnavailable);
+        }
+
+        let mut response_nonce = [0_u8; ENVELOPE_NONCE_BYTES];
+        self.entropy.fill(&mut response_nonce)?;
+        let mut token_nonce = [0_u8; ENVELOPE_NONCE_BYTES];
+        self.entropy.fill(&mut token_nonce)?;
+
+        // Two independent draws colliding means the generator is broken.
+        // Reusing one nonce across the response and continuation-token
+        // keystreams would cross-contaminate them, so fail closed.
+        if response_nonce == token_nonce {
+            return Err(RoundMaterialUnavailable);
+        }
+
+        let security_round = SecurityRoundCapture::new(security_epoch);
+        let reservation_authority = RoundReservationAuthority::new(
+            &security_round,
+            now_unix_seconds,
+            response_nonce,
+            token_nonce,
+        );
+        // Commit the observation only once the round cannot still fail.
+        self.last_observed_seconds = Some(now_unix_seconds);
+        Ok(RoundMaterial::new(
+            now_unix_seconds,
+            response_nonce,
+            token_nonce,
+            security_round,
+            reservation_authority,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +624,201 @@ mod tests {
         profile::test_profile_with_recent_snapshot,
         runtime_security::{ReplayCommitAuthority, RoundReservationAuthority},
     };
+
+    /// Entropy stub returning scripted bytes, then failing.
+    struct ScriptedEntropy {
+        draws: Vec<u8>,
+        next: usize,
+        fail_after: Option<usize>,
+    }
+
+    impl ScriptedEntropy {
+        fn new(draws: Vec<u8>) -> Self {
+            Self {
+                draws,
+                next: 0,
+                fail_after: None,
+            }
+        }
+
+        fn failing_after(draws: Vec<u8>, fail_after: usize) -> Self {
+            Self {
+                draws,
+                next: 0,
+                fail_after: Some(fail_after),
+            }
+        }
+    }
+
+    impl RoundEntropy for ScriptedEntropy {
+        fn fill(&mut self, bytes: &mut [u8]) -> Result<(), RoundMaterialUnavailable> {
+            if self.fail_after.is_some_and(|limit| self.next >= limit) {
+                return Err(RoundMaterialUnavailable);
+            }
+            let fill = *self.draws.get(self.next).ok_or(RoundMaterialUnavailable)?;
+            self.next += 1;
+            bytes.fill(fill);
+            Ok(())
+        }
+    }
+
+    /// Clock stub replaying a scripted sequence of observations.
+    struct ScriptedClock {
+        observations: Vec<Option<u64>>,
+        next: usize,
+    }
+
+    impl ScriptedClock {
+        fn new(observations: Vec<Option<u64>>) -> Self {
+            Self {
+                observations,
+                next: 0,
+            }
+        }
+    }
+
+    impl RoundClock for ScriptedClock {
+        fn now_unix_seconds(&mut self) -> Result<u64, RoundMaterialUnavailable> {
+            let observation = *self
+                .observations
+                .get(self.next)
+                .ok_or(RoundMaterialUnavailable)?;
+            self.next += 1;
+            observation.ok_or(RoundMaterialUnavailable)
+        }
+    }
+
+    fn epoch_tag() -> Result<SecurityEpochTag, Box<dyn std::error::Error>> {
+        let profile =
+            test_profile_with_recent_snapshot("round-material-test-v1", 4, 4, 1, 512, 3, 60)?;
+        let shape = CompiledQueryShape::<1, 512>::new(profile)?;
+        let identity = FixtureSecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
+        let lease = ActiveSecurityLease::from_fixture(shape, identity, (), (), (), ());
+        Ok(lease.security_epoch_tag.clone())
+    }
+
+    /// Sanity-checks that the system clock is wired to a real clock: any
+    /// reading at or before the 2023 constant would mean it is not.
+    #[test]
+    fn system_clock_reports_a_plausible_present() -> Result<(), Box<dyn std::error::Error>> {
+        let observed = SystemRoundClock
+            .now_unix_seconds()
+            .map_err(|_| "host clock must be readable")?;
+
+        assert!(observed > 1_700_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_source_draws_two_distinct_nonces_from_entropy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0xa1, 0xb2]),
+            ScriptedClock::new(vec![Some(1_700_000_000)]),
+        );
+
+        let material = source
+            .next_round_material(&tag)
+            .map_err(|_| "scripted round must succeed")?;
+
+        assert_eq!(material.now_unix_seconds(), 1_700_000_000);
+        assert_eq!(material.response_nonce(), [0xa1; ENVELOPE_NONCE_BYTES]);
+        assert_eq!(material.token_nonce(), [0xb2; ENVELOPE_NONCE_BYTES]);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_source_refuses_when_entropy_is_unavailable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tag = epoch_tag()?;
+        // Response nonce succeeds; the token nonce draw fails.
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::failing_after(vec![0xa1, 0xb2], 1),
+            ScriptedClock::new(vec![Some(1_700_000_000)]),
+        );
+
+        assert!(matches!(
+            source.next_round_material(&tag),
+            Err(RoundMaterialUnavailable)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn owned_source_refuses_when_the_clock_is_unavailable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0xa1, 0xb2]),
+            ScriptedClock::new(vec![None]),
+        );
+
+        assert!(matches!(
+            source.next_round_material(&tag),
+            Err(RoundMaterialUnavailable)
+        ));
+        Ok(())
+    }
+
+    /// A clock that jumps backwards would let a retired reservation window be
+    /// reused, so the source fails closed rather than trusting the host.
+    #[test]
+    fn owned_source_refuses_a_clock_that_moves_backwards() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0xa1, 0xb2, 0xc3, 0xd4]),
+            ScriptedClock::new(vec![Some(1_700_000_010), Some(1_700_000_009)]),
+        );
+
+        source
+            .next_round_material(&tag)
+            .map_err(|_| "first round must succeed")?;
+        assert!(matches!(
+            source.next_round_material(&tag),
+            Err(RoundMaterialUnavailable)
+        ));
+        Ok(())
+    }
+
+    /// Two rounds inside the same second are ordinary, not a rollback.
+    #[test]
+    fn owned_source_accepts_a_repeated_second() -> Result<(), Box<dyn std::error::Error>> {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0xa1, 0xb2, 0xc3, 0xd4]),
+            ScriptedClock::new(vec![Some(1_700_000_010), Some(1_700_000_010)]),
+        );
+
+        source
+            .next_round_material(&tag)
+            .map_err(|_| "first round must succeed")?;
+        let second = source
+            .next_round_material(&tag)
+            .map_err(|_| "same-second round must succeed")?;
+
+        assert_eq!(second.now_unix_seconds(), 1_700_000_010);
+        Ok(())
+    }
+
+    /// Identical draws mean the entropy source is broken. Reusing one nonce for
+    /// both the response and the continuation token would cross-contaminate two
+    /// keystreams, so the round fails closed.
+    #[test]
+    fn owned_source_refuses_identical_nonce_draws() -> Result<(), Box<dyn std::error::Error>> {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0x7f, 0x7f]),
+            ScriptedClock::new(vec![Some(1_700_000_000)]),
+        );
+
+        assert!(matches!(
+            source.next_round_material(&tag),
+            Err(RoundMaterialUnavailable)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn dropping_lease_retires_an_already_minted_release_witness(
