@@ -793,6 +793,33 @@ pub struct BlockData {
 }
 
 impl BlockData {
+    /// Creates a new `BlockData` instance.
+    ///
+    /// Retained in this fork: upstream removed this constructor as unused in
+    /// its own tree, but the ORAM regtest fixtures in `zaino-oram` and
+    /// `zainod-oram` construct `BlockData` directly. Delete this if those
+    /// fixtures stop needing it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        version: u32,
+        time: i64,
+        merkle_root: [u8; 32],
+        block_commitments: [u8; 32],
+        bits: CompactDifficulty,
+        nonce: [u8; 32],
+        solution: EquihashSolution,
+    ) -> Self {
+        Self {
+            version,
+            time,
+            merkle_root,
+            block_commitments,
+            bits,
+            nonce,
+            solution,
+        }
+    }
+
     /// Convert zebra block commitment to 32-byte array
     pub fn commitment_to_bytes(commitment: zebra_chain::block::Commitment) -> [u8; 32] {
         match commitment {
