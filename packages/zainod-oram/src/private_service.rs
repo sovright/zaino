@@ -1,10 +1,12 @@
-//! Listener-free adaptation between the private wire contract and an ORAM handler.
+//! Adaptation between the private wire contract and an ORAM handler.
 
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the listener-free adapter lands before its guarded Tonic body consumer"
+        reason = "the wire adapter, its Tonic body, and the bound listener land \
+                  before the zainod-oram entry point that composes a real runtime \
+                  behind them"
     )
 )]
 
@@ -15,6 +17,7 @@ use zaino_oram::{PendingFixedEnvelope, PrivateQueryUnavailable};
 
 use crate::private_proto;
 
+mod listener;
 mod tonic_body;
 
 /// Exact application envelope after validation at the private wire boundary.
