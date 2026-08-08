@@ -29,7 +29,7 @@ where
     P: ProjectionCheckpointPublisher,
 {
     /// Consumes a Ready projection owner into its read-only serving facade.
-    pub(super) fn into_serving_store(
+    pub(crate) fn into_serving_store(
         self,
     ) -> Result<FinalizedProjectionServingStore, FinalizedProjectionServingStoreBuildError> {
         let (config, checkpoint, worker) = self
@@ -100,7 +100,7 @@ impl fmt::Debug for FinalizedProjectionServingStore {
 
 /// A completed owner could not issue a finalized serving-store generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FinalizedProjectionServingStoreBuildError;
+pub(crate) struct FinalizedProjectionServingStoreBuildError;
 
 impl fmt::Display for FinalizedProjectionServingStoreBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

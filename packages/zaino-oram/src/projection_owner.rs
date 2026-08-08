@@ -28,7 +28,7 @@ use crate::{
 };
 
 /// Owns the only worker handle for one unpublished offline projection candidate.
-struct OfflineProjectionOwner<P = NoopProjectionCheckpointPublisher> {
+pub(crate) struct OfflineProjectionOwner<P = NoopProjectionCheckpointPublisher> {
     coordinator: ProjectionCheckpointCoordinator<AtomicWorker, P>,
 }
 
@@ -54,7 +54,10 @@ impl OfflineProjectionOwner<NoopProjectionCheckpointPublisher> {
     /// table abstraction proceed while the upstream `rostl` obliviousness
     /// audit is still open. It provides no obliviousness of its own and must
     /// never back a deployment that claims any.
-    fn new_on_qualification_memory<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
+    pub(crate) fn new_on_qualification_memory<
+        const DIRECTORY_PROBES: usize,
+        const EVENT_PROBES: usize,
+    >(
         projection: ProjectionConfig,
         layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
         directory_capacity: usize,
@@ -111,7 +114,7 @@ where
         }
     }
 
-    fn apply_finalized(
+    pub(crate) fn apply_finalized(
         &mut self,
         block: &IndexedBlock,
     ) -> Result<PublicChainCheckpoint, ProjectionOwnerCommandError> {
@@ -120,7 +123,7 @@ where
             .map_err(|_| ProjectionOwnerCommandError::FailedClosed)
     }
 
-    fn finish(
+    pub(crate) fn finish(
         &mut self,
         target: PublicChainCheckpoint,
     ) -> Result<PublicChainCheckpoint, ProjectionOwnerCommandError> {
@@ -137,7 +140,7 @@ where
         committed_from_readiness(self.readiness())
     }
 
-    fn shutdown(self) -> ProjectionOwnerShutdownOutcome {
+    pub(crate) fn shutdown(self) -> ProjectionOwnerShutdownOutcome {
         let (status, worker) = self.coordinator.into_shutdown_parts();
         let readiness = readiness_from_status(status);
         let committed = committed_from_readiness(readiness);
@@ -249,7 +252,7 @@ const fn committed_from_readiness(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionOwnerConfigMismatch {
+pub(crate) enum ProjectionOwnerConfigMismatch {
     Network,
     SchemaVersion,
     KeyEpoch,
@@ -259,7 +262,7 @@ enum ProjectionOwnerConfigMismatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionOwnerBuildError {
+pub(crate) enum ProjectionOwnerBuildError {
     ConfigMismatch(ProjectionOwnerConfigMismatch),
     #[cfg(not(all(
         feature = "rostl-experimental",
@@ -288,7 +291,7 @@ impl fmt::Display for ProjectionOwnerBuildError {
 impl std::error::Error for ProjectionOwnerBuildError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionOwnerCommandError {
+pub(crate) enum ProjectionOwnerCommandError {
     FailedClosed,
 }
 
@@ -303,7 +306,7 @@ impl fmt::Display for ProjectionOwnerCommandError {
 impl std::error::Error for ProjectionOwnerCommandError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionOwnerReadiness {
+pub(crate) enum ProjectionOwnerReadiness {
     Building {
         committed: Option<PublicChainCheckpoint>,
     },
@@ -316,7 +319,7 @@ enum ProjectionOwnerReadiness {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionOwnerShutdownOutcome {
+pub(crate) enum ProjectionOwnerShutdownOutcome {
     Stopped {
         readiness: ProjectionOwnerReadiness,
     },

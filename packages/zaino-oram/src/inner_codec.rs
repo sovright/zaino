@@ -39,6 +39,14 @@ mod security_state_binding;
 mod security_state_store;
 mod xchacha20;
 
+// The crate's one public composition seam. It lives inside `inner_codec`
+// rather than beside it because composing a runtime means naming the
+// protector, lease, and journal types this module keeps private; hoisting it
+// out would mean widening all of them, which is exactly the hiding the codec
+// is built around. Only the opaque `impl Trait` it returns leaves the crate.
+#[cfg(feature = "corpus-zaino")]
+pub(super) mod private_service;
+
 const FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
 const U32_BYTES: usize = 4;

@@ -19,12 +19,16 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+};
 use tonic::{
     body::Body as TonicBody,
     codegen::{http, Service},
     server::NamedService,
-    transport::server::Server,
+    transport::server::{Connected, Server},
 };
 
 use zaino_oram::FixedEnvelopeRuntime;
@@ -34,19 +38,21 @@ use crate::private_proto;
 
 /// The one method this surface answers.
 const QUERY_PAGE_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/QueryPage";
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 1;
 
 /// One private-query endpoint bound to a local address.
 ///
 /// Binding is separate from serving so a caller can learn the assigned port
 /// before any request is accepted, and so a bind failure is reported as such
 /// rather than surfacing inside the serve loop.
-pub(super) struct PrivateQueryListener {
+pub(crate) struct PrivateQueryListener {
     listener: TcpListener,
     local_addr: SocketAddr,
 }
 
 impl PrivateQueryListener {
-    pub(super) async fn bind(address: SocketAddr) -> std::io::Result<Self> {
+    pub(crate) async fn bind(address: SocketAddr) -> std::io::Result<Self> {
         let listener = TcpListener::bind(address).await?;
         let local_addr = listener.local_addr()?;
         Ok(Self {
@@ -55,12 +61,12 @@ impl PrivateQueryListener {
         })
     }
 
-    pub(super) const fn local_addr(&self) -> SocketAddr {
+    pub(crate) const fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     /// Serves the private surface until `shutdown` resolves.
-    pub(super) async fn serve<H, const N: usize>(
+    pub(crate) async fn serve<H, const N: usize>(
         self,
         handler: H,
         shutdown: impl Future<Output = ()>,
@@ -71,8 +77,12 @@ impl PrivateQueryListener {
     {
         let service = PrivateQueryService::<H, N>::new(handler);
         Server::builder()
+            .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
             .add_service(service)
-            .serve_with_incoming_shutdown(accepted_connections(self.listener), shutdown)
+            .serve_with_incoming_shutdown(
+                accepted_connections(self.listener, MAX_CONCURRENT_CONNECTIONS),
+                shutdown,
+            )
             .await
     }
 }
@@ -83,11 +93,66 @@ impl PrivateQueryListener {
 /// the listener is the whole requirement.
 fn accepted_connections(
     listener: TcpListener,
-) -> impl futures::Stream<Item = std::io::Result<tokio::net::TcpStream>> {
-    futures::stream::unfold(listener, |listener| async move {
-        let accepted = listener.accept().await.map(|(stream, _)| stream);
-        Some((accepted, listener))
+    limit: usize,
+) -> impl futures::Stream<Item = std::io::Result<PermitTcpStream>> {
+    let permits = Arc::new(Semaphore::new(limit));
+    futures::stream::unfold((listener, permits), |(listener, permits)| async move {
+        let accepted = match Arc::clone(&permits).acquire_owned().await {
+            Ok(permit) => listener.accept().await.map(|(stream, _)| PermitTcpStream {
+                stream,
+                _permit: permit,
+            }),
+            Err(error) => Err(std::io::Error::other(error)),
+        };
+        Some((accepted, (listener, permits)))
     })
+}
+
+struct PermitTcpStream {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Connected for PermitTcpStream {
+    type ConnectInfo = <TcpStream as Connected>::ConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.stream.connect_info()
+    }
+}
+
+impl AsyncRead for PermitTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for PermitTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.stream).poll_shutdown(context)
+    }
 }
 
 impl fmt::Debug for PrivateQueryListener {
@@ -180,6 +245,7 @@ mod tests {
         Arc,
     };
 
+    use futures::StreamExt;
     use zaino_oram::{PendingFixedEnvelope, PrivateQueryUnavailable};
 
     use super::*;
@@ -229,6 +295,32 @@ mod tests {
         EchoHandler {
             busy: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[tokio::test]
+    async fn accepted_connections_waits_for_a_connection_permit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let incoming = accepted_connections(listener, 1);
+        tokio::pin!(incoming);
+
+        let first_client = TcpStream::connect(address).await?;
+        let first_server = incoming
+            .next()
+            .await
+            .expect("the accept stream remains open")?;
+        let second_client = TcpStream::connect(address).await?;
+
+        assert!(futures::poll!(incoming.next()).is_pending());
+
+        drop(first_server);
+        let second_server = incoming
+            .next()
+            .await
+            .expect("releasing a permit allows the next accept")?;
+        drop((first_client, second_client, second_server));
+        Ok(())
     }
 
     /// Drives one real gRPC unary call against the bound address.
@@ -284,6 +376,70 @@ mod tests {
         let response = query_page_over_the_wire(address, vec![1, 2, 3, 4]).await?;
 
         assert_eq!(response.envelope, RESPONSE);
+
+        let _ = stop.send(());
+        served.await??;
+        Ok(())
+    }
+
+    /// The real composed runtime -- real XChaCha20 lease, real replay journal
+    /// on disk -- must be servable behind this listener, and must answer the
+    /// surface's one failure until a serving epoch is pinned.
+    ///
+    /// This is the seam the binary uses: everything below except the
+    /// `refresh` call is exactly what `zainod-oram private serve` performs.
+    /// Pinning an epoch needs a live chain subscriber, which no unit test can
+    /// stand up, so this covers composition and transport and stops there.
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently
+    /// on separate tasks and the client blocks on a response the server sends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_real_composed_runtime_serves_the_bound_surface(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let journal = tempfile::TempDir::new()?;
+        let deployment = zaino_oram::PrivateRuntimeDeployment {
+            service_namespace_id: [0x5a; 16],
+            owner_generation: 1,
+            replay_journal_root: journal.path().join("replay"),
+            projection: zaino_oram::PrivateProjectionShape {
+                network: zaino_oram::PrivateNetwork::Mainnet,
+                schema_version: 1,
+                key_epoch: 1,
+                projection_epoch: 1,
+                max_seen_outputs: 1,
+                max_live_outputs: 1,
+                directory_admission: 1,
+                event_admission: 4096,
+                max_events_per_address: zaino_oram::private_mainnet_store_reads()
+                    .map_err(|_| "the compiled profile reports its store reads")?,
+                directory_capacity: 8,
+                event_capacity: 8192,
+            },
+        };
+        let runtime = zaino_oram::mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
+            &deployment,
+            zaino_oram::PrivateRuntimeKeys::ephemeral()
+                .map_err(|_| "the OS generator yields four keys")?,
+        )
+        .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
+
+        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+        let address = listener.local_addr();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            listener
+                .serve::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(runtime, async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+
+        let status =
+            query_page_over_the_wire(address, vec![0; zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES])
+                .await
+                .expect_err("an unrefreshed runtime has no serving epoch to answer from");
+
+        assert_eq!(status.message(), "private query unavailable");
 
         let _ = stop.send(());
         served.await??;

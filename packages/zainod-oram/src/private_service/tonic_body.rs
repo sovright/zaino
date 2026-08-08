@@ -163,12 +163,17 @@ where
         let service = PrivateUnary {
             adapter: &mut self.adapter,
         };
-        let mut grpc = Grpc::new(PrivateResponseCodec::<H::PendingResponse, N>::new());
+        let mut grpc = Grpc::new(PrivateResponseCodec::<H::PendingResponse, N>::new())
+            .max_decoding_message_size(fixed_envelope_wire_size(N));
         let mut response = grpc.unary(service, request).await;
         coarsen_initial_status(&mut response);
         let (parts, body) = response.into_parts();
         http::Response::from_parts(parts, TonicBody::new(UniformStatusBody::new(body)))
     }
+}
+
+fn fixed_envelope_wire_size(envelope_bytes: usize) -> usize {
+    1 + prost::length_delimiter_len(envelope_bytes) + envelope_bytes
 }
 
 impl<H, const N: usize> std::fmt::Debug for PrivateTonicBodyAdapter<H, N> {
@@ -545,6 +550,16 @@ mod tests {
         assert_uniform_status(response.headers());
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.release_checks.load(Ordering::SeqCst), 0);
+        assert!(response.into_body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_with_the_uniform_refusal() {
+        let (mut adapter, state) = fixture();
+        let response = adapter.query_page(request(&[1, 2, 3, 4, 5])).await;
+
+        assert_uniform_status(response.headers());
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
         assert!(response.into_body().is_end_stream());
     }
 
