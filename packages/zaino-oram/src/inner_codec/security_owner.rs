@@ -25,10 +25,8 @@ use crate::{
 
 use super::{EnvelopeProtector, ENVELOPE_NONCE_BYTES, SESSION_BINDING_BYTES};
 
-#[cfg(test)]
 use crate::profile::CompiledQueryShape;
 
-#[cfg(test)]
 use super::UniformExternalFailure;
 
 const RUNTIME_SECURITY_PROTOCOL_VERSION: u16 = 1;
@@ -400,9 +398,14 @@ impl<E, T, R, M> Drop for ActiveSecurityLease<E, T, R, M> {
     }
 }
 
-/// Stable fixture inputs used to mint one opaque in-process security lease.
-#[cfg(test)]
-pub(super) struct FixtureSecurityLeaseIdentity {
+/// Identity inputs used to mint one opaque in-process security lease.
+///
+/// The deployment-scoped fields — `service_namespace_id`, `owner_generation`,
+/// and `key_epoch` — are supplied by the caller because they must survive a
+/// restart and stay distinct across owners. The two secret bindings are drawn
+/// fresh per lease by [`mint`](Self::mint); [`new`](Self::new) exists for
+/// fixtures that need every field pinned.
+pub(super) struct SecurityLeaseIdentity {
     key_epoch: u64,
     session_binding: [u8; SESSION_BINDING_BYTES],
     service_namespace_id: [u8; 16],
@@ -410,8 +413,37 @@ pub(super) struct FixtureSecurityLeaseIdentity {
     security_epoch_binding: [u8; 32],
 }
 
-#[cfg(test)]
-impl FixtureSecurityLeaseIdentity {
+impl SecurityLeaseIdentity {
+    /// Mints one identity whose secret bindings come from `entropy`.
+    pub(super) fn mint(
+        key_epoch: u64,
+        service_namespace_id: [u8; 16],
+        owner_generation: u64,
+        entropy: &mut impl RoundEntropy,
+    ) -> Result<Self, UniformExternalFailure> {
+        let mut session_binding = [0; SESSION_BINDING_BYTES];
+        let mut security_epoch_binding = [0; 32];
+        entropy
+            .fill(&mut session_binding)
+            .map_err(|_| UniformExternalFailure)?;
+        entropy
+            .fill(&mut security_epoch_binding)
+            .map_err(|_| UniformExternalFailure)?;
+        // Two independent draws never collide by chance; equality here means the
+        // generator repeated a block, which must fail closed rather than mint a
+        // lease whose session and epoch bindings are the same secret.
+        if session_binding == security_epoch_binding {
+            return Err(UniformExternalFailure);
+        }
+        Self::new(
+            key_epoch,
+            session_binding,
+            service_namespace_id,
+            owner_generation,
+            security_epoch_binding,
+        )
+    }
+
     pub(super) fn new(
         key_epoch: u64,
         session_binding: [u8; SESSION_BINDING_BYTES],
@@ -437,17 +469,17 @@ impl FixtureSecurityLeaseIdentity {
     }
 }
 
-#[cfg(test)]
 impl<E, T, R, M> ActiveSecurityLease<E, T, R, M> {
-    pub(super) fn from_fixture<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>(
+    /// Mints one lease binding a compiled shape to its four security providers.
+    pub(super) fn mint<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>(
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-        identity: FixtureSecurityLeaseIdentity,
+        identity: SecurityLeaseIdentity,
         envelope_protector: E,
         token_protector: T,
         replay_guard: R,
         material_source: M,
     ) -> Self {
-        let FixtureSecurityLeaseIdentity {
+        let SecurityLeaseIdentity {
             key_epoch,
             session_binding,
             service_namespace_id,
@@ -480,23 +512,22 @@ impl<E, T, R, M> ActiveSecurityLease<E, T, R, M> {
     }
 }
 
-/// Test-only composer for the three concrete XChaCha20 keys and fixture state.
-#[cfg(test)]
-pub(super) fn xchacha20_fixture_security_lease<
+/// Composes one lease over the three concrete XChaCha20 role keys.
+pub(super) fn xchacha20_security_lease<
     R,
     M,
     const RESPONSE_SLOTS: usize,
     const ENVELOPE_BYTES: usize,
 >(
     shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-    identity: FixtureSecurityLeaseIdentity,
+    identity: SecurityLeaseIdentity,
     request_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
     response_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
     token_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
     replay_guard: R,
     material_source: M,
 ) -> ActiveSecurityLease<impl EnvelopeProtector, impl ContinuationTokenProtector, R, M> {
-    ActiveSecurityLease::from_fixture(
+    ActiveSecurityLease::mint(
         shape,
         identity,
         super::xchacha20_envelope_protector(request_key, response_key),
@@ -711,9 +742,53 @@ mod tests {
         let profile =
             test_profile_with_recent_snapshot("round-material-test-v1", 4, 4, 1, 512, 3, 60)?;
         let shape = CompiledQueryShape::<1, 512>::new(profile)?;
-        let identity = FixtureSecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
-        let lease = ActiveSecurityLease::from_fixture(shape, identity, (), (), (), ());
+        let identity = SecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
+        let lease = ActiveSecurityLease::mint(shape, identity, (), (), (), ());
         Ok(lease.security_epoch_tag.clone())
+    }
+
+    #[test]
+    fn minting_an_identity_draws_both_secret_bindings_from_entropy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut entropy = ScriptedEntropy::new(vec![0x41, 0x42]);
+
+        let identity = SecurityLeaseIdentity::mint(7, [2; 16], 3, &mut entropy)?;
+
+        assert_eq!(identity.key_epoch, 7);
+        assert_eq!(identity.service_namespace_id, [2; 16]);
+        assert_eq!(identity.owner_generation, 3);
+        assert_eq!(identity.session_binding, [0x41; SESSION_BINDING_BYTES]);
+        assert_eq!(identity.security_epoch_binding, [0x42; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn minting_an_identity_refuses_a_repeating_or_failing_generator() {
+        let mut repeating = ScriptedEntropy::new(vec![0x41, 0x41]);
+        assert!(SecurityLeaseIdentity::mint(7, [2; 16], 3, &mut repeating).is_err());
+
+        let mut zeroed = ScriptedEntropy::new(vec![0x00, 0x42]);
+        assert!(SecurityLeaseIdentity::mint(7, [2; 16], 3, &mut zeroed).is_err());
+
+        let mut exhausted = ScriptedEntropy::new(vec![0x41]);
+        assert!(SecurityLeaseIdentity::mint(7, [2; 16], 3, &mut exhausted).is_err());
+    }
+
+    #[test]
+    fn minting_an_identity_refuses_missing_deployment_identity() {
+        for (key_epoch, service_namespace_id, owner_generation) in
+            [(0, [2; 16], 3), (7, [0; 16], 3), (7, [2; 16], 0)]
+        {
+            let mut entropy = ScriptedEntropy::new(vec![0x41, 0x42]);
+
+            assert!(SecurityLeaseIdentity::mint(
+                key_epoch,
+                service_namespace_id,
+                owner_generation,
+                &mut entropy,
+            )
+            .is_err());
+        }
     }
 
     /// Sanity-checks that the OS generator is wired to real entropy rather than
@@ -883,8 +958,8 @@ mod tests {
         let profile =
             test_profile_with_recent_snapshot("security-owner-test-v1", 4, 4, 1, 512, 3, 60)?;
         let shape = CompiledQueryShape::<1, 512>::new(profile)?;
-        let identity = FixtureSecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
-        let lease = ActiveSecurityLease::from_fixture(shape, identity, (), (), (), ());
+        let identity = SecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
+        let lease = ActiveSecurityLease::mint(shape, identity, (), (), (), ());
         let security_round = SecurityRoundCapture::new(&lease.security_epoch_tag);
         let response_nonce = [4; ENVELOPE_NONCE_BYTES];
         let token_nonce = [5; ENVELOPE_NONCE_BYTES];
