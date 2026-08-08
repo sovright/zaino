@@ -1121,6 +1121,31 @@ pub(super) struct ReplayJournalStore<P> {
     protector: P,
     instance_identity: ReplayJournalInstanceIdentity,
     state: ReplayJournalState,
+    // Both claim sets are plain hash sets, on purpose, even though this crate
+    // otherwise buys fixed work. Three facts make a constant-time membership
+    // scan the wrong trade here:
+    //
+    // 1. The verdict is not secret. A `RequestDuplicate` becomes
+    //    `QueryOutcome::ProjectionNotReady` and a `ContinuationDuplicate`
+    //    becomes `QueryOutcome::InvalidContinuation` in the response the same
+    //    caller receives. A lookup-timing oracle would reveal only what the
+    //    reply already states, and each lookup asks about the caller's own key
+    //    -- never another caller's claim.
+    // 2. The measurement would have to survive the commit it is embedded in.
+    //    Every `commit_transaction_and_capture` stages, renames, and `fsync`s
+    //    an entry file and the current-state file before returning; those
+    //    durable steps dominate a probe-and-compare by several orders of
+    //    magnitude, and they are identical on the fresh and duplicate paths
+    //    (see `duplicate_cover_commit_matches_the_fresh_claim_durable_footprint`).
+    // 3. Bucket placement is unpredictable anyway: keys are Blake2s256 digests
+    //    over the session-bound namespace, and `RandomState` re-keys SipHash
+    //    per process, so an attacker cannot aim probes at a chosen bucket.
+    //
+    // The obliviousness this module owes its callers is the durable record
+    // shape -- fixed-size sealed bodies that hide lane tags and identities --
+    // not in-process memory access. Oblivious memory remains an explicit
+    // non-goal of this module (see the module docs). Revisit if the duplicate
+    // verdict ever stops being visible in the response.
     request_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
     continuation_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
     health: ReplayJournalStoreHealth,
@@ -4572,6 +4597,68 @@ mod tests {
                 expiry_bucket_ordinal: NonZeroU64::new(7)
                     .expect("fixture expiry bucket ordinal is nonzero"),
             }
+        );
+        Ok(())
+    }
+
+    /// The claim sets decide `Fresh` versus duplicate, so the durable footprint
+    /// of that decision is the channel that matters: it survives the process,
+    /// is readable by anyone with the recovery directory, and is the only part
+    /// of the commit an adversary can observe without nanosecond-scale local
+    /// measurement. Pin it so a later "skip the write for duplicates"
+    /// optimisation cannot make a duplicate cheaper on disk than a fresh claim.
+    #[test]
+    fn duplicate_cover_commit_matches_the_fresh_claim_durable_footprint() -> TestResult {
+        fn footprint(
+            store: &ReplayJournalStore<DeterministicTestProtector>,
+            sequence: u64,
+        ) -> Result<(u64, u64, usize, usize), io::Error> {
+            let entry_len = fs::metadata(store.entry_path(sequence))?.len();
+            let current_len = fs::metadata(store.current_path())?.len();
+            let entries = fs::read_dir(store.entries_directory())?.count();
+            let staged = fs::read_dir(store.staging_directory())?.count();
+            Ok((entry_len, current_len, entries, staged))
+        }
+
+        let fresh_directory = tempfile::tempdir()?;
+        let mut fresh_store = open_store(&fresh_directory)?;
+        let (_, fresh_round) = security_round();
+        let fresh = fresh_store.commit_transaction(
+            &fresh_round,
+            &request_key(1),
+            &ContinuationReplayPlan::ClaimOrCover(continuation_claim(continuation_key(2), 7)),
+        )?;
+        let (_, fresh_decision) = fresh.into_parts();
+        assert_eq!(fresh_decision, ReplayDuplicateDecision::Fresh);
+
+        let duplicate_directory = tempfile::tempdir()?;
+        let mut duplicate_store = open_store(&duplicate_directory)?;
+        let (_, duplicate_round) = security_round();
+        duplicate_store.commit_transaction(
+            &duplicate_round,
+            &request_key(1),
+            &ContinuationReplayPlan::Cover,
+        )?;
+        let duplicate = duplicate_store.commit_transaction(
+            &duplicate_round,
+            &request_key(1),
+            &ContinuationReplayPlan::ClaimOrCover(continuation_claim(continuation_key(2), 7)),
+        )?;
+        let (_, duplicate_decision) = duplicate.into_parts();
+        assert_eq!(
+            duplicate_decision,
+            ReplayDuplicateDecision::RequestDuplicate
+        );
+
+        // Same per-commit record sizes, one new entry file per commit, and no
+        // staging residue — on either decision.
+        assert_eq!(
+            footprint(&fresh_store, 1)?,
+            (ENTRY_RECORD_BYTES as u64, CURRENT_RECORD_BYTES as u64, 1, 0)
+        );
+        assert_eq!(
+            footprint(&duplicate_store, 2)?,
+            (ENTRY_RECORD_BYTES as u64, CURRENT_RECORD_BYTES as u64, 2, 0)
         );
         Ok(())
     }
