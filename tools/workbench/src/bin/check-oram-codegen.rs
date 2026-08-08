@@ -767,6 +767,10 @@ fn parse_exact_direct_call_symbols(
     unwind_listing: &str,
 ) -> Result<ExactDirectCallSymbols, Vec<String>> {
     let mut resolved = ExactDirectCallSymbols::new();
+    // Collect every mismatch rather than returning on the first. Re-pinning
+    // after a toolchain or dependency-graph move otherwise costs one full
+    // release build per identity to discover the next one.
+    let mut mismatches: Vec<String> = Vec::new();
     for target in [
         ExactDirectCallTarget::RandomRange,
         ExactDirectCallTarget::CircuitRead,
@@ -784,26 +788,29 @@ fn parse_exact_direct_call_symbols(
                 .collect::<Vec<_>>();
             let [address] = addresses.as_slice() else {
                 // Name the instantiations that DO exist for this path. The
-                // trailing `17h<hash>` is a compiler disambiguator derived from
-                // the instantiating crate's `-C metadata`, so it moves whenever
-                // the dependency graph changes even though the emitted code has
-                // not. Without this list, re-qualifying after such a move means
-                // guessing the new hash. The hash is still matched exactly:
-                // distinct instantiations of one path are distinguished by it.
+                // trailing `17h<hash>` is a compiler disambiguator, so it moves
+                // when the toolchain or dependency graph does. Without this
+                // list, re-qualifying means guessing the new value. The hash is
+                // still matched exactly: distinct instantiations of one path are
+                // distinguished by it and nothing else.
                 let present = same_path_instantiations(text_symbols, raw_symbol);
                 let found = if present.is_empty() {
                     "none".to_string()
                 } else {
                     present.join(", ")
                 };
-                return Err(vec![format!(
+                mismatches.push(format!(
                     "expected exactly one defined raw text identity `{raw_symbol}`; \
                      found {}. Instantiations present for this path: {found}",
                     addresses.len()
-                )]);
+                ));
+                continue;
             };
             insert_exact_direct_target(&mut resolved, *address, target)?;
         }
+    }
+    if !mismatches.is_empty() {
+        return Err(mismatches);
     }
     let unwind = parse_unwind_plt_address(unwind_listing, relocations)?;
     insert_exact_direct_target(&mut resolved, unwind, ExactDirectCallTarget::UnwindResume)?;
