@@ -541,7 +541,7 @@ fn update_profile_u64_dimension(hasher: &mut Blake2s256, semantic_unit_tag: u8, 
 /// are extrapolated beyond the measured 2^10..2^14 range and time a complete
 /// insertion rather than a single read, so they screen a design point rather
 /// than establish an SLO.
-const MAINNET_QUERY_SLOTS: usize = 256;
+pub(super) const MAINNET_QUERY_SLOTS: usize = 256;
 
 /// Probe counts fixed by the compiled layout, mirrored from `cost_model`.
 const MAINNET_DIRECTORY_PROBES: usize = 4;
@@ -559,7 +559,7 @@ const MAINNET_STORE_READS: usize =
 /// binding) and the envelope adds 40 bytes of nonce and authentication. The
 /// remainder is zero padding the codec already requires, kept as headroom for
 /// layout growth that would otherwise force a profile identifier change.
-const MAINNET_ENVELOPE_BYTES: usize = 24_576;
+pub(super) const MAINNET_ENVELOPE_BYTES: usize = 24_576;
 
 /// Total committed replay transactions before the journal must be rotated.
 ///
