@@ -9,6 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use rand::TryRngCore as _;
+
 use crate::{
     continuation_token::{
         ContinuationInspection, ContinuationReplayGuard, ContinuationReplayOutcome,
@@ -23,10 +25,8 @@ use crate::{
 
 use super::{EnvelopeProtector, ENVELOPE_NONCE_BYTES, SESSION_BINDING_BYTES};
 
-#[cfg(test)]
 use crate::profile::CompiledQueryShape;
 
-#[cfg(test)]
 use super::UniformExternalFailure;
 
 const RUNTIME_SECURITY_PROTOCOL_VERSION: u16 = 1;
@@ -398,9 +398,14 @@ impl<E, T, R, M> Drop for ActiveSecurityLease<E, T, R, M> {
     }
 }
 
-/// Stable fixture inputs used to mint one opaque in-process security lease.
-#[cfg(test)]
-pub(super) struct FixtureSecurityLeaseIdentity {
+/// Identity inputs used to mint one opaque in-process security lease.
+///
+/// The deployment-scoped fields — `service_namespace_id`, `owner_generation`,
+/// and `key_epoch` — are supplied by the caller because they must survive a
+/// restart and stay distinct across owners. The two secret bindings are drawn
+/// fresh per lease by [`mint`](Self::mint); [`new`](Self::new) exists for
+/// fixtures that need every field pinned.
+pub(super) struct SecurityLeaseIdentity {
     key_epoch: u64,
     session_binding: [u8; SESSION_BINDING_BYTES],
     service_namespace_id: [u8; 16],
@@ -408,8 +413,37 @@ pub(super) struct FixtureSecurityLeaseIdentity {
     security_epoch_binding: [u8; 32],
 }
 
-#[cfg(test)]
-impl FixtureSecurityLeaseIdentity {
+impl SecurityLeaseIdentity {
+    /// Mints one identity whose secret bindings come from `entropy`.
+    pub(super) fn mint(
+        key_epoch: u64,
+        service_namespace_id: [u8; 16],
+        owner_generation: u64,
+        entropy: &mut impl RoundEntropy,
+    ) -> Result<Self, UniformExternalFailure> {
+        let mut session_binding = [0; SESSION_BINDING_BYTES];
+        let mut security_epoch_binding = [0; 32];
+        entropy
+            .fill(&mut session_binding)
+            .map_err(|_| UniformExternalFailure)?;
+        entropy
+            .fill(&mut security_epoch_binding)
+            .map_err(|_| UniformExternalFailure)?;
+        // Two independent draws never collide by chance; equality here means the
+        // generator repeated a block, which must fail closed rather than mint a
+        // lease whose session and epoch bindings are the same secret.
+        if session_binding == security_epoch_binding {
+            return Err(UniformExternalFailure);
+        }
+        Self::new(
+            key_epoch,
+            session_binding,
+            service_namespace_id,
+            owner_generation,
+            security_epoch_binding,
+        )
+    }
+
     pub(super) fn new(
         key_epoch: u64,
         session_binding: [u8; SESSION_BINDING_BYTES],
@@ -435,17 +469,17 @@ impl FixtureSecurityLeaseIdentity {
     }
 }
 
-#[cfg(test)]
 impl<E, T, R, M> ActiveSecurityLease<E, T, R, M> {
-    pub(super) fn from_fixture<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>(
+    /// Mints one lease binding a compiled shape to its four security providers.
+    pub(super) fn mint<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>(
         shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-        identity: FixtureSecurityLeaseIdentity,
+        identity: SecurityLeaseIdentity,
         envelope_protector: E,
         token_protector: T,
         replay_guard: R,
         material_source: M,
     ) -> Self {
-        let FixtureSecurityLeaseIdentity {
+        let SecurityLeaseIdentity {
             key_epoch,
             session_binding,
             service_namespace_id,
@@ -478,23 +512,22 @@ impl<E, T, R, M> ActiveSecurityLease<E, T, R, M> {
     }
 }
 
-/// Test-only composer for the three concrete XChaCha20 keys and fixture state.
-#[cfg(test)]
-pub(super) fn xchacha20_fixture_security_lease<
+/// Composes one lease over the three concrete XChaCha20 role keys.
+pub(super) fn xchacha20_security_lease<
     R,
     M,
     const RESPONSE_SLOTS: usize,
     const ENVELOPE_BYTES: usize,
 >(
     shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
-    identity: FixtureSecurityLeaseIdentity,
+    identity: SecurityLeaseIdentity,
     request_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
     response_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
     token_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
     replay_guard: R,
     material_source: M,
 ) -> ActiveSecurityLease<impl EnvelopeProtector, impl ContinuationTokenProtector, R, M> {
-    ActiveSecurityLease::from_fixture(
+    ActiveSecurityLease::mint(
         shape,
         identity,
         super::xchacha20_envelope_protector(request_key, response_key),
@@ -502,6 +535,136 @@ pub(super) fn xchacha20_fixture_security_lease<
         replay_guard,
         material_source,
     )
+}
+
+/// Fills a buffer with unpredictable bytes for one round's nonces.
+///
+/// Injected rather than called directly so nonce handling is testable: a real
+/// generator cannot be made to fail, repeat, or collide on demand, and those
+/// are exactly the paths that must fail closed.
+pub(super) trait RoundEntropy {
+    fn fill(&mut self, bytes: &mut [u8]) -> Result<(), RoundMaterialUnavailable>;
+}
+
+/// Observes wall-clock time in Unix seconds.
+///
+/// This is a host observation, not a trusted time authority; see the module
+/// header. Injected for the same reason as [`RoundEntropy`] — a real clock
+/// cannot be made to fail or run backwards on demand.
+pub(super) trait RoundClock {
+    fn now_unix_seconds(&mut self) -> Result<u64, RoundMaterialUnavailable>;
+}
+
+/// Draws nonce bytes from the operating system generator.
+///
+/// `OsRng` is stateless and reseeds nothing in-process, so a round never
+/// depends on process-local generator state surviving a restart. A generator
+/// failure surfaces as [`RoundMaterialUnavailable`] and the round is refused;
+/// there is deliberately no fallback source, because silently degrading to a
+/// weaker generator is the failure mode this type exists to prevent.
+pub(super) struct OsEntropy;
+
+impl RoundEntropy for OsEntropy {
+    fn fill(&mut self, bytes: &mut [u8]) -> Result<(), RoundMaterialUnavailable> {
+        rand::rngs::OsRng
+            .try_fill_bytes(bytes)
+            .map_err(|_| RoundMaterialUnavailable)
+    }
+}
+
+/// Reads the host wall clock.
+///
+/// A pre-epoch reading is refused rather than saturated: a clock that far wrong
+/// is not an observation worth binding a round to.
+pub(super) struct SystemRoundClock;
+
+impl RoundClock for SystemRoundClock {
+    fn now_unix_seconds(&mut self) -> Result<u64, RoundMaterialUnavailable> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .map_err(|_| RoundMaterialUnavailable)
+    }
+}
+
+/// Round material drawn from an entropy source and a host clock.
+///
+/// Supplies the two per-round nonces from `E` and the time observation from
+/// `C`, binding both to the caller's security epoch. Every failure path returns
+/// [`RoundMaterialUnavailable`] and yields no material.
+///
+/// What this does establish: nonces come from the injected generator rather
+/// than a counter, the two nonces in a round are distinct, and an observed
+/// clock that moves backwards is refused.
+///
+/// What it still does not establish, per the module header: trusted time,
+/// durable nonce persistence across restarts, rollback resistance beyond the
+/// in-process observation below, or key custody.
+pub(super) struct OwnedRoundMaterialSource<E, C> {
+    entropy: E,
+    clock: C,
+    last_observed_seconds: Option<u64>,
+}
+
+impl<E, C> OwnedRoundMaterialSource<E, C> {
+    pub(super) const fn new(entropy: E, clock: C) -> Self {
+        Self {
+            entropy,
+            clock,
+            last_observed_seconds: None,
+        }
+    }
+}
+
+impl<E, C> RoundMaterialSource for OwnedRoundMaterialSource<E, C>
+where
+    E: RoundEntropy,
+    C: RoundClock,
+{
+    fn next_round_material(
+        &mut self,
+        security_epoch: &SecurityEpochTag,
+    ) -> Result<RoundMaterial, RoundMaterialUnavailable> {
+        let now_unix_seconds = self.clock.now_unix_seconds()?;
+        // A repeated second is ordinary; a decrease is not. Accepting a
+        // backwards jump would let an already-retired reservation window be
+        // observed again, so refuse rather than trust the host clock.
+        if self
+            .last_observed_seconds
+            .is_some_and(|last| now_unix_seconds < last)
+        {
+            return Err(RoundMaterialUnavailable);
+        }
+
+        let mut response_nonce = [0_u8; ENVELOPE_NONCE_BYTES];
+        self.entropy.fill(&mut response_nonce)?;
+        let mut token_nonce = [0_u8; ENVELOPE_NONCE_BYTES];
+        self.entropy.fill(&mut token_nonce)?;
+
+        // Two independent draws colliding means the generator is broken.
+        // Reusing one nonce across the response and continuation-token
+        // keystreams would cross-contaminate them, so fail closed.
+        if response_nonce == token_nonce {
+            return Err(RoundMaterialUnavailable);
+        }
+
+        let security_round = SecurityRoundCapture::new(security_epoch);
+        let reservation_authority = RoundReservationAuthority::new(
+            &security_round,
+            now_unix_seconds,
+            response_nonce,
+            token_nonce,
+        );
+        // Commit the observation only once the round cannot still fail.
+        self.last_observed_seconds = Some(now_unix_seconds);
+        Ok(RoundMaterial::new(
+            now_unix_seconds,
+            response_nonce,
+            token_nonce,
+            security_round,
+            reservation_authority,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -512,14 +675,291 @@ mod tests {
         runtime_security::{ReplayCommitAuthority, RoundReservationAuthority},
     };
 
+    /// Entropy stub returning scripted bytes, then failing.
+    struct ScriptedEntropy {
+        draws: Vec<u8>,
+        next: usize,
+        fail_after: Option<usize>,
+    }
+
+    impl ScriptedEntropy {
+        fn new(draws: Vec<u8>) -> Self {
+            Self {
+                draws,
+                next: 0,
+                fail_after: None,
+            }
+        }
+
+        fn failing_after(draws: Vec<u8>, fail_after: usize) -> Self {
+            Self {
+                draws,
+                next: 0,
+                fail_after: Some(fail_after),
+            }
+        }
+    }
+
+    impl RoundEntropy for ScriptedEntropy {
+        fn fill(&mut self, bytes: &mut [u8]) -> Result<(), RoundMaterialUnavailable> {
+            if self.fail_after.is_some_and(|limit| self.next >= limit) {
+                return Err(RoundMaterialUnavailable);
+            }
+            let fill = *self.draws.get(self.next).ok_or(RoundMaterialUnavailable)?;
+            self.next += 1;
+            bytes.fill(fill);
+            Ok(())
+        }
+    }
+
+    /// Clock stub replaying a scripted sequence of observations.
+    struct ScriptedClock {
+        observations: Vec<Option<u64>>,
+        next: usize,
+    }
+
+    impl ScriptedClock {
+        fn new(observations: Vec<Option<u64>>) -> Self {
+            Self {
+                observations,
+                next: 0,
+            }
+        }
+    }
+
+    impl RoundClock for ScriptedClock {
+        fn now_unix_seconds(&mut self) -> Result<u64, RoundMaterialUnavailable> {
+            let observation = *self
+                .observations
+                .get(self.next)
+                .ok_or(RoundMaterialUnavailable)?;
+            self.next += 1;
+            observation.ok_or(RoundMaterialUnavailable)
+        }
+    }
+
+    fn epoch_tag() -> Result<SecurityEpochTag, Box<dyn std::error::Error>> {
+        let profile =
+            test_profile_with_recent_snapshot("round-material-test-v1", 4, 4, 1, 512, 3, 60)?;
+        let shape = CompiledQueryShape::<1, 512>::new(profile)?;
+        let identity = SecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
+        let lease = ActiveSecurityLease::mint(shape, identity, (), (), (), ());
+        Ok(lease.security_epoch_tag.clone())
+    }
+
+    #[test]
+    fn minting_an_identity_draws_both_secret_bindings_from_entropy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut entropy = ScriptedEntropy::new(vec![0x41, 0x42]);
+
+        let identity = SecurityLeaseIdentity::mint(7, [2; 16], 3, &mut entropy)?;
+
+        assert_eq!(identity.key_epoch, 7);
+        assert_eq!(identity.service_namespace_id, [2; 16]);
+        assert_eq!(identity.owner_generation, 3);
+        assert_eq!(identity.session_binding, [0x41; SESSION_BINDING_BYTES]);
+        assert_eq!(identity.security_epoch_binding, [0x42; 32]);
+        Ok(())
+    }
+
+    #[test]
+    fn minting_an_identity_refuses_a_repeating_or_failing_generator() {
+        let mut repeating = ScriptedEntropy::new(vec![0x41, 0x41]);
+        assert!(SecurityLeaseIdentity::mint(7, [2; 16], 3, &mut repeating).is_err());
+
+        let mut zeroed = ScriptedEntropy::new(vec![0x00, 0x42]);
+        assert!(SecurityLeaseIdentity::mint(7, [2; 16], 3, &mut zeroed).is_err());
+
+        let mut exhausted = ScriptedEntropy::new(vec![0x41]);
+        assert!(SecurityLeaseIdentity::mint(7, [2; 16], 3, &mut exhausted).is_err());
+    }
+
+    #[test]
+    fn minting_an_identity_refuses_missing_deployment_identity() {
+        for (key_epoch, service_namespace_id, owner_generation) in
+            [(0, [2; 16], 3), (7, [0; 16], 3), (7, [2; 16], 0)]
+        {
+            let mut entropy = ScriptedEntropy::new(vec![0x41, 0x42]);
+
+            assert!(SecurityLeaseIdentity::mint(
+                key_epoch,
+                service_namespace_id,
+                owner_generation,
+                &mut entropy,
+            )
+            .is_err());
+        }
+    }
+
+    /// Sanity-checks that the OS generator is wired to real entropy rather than
+    /// a zeroed or constant buffer. Two draws matching, or either draw being
+    /// all-zero, would mean it is not.
+    #[test]
+    fn os_entropy_produces_varying_nonzero_draws() -> Result<(), Box<dyn std::error::Error>> {
+        let mut entropy = OsEntropy;
+        let mut first = [0_u8; ENVELOPE_NONCE_BYTES];
+        let mut second = [0_u8; ENVELOPE_NONCE_BYTES];
+
+        entropy
+            .fill(&mut first)
+            .map_err(|_| "OS entropy must be available")?;
+        entropy
+            .fill(&mut second)
+            .map_err(|_| "OS entropy must be available")?;
+
+        assert_ne!(first, [0_u8; ENVELOPE_NONCE_BYTES]);
+        assert_ne!(second, [0_u8; ENVELOPE_NONCE_BYTES]);
+        assert_ne!(first, second);
+        Ok(())
+    }
+
+    /// The production pairing must produce a usable round end to end.
+    #[test]
+    fn os_backed_source_produces_a_distinct_nonce_round() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(OsEntropy, SystemRoundClock);
+
+        let material = source
+            .next_round_material(&tag)
+            .map_err(|_| "OS-backed round must succeed")?;
+
+        assert_ne!(material.response_nonce(), material.token_nonce());
+        assert!(material.now_unix_seconds() > 1_700_000_000);
+        Ok(())
+    }
+
+    /// Sanity-checks that the system clock is wired to a real clock: any
+    /// reading at or before the 2023 constant would mean it is not.
+    #[test]
+    fn system_clock_reports_a_plausible_present() -> Result<(), Box<dyn std::error::Error>> {
+        let observed = SystemRoundClock
+            .now_unix_seconds()
+            .map_err(|_| "host clock must be readable")?;
+
+        assert!(observed > 1_700_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_source_draws_two_distinct_nonces_from_entropy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0xa1, 0xb2]),
+            ScriptedClock::new(vec![Some(1_700_000_000)]),
+        );
+
+        let material = source
+            .next_round_material(&tag)
+            .map_err(|_| "scripted round must succeed")?;
+
+        assert_eq!(material.now_unix_seconds(), 1_700_000_000);
+        assert_eq!(material.response_nonce(), [0xa1; ENVELOPE_NONCE_BYTES]);
+        assert_eq!(material.token_nonce(), [0xb2; ENVELOPE_NONCE_BYTES]);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_source_refuses_when_entropy_is_unavailable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tag = epoch_tag()?;
+        // Response nonce succeeds; the token nonce draw fails.
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::failing_after(vec![0xa1, 0xb2], 1),
+            ScriptedClock::new(vec![Some(1_700_000_000)]),
+        );
+
+        assert!(matches!(
+            source.next_round_material(&tag),
+            Err(RoundMaterialUnavailable)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn owned_source_refuses_when_the_clock_is_unavailable() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0xa1, 0xb2]),
+            ScriptedClock::new(vec![None]),
+        );
+
+        assert!(matches!(
+            source.next_round_material(&tag),
+            Err(RoundMaterialUnavailable)
+        ));
+        Ok(())
+    }
+
+    /// A clock that jumps backwards would let a retired reservation window be
+    /// reused, so the source fails closed rather than trusting the host.
+    #[test]
+    fn owned_source_refuses_a_clock_that_moves_backwards() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0xa1, 0xb2, 0xc3, 0xd4]),
+            ScriptedClock::new(vec![Some(1_700_000_010), Some(1_700_000_009)]),
+        );
+
+        source
+            .next_round_material(&tag)
+            .map_err(|_| "first round must succeed")?;
+        assert!(matches!(
+            source.next_round_material(&tag),
+            Err(RoundMaterialUnavailable)
+        ));
+        Ok(())
+    }
+
+    /// Two rounds inside the same second are ordinary, not a rollback.
+    #[test]
+    fn owned_source_accepts_a_repeated_second() -> Result<(), Box<dyn std::error::Error>> {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0xa1, 0xb2, 0xc3, 0xd4]),
+            ScriptedClock::new(vec![Some(1_700_000_010), Some(1_700_000_010)]),
+        );
+
+        source
+            .next_round_material(&tag)
+            .map_err(|_| "first round must succeed")?;
+        let second = source
+            .next_round_material(&tag)
+            .map_err(|_| "same-second round must succeed")?;
+
+        assert_eq!(second.now_unix_seconds(), 1_700_000_010);
+        Ok(())
+    }
+
+    /// Identical draws mean the entropy source is broken. Reusing one nonce for
+    /// both the response and the continuation token would cross-contaminate two
+    /// keystreams, so the round fails closed.
+    #[test]
+    fn owned_source_refuses_identical_nonce_draws() -> Result<(), Box<dyn std::error::Error>> {
+        let tag = epoch_tag()?;
+        let mut source = OwnedRoundMaterialSource::new(
+            ScriptedEntropy::new(vec![0x7f, 0x7f]),
+            ScriptedClock::new(vec![Some(1_700_000_000)]),
+        );
+
+        assert!(matches!(
+            source.next_round_material(&tag),
+            Err(RoundMaterialUnavailable)
+        ));
+        Ok(())
+    }
+
     #[test]
     fn dropping_lease_retires_an_already_minted_release_witness(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let profile =
             test_profile_with_recent_snapshot("security-owner-test-v1", 4, 4, 1, 512, 3, 60)?;
         let shape = CompiledQueryShape::<1, 512>::new(profile)?;
-        let identity = FixtureSecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
-        let lease = ActiveSecurityLease::from_fixture(shape, identity, (), (), (), ());
+        let identity = SecurityLeaseIdentity::new(1, [1; 32], [2; 16], 1, [3; 32])?;
+        let lease = ActiveSecurityLease::mint(shape, identity, (), (), (), ());
         let security_round = SecurityRoundCapture::new(&lease.security_epoch_tag);
         let response_nonce = [4; ENVELOPE_NONCE_BYTES];
         let token_nonce = [5; ENVELOPE_NONCE_BYTES];

@@ -3,10 +3,11 @@
 //! The journal records the request lane and the continuation real-or-cover
 //! lane as one ordered local transaction. Fixed-size record bodies are sealed
 //! behind an injected protector so the first file format does not expose lane
-//! tags, replay identities, or counters in plaintext. This module deliberately
-//! supplies no production protector, external freshness witness, trusted time,
-//! durable nonce owner, runtime wiring, or oblivious memory, page, storage, or
-//! timing access. It also assumes exactly one live writer for a recovery
+//! tags, replay identities, or counters in plaintext. The production protector
+//! lives in the [`xchacha20`] submodule; this module deliberately supplies no
+//! external freshness witness, trusted time, runtime wiring, or oblivious
+//! memory, page, storage, or timing access. It also assumes exactly one live
+//! writer for a recovery
 //! directory; no process lock or multi-writer linearizability is provided.
 //!
 //! The v6 journal is append-only and capacity counts total committed
@@ -53,6 +54,8 @@ use super::{
         SecurityStateStoreError, STATE_DIGEST_BYTES,
     },
 };
+
+mod xchacha20;
 
 const CURRENT_FORMAT_VERSION: u16 = 3;
 const ENTRY_FORMAT_VERSION: u16 = 2;

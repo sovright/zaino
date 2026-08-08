@@ -70,8 +70,7 @@ use super::{security_owner::SecurityEpochReleaseWitness, PrivateNetwork};
 
 #[cfg(test)]
 use super::security_owner::{
-    xchacha20_fixture_security_lease, FixtureSecurityLeaseIdentity, RoundMaterial,
-    RoundMaterialUnavailable,
+    xchacha20_security_lease, RoundMaterial, RoundMaterialUnavailable, SecurityLeaseIdentity,
 };
 
 /// One encoded response retaining both fixture-contract authorities.
@@ -2354,7 +2353,7 @@ mod tests {
         >,
         UniformExternalFailure,
     > {
-        Ok(ActiveSecurityLease::from_fixture(
+        Ok(ActiveSecurityLease::mint(
             shape,
             fixture_security_lease_identity(key_epoch, session_binding)?,
             DeterministicEnvelopeProtector::default(),
@@ -2367,8 +2366,8 @@ mod tests {
     fn fixture_security_lease_identity(
         key_epoch: u64,
         session_binding: [u8; 32],
-    ) -> Result<FixtureSecurityLeaseIdentity, UniformExternalFailure> {
-        FixtureSecurityLeaseIdentity::new(
+    ) -> Result<SecurityLeaseIdentity, UniformExternalFailure> {
+        SecurityLeaseIdentity::new(
             key_epoch,
             session_binding,
             SERVICE_NAMESPACE_ID,
@@ -2935,7 +2934,7 @@ mod tests {
         let entries = [(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))];
         let serving_epoch = serving_epoch(empty_recent_snapshot(), store(4, &entries)?);
         let shape = runtime_shape(4)?;
-        let security_lease = xchacha20_fixture_security_lease(
+        let security_lease = xchacha20_security_lease(
             shape,
             fixture_security_lease_identity(checkpoint().key_epoch, SESSION_BINDING)?,
             zeroize::Zeroizing::new(XCHACHA_REQUEST_KEY),
