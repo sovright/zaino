@@ -174,6 +174,52 @@ fn is_concrete_numeric(channel: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Length in bytes of a whitespace-separated hex-byte encoding, if well formed.
+///
+/// Shared by the ORAM codegen guards; see `check-oram-codegen` and
+/// `check-oram-page-codegen`.
+pub fn encoded_byte_len(value: &str) -> Option<u64> {
+    let bytes = value.split_whitespace().collect::<Vec<_>>();
+    if bytes.is_empty()
+        || bytes.len() > 15
+        || bytes
+            .iter()
+            .any(|byte| byte.len() != 2 || !byte.bytes().all(|part| part.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    u64::try_from(bytes.len()).ok()
+}
+
+/// True for GNU-syntax instruction prefixes that carry no opcode of their own.
+pub fn is_gnu_prefix(value: &str) -> bool {
+    value == "rex"
+        || value.starts_with("rex.")
+        || matches!(
+            value,
+            "addr16"
+                | "addr32"
+                | "bnd"
+                | "cs"
+                | "data16"
+                | "data32"
+                | "ds"
+                | "es"
+                | "fs"
+                | "gs"
+                | "lock"
+                | "notrack"
+                | "rep"
+                | "repe"
+                | "repne"
+                | "repnz"
+                | "repz"
+                | "ss"
+                | "xacquire"
+                | "xrelease"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

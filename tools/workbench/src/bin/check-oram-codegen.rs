@@ -56,7 +56,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
-use workbench::{command as tool, run};
+use workbench::{command as tool, encoded_byte_len, is_gnu_prefix, run};
 
 /// The original access-path function whose body must match the approved
 /// profile. These constants remain the default so the historical one-argument
@@ -2306,47 +2306,6 @@ fn parse_instruction(line: &str) -> Result<Option<ParsedInstruction>, &'static s
         },
         encoded_len,
     }))
-}
-
-fn encoded_byte_len(value: &str) -> Option<u64> {
-    let bytes = value.split_whitespace().collect::<Vec<_>>();
-    if bytes.is_empty()
-        || bytes.len() > 15
-        || bytes
-            .iter()
-            .any(|byte| byte.len() != 2 || !byte.chars().all(|c| c.is_ascii_hexdigit()))
-    {
-        return None;
-    }
-    u64::try_from(bytes.len()).ok()
-}
-
-fn is_gnu_prefix(value: &str) -> bool {
-    value == "rex"
-        || value.starts_with("rex.")
-        || matches!(
-            value,
-            "addr16"
-                | "addr32"
-                | "bnd"
-                | "cs"
-                | "data16"
-                | "data32"
-                | "ds"
-                | "es"
-                | "fs"
-                | "gs"
-                | "lock"
-                | "notrack"
-                | "rep"
-                | "repe"
-                | "repne"
-                | "repnz"
-                | "repz"
-                | "ss"
-                | "xacquire"
-                | "xrelease"
-        )
 }
 
 fn is_control_mnemonic(value: &str) -> bool {
