@@ -56,7 +56,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
-use workbench::{command as tool, run};
+use workbench::{command as tool, encoded_byte_len, is_gnu_prefix, run};
 
 /// The original access-path function whose body must match the approved
 /// profile. These constants remain the default so the historical one-argument
@@ -68,18 +68,36 @@ const FIXED_EXACT_UPSERT: &str = "fixed_exact_upsert";
 const FIXED_EXACT_UPSERT_SYMBOL: &str =
     "zaino_oram::layout::atomic_store::worker::rostl::fixed_exact_upsert";
 
-const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h6b3ca648fa0c8fb8E";
+// Re-pinned from the qualifying Linux x86_64 release build after the upstream
+// sync. Every `17h<hash>` disambiguator moved at once, which is what a
+// dependency-graph change does: cargo derives `-C metadata` from it.
+//
+// `read` and `write_or_insert` each had two instantiations before and have two
+// now, so for them this is churn. `random_range` is different: only one
+// identity was ever pinned while two are present, so the guard counted
+// addresses for the pinned symbol alone. Whether the second appeared with this
+// sync or was always there and unpinned is not decidable from what the guard
+// reports, so both are pinned here and the question is left open rather than
+// answered by assumption.
+//
+// The DIRECTORY/EVENT split in these names records the original qualification's
+// attribution. This re-pin cannot re-confirm it: the guard reports which
+// instantiations exist for a path, not which record type each serves, and both
+// map to the same target either way. Treat the suffix as historical.
+const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h3737605460051b15E";
+const RANDOM_RANGE_SECOND_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17hb9510b448ebef3c3E";
 const CIRCUIT_READ_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h7476e1361c793b48E";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h681ef66e9d04c538E";
 const CIRCUIT_EVENT_READ_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h66f54b80c4c5a7dbE";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17hb314dfa0f6912035E";
 const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h4d06f976a0b09474E";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h64bd35feec61c112E";
 const CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h0bc0fd51e177f34aE";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17haf4b8093684385e6E";
 const UNWIND_DYNAMIC_SYMBOL: &str = "_Unwind_Resume@GCC_3.0";
 
-const RANDOM_RANGE_RAW_SYMBOLS: &[&str] = &[RANDOM_RANGE_RAW_SYMBOL];
+const RANDOM_RANGE_RAW_SYMBOLS: &[&str] =
+    &[RANDOM_RANGE_RAW_SYMBOL, RANDOM_RANGE_SECOND_RAW_SYMBOL];
 const CIRCUIT_READ_RAW_SYMBOLS: &[&str] = &[CIRCUIT_READ_RAW_SYMBOL, CIRCUIT_EVENT_READ_RAW_SYMBOL];
 const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOLS: &[&str] = &[
     CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL,
@@ -733,12 +751,37 @@ fn exact_direct_call_symbols(
     parse_exact_direct_call_symbols(text_symbols, relocations, &unwind_listing)
 }
 
+/// Symbols sharing `pinned`'s demangled path but not its disambiguator hash.
+///
+/// Diagnostic only: it reports what a stale pin should be updated to. Matching
+/// itself stays exact, because one path can have several legitimate
+/// instantiations that only the hash tells apart.
+fn same_path_instantiations(text_symbols: &TextSymbols, pinned: &str) -> Vec<String> {
+    let Some(prefix_end) = pinned.rfind("17h") else {
+        return Vec::new();
+    };
+    let prefix = &pinned[..prefix_end];
+    let mut found = text_symbols
+        .values()
+        .flatten()
+        .filter(|name| name.starts_with(prefix) && name.as_str() != pinned)
+        .cloned()
+        .collect::<Vec<_>>();
+    found.sort();
+    found.dedup();
+    found
+}
+
 fn parse_exact_direct_call_symbols(
     text_symbols: &TextSymbols,
     relocations: &DynamicRelocations,
     unwind_listing: &str,
 ) -> Result<ExactDirectCallSymbols, Vec<String>> {
     let mut resolved = ExactDirectCallSymbols::new();
+    // Collect every mismatch rather than returning on the first. Re-pinning
+    // after a toolchain or dependency-graph move otherwise costs one full
+    // release build per identity to discover the next one.
+    let mut mismatches: Vec<String> = Vec::new();
     for target in [
         ExactDirectCallTarget::RandomRange,
         ExactDirectCallTarget::CircuitRead,
@@ -755,14 +798,30 @@ fn parse_exact_direct_call_symbols(
                 })
                 .collect::<Vec<_>>();
             let [address] = addresses.as_slice() else {
-                return Err(vec![format!(
+                // Name the instantiations that DO exist for this path. The
+                // trailing `17h<hash>` is a compiler disambiguator, so it moves
+                // when the toolchain or dependency graph does. Without this
+                // list, re-qualifying means guessing the new value. The hash is
+                // still matched exactly: distinct instantiations of one path are
+                // distinguished by it and nothing else.
+                let present = same_path_instantiations(text_symbols, raw_symbol);
+                let found = if present.is_empty() {
+                    "none".to_string()
+                } else {
+                    present.join(", ")
+                };
+                mismatches.push(format!(
                     "expected exactly one defined raw text identity `{raw_symbol}`; \
-                     found {}",
+                     found {}. Instantiations present for this path: {found}",
                     addresses.len()
-                )]);
+                ));
+                continue;
             };
             insert_exact_direct_target(&mut resolved, *address, target)?;
         }
+    }
+    if !mismatches.is_empty() {
+        return Err(mismatches);
     }
     let unwind = parse_unwind_plt_address(unwind_listing, relocations)?;
     insert_exact_direct_target(&mut resolved, unwind, ExactDirectCallTarget::UnwindResume)?;
@@ -2308,47 +2367,6 @@ fn parse_instruction(line: &str) -> Result<Option<ParsedInstruction>, &'static s
     }))
 }
 
-fn encoded_byte_len(value: &str) -> Option<u64> {
-    let bytes = value.split_whitespace().collect::<Vec<_>>();
-    if bytes.is_empty()
-        || bytes.len() > 15
-        || bytes
-            .iter()
-            .any(|byte| byte.len() != 2 || !byte.chars().all(|c| c.is_ascii_hexdigit()))
-    {
-        return None;
-    }
-    u64::try_from(bytes.len()).ok()
-}
-
-fn is_gnu_prefix(value: &str) -> bool {
-    value == "rex"
-        || value.starts_with("rex.")
-        || matches!(
-            value,
-            "addr16"
-                | "addr32"
-                | "bnd"
-                | "cs"
-                | "data16"
-                | "data32"
-                | "ds"
-                | "es"
-                | "fs"
-                | "gs"
-                | "lock"
-                | "notrack"
-                | "rep"
-                | "repe"
-                | "repne"
-                | "repnz"
-                | "repz"
-                | "ss"
-                | "xacquire"
-                | "xrelease"
-        )
-}
-
 fn is_control_mnemonic(value: &str) -> bool {
     matches!(
         value,
@@ -2501,6 +2519,7 @@ mod tests {
     fn exact_direct_text_symbols() -> TextSymbols {
         TextSymbols::from([
             (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
+            (0x601, vec![RANDOM_RANGE_SECOND_RAW_SYMBOL.to_string()]),
             (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
             (0x611, vec![CIRCUIT_EVENT_READ_RAW_SYMBOL.to_string()]),
             (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),
@@ -3037,6 +3056,7 @@ mod tests {
             resolved,
             ExactDirectCallSymbols::from([
                 (0x600, ExactDirectCallTarget::RandomRange),
+                (0x601, ExactDirectCallTarget::RandomRange),
                 (0x610, ExactDirectCallTarget::CircuitRead),
                 (0x611, ExactDirectCallTarget::CircuitRead),
                 (0x620, ExactDirectCallTarget::CircuitWriteOrInsert),
@@ -3045,7 +3065,7 @@ mod tests {
             ])
         );
 
-        for missing in [0x600, 0x610, 0x611, 0x620, 0x621] {
+        for missing in [0x600, 0x601, 0x610, 0x611, 0x620, 0x621] {
             let mut incomplete = symbols.clone();
             incomplete.remove(&missing);
             assert!(
@@ -3065,9 +3085,13 @@ mod tests {
             "two approved raw identities at one address must be ambiguous"
         );
 
+        // One identity at two addresses is ambiguous even when every other
+        // required identity is present, so the second `random_range`
+        // instantiation is still supplied at its own address below.
         let duplicated = TextSymbols::from([
             (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
             (0x601, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
+            (0x602, vec![RANDOM_RANGE_SECOND_RAW_SYMBOL.to_string()]),
             (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
             (0x611, vec![CIRCUIT_EVENT_READ_RAW_SYMBOL.to_string()]),
             (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),

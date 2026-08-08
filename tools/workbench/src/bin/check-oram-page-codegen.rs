@@ -26,7 +26,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use workbench::{command as tool, run};
+use workbench::{command as tool, encoded_byte_len, is_gnu_prefix, run};
 
 const EXPECTED_SYMBOL_SIZE: u64 = 0xca9;
 const EXPECTED_BRANCHES: usize = 26;
@@ -624,47 +624,6 @@ fn parse_instruction(line: &str) -> Result<Option<Instruction>, &'static str> {
         mnemonic,
         operands: parts[prefixes + 1..].join(" "),
     }))
-}
-
-fn encoded_byte_len(value: &str) -> Option<u64> {
-    let bytes = value.split_whitespace().collect::<Vec<_>>();
-    if bytes.is_empty()
-        || bytes.len() > 15
-        || bytes
-            .iter()
-            .any(|byte| byte.len() != 2 || !byte.bytes().all(|part| part.is_ascii_hexdigit()))
-    {
-        return None;
-    }
-    u64::try_from(bytes.len()).ok()
-}
-
-fn is_gnu_prefix(value: &str) -> bool {
-    value == "rex"
-        || value.starts_with("rex.")
-        || matches!(
-            value,
-            "addr16"
-                | "addr32"
-                | "bnd"
-                | "cs"
-                | "data16"
-                | "data32"
-                | "ds"
-                | "es"
-                | "fs"
-                | "gs"
-                | "lock"
-                | "notrack"
-                | "rep"
-                | "repe"
-                | "repne"
-                | "repnz"
-                | "repz"
-                | "ss"
-                | "xacquire"
-                | "xrelease"
-        )
 }
 
 fn validate_instruction_coverage(
