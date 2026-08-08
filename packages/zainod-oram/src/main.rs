@@ -3,6 +3,8 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "private-service")]
+use blake2::{Blake2s256, Digest};
 use std::{
     error::Error,
     fmt,
@@ -11,6 +13,12 @@ use std::{
     ops::RangeInclusive,
     path::PathBuf,
     process::ExitCode,
+};
+#[cfg(feature = "private-service")]
+use std::{
+    net::SocketAddr,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 #[cfg(feature = "typed-qualification")]
 use std::{num::NonZeroU64, time::Duration};
@@ -27,6 +35,12 @@ use zaino_oram::{
     TypedWorkerColdRebuildSession, TypedWorkerFullMapSaturationProfile, TypedWorkerStressProfile,
     TypedWorkerTargetLoadProfile,
 };
+#[cfg(feature = "private-service")]
+use zaino_oram::{
+    mainnet_private_query_runtime, FinalizedProjectionBuilder, MainnetPrivateQueryRuntime,
+    PrivateNetwork, PrivateProjectionShape, PrivateRuntimeDeployment, PrivateRuntimeKeys,
+    PRIVATE_MAINNET_ENVELOPE_BYTES,
+};
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_oram::{
     SourceBoundHybridSizingProfile, SourceBoundHybridSizingReport, SourceBoundHybridSizingSession,
@@ -35,6 +49,8 @@ use zaino_oram::{
     SourceBoundInsertionBudgetProfile, SourceBoundInsertionBudgetReport,
     SourceBoundInsertionBudgetSession,
 };
+#[cfg(feature = "private-service")]
+use zaino_state::ValidatorConnector;
 use zaino_state::{
     chain_index::NonFinalizedSnapshot, ChainIndex, ChainIndexSnapshot, Height, IndexedBlock,
     NodeBackedIndexerService, NodeBackedIndexerServiceConfig, ZcashService,
@@ -90,6 +106,8 @@ mod insertion_bound_artifact;
 mod private_proto;
 #[cfg(feature = "private-service")]
 mod private_service;
+#[cfg(feature = "private-service")]
+use crate::private_service::PrivateQueryListener;
 #[cfg(feature = "typed-qualification")]
 mod qualification_artifact;
 #[cfg(feature = "typed-qualification")]
@@ -125,6 +143,51 @@ enum Command {
     Release(ReleaseCommand),
     /// Run source-bound or typed-worker qualification procedures without a listener.
     Qualification(QualificationCommand),
+    /// Serve the private ORAM query surface over a bound gRPC listener.
+    #[cfg(feature = "private-service")]
+    Private(PrivateCommand),
+}
+
+#[cfg(feature = "private-service")]
+#[derive(Debug, Args)]
+struct PrivateCommand {
+    #[command(subcommand)]
+    command: PrivateSubcommand,
+}
+
+#[cfg(feature = "private-service")]
+#[derive(Debug, Subcommand)]
+enum PrivateSubcommand {
+    /// Rebuild a finalized projection from the node, then serve private queries.
+    Serve(PrivateServeArgs),
+}
+
+#[cfg(feature = "private-service")]
+#[derive(Debug, Args)]
+struct PrivateServeArgs {
+    /// Mainnet Zainod TOML config used to open the canonical indexed source.
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+
+    /// Complete three-file capture directory bound to the sizing input.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Complete three-file sizing directory that fixes the projection shape.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+
+    /// Directory holding this runtime's crash-durable replay journal.
+    #[arg(long, value_name = "DIR")]
+    replay_journal_dir: PathBuf,
+
+    /// Address the private gRPC surface binds to.
+    #[arg(long, value_name = "ADDR")]
+    listen_address: SocketAddr,
+
+    /// Emit projection-replay progress every this many public block heights.
+    #[arg(long)]
+    progress_interval: NonZeroU32,
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -755,6 +818,10 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             QualificationSubcommand::InsertionBound(args) => run_insertion_bound(args).await,
             QualificationSubcommand::HybridSizing(args) => run_hybrid_sizing(args).await,
         },
+        #[cfg(feature = "private-service")]
+        Command::Private(command) => match command.command {
+            PrivateSubcommand::Serve(args) => run_private_serve(args).await,
+        },
     }
 }
 
@@ -1297,6 +1364,191 @@ async fn analyze_hybrid_sizing_fixed_snapshot(
     .await
 }
 
+/// Record-schema and key-epoch version this runner composes runtimes at.
+///
+/// Fixed rather than configurable: both are bound into the serving identity a
+/// refresh pins, so a runner that let them drift would produce projections no
+/// runtime could recognise.
+#[cfg(feature = "private-service")]
+const PRIVATE_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "private-service")]
+const PRIVATE_KEY_EPOCH: u64 = 1;
+
+/// Rebuilds the projection this process will serve, then serves it.
+///
+/// Binding happens before the indexer is spawned so a port collision is
+/// reported as such rather than after a full chain replay has been paid for.
+#[cfg(feature = "private-service")]
+async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    let config = load_config(&args.config)?;
+    if config.network != Network::Mainnet {
+        return Err(RunnerError::MainnetRequired {
+            configured: config.network,
+        }
+        .into());
+    }
+    let source_backend = backend_kind(config.backend);
+    let shape = private_projection_shape(&capture, &sizing)?;
+
+    let listener = PrivateQueryListener::bind(args.listen_address).await?;
+    let listening_on = listener.local_addr();
+
+    let service_config = NodeBackedIndexerServiceConfig::try_from(config)?;
+    let mut service = NodeBackedIndexerService::spawn(service_config).await?;
+    let served = serve_private_surface(
+        &service,
+        listener,
+        listening_on,
+        &capture,
+        source_backend,
+        args.progress_interval,
+        shape,
+        &args.replay_journal_dir,
+    )
+    .await;
+    service.close();
+    served
+}
+
+/// Derives the projection dimensions from the validated sizing artifact.
+///
+/// Nothing here is a knob: the sizing artifact is the measured answer to how
+/// wide the tables must be, and the seen/live output bounds come from the
+/// capture the sizing was validated against.
+#[cfg(feature = "private-service")]
+fn private_projection_shape(
+    capture: &ValidatedCapture,
+    sizing: &ValidatedSizing,
+) -> RunnerResult<PrivateProjectionShape> {
+    let model = sizing.qualification().model();
+    let outputs = usize::try_from(capture.measurement().output_count())
+        .map_err(|_| RunnerError::PrivateProjectionUnavailable)?
+        .max(1);
+    let width = |value: u64| -> RunnerResult<usize> {
+        usize::try_from(value).map_err(|_| RunnerError::PrivateProjectionUnavailable.into())
+    };
+    Ok(PrivateProjectionShape {
+        network: PrivateNetwork::Mainnet,
+        schema_version: PRIVATE_SCHEMA_VERSION,
+        key_epoch: PRIVATE_KEY_EPOCH,
+        projection_epoch: fresh_private_epoch()?,
+        max_seen_outputs: outputs,
+        max_live_outputs: outputs,
+        directory_admission: width(model.directory_admission_limit())?,
+        event_admission: width(model.event_admission_limit())?,
+        max_events_per_address: width(model.max_events_per_address())?,
+        directory_capacity: model.directory_capacity(),
+        event_capacity: model.event_capacity(),
+    })
+}
+
+/// A nonzero epoch no earlier run of this binary can collide with.
+///
+/// Wall-clock nanoseconds with the low bit forced: the epoch only has to
+/// separate this process's durable state from a predecessor's, and a clock
+/// that went backwards would produce a stale-looking epoch the journal's own
+/// identity checks reject rather than a silently reused one.
+#[cfg(feature = "private-service")]
+fn fresh_private_epoch() -> RunnerResult<u64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RunnerError::PrivateProjectionUnavailable)?;
+    Ok(u64::try_from(now.as_nanos() % u128::from(u64::MAX))
+        .map_err(|_| RunnerError::PrivateProjectionUnavailable)?
+        | 1)
+}
+
+/// Replays the finalized chain into a projection, pins it, and serves.
+#[cfg(feature = "private-service")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every input is a distinct deployment decision; grouping them into \
+              a struct used at exactly one call site would hide that"
+)]
+async fn serve_private_surface(
+    service: &NodeBackedIndexerService,
+    listener: PrivateQueryListener,
+    listening_on: SocketAddr,
+    capture: &ValidatedCapture,
+    source_backend: BackendKind,
+    progress_interval: NonZeroU32,
+    shape: PrivateProjectionShape,
+    replay_journal_dir: &Path,
+) -> RunnerResult<()> {
+    let (projection, _source_snapshot) = replay_preverified_snapshot(
+        service,
+        capture,
+        source_backend,
+        progress_interval,
+        "private_projection",
+        || {
+            FinalizedProjectionBuilder::start(&shape)
+                .map_err(|_| RunnerError::PrivateProjectionUnavailable.into())
+        },
+        |builder, block| {
+            builder
+                .push(block)
+                .map_err(|_| RunnerError::PrivateProjectionUnavailable.into())
+        },
+        |builder| {
+            builder
+                .finish()
+                .map_err(|_| RunnerError::PrivateProjectionUnavailable.into())
+        },
+    )
+    .await?;
+    let committed_height = projection.committed_height();
+
+    let deployment = PrivateRuntimeDeployment {
+        // The capture digest is already this deployment's public identity;
+        // deriving the namespace from it keeps one more operator-supplied
+        // identifier out of the surface.
+        service_namespace_id: private_service_namespace_id(capture),
+        owner_generation: fresh_private_epoch()?,
+        replay_journal_root: replay_journal_dir.to_path_buf(),
+        projection: shape,
+    };
+    let mut runtime = mainnet_private_query_runtime::<ValidatorConnector>(
+        &deployment,
+        PrivateRuntimeKeys::ephemeral().map_err(|_| RunnerError::PrivateRuntimeUnavailable)?,
+    )
+    .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
+
+    let subscriber = service.get_subscriber().inner();
+    runtime
+        .refresh(&subscriber.indexer, projection)
+        .await
+        .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
+
+    println!(
+        "private_surface_listening={listening_on},committed_height:{committed_height},envelope_bytes:{PRIVATE_MAINNET_ENVELOPE_BYTES}"
+    );
+    listener
+        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(runtime, async {
+            // A failed signal registration must stop the server rather than
+            // leave it serving with no way to be asked to stop.
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                eprintln!("private_surface_shutdown=signal_unavailable,error:{error}");
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+/// Binds the replay journal's namespace to the capture this service serves.
+#[cfg(feature = "private-service")]
+fn private_service_namespace_id(capture: &ValidatedCapture) -> [u8; 16] {
+    let mut hasher = Blake2s256::new();
+    Digest::update(&mut hasher, b"zainod-oram/private-service-namespace/v1\0");
+    Digest::update(&mut hasher, capture.measurement_blake2s256().as_bytes());
+    let digest = Digest::finalize(hasher);
+    let mut namespace = [0; 16];
+    namespace.copy_from_slice(&digest[..16]);
+    namespace
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the helper keeps source preverification and ordered replay identical across consumers"
@@ -1660,6 +1912,10 @@ enum RunnerError {
     InsertionFailureBudgetMiss {
         failure_budget_bps: u64,
     },
+    #[cfg(feature = "private-service")]
+    PrivateProjectionUnavailable,
+    #[cfg(feature = "private-service")]
+    PrivateRuntimeUnavailable,
     IncompleteCheckpoint,
     InvalidCheckpointHash,
     TargetAboveServiceable {
@@ -1725,6 +1981,14 @@ impl fmt::Display for RunnerError {
                 f,
                 "source-bound insertion analysis exceeded the declared {failure_budget_bps}-basis-point sampled failure budget; the valid NO-GO artifact was published"
             ),
+            #[cfg(feature = "private-service")]
+            Self::PrivateProjectionUnavailable => f.write_str(
+                "the sized projection could not be built from the canonical finalized chain",
+            ),
+            #[cfg(feature = "private-service")]
+            Self::PrivateRuntimeUnavailable => {
+                f.write_str("the private-query runtime could not be composed or refreshed")
+            }
             Self::IncompleteCheckpoint => {
                 f.write_str("target height and target hash must be supplied together")
             }
@@ -1922,6 +2186,8 @@ mod tests {
             },
             Command::Corpus(_) => panic!("release arguments parsed as corpus"),
             Command::Qualification(_) => panic!("release arguments parsed as qualification"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("release arguments parsed as private"),
         };
         assert_eq!(
             args.source_revision,
@@ -1964,6 +2230,8 @@ mod tests {
             },
             Command::Corpus(_) => panic!("release arguments parsed as corpus"),
             Command::Qualification(_) => panic!("release arguments parsed as qualification"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("release arguments parsed as private"),
         }
         Ok(())
     }
@@ -2224,6 +2492,8 @@ mod tests {
             #[cfg(feature = "typed-qualification")]
             Command::Release(_) => panic!("release arguments parsed as corpus"),
             Command::Qualification(_) => panic!("qualification arguments parsed as corpus"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("corpus arguments parsed as private"),
         }
     }
 
@@ -2247,6 +2517,8 @@ mod tests {
             Command::Corpus(_) => panic!("insertion-bound arguments parsed as corpus"),
             #[cfg(feature = "typed-qualification")]
             Command::Release(_) => panic!("insertion-bound arguments parsed as release"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("insertion-bound arguments parsed as private"),
         }
     }
 
@@ -2272,6 +2544,8 @@ mod tests {
             Command::Corpus(_) => panic!("hybrid-sizing arguments parsed as corpus"),
             #[cfg(feature = "typed-qualification")]
             Command::Release(_) => panic!("hybrid-sizing arguments parsed as release"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("hybrid-sizing arguments parsed as private"),
         }
     }
 
@@ -2304,6 +2578,8 @@ mod tests {
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
             Command::Release(_) => panic!("stress arguments parsed as release"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("stress arguments parsed as private"),
         }
     }
 
@@ -2338,6 +2614,8 @@ mod tests {
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
             Command::Release(_) => panic!("qualification arguments parsed as release"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("qualification arguments parsed as private"),
         };
         assert_eq!(args.output_dir, PathBuf::from("/tmp/oram-qualification"));
 
@@ -2689,6 +2967,8 @@ mod tests {
             },
             Command::Corpus(_) => panic!("target-load arguments parsed as corpus"),
             Command::Release(_) => panic!("target-load arguments parsed as release"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("target-load arguments parsed as private"),
         };
         assert_eq!(args.profile, TargetLoadProfileArg::BuilderFoundationV1);
         assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
@@ -2731,6 +3011,8 @@ mod tests {
             },
             Command::Corpus(_) => panic!("cold-rebuild arguments parsed as corpus"),
             Command::Release(_) => panic!("cold-rebuild arguments parsed as release"),
+            #[cfg(feature = "private-service")]
+            Command::Private(_) => panic!("cold-rebuild arguments parsed as private"),
         };
         assert_eq!(args.profile, ColdRebuildProfileArg::SourceBoundBuilderV1);
         assert_eq!(args.config, PathBuf::from("/tmp/zainod.toml"));

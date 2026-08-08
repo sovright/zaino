@@ -458,7 +458,12 @@ impl MainnetCorpusMeasurement {
         &self.checkpoint
     }
 
-    pub(super) const fn output_count(&self) -> u64 {
+    /// Transparent outputs the measured corpus observed.
+    ///
+    /// Public because a private-service deployment sizes its projection's
+    /// seen- and live-output bounds from exactly this figure; it is already
+    /// public chain data recorded in the capture artifact.
+    pub const fn output_count(&self) -> u64 {
         self.aggregate.output_count()
     }
 

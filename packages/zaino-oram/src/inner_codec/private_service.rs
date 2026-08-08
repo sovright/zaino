@@ -40,7 +40,7 @@ use zeroize::Zeroizing;
 use super::{
     composition::{finalized_runtime_owner, RuntimeDeployment, RuntimeKeyMaterial},
     runtime::FinalizedRuntimeOwner,
-    security_owner::RoundMaterialSource,
+    security_owner::{OsEntropy, RoundEntropy, RoundMaterialSource},
     EnvelopeProtector,
 };
 use crate::{
@@ -276,6 +276,31 @@ pub struct PrivateRuntimeKeys {
 }
 
 impl PrivateRuntimeKeys {
+    /// Draws four fresh keys from the operating-system generator.
+    ///
+    /// Process-lifetime only, and that is the point: this crate has no key
+    /// custody, so rather than invent one, a deployment without an external
+    /// custodian gets keys that die with the process. Every continuation token
+    /// and journal record sealed under them becomes unreadable at restart,
+    /// which fails closed rather than silently reusing material whose
+    /// provenance nobody can state.
+    pub fn ephemeral() -> Result<Self, PrivateQueryUnavailable> {
+        let mut entropy = OsEntropy;
+        let mut key = || -> Result<[u8; PRIVATE_RUNTIME_KEY_BYTES], PrivateQueryUnavailable> {
+            let mut bytes = [0; PRIVATE_RUNTIME_KEY_BYTES];
+            entropy
+                .fill(&mut bytes)
+                .map_err(|_| PrivateQueryUnavailable)?;
+            Ok(bytes)
+        };
+        Ok(Self {
+            request_key: key()?,
+            response_key: key()?,
+            token_key: key()?,
+            replay_journal_key: key()?,
+        })
+    }
+
     fn material(self) -> RuntimeKeyMaterial {
         RuntimeKeyMaterial {
             request_key: Zeroizing::new(self.request_key),
@@ -435,7 +460,13 @@ where
 pub fn mainnet_private_query_runtime<Source>(
     deployment: &PrivateRuntimeDeployment,
     keys: PrivateRuntimeKeys,
-) -> Result<impl MainnetPrivateQueryRuntime<Source> + Send + 'static, PrivateQueryUnavailable>
+) -> Result<
+    // The pending response must be `Send + 'static` for a listener to own the
+    // runtime on a spawned task; the concrete type satisfies it, but the
+    // opaque return would otherwise not say so.
+    impl MainnetPrivateQueryRuntime<Source, PendingResponse: Send + 'static> + Send + 'static,
+    PrivateQueryUnavailable,
+>
 where
     Source: BlockchainSource,
 {
@@ -558,6 +589,46 @@ mod tests {
         narrow.max_events_per_address -= 1;
 
         assert!(FinalizedProjectionBuilder::start(&narrow).is_err());
+        Ok(())
+    }
+
+    /// The composed runtime opens a real replay journal and, having never
+    /// pinned a serving epoch, refuses every request. A listener may bind to
+    /// it in that state; it must simply answer nothing.
+    #[test]
+    fn a_composed_runtime_refuses_every_request_before_its_first_refresh() -> FixtureResult<()> {
+        let root = tempfile::TempDir::new()?;
+        let deployment = PrivateRuntimeDeployment {
+            service_namespace_id: [0x55; 16],
+            owner_generation: 1,
+            replay_journal_root: root.path().join("replay"),
+            projection: shape(private_mainnet_store_reads()?),
+        };
+
+        let mut runtime = mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
+            &deployment,
+            PrivateRuntimeKeys::ephemeral().map_err(|_| "the OS generator yields four keys")?,
+        )
+        .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
+
+        assert!(runtime
+            .query_page([0; PRIVATE_MAINNET_ENVELOPE_BYTES])
+            .is_err());
+        MainnetPrivateQueryRuntime::<zaino_state::ValidatorConnector>::shutdown(&mut runtime)
+            .map_err(|_| "an idle runtime stops cleanly")?;
+        Ok(())
+    }
+
+    /// Four keys drawn in one call must not collide; a repeated key would
+    /// cross-authenticate two protection domains that are meant to be separate.
+    #[test]
+    fn ephemeral_keys_are_drawn_independently() -> FixtureResult<()> {
+        let keys = PrivateRuntimeKeys::ephemeral().map_err(|_| "the OS generator yields keys")?;
+
+        assert_ne!(keys.request_key, keys.response_key);
+        assert_ne!(keys.token_key, keys.replay_journal_key);
+        assert_ne!(keys.request_key, keys.token_key);
+        assert_eq!(format!("{keys:?}"), "PrivateRuntimeKeys { ..REDACTED.. }");
         Ok(())
     }
 

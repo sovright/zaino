@@ -40,13 +40,13 @@ const QUERY_PAGE_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/Query
 /// Binding is separate from serving so a caller can learn the assigned port
 /// before any request is accepted, and so a bind failure is reported as such
 /// rather than surfacing inside the serve loop.
-pub(super) struct PrivateQueryListener {
+pub(crate) struct PrivateQueryListener {
     listener: TcpListener,
     local_addr: SocketAddr,
 }
 
 impl PrivateQueryListener {
-    pub(super) async fn bind(address: SocketAddr) -> std::io::Result<Self> {
+    pub(crate) async fn bind(address: SocketAddr) -> std::io::Result<Self> {
         let listener = TcpListener::bind(address).await?;
         let local_addr = listener.local_addr()?;
         Ok(Self {
@@ -55,12 +55,12 @@ impl PrivateQueryListener {
         })
     }
 
-    pub(super) const fn local_addr(&self) -> SocketAddr {
+    pub(crate) const fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     /// Serves the private surface until `shutdown` resolves.
-    pub(super) async fn serve<H, const N: usize>(
+    pub(crate) async fn serve<H, const N: usize>(
         self,
         handler: H,
         shutdown: impl Future<Output = ()>,
@@ -284,6 +284,70 @@ mod tests {
         let response = query_page_over_the_wire(address, vec![1, 2, 3, 4]).await?;
 
         assert_eq!(response.envelope, RESPONSE);
+
+        let _ = stop.send(());
+        served.await??;
+        Ok(())
+    }
+
+    /// The real composed runtime -- real XChaCha20 lease, real replay journal
+    /// on disk -- must be servable behind this listener, and must answer the
+    /// surface's one failure until a serving epoch is pinned.
+    ///
+    /// This is the seam the binary uses: everything below except the
+    /// `refresh` call is exactly what `zainod-oram private serve` performs.
+    /// Pinning an epoch needs a live chain subscriber, which no unit test can
+    /// stand up, so this covers composition and transport and stops there.
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently
+    /// on separate tasks and the client blocks on a response the server sends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_real_composed_runtime_serves_the_bound_surface(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let journal = tempfile::TempDir::new()?;
+        let deployment = zaino_oram::PrivateRuntimeDeployment {
+            service_namespace_id: [0x5a; 16],
+            owner_generation: 1,
+            replay_journal_root: journal.path().join("replay"),
+            projection: zaino_oram::PrivateProjectionShape {
+                network: zaino_oram::PrivateNetwork::Mainnet,
+                schema_version: 1,
+                key_epoch: 1,
+                projection_epoch: 1,
+                max_seen_outputs: 1,
+                max_live_outputs: 1,
+                directory_admission: 1,
+                event_admission: 4096,
+                max_events_per_address: zaino_oram::private_mainnet_store_reads()
+                    .map_err(|_| "the compiled profile reports its store reads")?,
+                directory_capacity: 8,
+                event_capacity: 8192,
+            },
+        };
+        let runtime = zaino_oram::mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
+            &deployment,
+            zaino_oram::PrivateRuntimeKeys::ephemeral()
+                .map_err(|_| "the OS generator yields four keys")?,
+        )
+        .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
+
+        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+        let address = listener.local_addr();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            listener
+                .serve::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(runtime, async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+
+        let status =
+            query_page_over_the_wire(address, vec![0; zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES])
+                .await
+                .expect_err("an unrefreshed runtime has no serving epoch to answer from");
+
+        assert_eq!(status.message(), "private query unavailable");
 
         let _ = stop.send(());
         served.await??;
