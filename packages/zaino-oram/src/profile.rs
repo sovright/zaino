@@ -579,6 +579,14 @@ pub(super) fn mainnet_utxo_history_profile() -> Result<PrivacyProfile, PrivacyPr
         label: "zaino.private.mainnet.utxo-history.v1",
         store_reads: MAINNET_STORE_READS,
         padded_input_slots: 1,
+        // UNMEASURED. Set to match the finalized width by symmetry, not from
+        // evidence. The Gate 1 capture records only `max_per_address_delta_events`
+        // per rebuild interval (153,037 at 288 blocks), which is the same outlier
+        // address the finalized width deliberately ignores, and no per-address
+        // delta histogram exists: `GenerationSummary` collapses to maxima before
+        // the report is written. Grounding this needs that histogram threaded
+        // through generation accumulation and a rescan. Until then this is the
+        // one dimension of the identifier below not backed by a measurement.
         recent_snapshot_scan_slots: MAINNET_QUERY_SLOTS,
         response_slots: MAINNET_QUERY_SLOTS,
         envelope_bytes: MAINNET_ENVELOPE_BYTES,
