@@ -1,15 +1,5 @@
 //! Adaptation between the private wire contract and an ORAM handler.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the wire adapter, its Tonic body, and the bound listener land \
-                  before the zainod-oram entry point that composes a real runtime \
-                  behind them"
-    )
-)]
-
 use std::fmt;
 use zaino_oram::FixedEnvelopeRuntime;
 #[cfg(test)]
@@ -19,6 +9,8 @@ use crate::private_proto;
 
 mod listener;
 mod tonic_body;
+
+pub(crate) use listener::PrivateQueryListener;
 
 /// Exact application envelope after validation at the private wire boundary.
 struct ValidatedFixedEnvelope<const N: usize> {

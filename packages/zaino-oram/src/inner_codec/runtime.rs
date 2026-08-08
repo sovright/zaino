@@ -1362,7 +1362,7 @@ where
     }
 
     /// Retires the prior epoch before capture and publishes no stale fallback.
-    async fn refresh(
+    pub(super) async fn refresh(
         &mut self,
         subscriber: &NodeBackedChainIndexSubscriber<Source>,
         finalized_store: FinalizedProjectionServingStore,
@@ -1407,7 +1407,7 @@ where
         result
     }
 
-    fn shutdown(&mut self) -> Result<(), FinalizedRuntimeOwnerError> {
+    pub(super) fn shutdown(&mut self) -> Result<(), FinalizedRuntimeOwnerError> {
         stop_finalized_runtime_after_responses(
             &mut self.runtime,
             &mut self.stopped,

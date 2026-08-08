@@ -172,15 +172,6 @@ pub(super) fn security_lease<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: 
 /// job is to make sure no request is served from an epoch that was never
 /// pinned.
 #[cfg(feature = "corpus-zaino")]
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "the composition root lands before the zainod-oram service that binds a \
-                  listener to it; constructing one here would need a BlockchainSource stub \
-                  that exercises nothing, since only refresh touches the source"
-    )
-)]
 pub(super) fn finalized_runtime_owner<
     Source,
     const RESPONSE_SLOTS: usize,

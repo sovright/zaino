@@ -38,7 +38,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tar = { version = "0.4.46", default-features = false }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tonic = { workspace = true, optional = true }
 tonic-prost = { version = "0.14", optional = true }
 zaino-common = { version = "0.2.0", path = "../zaino-common" }
