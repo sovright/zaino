@@ -518,6 +518,85 @@ fn update_profile_u64_dimension(hasher: &mut Blake2s256, semantic_unit_tag: u8, 
     Digest::update(hasher, dimension.to_be_bytes());
 }
 
+/// Fixed per-request scan depth and response width for the mainnet profile.
+///
+/// One number governs both: scanning deeper than the envelope can return is
+/// wasted work, and returning more than was scanned is impossible. Its value is
+/// derived from the Gate 1 Mainnet capture at height 3,425,046
+/// (`docs/evidence/oram/gate1/hybrid-mainnet-2316644-h3425046-v1/`), whose
+/// live-UTXO histogram covers all 9,193,009 distinct standard addresses:
+///
+/// - 90.81% hold no live UTXO at all and complete in one round trip trivially.
+/// - Among the 844,678 that hold any, the median is 1 and the 90th percentile
+///   is 36. At 256 slots, 98.85% of them complete in one round trip, as do
+///   99.89% of all addresses.
+/// - The maximum is 262,983, held by one address whose profile is an exchange
+///   rather than a user. Sizing the fixed work to it would charge every request
+///   roughly 16 times this scan for a population 7,000 times smaller than the
+///   90th percentile, so it is deliberately left to paginate.
+///
+/// Cost follows from the same capture's insertion-equivalent curve in
+/// `cost_model`: roughly 55 ms of scan work per request against the finalized
+/// table, and the same again against the recent-snapshot window. Those figures
+/// are extrapolated beyond the measured 2^10..2^14 range and time a complete
+/// insertion rather than a single read, so they screen a design point rather
+/// than establish an SLO.
+const MAINNET_QUERY_SLOTS: usize = 256;
+
+/// Probe counts fixed by the compiled layout, mirrored from `cost_model`.
+const MAINNET_DIRECTORY_PROBES: usize = 4;
+const MAINNET_EVENT_PROBES: usize = 4;
+
+/// Logical store calls per query: one directory probe set plus one probe set
+/// per scanned slot.
+const MAINNET_STORE_READS: usize =
+    MAINNET_DIRECTORY_PROBES + MAINNET_EVENT_PROBES * MAINNET_QUERY_SLOTS;
+
+/// Fixed protected envelope width.
+///
+/// The response body needs 21,742 bytes at 256 slots (`RESULT_SLOT_BYTES` is
+/// 84, plus the header, outcome, flags, continuation token, and session
+/// binding) and the envelope adds 40 bytes of nonce and authentication. The
+/// remainder is zero padding the codec already requires, kept as headroom for
+/// layout growth that would otherwise force a profile identifier change.
+const MAINNET_ENVELOPE_BYTES: usize = 24_576;
+
+/// Total committed replay transactions before the journal must be rotated.
+///
+/// The journal is append-only and reclaims nothing, so this is an operational
+/// deadline rather than a steady-state limit: roughly two years at one request
+/// per second.
+const MAINNET_REPLAY_TRANSACTION_CAPACITY: u64 = 1 << 26;
+
+/// The compiled mainnet transparent UTXO-history profile.
+///
+/// Every dimension below is authoritative: each one is hashed into the profile
+/// identifier that the security lease, replay namespace, and every envelope's
+/// associated data bind to. Changing any of them is a new profile, not a
+/// reconfiguration of this one.
+pub(super) fn mainnet_utxo_history_profile() -> Result<PrivacyProfile, PrivacyProfileError> {
+    PrivacyProfile::new(PrivacyProfileDefinition {
+        label: "zaino.private.mainnet.utxo-history.v1",
+        store_reads: MAINNET_STORE_READS,
+        padded_input_slots: 1,
+        recent_snapshot_scan_slots: MAINNET_QUERY_SLOTS,
+        response_slots: MAINNET_QUERY_SLOTS,
+        envelope_bytes: MAINNET_ENVELOPE_BYTES,
+        // One real round and one cover round.
+        cover_rounds: 2,
+        // The largest address paginates over roughly a thousand requests; an
+        // hour keeps that walk inside a single continuation lifetime.
+        continuation_ttl_seconds: 3_600,
+        // Above the roughly 110 ms of worst-case scan work, so the observable
+        // bucket does not vary with the work actually performed.
+        timeout_bucket_millis: 250,
+        concurrency_queue_limit: 64,
+        replay_transaction_capacity: MAINNET_REPLAY_TRANSACTION_CAPACITY,
+        replay_expiry_bucket_width_seconds: 600,
+        replay_garbage_collection_interval_seconds: 600,
+    })
+}
+
 #[cfg(test)]
 const TEST_REPLAY_TRANSACTION_CAPACITY: u64 = 32;
 #[cfg(test)]
@@ -933,5 +1012,52 @@ mod tests {
             .expect("test profile exactly matches its compiled shapes");
         assert_eq!(shape.profile().cover_rounds(), 3);
         assert_eq!(shape.empty_envelope().as_bytes().len(), 128);
+    }
+
+    #[test]
+    fn mainnet_profile_compiles_to_its_declared_shape() -> Result<(), Box<dyn std::error::Error>> {
+        let profile = mainnet_utxo_history_profile()?;
+
+        assert_eq!(profile.response_slots(), MAINNET_QUERY_SLOTS);
+        assert_eq!(profile.envelope_bytes(), MAINNET_ENVELOPE_BYTES);
+        assert_eq!(profile.store_reads(), 1_028);
+        profile.validate_recent_snapshot_slots::<MAINNET_QUERY_SLOTS>()?;
+
+        let shape =
+            CompiledQueryShape::<MAINNET_QUERY_SLOTS, MAINNET_ENVELOPE_BYTES>::new(profile)?;
+        assert_eq!(
+            shape.empty_envelope().as_bytes().len(),
+            MAINNET_ENVELOPE_BYTES
+        );
+        Ok(())
+    }
+
+    /// The identifier binds every authoritative dimension, so a changed
+    /// parameter silently invalidates every lease, replay namespace, and sealed
+    /// envelope minted under the old one. Pinning the bytes makes that a test
+    /// failure rather than a production mismatch.
+    #[test]
+    fn mainnet_profile_identifier_is_pinned() -> Result<(), PrivacyProfileError> {
+        const MAINNET_PROFILE_ID: [u8; PROFILE_ID_BYTES] = [
+            0x67, 0x4f, 0xfb, 0xb1, 0x66, 0x9b, 0xe6, 0xfe, 0x65, 0xa1, 0xaa, 0x5d, 0x01, 0xf6,
+            0xcb, 0x93,
+        ];
+        let profile = mainnet_utxo_history_profile()?;
+
+        assert_eq!(profile.profile_id(), &MAINNET_PROFILE_ID);
+        Ok(())
+    }
+
+    /// The scan depth is one number because scanning deeper than the envelope
+    /// can return is wasted work. This pins the two together.
+    #[test]
+    fn mainnet_scan_depth_matches_the_response_width() -> Result<(), PrivacyProfileError> {
+        let profile = mainnet_utxo_history_profile()?;
+
+        assert_eq!(
+            profile.store_reads(),
+            MAINNET_DIRECTORY_PROBES + MAINNET_EVENT_PROBES * profile.response_slots()
+        );
+        Ok(())
     }
 }
