@@ -7,7 +7,7 @@
 //! is not an ORAM layout, insertion-failure, backend, or target-hardware
 //! qualification.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use zaino_state::IndexedBlock;
@@ -109,6 +109,22 @@ struct LiveUtxoBucket {
     address_count: u64,
 }
 
+/// One point of the per-address delta-event distribution for a rebuild
+/// interval.
+///
+/// `address_count` counts address-generation observations, not distinct
+/// addresses: an address that moves in three generations contributes three
+/// observations, one per generation, each bucketed by that generation's own
+/// event count. Addresses idle for a generation contribute nothing, so the
+/// distribution is over the addresses a generation actually touches — which is
+/// exactly the population a recent-snapshot scan has to cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeltaEventBucket {
+    delta_events: u64,
+    address_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BasePageCandidateReport {
@@ -175,6 +191,15 @@ struct RebuildIntervalReport {
     max_per_address_add_events: u64,
     max_per_address_spend_events: u64,
     max_per_address_delta_events: u64,
+    /// Full per-address delta-event distribution over every generation of this
+    /// interval, ascending by `delta_events`.
+    ///
+    /// Empty means unmeasured, not "no deltas": captures published before this
+    /// field existed carry no distribution, and rejecting them would invalidate
+    /// evidence that is otherwise byte-identical and still reproducible. A
+    /// populated histogram is validated exactly against the replay totals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    per_address_delta_event_histogram: Vec<DeltaEventBucket>,
     page_candidates: Vec<DeltaPageCandidateReport>,
 }
 
@@ -596,6 +621,13 @@ impl fmt::Display for SourceBoundHybridSizingReport {
                 interval.max_per_address_spend_events,
                 interval.max_per_address_delta_events,
             )?;
+            for bucket in &interval.per_address_delta_event_histogram {
+                writeln!(
+                    f,
+                    "per_address_delta_bucket=interval_blocks:{},delta_events:{},address_count:{}",
+                    interval.interval_blocks, bucket.delta_events, bucket.address_count,
+                )?;
+            }
             for candidate in &interval.page_candidates {
                 writeln!(
                     f,
@@ -1127,6 +1159,7 @@ impl RebuildIntervalReport {
                     .checked_add(self.max_per_address_spend_events)
                     .ok_or(SourceBoundHybridSizingError::InvalidReport)?
             || self.page_candidates.len() != PAGE_CANDIDATES.len()
+            || !self.per_address_delta_event_histogram_is_consistent(delta_events)?
         {
             return Ok(false);
         }
@@ -1150,6 +1183,39 @@ impl RebuildIntervalReport {
             previous = Some(candidate);
         }
         Ok(true)
+    }
+
+    /// Checks a populated distribution against the replay it was measured from.
+    ///
+    /// Generations partition the applied blocks and every delta event belongs
+    /// to exactly one address in exactly one generation, so the weighted bucket
+    /// sum must equal the replay's total delta events — an exact identity, not
+    /// a bound. An empty histogram is the unmeasured case and passes.
+    fn per_address_delta_event_histogram_is_consistent(
+        &self,
+        delta_events: u64,
+    ) -> Result<bool, SourceBoundHybridSizingError> {
+        if self.per_address_delta_event_histogram.is_empty() {
+            return Ok(true);
+        }
+        let mut previous = None;
+        let mut observed_delta_events = 0_u64;
+        for bucket in &self.per_address_delta_event_histogram {
+            if bucket.delta_events == 0
+                || bucket.address_count == 0
+                || previous.is_some_and(|previous| bucket.delta_events <= previous)
+            {
+                return Ok(false);
+            }
+            observed_delta_events = bucket
+                .delta_events
+                .checked_mul(bucket.address_count)
+                .and_then(|events| observed_delta_events.checked_add(events))
+                .ok_or(SourceBoundHybridSizingError::InvalidReport)?;
+            previous = Some(bucket.delta_events);
+        }
+        Ok(observed_delta_events == delta_events
+            && previous == Some(self.max_per_address_delta_events))
     }
 }
 
@@ -1210,6 +1276,7 @@ struct RebuildIntervalAccumulator {
     max_per_address_add_events: u64,
     max_per_address_spend_events: u64,
     max_per_address_delta_events: u64,
+    per_address_delta_event_counts: BTreeMap<u64, u64>,
     page_candidates: Vec<DeltaPageCandidateReport>,
     tracker: SparseGenerationTracker,
 }
@@ -1236,6 +1303,7 @@ impl RebuildIntervalAccumulator {
             max_per_address_add_events: 0,
             max_per_address_spend_events: 0,
             max_per_address_delta_events: 0,
+            per_address_delta_event_counts: BTreeMap::new(),
             page_candidates,
             tracker: SparseGenerationTracker::new(),
         })
@@ -1281,6 +1349,8 @@ impl RebuildIntervalAccumulator {
         } else {
             None
         };
+        let per_address_delta_event_histogram =
+            build_delta_event_histogram(&self.per_address_delta_event_counts)?;
         let report = RebuildIntervalReport {
             interval_blocks: self.interval_blocks,
             generation_count: self.generation_count,
@@ -1291,6 +1361,7 @@ impl RebuildIntervalAccumulator {
             max_per_address_add_events: self.max_per_address_add_events,
             max_per_address_spend_events: self.max_per_address_spend_events,
             max_per_address_delta_events: self.max_per_address_delta_events,
+            per_address_delta_event_histogram,
             page_candidates: self.page_candidates,
         };
         Ok((report, trailing_partial_generation))
@@ -1314,8 +1385,17 @@ impl RebuildIntervalAccumulator {
         self.max_per_address_delta_events = self
             .max_per_address_delta_events
             .max(summary.max_per_address_delta_events);
-        for (candidate, page_summary) in
-            self.page_candidates.iter_mut().zip(summary.page_candidates)
+        for (&delta_events, &address_count) in &summary.per_address_delta_event_counts {
+            accumulate_delta_event_count(
+                &mut self.per_address_delta_event_counts,
+                delta_events,
+                address_count,
+            )?;
+        }
+        for (candidate, page_summary) in self
+            .page_candidates
+            .iter_mut()
+            .zip(summary.page_candidates.iter().copied())
         {
             candidate.update(page_summary);
         }
@@ -2181,7 +2261,8 @@ struct GenerationEntry {
     spend_events: u64,
 }
 
-#[derive(Clone, Copy)]
+/// Not `Copy`: the retained distribution below owns a map, and reducing it to a
+/// maximum here is exactly what left the recent-snapshot scan width unmeasured.
 struct GenerationSummary {
     total_add_events: u64,
     total_spend_events: u64,
@@ -2189,6 +2270,8 @@ struct GenerationSummary {
     max_per_address_add_events: u64,
     max_per_address_spend_events: u64,
     max_per_address_delta_events: u64,
+    /// Addresses touched by this generation, keyed by their delta-event count.
+    per_address_delta_event_counts: BTreeMap<u64, u64>,
     page_candidates: [GenerationPageSummary; PAGE_CANDIDATES.len()],
 }
 
@@ -2201,6 +2284,7 @@ impl GenerationSummary {
             max_per_address_add_events: 0,
             max_per_address_spend_events: 0,
             max_per_address_delta_events: 0,
+            per_address_delta_event_counts: BTreeMap::new(),
             page_candidates: [GenerationPageSummary::EMPTY; PAGE_CANDIDATES.len()],
         }
     }
@@ -2226,6 +2310,7 @@ impl GenerationSummary {
         self.max_per_address_spend_events =
             self.max_per_address_spend_events.max(entry.spend_events);
         self.max_per_address_delta_events = self.max_per_address_delta_events.max(delta_events);
+        accumulate_delta_event_count(&mut self.per_address_delta_event_counts, delta_events, 1)?;
         for (index, entries_per_page) in PAGE_CANDIDATES.into_iter().enumerate() {
             self.page_candidates[index].record(entry, entries_per_page)?;
         }
@@ -2281,6 +2366,41 @@ impl GenerationPageSummary {
             self.max_per_address_separate_pages.max(separate_pages);
         Ok(())
     }
+}
+
+/// Adds `address_count` observations of `delta_events` to a distribution.
+///
+/// Shared by the per-generation tally and the per-interval merge so both sides
+/// of the roll-up saturate the same way.
+fn accumulate_delta_event_count(
+    counts: &mut BTreeMap<u64, u64>,
+    delta_events: u64,
+    address_count: u64,
+) -> Result<(), SourceBoundHybridSizingError> {
+    let bucket = counts.entry(delta_events).or_insert(0);
+    *bucket = bucket
+        .checked_add(address_count)
+        .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+    Ok(())
+}
+
+fn build_delta_event_histogram(
+    counts: &BTreeMap<u64, u64>,
+) -> Result<Vec<DeltaEventBucket>, SourceBoundHybridSizingError> {
+    let mut histogram = Vec::new();
+    histogram
+        .try_reserve_exact(counts.len())
+        .map_err(|_| SourceBoundHybridSizingError::AllocationFailed)?;
+    // `BTreeMap` iterates ascending, which is the order the report requires.
+    histogram.extend(
+        counts
+            .iter()
+            .map(|(&delta_events, &address_count)| DeltaEventBucket {
+                delta_events,
+                address_count,
+            }),
+    );
+    Ok(histogram)
 }
 
 fn build_live_histogram(
@@ -2547,6 +2667,48 @@ mod tests {
     }
 
     #[test]
+    fn per_address_delta_histogram_retains_every_address_generation_observation(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let mut interval = RebuildIntervalAccumulator::new(2)?;
+        interval.register_address(0)?;
+        interval.register_address(1)?;
+        for _ in 0..9 {
+            interval.record(0, true)?;
+        }
+        interval.record(1, true)?;
+        interval.record(1, false)?;
+        let _ = interval.finish_block()?;
+        let _ = interval.finish_block()?;
+
+        for _ in 0..8 {
+            interval.record(0, false)?;
+        }
+        let _ = interval.finish_block()?;
+        let report = interval.finish()?;
+
+        // Two addresses in the closed generation and one in the trailing
+        // partial generation: the distribution the maxima alone discard.
+        assert_eq!(
+            report.per_address_delta_event_histogram,
+            vec![
+                DeltaEventBucket {
+                    delta_events: 2,
+                    address_count: 1,
+                },
+                DeltaEventBucket {
+                    delta_events: 8,
+                    address_count: 1,
+                },
+                DeltaEventBucket {
+                    delta_events: 9,
+                    address_count: 1,
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sparse_positions_reset_without_scanning_the_registered_domain(
     ) -> Result<(), SourceBoundHybridSizingError> {
         let mut tracker = SparseGenerationTracker::new();
@@ -2671,6 +2833,7 @@ mod tests {
             max_per_address_add_events: 80,
             max_per_address_spend_events: 48,
             max_per_address_delta_events: 128,
+            per_address_delta_event_histogram: Vec::new(),
             page_candidates: vec![DeltaPageCandidateReport {
                 entries_per_page: SELECTED_PAGE_ENTRIES,
                 max_total_add_pages: 5,
@@ -2863,6 +3026,10 @@ mod tests {
                 max_per_address_add_events: 1,
                 max_per_address_spend_events: 0,
                 max_per_address_delta_events: 1,
+                per_address_delta_event_histogram: vec![DeltaEventBucket {
+                    delta_events: 1,
+                    address_count: 1,
+                }],
                 page_candidates: PAGE_CANDIDATES
                     .into_iter()
                     .map(|entries_per_page| DeltaPageCandidateReport {
@@ -2982,6 +3149,65 @@ mod tests {
             report.validate_against(&measurement, &"11".repeat(32)),
             Err(SourceBoundHybridSizingError::InvalidReport)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delta_histogram_accounts_for_every_replayed_delta_event(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let mut report = source_report(&blocks, &measurement)?;
+        for interval in &report.rebuild_interval_reports {
+            let accounted = interval.per_address_delta_event_histogram.iter().try_fold(
+                0_u64,
+                |total, bucket| {
+                    bucket
+                        .delta_events
+                        .checked_mul(bucket.address_count)
+                        .and_then(|events| total.checked_add(events))
+                        .ok_or("histogram weight overflowed")
+                },
+            )?;
+            assert_eq!(accounted, report.delta_events);
+        }
+
+        let interval = report
+            .rebuild_interval_reports
+            .first_mut()
+            .ok_or("fixed interval report must exist")?;
+        let bucket = interval
+            .per_address_delta_event_histogram
+            .first_mut()
+            .ok_or("a replayed generation must contribute a bucket")?;
+        bucket.address_count = bucket
+            .address_count
+            .checked_add(1)
+            .ok_or("bucket count overflowed")?;
+        assert_eq!(
+            report.validate(),
+            Err(SourceBoundHybridSizingError::InvalidReport)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_validation_accepts_a_capture_predating_the_delta_histogram(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let mut report = source_report(&blocks, &measurement)?;
+        // Captures published before the distribution was recorded stay valid;
+        // an empty histogram means unmeasured, not "no deltas".
+        for interval in &mut report.rebuild_interval_reports {
+            interval.per_address_delta_event_histogram.clear();
+        }
+
+        report.validate()?;
+        let encoded = serde_json::to_vec(&report)?;
+        assert!(!encoded
+            .windows(b"per_address_delta_event_histogram".len())
+            .any(|window| window == b"per_address_delta_event_histogram"));
+        let decoded: SourceBoundHybridSizingReport = serde_json::from_slice(&encoded)?;
+        assert_eq!(decoded, report);
         Ok(())
     }
 
