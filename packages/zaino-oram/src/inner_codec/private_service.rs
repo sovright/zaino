@@ -1,0 +1,573 @@
+//! The crate's one public composition seam for a serving private-query runtime.
+//!
+//! Everything the private engine is built from — protectors, leases, the
+//! replay journal, the projection owner — stays crate-internal by design, and
+//! their concrete types are deliberately hidden behind `impl Trait` so no
+//! consumer can name or substitute them. That hiding is why this module
+//! exists: a server binary needs *something* it can hold, and this is the
+//! smallest surface that lets it hold one without learning any of the above.
+//!
+//! The surface is three things and no more:
+//!
+//! 1. [`PrivateRuntimeDeployment`] / [`PrivateRuntimeKeys`] — the inputs a
+//!    deployment must supply. Key custody is still the caller's problem; the
+//!    keys arrive already derived, exactly as [`crate::inner_codec`] requires.
+//! 2. [`FinalizedProjectionBuilder`] → [`FinalizedProjection`] — the only way
+//!    to obtain the read-only serving generation that a first refresh needs.
+//!    Before this, a finalized serving store could be built only inside the
+//!    crate's own tests, so no binary could ever pin a serving epoch.
+//! 3. [`mainnet_private_query_runtime`] returning an
+//!    `impl MainnetPrivateQueryRuntime` — an opaque handle that implements the
+//!    public [`FixedEnvelopeRuntime`] seam a listener consumes, plus the two
+//!    lifecycle operations (`refresh`, `shutdown`) a server must drive.
+//!
+//! Returning `impl Trait` rather than a named struct is load-bearing: the
+//! composed owner's protector types are unnameable by construction, and
+//! erasing them behind a `Box<dyn ..>` would add a vtable hop to the one
+//! fixed-schedule code path this crate exists to keep uniform.
+//!
+//! What this module does *not* establish: obliviousness. The projection below
+//! is built on the qualification memory backend, which provides none — see
+//! [`crate::projection_owner`]. This is a research composition and makes no
+//! production privacy claim.
+
+use std::{future::Future, path::PathBuf};
+
+use blake2::{Blake2s256, Digest};
+use zaino_state::{BlockchainSource, IndexedBlock, NodeBackedChainIndexSubscriber};
+use zeroize::Zeroizing;
+
+use super::{
+    composition::{finalized_runtime_owner, RuntimeDeployment, RuntimeKeyMaterial},
+    runtime::FinalizedRuntimeOwner,
+    security_owner::RoundMaterialSource,
+    EnvelopeProtector,
+};
+use crate::{
+    canonical_chain::{CanonicalNetwork, PublicChainCheckpoint},
+    continuation_token::{ContinuationReplayGuard, ContinuationTokenProtector},
+    layout::{
+        DirectoryTableConfiguration, EventTableConfiguration, FixedProbeLayout, LayoutIdentity,
+        LayoutNetwork,
+    },
+    private_runtime::{FixedEnvelopeRuntime, PrivateQueryUnavailable},
+    profile::{
+        mainnet_utxo_history_profile, CompiledQueryShape, MAINNET_ENVELOPE_BYTES,
+        MAINNET_QUERY_SLOTS,
+    },
+    projection::{ProjectionCapacities, ProjectionConfig},
+    projection_owner::{FinalizedProjectionServingStore, OfflineProjectionOwner},
+    xchacha20::KEY_BYTES,
+};
+
+/// Probe counts fixed by the compiled mainnet layout.
+///
+/// Mirrored from the cost model exactly as `projection_owner::cold_rebuild`
+/// mirrors them; the profile identifier already commits to these figures, so
+/// they are not a knob a deployment may turn.
+const DIRECTORY_PROBES: usize = 4;
+const EVENT_PROBES: usize = 4;
+
+/// One in-flight command; the compiled profile admits a single worker.
+const QUEUE_CAPACITY: usize = 1;
+
+const LAYOUT_SEED_DOMAIN: &[u8] = b"zaino-oram/private-service-layout-seed/v1\0";
+
+/// Exact application-envelope width every request and response must carry.
+pub const PRIVATE_MAINNET_ENVELOPE_BYTES: usize = MAINNET_ENVELOPE_BYTES;
+
+/// Length of each long-lived runtime key.
+pub const PRIVATE_RUNTIME_KEY_BYTES: usize = KEY_BYTES;
+
+/// Chain a private deployment projects and serves.
+///
+/// Mirrors the crate-internal canonical network so a consumer never needs to
+/// name that type. Testnet and regtest exist because the projection is
+/// exercised against them; the compiled profile itself is mainnet-shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateNetwork {
+    /// Zcash mainnet.
+    Mainnet,
+    /// The public Zcash test network.
+    Testnet,
+    /// A local regression-test network.
+    Regtest,
+}
+
+impl PrivateNetwork {
+    const fn canonical(self) -> CanonicalNetwork {
+        match self {
+            Self::Mainnet => CanonicalNetwork::Mainnet,
+            Self::Testnet => CanonicalNetwork::Testnet,
+            Self::Regtest => CanonicalNetwork::Regtest,
+        }
+    }
+
+    const fn layout(self) -> LayoutNetwork {
+        match self {
+            Self::Mainnet => LayoutNetwork::Mainnet,
+            Self::Testnet => LayoutNetwork::Testnet,
+            Self::Regtest => LayoutNetwork::Regtest,
+        }
+    }
+}
+
+/// Fixed dimensions of one finalized projection generation.
+///
+/// Every field is authoritative and is bound into the serving identity the
+/// runtime pins, so two runs that differ in any of them are different
+/// projections rather than one reconfigured projection. Sizing these is a
+/// deployment decision informed by the crate's corpus measurements; nothing
+/// here derives them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivateProjectionShape {
+    /// Chain this projection is built from.
+    pub network: PrivateNetwork,
+    /// Nonzero record-schema version bound into the layout and identity.
+    pub schema_version: u32,
+    /// Nonzero key epoch separating this generation's material from a prior one.
+    pub key_epoch: u64,
+    /// Nonzero projection lifecycle epoch, also used as the layout generation.
+    pub projection_epoch: u64,
+    /// Total transparent outputs the projection may ever observe.
+    pub max_seen_outputs: usize,
+    /// Transparent outputs that may be live at once.
+    pub max_live_outputs: usize,
+    /// Standard addresses the directory table admits; below `directory_capacity`.
+    pub directory_admission: usize,
+    /// Address events the event table admits in total; below `event_capacity`.
+    pub event_admission: usize,
+    /// Events retained per address.
+    ///
+    /// Must be at least [`private_mainnet_store_reads`] — a narrower
+    /// projection cannot answer one compiled query — and at most
+    /// `event_admission`.
+    pub max_events_per_address: usize,
+    /// Physical directory-table slots; a power of two.
+    pub directory_capacity: u64,
+    /// Physical event-table slots; a power of two.
+    pub event_capacity: u64,
+}
+
+impl PrivateProjectionShape {
+    /// Derives the layout probe seed from every authoritative dimension.
+    ///
+    /// Bound to the shape rather than drawn fresh so one shape always lays out
+    /// identically: a rebuild of the same generation must probe the same slots.
+    fn layout_seed(&self) -> [u8; 32] {
+        let mut hasher = Blake2s256::new();
+        Digest::update(&mut hasher, LAYOUT_SEED_DOMAIN);
+        Digest::update(&mut hasher, [self.network as u8]);
+        Digest::update(&mut hasher, self.schema_version.to_be_bytes());
+        Digest::update(&mut hasher, self.key_epoch.to_be_bytes());
+        Digest::update(&mut hasher, self.projection_epoch.to_be_bytes());
+        Digest::update(&mut hasher, self.directory_capacity.to_be_bytes());
+        Digest::update(&mut hasher, self.event_capacity.to_be_bytes());
+        let digest = Digest::finalize(hasher);
+        let mut seed = [0; 32];
+        seed.copy_from_slice(&digest);
+        seed
+    }
+
+    fn projection_config(&self) -> Result<ProjectionConfig, PrivateQueryUnavailable> {
+        let capacities = ProjectionCapacities::new(
+            self.max_seen_outputs,
+            self.max_live_outputs,
+            self.directory_admission,
+            self.event_admission,
+            self.max_events_per_address,
+        )
+        .map_err(|_| PrivateQueryUnavailable)?;
+        ProjectionConfig::new(
+            self.network.canonical(),
+            self.schema_version,
+            self.key_epoch,
+            self.projection_epoch,
+            capacities,
+        )
+        .map_err(|_| PrivateQueryUnavailable)
+    }
+
+    fn layout(
+        &self,
+    ) -> Result<FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>, PrivateQueryUnavailable> {
+        let identity = LayoutIdentity::new(
+            self.network.layout(),
+            self.schema_version,
+            self.key_epoch,
+            self.projection_epoch,
+            self.layout_seed(),
+        )
+        .map_err(|_| PrivateQueryUnavailable)?;
+        let directory = DirectoryTableConfiguration::<DIRECTORY_PROBES>::new(
+            self.directory_capacity,
+            u64::try_from(self.directory_admission).map_err(|_| PrivateQueryUnavailable)?,
+        )
+        .map_err(|_| PrivateQueryUnavailable)?;
+        let events = EventTableConfiguration::<EVENT_PROBES>::new(
+            self.event_capacity,
+            u64::try_from(self.event_admission).map_err(|_| PrivateQueryUnavailable)?,
+        )
+        .map_err(|_| PrivateQueryUnavailable)?;
+        FixedProbeLayout::new(
+            identity,
+            directory,
+            events,
+            u64::try_from(self.max_events_per_address).map_err(|_| PrivateQueryUnavailable)?,
+        )
+        .map_err(|_| PrivateQueryUnavailable)
+    }
+}
+
+/// Logical store reads one compiled mainnet query performs.
+///
+/// A projection whose per-address width is below this cannot answer a single
+/// round, so the builder refuses it up front rather than letting the first
+/// query fail after a real chain replay has already been paid for.
+pub fn private_mainnet_store_reads() -> Result<usize, PrivateQueryUnavailable> {
+    Ok(mainnet_utxo_history_profile()
+        .map_err(|_| PrivateQueryUnavailable)?
+        .store_reads())
+}
+
+/// Deployment identity, durable locations, and the projection they scope.
+///
+/// The projection shape lives here rather than beside it because the runtime
+/// and its serving generation must agree on network, schema version, key
+/// epoch, and projection epoch: pinning a serving epoch compares exactly those
+/// four. Carrying one shape makes disagreement unrepresentable.
+#[derive(Debug, Clone)]
+pub struct PrivateRuntimeDeployment {
+    /// Namespace separating this service's replay journal from any other.
+    pub service_namespace_id: [u8; 16],
+    /// Nonzero generation separating this owner's journal from a predecessor's.
+    pub owner_generation: u64,
+    /// Directory holding the crash-durable replay journal.
+    pub replay_journal_root: PathBuf,
+    /// Shape of the finalized projection this runtime will serve.
+    pub projection: PrivateProjectionShape,
+}
+
+impl PrivateRuntimeDeployment {
+    fn runtime_deployment(&self) -> RuntimeDeployment {
+        RuntimeDeployment {
+            service_namespace_id: self.service_namespace_id,
+            owner_generation: self.owner_generation,
+            key_epoch: self.projection.key_epoch,
+            replay_journal_root: self.replay_journal_root.clone(),
+        }
+    }
+}
+
+/// The four long-lived keys one runtime owns, supplied already derived.
+///
+/// Taken by value and zeroized into the composition, so a caller that drops
+/// this value after handing it over leaves no second copy behind. Where the
+/// keys come from is a custody decision this crate does not make.
+pub struct PrivateRuntimeKeys {
+    /// Protects request envelopes.
+    pub request_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
+    /// Protects response envelopes.
+    pub response_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
+    /// Protects continuation tokens.
+    pub token_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
+    /// Protects replay-journal records.
+    pub replay_journal_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
+}
+
+impl PrivateRuntimeKeys {
+    fn material(self) -> RuntimeKeyMaterial {
+        RuntimeKeyMaterial {
+            request_key: Zeroizing::new(self.request_key),
+            response_key: Zeroizing::new(self.response_key),
+            token_key: Zeroizing::new(self.token_key),
+            replay_journal_key: Zeroizing::new(self.replay_journal_key),
+        }
+    }
+}
+
+impl std::fmt::Debug for PrivateRuntimeKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrivateRuntimeKeys { ..REDACTED.. }")
+    }
+}
+
+/// One completed, read-only finalized projection generation.
+///
+/// Opaque on purpose: it exists to be handed to
+/// [`MainnetPrivateQueryRuntime::refresh`] and to nothing else. Holding one is
+/// not authority to read it.
+pub struct FinalizedProjection {
+    store: FinalizedProjectionServingStore,
+    checkpoint: PublicChainCheckpoint,
+}
+
+impl FinalizedProjection {
+    /// Height of the finalized checkpoint this generation committed to.
+    ///
+    /// The only observation offered, and it is already public chain data: a
+    /// server needs it to report what it is serving.
+    pub const fn committed_height(&self) -> u32 {
+        self.checkpoint.height()
+    }
+}
+
+impl std::fmt::Debug for FinalizedProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FinalizedProjection { ..REDACTED.. }")
+    }
+}
+
+/// Builds one finalized projection generation from canonical indexed blocks.
+///
+/// Blocks must arrive in canonical order from the chain's genesis; the owner
+/// underneath fails closed on any gap or fork, and a failed builder cannot be
+/// finished. Dropping a builder shuts its worker down.
+pub struct FinalizedProjectionBuilder {
+    owner: Option<OfflineProjectionOwner>,
+    latest: Option<PublicChainCheckpoint>,
+}
+
+impl FinalizedProjectionBuilder {
+    /// Allocates one fresh volatile projection worker for `shape`.
+    ///
+    /// Refuses a shape too narrow to answer a compiled mainnet query, because
+    /// that failure is cheap here and expensive after a full replay.
+    pub fn start(shape: &PrivateProjectionShape) -> Result<Self, PrivateQueryUnavailable> {
+        if shape.max_events_per_address < private_mainnet_store_reads()? {
+            return Err(PrivateQueryUnavailable);
+        }
+        let owner = OfflineProjectionOwner::new_on_qualification_memory(
+            shape.projection_config()?,
+            shape.layout()?,
+            usize::try_from(shape.directory_capacity).map_err(|_| PrivateQueryUnavailable)?,
+            usize::try_from(shape.event_capacity).map_err(|_| PrivateQueryUnavailable)?,
+            QUEUE_CAPACITY,
+        )
+        .map_err(|_| PrivateQueryUnavailable)?;
+        Ok(Self {
+            owner: Some(owner),
+            latest: None,
+        })
+    }
+
+    /// Applies one canonical finalized block and waits for its mutations.
+    pub fn push(&mut self, block: &IndexedBlock) -> Result<(), PrivateQueryUnavailable> {
+        let owner = self.owner.as_mut().ok_or(PrivateQueryUnavailable)?;
+        match owner.apply_finalized(block) {
+            Ok(checkpoint) => {
+                self.latest = Some(checkpoint);
+                Ok(())
+            }
+            Err(_) => {
+                self.fail_and_discard();
+                Err(PrivateQueryUnavailable)
+            }
+        }
+    }
+
+    /// Seals the generation at the last applied block and yields it for serving.
+    pub fn finish(mut self) -> Result<FinalizedProjection, PrivateQueryUnavailable> {
+        let target = self.latest.ok_or(PrivateQueryUnavailable)?;
+        let mut owner = self.owner.take().ok_or(PrivateQueryUnavailable)?;
+        if owner.finish(target).map_err(|_| PrivateQueryUnavailable)? != target {
+            return Err(PrivateQueryUnavailable);
+        }
+        let store = owner
+            .into_serving_store()
+            .map_err(|_| PrivateQueryUnavailable)?;
+        Ok(FinalizedProjection {
+            store,
+            checkpoint: target,
+        })
+    }
+
+    fn fail_and_discard(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            let _ = owner.shutdown();
+        }
+    }
+}
+
+impl Drop for FinalizedProjectionBuilder {
+    fn drop(&mut self) {
+        self.fail_and_discard();
+    }
+}
+
+impl std::fmt::Debug for FinalizedProjectionBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FinalizedProjectionBuilder { ..REDACTED.. }")
+    }
+}
+
+/// Lifecycle a server drives around the fixed-envelope query seam.
+///
+/// A freshly composed runtime has no serving epoch and refuses every request
+/// until [`refresh`](Self::refresh) pins one from a live subscriber. That is
+/// the contract: no response is ever served from an epoch that was never
+/// checked against the chain.
+pub trait MainnetPrivateQueryRuntime<Source>:
+    FixedEnvelopeRuntime<PRIVATE_MAINNET_ENVELOPE_BYTES>
+where
+    Source: BlockchainSource,
+{
+    /// Retires the prior epoch, then pins `projection` against the live source.
+    ///
+    /// Failure leaves the runtime with no epoch rather than the previous one:
+    /// a refused refresh must never fall back to stale state.
+    fn refresh<'runtime>(
+        &'runtime mut self,
+        subscriber: &'runtime NodeBackedChainIndexSubscriber<Source>,
+        projection: FinalizedProjection,
+    ) -> impl Future<Output = Result<(), PrivateQueryUnavailable>> + Send + 'runtime;
+
+    /// Stops serving once every in-flight response has been released.
+    fn shutdown(&mut self) -> Result<(), PrivateQueryUnavailable>;
+}
+
+/// Composes one process-lifetime runtime over the compiled mainnet profile.
+///
+/// The returned value serves nothing until refreshed; see
+/// [`MainnetPrivateQueryRuntime`]. Composition opens the deployment's replay
+/// journal, so a failure here is a durable-state failure and not a transient
+/// one.
+pub fn mainnet_private_query_runtime<Source>(
+    deployment: &PrivateRuntimeDeployment,
+    keys: PrivateRuntimeKeys,
+) -> Result<impl MainnetPrivateQueryRuntime<Source> + Send + 'static, PrivateQueryUnavailable>
+where
+    Source: BlockchainSource,
+{
+    let profile = mainnet_utxo_history_profile().map_err(|_| PrivateQueryUnavailable)?;
+    let shape = CompiledQueryShape::<MAINNET_QUERY_SLOTS, MAINNET_ENVELOPE_BYTES>::new(profile)
+        .map_err(|_| PrivateQueryUnavailable)?;
+    finalized_runtime_owner::<
+        Source,
+        MAINNET_QUERY_SLOTS,
+        MAINNET_ENVELOPE_BYTES,
+        MAINNET_QUERY_SLOTS,
+    >(
+        &deployment.runtime_deployment(),
+        deployment.projection.network.canonical(),
+        deployment.projection.schema_version,
+        deployment.projection.projection_epoch,
+        shape,
+        keys.material(),
+    )
+    .map_err(|_| PrivateQueryUnavailable)
+}
+
+impl<Source, E, T, R, N> MainnetPrivateQueryRuntime<Source>
+    for FinalizedRuntimeOwner<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        MAINNET_QUERY_SLOTS,
+        MAINNET_ENVELOPE_BYTES,
+        MAINNET_QUERY_SLOTS,
+    >
+where
+    Source: BlockchainSource,
+    E: EnvelopeProtector + Send,
+    T: ContinuationTokenProtector + Send,
+    R: ContinuationReplayGuard + Send,
+    N: RoundMaterialSource + Send,
+{
+    // Written as an explicit `impl Future` rather than `async fn`: the trait
+    // promises a `Send` future so a server can drive the refresh from a
+    // spawned task, and `async fn` in a trait cannot state that bound.
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "the returned future's Send bound is part of the trait contract"
+    )]
+    fn refresh<'runtime>(
+        &'runtime mut self,
+        subscriber: &'runtime NodeBackedChainIndexSubscriber<Source>,
+        projection: FinalizedProjection,
+    ) -> impl Future<Output = Result<(), PrivateQueryUnavailable>> + Send + 'runtime {
+        async move {
+            Self::refresh(self, subscriber, projection.store)
+                .await
+                .map_err(|_| PrivateQueryUnavailable)
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), PrivateQueryUnavailable> {
+        Self::shutdown(self).map_err(|_| PrivateQueryUnavailable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zaino_fixtures::{projection_chain, FixtureResult};
+
+    /// A regtest shape wide enough for one compiled mainnet query.
+    ///
+    /// `max_events_per_address` is the profile's store-read count, the
+    /// narrowest projection the engine will read from. The event table has to
+    /// admit at least that many events for a single address, so admission and
+    /// capacity are sized off the same figure rather than fixed.
+    fn shape(store_reads: usize) -> PrivateProjectionShape {
+        let event_capacity = u64::try_from(store_reads)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+            .next_power_of_two();
+        PrivateProjectionShape {
+            network: PrivateNetwork::Regtest,
+            schema_version: 1,
+            key_epoch: 7,
+            projection_epoch: 11,
+            max_seen_outputs: 64,
+            max_live_outputs: 64,
+            directory_admission: 3,
+            event_admission: store_reads,
+            max_events_per_address: store_reads,
+            directory_capacity: 8,
+            event_capacity,
+        }
+    }
+
+    #[test]
+    fn a_builder_seals_a_chain_into_a_serving_generation() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let mut builder = FinalizedProjectionBuilder::start(&shape(private_mainnet_store_reads()?))
+            .map_err(|_| "a wide enough regtest shape builds")?;
+
+        for block in &blocks {
+            builder.push(block).map_err(|_| "canonical block applies")?;
+        }
+        let projection = builder.finish().map_err(|_| "the generation seals")?;
+
+        assert_eq!(projection.committed_height(), 2);
+        assert_eq!(
+            format!("{projection:?}"),
+            "FinalizedProjection { ..REDACTED.. }"
+        );
+        Ok(())
+    }
+
+    /// A projection narrower than one query's store reads cannot answer a
+    /// single round, so it must be refused before any chain work is done.
+    #[test]
+    fn a_projection_too_narrow_for_one_query_is_refused_up_front() -> FixtureResult<()> {
+        let mut narrow = shape(private_mainnet_store_reads()?);
+        narrow.max_events_per_address -= 1;
+
+        assert!(FinalizedProjectionBuilder::start(&narrow).is_err());
+        Ok(())
+    }
+
+    /// Finishing without a single applied block has no checkpoint to seal at.
+    #[test]
+    fn an_empty_builder_cannot_seal_a_generation() -> FixtureResult<()> {
+        let builder = FinalizedProjectionBuilder::start(&shape(private_mainnet_store_reads()?))
+            .map_err(|_| "a wide enough regtest shape builds")?;
+
+        assert!(builder.finish().is_err());
+        Ok(())
+    }
+}
