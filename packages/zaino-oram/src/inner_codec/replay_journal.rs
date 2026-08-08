@@ -55,6 +55,9 @@ use super::{
     },
 };
 
+#[cfg(test)]
+use super::security_state_store::witness_conformance;
+
 mod xchacha20;
 
 pub(super) use xchacha20::{record_protector, OsJournalRecordNonces};
@@ -2201,6 +2204,7 @@ mod tests {
     enum CoordinatorWitnessError {
         Conflict,
         Rejected,
+        InvalidTransition,
         AdvanceUnresolved,
     }
 
@@ -2255,12 +2259,36 @@ mod tests {
             if self.state.get() != expected {
                 return Err(CoordinatorWitnessError::Conflict);
             }
+            // A real authority admits only `None -> 1` and exact `n -> n + 1`.
+            // Without this the double would accept sequences the coordinator
+            // could never observe in production, and coordinator tests would
+            // be passing over transitions no conforming witness allows.
+            let valid_sequence = match expected {
+                None => next.test_sequence() == 1,
+                Some(current) => current
+                    .test_sequence()
+                    .checked_add(1)
+                    .is_some_and(|sequence| sequence == next.test_sequence()),
+            };
+            if !valid_sequence {
+                return Err(CoordinatorWitnessError::InvalidTransition);
+            }
             self.state.set(Some(next));
             if self.advance_then_fail.replace(false) {
                 return Err(CoordinatorWitnessError::AdvanceUnresolved);
             }
             Ok(())
         }
+    }
+
+    /// The coordinator's witness double stands in for the external freshness
+    /// authority in every coordinator test, so a double that accepts
+    /// transitions the real contract forbids would let those tests pass over
+    /// sequences no conforming authority would ever produce.
+    #[test]
+    fn the_coordinator_witness_satisfies_the_freshness_contract() -> Result<(), Box<dyn Error>> {
+        witness_conformance::assert_witness_conforms(CoordinatorWitness::empty)?;
+        Ok(())
     }
 
     // Non-cryptographic fixture: its plaintext-derived nonce is deterministic

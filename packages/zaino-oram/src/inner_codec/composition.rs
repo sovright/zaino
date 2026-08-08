@@ -15,6 +15,17 @@
 //! against it. `ReplaySnapshotCoordinator` is the seam for that hardening; it
 //! requires an authority outside the host, which is an attestation decision
 //! rather than a code one.
+//!
+//! That seam stays unwired on purpose. Substituting a host-local witness to
+//! make the coordinator constructible here would close the type hole while
+//! leaving the security hole exactly as open, and would do so under a name
+//! suggesting otherwise — the attacker this property defends against is the
+//! party holding the filesystem. The contract the eventual authority must meet
+//! is written down and executable as
+//! `security_state_store::witness_conformance`; until an implementation backed
+//! by a TPM NV counter, a TEE monotonic counter service, or a remote quorum
+//! clears it, this composition keeps the bare journal and states the limitation
+//! rather than papering over it.
 
 use std::path::PathBuf;
 
