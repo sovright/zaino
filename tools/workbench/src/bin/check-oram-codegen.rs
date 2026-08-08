@@ -56,7 +56,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
-use workbench::{command as tool, run};
+use workbench::{command as tool, encoded_byte_len, is_gnu_prefix, run};
 
 /// The original access-path function whose body must match the approved
 /// profile. These constants remain the default so the historical one-argument
@@ -733,6 +733,27 @@ fn exact_direct_call_symbols(
     parse_exact_direct_call_symbols(text_symbols, relocations, &unwind_listing)
 }
 
+/// Symbols sharing `pinned`'s demangled path but not its disambiguator hash.
+///
+/// Diagnostic only: it reports what a stale pin should be updated to. Matching
+/// itself stays exact, because one path can have several legitimate
+/// instantiations that only the hash tells apart.
+fn same_path_instantiations(text_symbols: &TextSymbols, pinned: &str) -> Vec<String> {
+    let Some(prefix_end) = pinned.rfind("17h") else {
+        return Vec::new();
+    };
+    let prefix = &pinned[..prefix_end];
+    let mut found = text_symbols
+        .values()
+        .flatten()
+        .filter(|name| name.starts_with(prefix) && name.as_str() != pinned)
+        .cloned()
+        .collect::<Vec<_>>();
+    found.sort();
+    found.dedup();
+    found
+}
+
 fn parse_exact_direct_call_symbols(
     text_symbols: &TextSymbols,
     relocations: &DynamicRelocations,
@@ -755,9 +776,22 @@ fn parse_exact_direct_call_symbols(
                 })
                 .collect::<Vec<_>>();
             let [address] = addresses.as_slice() else {
+                // Name the instantiations that DO exist for this path. The
+                // trailing `17h<hash>` is a compiler disambiguator derived from
+                // the instantiating crate's `-C metadata`, so it moves whenever
+                // the dependency graph changes even though the emitted code has
+                // not. Without this list, re-qualifying after such a move means
+                // guessing the new hash. The hash is still matched exactly:
+                // distinct instantiations of one path are distinguished by it.
+                let present = same_path_instantiations(text_symbols, raw_symbol);
+                let found = if present.is_empty() {
+                    "none".to_string()
+                } else {
+                    present.join(", ")
+                };
                 return Err(vec![format!(
                     "expected exactly one defined raw text identity `{raw_symbol}`; \
-                     found {}",
+                     found {}. Instantiations present for this path: {found}",
                     addresses.len()
                 )]);
             };
@@ -2306,47 +2340,6 @@ fn parse_instruction(line: &str) -> Result<Option<ParsedInstruction>, &'static s
         },
         encoded_len,
     }))
-}
-
-fn encoded_byte_len(value: &str) -> Option<u64> {
-    let bytes = value.split_whitespace().collect::<Vec<_>>();
-    if bytes.is_empty()
-        || bytes.len() > 15
-        || bytes
-            .iter()
-            .any(|byte| byte.len() != 2 || !byte.chars().all(|c| c.is_ascii_hexdigit()))
-    {
-        return None;
-    }
-    u64::try_from(bytes.len()).ok()
-}
-
-fn is_gnu_prefix(value: &str) -> bool {
-    value == "rex"
-        || value.starts_with("rex.")
-        || matches!(
-            value,
-            "addr16"
-                | "addr32"
-                | "bnd"
-                | "cs"
-                | "data16"
-                | "data32"
-                | "ds"
-                | "es"
-                | "fs"
-                | "gs"
-                | "lock"
-                | "notrack"
-                | "rep"
-                | "repe"
-                | "repne"
-                | "repnz"
-                | "repz"
-                | "ss"
-                | "xacquire"
-                | "xrelease"
-        )
 }
 
 fn is_control_mnemonic(value: &str) -> bool {
