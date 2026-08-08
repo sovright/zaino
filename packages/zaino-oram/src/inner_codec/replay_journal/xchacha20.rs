@@ -32,12 +32,12 @@ const _: () = assert!(PROTECTION_OVERHEAD_BYTES == CIPHERTEXT_START);
 /// Injected rather than drawn inline so the exhaustion and repetition paths
 /// stay testable: a real generator cannot be made to fail or repeat on demand,
 /// and both are exactly the paths that must fail closed.
-pub(super) trait JournalRecordNonces {
+pub(in crate::inner_codec) trait JournalRecordNonces {
     fn next_nonce(&self) -> Result<[u8; NONCE_BYTES], ProtectionUnavailable>;
 }
 
 /// Draws record nonces from the operating system generator.
-pub(super) struct OsJournalRecordNonces;
+pub(in crate::inner_codec) struct OsJournalRecordNonces;
 
 impl JournalRecordNonces for OsJournalRecordNonces {
     fn next_nonce(&self) -> Result<[u8; NONCE_BYTES], ProtectionUnavailable> {
@@ -50,7 +50,7 @@ impl JournalRecordNonces for OsJournalRecordNonces {
 }
 
 /// Composes the production record protector over one journal record key.
-pub(super) fn record_protector<N>(
+pub(in crate::inner_codec) fn record_protector<N>(
     record_key: Zeroizing<[u8; KEY_BYTES]>,
     nonces: N,
 ) -> impl ReplayJournalRecordProtector

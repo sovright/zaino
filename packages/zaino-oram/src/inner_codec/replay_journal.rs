@@ -57,6 +57,8 @@ use super::{
 
 mod xchacha20;
 
+pub(super) use xchacha20::{record_protector, OsJournalRecordNonces};
+
 const CURRENT_FORMAT_VERSION: u16 = 3;
 const ENTRY_FORMAT_VERSION: u16 = 2;
 const U16_BYTES: usize = 2;
@@ -122,7 +124,7 @@ const _: [(); 146] = [(); ENTRY_RECORD_BYTES];
 /// output unchanged on rejection or provider error. Existing request,
 /// response, and continuation-token role keys must not be reused. This PR
 /// intentionally supplies only a deterministic test implementation.
-trait ReplayJournalRecordProtector {
+pub(super) trait ReplayJournalRecordProtector {
     fn seal(
         &self,
         context: &ReplayJournalProtectionContext,
@@ -141,10 +143,10 @@ trait ReplayJournalRecordProtector {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct ReplayJournalProtectionContext([u8; DIGEST_BYTES]);
+pub(super) struct ReplayJournalProtectionContext([u8; DIGEST_BYTES]);
 
 impl ReplayJournalProtectionContext {
-    const fn new(binding: [u8; DIGEST_BYTES]) -> Self {
+    pub(super) const fn new(binding: [u8; DIGEST_BYTES]) -> Self {
         Self(binding)
     }
 
@@ -160,7 +162,7 @@ impl fmt::Debug for ReplayJournalProtectionContext {
 }
 
 #[derive(Clone, Copy)]
-enum ReplayJournalRecordKind {
+pub(super) enum ReplayJournalRecordKind {
     CurrentStateV3,
     ImmutableEntryV2,
 }
@@ -1111,7 +1113,7 @@ pub(super) trait ReplayJournalComponentState: sealed::Sealed {
     ) -> bool;
 }
 
-struct ReplayJournalStore<P> {
+pub(super) struct ReplayJournalStore<P> {
     recovery_directory: PathBuf,
     protection_context: ReplayJournalProtectionContext,
     protector: P,
@@ -1150,7 +1152,7 @@ impl<P> ReplayJournalStore<P>
 where
     P: ReplayJournalRecordProtector,
 {
-    fn open(
+    pub(super) fn open(
         root: impl Into<PathBuf>,
         profile: &PrivacyProfile,
         protection_context: ReplayJournalProtectionContext,
@@ -1926,7 +1928,7 @@ impl<P> fmt::Debug for ReplayJournalStore<P> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplayJournalStoreError {
+pub(super) enum ReplayJournalStoreError {
     LatchedIndeterminate,
     UnsafeRecoveryPath,
     ConfigurationMismatch,

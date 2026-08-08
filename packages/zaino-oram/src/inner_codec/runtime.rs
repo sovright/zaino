@@ -284,7 +284,7 @@ impl std::fmt::Debug for ResponseReleasePermit {
 
 /// One completed runtime round whose release permit remains outstanding.
 #[cfg(feature = "corpus-zaino")]
-struct PendingRuntimeRound<B, C, const ENVELOPE_BYTES: usize> {
+pub(super) struct PendingRuntimeRound<B, C, const ENVELOPE_BYTES: usize> {
     round: EncodedRuntimeRound<ENVELOPE_BYTES>,
     serving_release_witness: ServingEpochReleaseWitness<B, C>,
     security_release_witness: SecurityEpochReleaseWitness,
@@ -1277,15 +1277,16 @@ type FinalizedProcessRuntime<
 >;
 
 #[cfg(feature = "corpus-zaino")]
-type FinalizedPendingRuntimeRound<Source, const ENVELOPE_BYTES: usize> = PendingRuntimeRound<
-    CanonicalTransparentProjectionBoundary,
-    CanonicalServingEpochCurrentness<Source>,
-    ENVELOPE_BYTES,
->;
+pub(super) type FinalizedPendingRuntimeRound<Source, const ENVELOPE_BYTES: usize> =
+    PendingRuntimeRound<
+        CanonicalTransparentProjectionBoundary,
+        CanonicalServingEpochCurrentness<Source>,
+        ENVELOPE_BYTES,
+    >;
 
 /// Process-lifetime owner for one controller and at most one active epoch.
 #[cfg(feature = "corpus-zaino")]
-struct FinalizedRuntimeOwner<
+pub(super) struct FinalizedRuntimeOwner<
     Source,
     E,
     T,
@@ -1335,7 +1336,7 @@ where
     R: ContinuationReplayGuard,
     N: RoundMaterialSource,
 {
-    fn new(
+    pub(super) fn new(
         network: CanonicalNetwork,
         schema_version: u32,
         projection_epoch: u64,
@@ -1523,7 +1524,7 @@ fn coarsen_runtime_owner_error<T>(_: T) -> FinalizedRuntimeOwnerError {
 /// Coarsened process-lifecycle failure without epoch identifiers.
 #[cfg(feature = "corpus-zaino")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FinalizedRuntimeOwnerError;
+pub(super) struct FinalizedRuntimeOwnerError;
 
 #[cfg(feature = "corpus-zaino")]
 impl std::fmt::Debug for FinalizedRuntimeOwnerError {
