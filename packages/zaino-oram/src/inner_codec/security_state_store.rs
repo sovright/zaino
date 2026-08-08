@@ -7,6 +7,13 @@
 //! files first, this fixed local snapshot second, and the external freshness
 //! witness last. Any ambiguous local commit or witness advance latches the store
 //! unavailable for the rest of its in-process lifetime.
+//!
+//! The witness contract itself is executable rather than prose-only: see
+//! [`witness_conformance`], which any candidate implementation must pass. That
+//! suite is the acceptance gate for the external authority when one is chosen;
+//! it deliberately cannot certify the one property that matters most, namely
+//! that the authority sits outside the host's control. See
+//! [`SecurityFreshnessWitness`] for why no host-local implementation ships here.
 
 use std::{
     fmt, fs,
@@ -459,6 +466,17 @@ impl SecurityFreshness {
     const fn sequence(&self) -> u64 {
         self.sequence
     }
+
+    /// Sequence accessor for sibling-module witness doubles.
+    ///
+    /// Kept `cfg(test)` so the production accessor stays private: only test
+    /// witnesses outside this module need to enforce the sequence rule
+    /// themselves, and no production caller should be reading the sequence
+    /// out of a freshness value.
+    #[cfg(test)]
+    pub(super) const fn test_sequence(&self) -> u64 {
+        self.sequence()
+    }
 }
 
 impl fmt::Debug for SecurityFreshness {
@@ -473,6 +491,31 @@ impl fmt::Debug for SecurityFreshness {
 /// reject every successful transition except `None -> 1` or exact
 /// `n -> n + 1`. An `Err` is indeterminate: the witness may be unchanged or
 /// may already contain `next`, so the caller must fail closed and reconcile.
+///
+/// # The unstated obligation: where the authority lives
+///
+/// The clauses above are mechanical, and
+/// [`witness_conformance::assert_witness_conforms`] checks them. Passing that
+/// suite is necessary and *not* sufficient, because this trait's actual
+/// purpose is a trust assumption the type system cannot express: the counter
+/// must live somewhere the host cannot roll back.
+///
+/// This matters because the attacker in the surrounding threat model is the
+/// party with filesystem access. An implementation backed by a local file
+/// passes every clause above and still provides no rollback resistance at
+/// all — restoring an older copy of that file alongside an older local
+/// snapshot yields a pair that reconciles cleanly and replays. Crash-durability
+/// and monotonicity are what a local file can offer; freshness against a
+/// hostile host is not, and the two are easy to confuse precisely because they
+/// are indistinguishable on the happy path.
+///
+/// A conforming authority is therefore something like a TPM NV counter, a
+/// TEE/TDX monotonic counter service, or a remote quorum. Choosing among them
+/// is an attestation and deployment decision that has not been made, so this
+/// module intentionally ships no concrete implementation and no default: an
+/// absent witness fails closed and is honest, whereas a host-local one would
+/// present as working while silently holding none of the property its name
+/// promises.
 pub(super) trait SecurityFreshnessWitness {
     type Error;
 
@@ -483,6 +526,201 @@ pub(super) trait SecurityFreshnessWitness {
         expected: Option<SecurityFreshness>,
         next: SecurityFreshness,
     ) -> Result<(), Self::Error>;
+}
+
+/// Executable form of the [`SecurityFreshnessWitness`] contract.
+///
+/// The trait's obligations are otherwise stated only in prose, so every
+/// implementation restates them by hand and can silently disagree. This module
+/// turns the prose into a suite any candidate implementation must pass, which
+/// matters most for the implementation that does not exist yet: whichever
+/// external authority is eventually chosen (a TPM NV counter, a TEE monotonic
+/// counter service, a remote quorum), this is the acceptance test it has to
+/// clear before it may be wired in.
+///
+/// Crash-durability is deliberately *not* asserted here. It cannot be observed
+/// through the trait's own surface, and asserting it in-process would only
+/// prove that an in-memory double remembers a value. Each implementation owes
+/// that ordering proof against its own backing authority; `SecurityStateStore`
+/// separately proves it never calls the witness before the local commit is
+/// durable.
+#[cfg(test)]
+pub(super) mod witness_conformance {
+    use super::*;
+
+    /// The specific clause of the witness contract that an implementation broke.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in super::super) enum WitnessConformanceFailure {
+        /// A witness that has never advanced did not report `None`.
+        FreshWitnessIsNotAbsent,
+        /// `current()` failed on a witness expected to be reachable.
+        CurrentUnavailable,
+        /// A first advance to a sequence other than 1 was accepted.
+        FirstAdvanceSkippedSequenceOne,
+        /// The `None -> 1` transition was refused.
+        FirstAdvanceRefused,
+        /// An accepted advance was not visible to a following `current()`.
+        AdvanceNotObservable,
+        /// A transition that did not increment the sequence was accepted.
+        NonAdvancingSequenceAccepted,
+        /// A transition that skipped a sequence was accepted.
+        SkippedSequenceAccepted,
+        /// The `n -> n + 1` transition was refused.
+        SuccessorAdvanceRefused,
+        /// An advance naming `None` against a populated witness was accepted.
+        AbsentExpectedAgainstPresentAccepted,
+        /// An advance naming a superseded value was accepted.
+        StaleExpectedAccepted,
+    }
+
+    impl fmt::Display for WitnessConformanceFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let clause = match self {
+                Self::FreshWitnessIsNotAbsent => "a witness that never advanced must report None",
+                Self::CurrentUnavailable => "current() must succeed on a reachable witness",
+                Self::FirstAdvanceSkippedSequenceOne => "the first advance must be to sequence 1",
+                Self::FirstAdvanceRefused => "the None -> 1 transition must be accepted",
+                Self::AdvanceNotObservable => "an accepted advance must be reported by current()",
+                Self::NonAdvancingSequenceAccepted => "n -> n must be rejected",
+                Self::SkippedSequenceAccepted => "n -> n + 2 must be rejected",
+                Self::SuccessorAdvanceRefused => "the n -> n + 1 transition must be accepted",
+                Self::AbsentExpectedAgainstPresentAccepted => {
+                    "expected None against a populated witness must be rejected"
+                }
+                Self::StaleExpectedAccepted => "a superseded expected value must be rejected",
+            };
+            f.write_str(clause)
+        }
+    }
+
+    impl std::error::Error for WitnessConformanceFailure {}
+
+    /// Builds distinct freshness values whose digests differ per sequence.
+    ///
+    /// The digest is derived from the commitment rather than the sequence
+    /// alone, so an implementation cannot pass by comparing sequences while
+    /// ignoring the digest, nor the reverse.
+    fn freshness(sequence: u64) -> SecurityFreshness {
+        let seed = u8::try_from(sequence % 251).unwrap_or(0).wrapping_add(1);
+        let epochs = SecurityStateEpochs::new(1, 1, 1, 1)
+            .expect("conformance fixture epochs are non-zero by construction");
+        let identity = SecurityStateIdentity::new(
+            [seed; SERVICE_ID_BYTES],
+            epochs,
+            [seed.wrapping_add(1); PROFILE_ID_BYTES],
+            [seed.wrapping_add(2); SESSION_BINDING_BYTES],
+            [seed.wrapping_add(3); SECURITY_EPOCH_BINDING_BYTES],
+        )
+        .expect("conformance fixture identity is non-zero by construction");
+        let commitment = SecurityStateCommitment::new(
+            identity,
+            [seed.wrapping_add(4); STATE_DIGEST_BYTES],
+            [seed.wrapping_add(5); STATE_DIGEST_BYTES],
+        )
+        .expect("conformance fixture digests are non-zero by construction");
+        SecurityStateSnapshot::new(sequence, commitment)
+            .expect("conformance fixture sequence is non-zero by construction")
+            .freshness()
+    }
+
+    /// Advances `witness` through `None -> 1` for a case that starts populated.
+    fn advanced_to_one<W: SecurityFreshnessWitness>(
+        witness: &mut W,
+    ) -> Result<SecurityFreshness, WitnessConformanceFailure> {
+        let first = freshness(1);
+        witness
+            .compare_and_advance(None, first)
+            .map_err(|_| WitnessConformanceFailure::FirstAdvanceRefused)?;
+        Ok(first)
+    }
+
+    /// Asserts every clause of the witness contract against `mint`.
+    ///
+    /// `mint` must return a witness with no prior state on each call: a
+    /// rejected transition leaves the witness indeterminate by contract, so no
+    /// clause may observe state left behind by an earlier one.
+    pub(in super::super) fn assert_witness_conforms<W, F>(
+        mut mint: F,
+    ) -> Result<(), WitnessConformanceFailure>
+    where
+        W: SecurityFreshnessWitness,
+        F: FnMut() -> W,
+    {
+        let (first, second) = (freshness(1), freshness(2));
+
+        let mut witness = mint();
+        if witness
+            .current()
+            .map_err(|_| WitnessConformanceFailure::CurrentUnavailable)?
+            .is_some()
+        {
+            return Err(WitnessConformanceFailure::FreshWitnessIsNotAbsent);
+        }
+
+        // Only `None -> 1` opens a witness; jumping straight to a later
+        // sequence would let a restored-from-nothing host pick its own start.
+        let mut witness = mint();
+        if witness.compare_and_advance(None, second).is_ok() {
+            return Err(WitnessConformanceFailure::FirstAdvanceSkippedSequenceOne);
+        }
+
+        let mut witness = mint();
+        advanced_to_one(&mut witness)?;
+        if witness
+            .current()
+            .map_err(|_| WitnessConformanceFailure::CurrentUnavailable)?
+            != Some(first)
+        {
+            return Err(WitnessConformanceFailure::AdvanceNotObservable);
+        }
+
+        // `n -> n` would let a distinct state reuse a burnt sequence.
+        let mut witness = mint();
+        let held = advanced_to_one(&mut witness)?;
+        if witness.compare_and_advance(Some(held), first).is_ok() {
+            return Err(WitnessConformanceFailure::NonAdvancingSequenceAccepted);
+        }
+
+        // `n -> n + 2` would let one unobserved state be skipped over.
+        let mut witness = mint();
+        let held = advanced_to_one(&mut witness)?;
+        if witness
+            .compare_and_advance(Some(held), freshness(3))
+            .is_ok()
+        {
+            return Err(WitnessConformanceFailure::SkippedSequenceAccepted);
+        }
+
+        // A populated witness must never accept a caller claiming it is empty.
+        let mut witness = mint();
+        advanced_to_one(&mut witness)?;
+        if witness.compare_and_advance(None, second).is_ok() {
+            return Err(WitnessConformanceFailure::AbsentExpectedAgainstPresentAccepted);
+        }
+
+        let mut witness = mint();
+        let held = advanced_to_one(&mut witness)?;
+        witness
+            .compare_and_advance(Some(held), second)
+            .map_err(|_| WitnessConformanceFailure::SuccessorAdvanceRefused)?;
+        if witness
+            .current()
+            .map_err(|_| WitnessConformanceFailure::CurrentUnavailable)?
+            != Some(second)
+        {
+            return Err(WitnessConformanceFailure::AdvanceNotObservable);
+        }
+        // Replaying the superseded expected value is the rollback attempt the
+        // compare-and-advance shape exists to refuse.
+        if witness
+            .compare_and_advance(Some(held), freshness(3))
+            .is_ok()
+        {
+            return Err(WitnessConformanceFailure::StaleExpectedAccepted);
+        }
+
+        Ok(())
+    }
 }
 
 /// Fixed-width bytes for one local security-state snapshot.
@@ -1564,6 +1802,15 @@ mod tests {
         let second = SecurityStateSnapshot::new(2, base)?;
         assert_eq!(first.commitment.digest(), second.commitment.digest());
         assert_ne!(first.freshness(), second.freshness());
+        Ok(())
+    }
+
+    /// The in-module test double is held to the same contract as any real
+    /// witness, so store tests that rely on it are not relying on a double
+    /// that is more permissive than the authority it stands in for.
+    #[test]
+    fn the_shared_test_witness_satisfies_the_freshness_contract() -> TestResult {
+        witness_conformance::assert_witness_conforms(SharedWitness::empty)?;
         Ok(())
     }
 
