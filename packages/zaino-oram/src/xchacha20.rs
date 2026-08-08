@@ -16,6 +16,8 @@ pub(super) const AUTHENTICATION_BYTES: usize = 16;
 pub(super) const ENVELOPE_ASSOCIATED_DATA_DOMAIN: &[u8] = b"zaino.private.v1/aead/envelope/v1";
 pub(super) const CONTINUATION_ASSOCIATED_DATA_DOMAIN: &[u8] =
     b"zaino.private.v1/aead/continuation/v1";
+pub(super) const REPLAY_JOURNAL_ASSOCIATED_DATA_DOMAIN: &[u8] =
+    b"zaino.private.v1/aead/replay-journal/v1";
 
 const CHACHA_BLOCK_BYTES: usize = 64;
 const MAX_CHACHA_BLOCKS: usize = u32::MAX as usize;
