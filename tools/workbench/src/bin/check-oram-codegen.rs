@@ -68,7 +68,13 @@ const FIXED_EXACT_UPSERT: &str = "fixed_exact_upsert";
 const FIXED_EXACT_UPSERT_SYMBOL: &str =
     "zaino_oram::layout::atomic_store::worker::rostl::fixed_exact_upsert";
 
-const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h6b3ca648fa0c8fb8E";
+// Two instantiations, matching the two record monomorphizations the rest of
+// this guard already expects. Before the upstream sync the two record paths
+// shared a single `random_range` definition; afterwards each carries its own.
+// The dependency-graph change moved the disambiguators, so these were re-pinned
+// from the qualifying Linux x86_64 release build rather than carried over.
+const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h3737605460051b15E";
+const RANDOM_RANGE_SECOND_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17hb9510b448ebef3c3E";
 const CIRCUIT_READ_RAW_SYMBOL: &str =
     "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h7476e1361c793b48E";
 const CIRCUIT_EVENT_READ_RAW_SYMBOL: &str =
@@ -79,7 +85,8 @@ const CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
     "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h0bc0fd51e177f34aE";
 const UNWIND_DYNAMIC_SYMBOL: &str = "_Unwind_Resume@GCC_3.0";
 
-const RANDOM_RANGE_RAW_SYMBOLS: &[&str] = &[RANDOM_RANGE_RAW_SYMBOL];
+const RANDOM_RANGE_RAW_SYMBOLS: &[&str] =
+    &[RANDOM_RANGE_RAW_SYMBOL, RANDOM_RANGE_SECOND_RAW_SYMBOL];
 const CIRCUIT_READ_RAW_SYMBOLS: &[&str] = &[CIRCUIT_READ_RAW_SYMBOL, CIRCUIT_EVENT_READ_RAW_SYMBOL];
 const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOLS: &[&str] = &[
     CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL,
@@ -2494,6 +2501,7 @@ mod tests {
     fn exact_direct_text_symbols() -> TextSymbols {
         TextSymbols::from([
             (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
+            (0x601, vec![RANDOM_RANGE_SECOND_RAW_SYMBOL.to_string()]),
             (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
             (0x611, vec![CIRCUIT_EVENT_READ_RAW_SYMBOL.to_string()]),
             (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),
@@ -3030,6 +3038,7 @@ mod tests {
             resolved,
             ExactDirectCallSymbols::from([
                 (0x600, ExactDirectCallTarget::RandomRange),
+                (0x601, ExactDirectCallTarget::RandomRange),
                 (0x610, ExactDirectCallTarget::CircuitRead),
                 (0x611, ExactDirectCallTarget::CircuitRead),
                 (0x620, ExactDirectCallTarget::CircuitWriteOrInsert),
@@ -3038,7 +3047,7 @@ mod tests {
             ])
         );
 
-        for missing in [0x600, 0x610, 0x611, 0x620, 0x621] {
+        for missing in [0x600, 0x601, 0x610, 0x611, 0x620, 0x621] {
             let mut incomplete = symbols.clone();
             incomplete.remove(&missing);
             assert!(
@@ -3058,9 +3067,13 @@ mod tests {
             "two approved raw identities at one address must be ambiguous"
         );
 
+        // One identity at two addresses is ambiguous even when every other
+        // required identity is present, so the second `random_range`
+        // instantiation is still supplied at its own address below.
         let duplicated = TextSymbols::from([
             (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
             (0x601, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
+            (0x602, vec![RANDOM_RANGE_SECOND_RAW_SYMBOL.to_string()]),
             (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
             (0x611, vec![CIRCUIT_EVENT_READ_RAW_SYMBOL.to_string()]),
             (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),
