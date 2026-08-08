@@ -733,6 +733,27 @@ fn exact_direct_call_symbols(
     parse_exact_direct_call_symbols(text_symbols, relocations, &unwind_listing)
 }
 
+/// Symbols sharing `pinned`'s demangled path but not its disambiguator hash.
+///
+/// Diagnostic only: it reports what a stale pin should be updated to. Matching
+/// itself stays exact, because one path can have several legitimate
+/// instantiations that only the hash tells apart.
+fn same_path_instantiations(text_symbols: &TextSymbols, pinned: &str) -> Vec<String> {
+    let Some(prefix_end) = pinned.rfind("17h") else {
+        return Vec::new();
+    };
+    let prefix = &pinned[..prefix_end];
+    let mut found = text_symbols
+        .values()
+        .flatten()
+        .filter(|name| name.starts_with(prefix) && name.as_str() != pinned)
+        .cloned()
+        .collect::<Vec<_>>();
+    found.sort();
+    found.dedup();
+    found
+}
+
 fn parse_exact_direct_call_symbols(
     text_symbols: &TextSymbols,
     relocations: &DynamicRelocations,
@@ -755,9 +776,22 @@ fn parse_exact_direct_call_symbols(
                 })
                 .collect::<Vec<_>>();
             let [address] = addresses.as_slice() else {
+                // Name the instantiations that DO exist for this path. The
+                // trailing `17h<hash>` is a compiler disambiguator derived from
+                // the instantiating crate's `-C metadata`, so it moves whenever
+                // the dependency graph changes even though the emitted code has
+                // not. Without this list, re-qualifying after such a move means
+                // guessing the new hash. The hash is still matched exactly:
+                // distinct instantiations of one path are distinguished by it.
+                let present = same_path_instantiations(text_symbols, raw_symbol);
+                let found = if present.is_empty() {
+                    "none".to_string()
+                } else {
+                    present.join(", ")
+                };
                 return Err(vec![format!(
                     "expected exactly one defined raw text identity `{raw_symbol}`; \
-                     found {}",
+                     found {}. Instantiations present for this path: {found}",
                     addresses.len()
                 )]);
             };
