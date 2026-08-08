@@ -19,12 +19,16 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+};
 use tonic::{
     body::Body as TonicBody,
     codegen::{http, Service},
     server::NamedService,
-    transport::server::Server,
+    transport::server::{Connected, Server},
 };
 
 use zaino_oram::FixedEnvelopeRuntime;
@@ -34,6 +38,8 @@ use crate::private_proto;
 
 /// The one method this surface answers.
 const QUERY_PAGE_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/QueryPage";
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 1;
 
 /// One private-query endpoint bound to a local address.
 ///
@@ -71,8 +77,12 @@ impl PrivateQueryListener {
     {
         let service = PrivateQueryService::<H, N>::new(handler);
         Server::builder()
+            .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
             .add_service(service)
-            .serve_with_incoming_shutdown(accepted_connections(self.listener), shutdown)
+            .serve_with_incoming_shutdown(
+                accepted_connections(self.listener, MAX_CONCURRENT_CONNECTIONS),
+                shutdown,
+            )
             .await
     }
 }
@@ -83,11 +93,66 @@ impl PrivateQueryListener {
 /// the listener is the whole requirement.
 fn accepted_connections(
     listener: TcpListener,
-) -> impl futures::Stream<Item = std::io::Result<tokio::net::TcpStream>> {
-    futures::stream::unfold(listener, |listener| async move {
-        let accepted = listener.accept().await.map(|(stream, _)| stream);
-        Some((accepted, listener))
+    limit: usize,
+) -> impl futures::Stream<Item = std::io::Result<PermitTcpStream>> {
+    let permits = Arc::new(Semaphore::new(limit));
+    futures::stream::unfold((listener, permits), |(listener, permits)| async move {
+        let accepted = match Arc::clone(&permits).acquire_owned().await {
+            Ok(permit) => listener.accept().await.map(|(stream, _)| PermitTcpStream {
+                stream,
+                _permit: permit,
+            }),
+            Err(error) => Err(std::io::Error::other(error)),
+        };
+        Some((accepted, (listener, permits)))
     })
+}
+
+struct PermitTcpStream {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Connected for PermitTcpStream {
+    type ConnectInfo = <TcpStream as Connected>::ConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.stream.connect_info()
+    }
+}
+
+impl AsyncRead for PermitTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for PermitTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.stream).poll_shutdown(context)
+    }
 }
 
 impl fmt::Debug for PrivateQueryListener {
@@ -180,6 +245,7 @@ mod tests {
         Arc,
     };
 
+    use futures::StreamExt;
     use zaino_oram::{PendingFixedEnvelope, PrivateQueryUnavailable};
 
     use super::*;
@@ -229,6 +295,32 @@ mod tests {
         EchoHandler {
             busy: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[tokio::test]
+    async fn accepted_connections_waits_for_a_connection_permit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let incoming = accepted_connections(listener, 1);
+        tokio::pin!(incoming);
+
+        let first_client = TcpStream::connect(address).await?;
+        let first_server = incoming
+            .next()
+            .await
+            .expect("the accept stream remains open")?;
+        let second_client = TcpStream::connect(address).await?;
+
+        assert!(futures::poll!(incoming.next()).is_pending());
+
+        drop(first_server);
+        let second_server = incoming
+            .next()
+            .await
+            .expect("releasing a permit allows the next accept")?;
+        drop((first_client, second_client, second_server));
+        Ok(())
     }
 
     /// Drives one real gRPC unary call against the bound address.

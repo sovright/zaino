@@ -1,9 +1,11 @@
 //! Atomic, self-validating artifacts for offline ORAM research evidence.
 
+#[cfg(feature = "typed-qualification")]
+use std::ffi::OsStr;
 use std::{
     collections::BTreeSet,
     error::Error,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fmt, fs,
     fs::File,
     io::{self, Read, Write},
@@ -14,10 +16,15 @@ use std::{
 use std::{os::fd::OwnedFd, os::unix::ffi::OsStringExt};
 
 use blake2::{Blake2s256, Digest};
+#[cfg(all(
+    feature = "typed-qualification",
+    any(target_vendor = "apple", target_os = "linux")
+))]
+use rustix::fs::{flock, FlockOperation};
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 use rustix::fs::{
-    flock, fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, Dir,
-    FlockOperation, Mode, OFlags, RenameFlags,
+    fstat, fsync, mkdirat, open, openat, renameat_with, unlinkat, AtFlags, Dir, Mode, OFlags,
+    RenameFlags,
 };
 use serde::{Deserialize, Serialize};
 use zaino_oram::{MainnetCorpusError, MainnetCorpusMeasurement, MainnetSizingQualification};
@@ -931,6 +938,7 @@ pub(super) fn open_artifact_child_directory(
     Err(ArtifactError::UnsupportedPlatform)
 }
 
+#[cfg(feature = "typed-qualification")]
 fn validate_relative_component(name: &OsStr) -> Result<(), ArtifactError> {
     let path = Path::new(name);
     if name.is_empty() || path.file_name() != Some(name) {

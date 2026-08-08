@@ -165,6 +165,10 @@ enum PrivateSubcommand {
 #[cfg(feature = "private-service")]
 #[derive(Debug, Args)]
 struct PrivateServeArgs {
+    /// Explicitly allow the qualification-only, non-oblivious backend to listen.
+    #[arg(long)]
+    allow_qualification_backend: bool,
+
     /// Mainnet Zainod TOML config used to open the canonical indexed source.
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
@@ -1380,6 +1384,10 @@ const PRIVATE_KEY_EPOCH: u64 = 1;
 /// reported as such rather than after a full chain replay has been paid for.
 #[cfg(feature = "private-service")]
 async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
+    require_private_listener_opt_in(args.allow_qualification_backend)?;
+    eprintln!(
+        "WARNING: private-query listener uses a qualification-only backend; it provides no physical obliviousness"
+    );
     let capture = load_capture(&args.capture_dir)?;
     let sizing = load_sizing(&args.sizing_dir, &capture)?;
     let config = load_config(&args.config)?;
@@ -1410,6 +1418,15 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
     .await;
     service.close();
     served
+}
+
+#[cfg(feature = "private-service")]
+fn require_private_listener_opt_in(enabled: bool) -> RunnerResult<()> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(RunnerError::PrivateListenerOptInRequired.into())
+    }
 }
 
 /// Derives the projection dimensions from the validated sizing artifact.
@@ -1916,6 +1933,8 @@ enum RunnerError {
     PrivateProjectionUnavailable,
     #[cfg(feature = "private-service")]
     PrivateRuntimeUnavailable,
+    #[cfg(feature = "private-service")]
+    PrivateListenerOptInRequired,
     IncompleteCheckpoint,
     InvalidCheckpointHash,
     TargetAboveServiceable {
@@ -1989,6 +2008,10 @@ impl fmt::Display for RunnerError {
             Self::PrivateRuntimeUnavailable => {
                 f.write_str("the private-query runtime could not be composed or refreshed")
             }
+            #[cfg(feature = "private-service")]
+            Self::PrivateListenerOptInRequired => f.write_str(
+                "private listener refused: pass --allow-qualification-backend to acknowledge that the qualification-only backend provides no physical obliviousness",
+            ),
             Self::IncompleteCheckpoint => {
                 f.write_str("target height and target hash must be supplied together")
             }
@@ -2033,6 +2056,18 @@ mod tests {
     };
 
     use crate::corpus_artifact::typed_test_measurement;
+
+    #[cfg(feature = "private-service")]
+    #[test]
+    fn private_listener_requires_explicit_qualification_backend_opt_in() {
+        let error = require_private_listener_opt_in(false)
+            .expect_err("the private listener is gated off by default");
+        assert_eq!(
+            error.to_string(),
+            "private listener refused: pass --allow-qualification-backend to acknowledge that the qualification-only backend provides no physical obliviousness"
+        );
+        assert!(require_private_listener_opt_in(true).is_ok());
+    }
 
     #[derive(Debug, PartialEq, Eq, serde::Serialize)]
     struct OrderedFetchFixture {
