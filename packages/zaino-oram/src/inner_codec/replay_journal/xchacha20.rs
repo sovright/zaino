@@ -164,13 +164,13 @@ mod tests {
     ];
 
     /// Hands out distinct, predictable nonces and can be made to fail on demand.
-    struct CountingNonces {
+    pub(super) struct CountingNonces {
         next: Cell<u8>,
         available: Cell<bool>,
     }
 
     impl CountingNonces {
-        const fn new() -> Self {
+        pub(super) const fn new() -> Self {
             Self {
                 next: Cell::new(1),
                 available: Cell::new(true),
@@ -348,5 +348,138 @@ mod tests {
             REPLAY_JOURNAL_ASSOCIATED_DATA_DOMAIN,
             crate::xchacha20::CONTINUATION_ASSOCIATED_DATA_DOMAIN
         );
+    }
+}
+
+/// Property tests over the record protector's whole input space.
+///
+/// The hand-written tests above pin one body width and one corruption pattern.
+/// These explore arbitrary widths, kinds, contexts, and nonce sequences,
+/// because the journal's records are fixed-width but its bodies are not, and
+/// the boundaries between them are where a length or offset error would hide.
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::{tests::CountingNonces, *};
+
+    /// Bodies from empty to wider than one ChaCha block, so the stream cipher's
+    /// block boundary is inside the explored range rather than beside it.
+    fn body() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(any::<u8>(), 0..=200)
+    }
+
+    fn kind() -> impl Strategy<Value = ReplayJournalRecordKind> {
+        prop_oneof![
+            Just(ReplayJournalRecordKind::CurrentStateV3),
+            Just(ReplayJournalRecordKind::ImmutableEntryV2),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn any_body_round_trips_under_its_own_context(
+            body in body(),
+            binding in any::<[u8; DIGEST_BYTES]>(),
+            kind in kind(),
+        ) {
+            let protector = record_protector(Zeroizing::new([0x31; KEY_BYTES]), CountingNonces::new());
+            let context = ReplayJournalProtectionContext::new(binding);
+            let mut protected = vec![0; body.len() + PROTECTION_OVERHEAD_BYTES];
+
+            protector.seal(&context, kind, &body, &mut protected)?;
+            let mut recovered = vec![0; body.len()];
+
+            prop_assert_eq!(
+                protector.open(&context, kind, &protected, &mut recovered)?,
+                AuthenticationDecision::Accepted
+            );
+            prop_assert_eq!(recovered, body);
+        }
+
+        #[test]
+        fn any_single_byte_change_is_rejected_without_exposing_plaintext(
+            body in proptest::collection::vec(any::<u8>(), 1..=120),
+            binding in any::<[u8; DIGEST_BYTES]>(),
+            kind in kind(),
+            index in any::<prop::sample::Index>(),
+            flip in 1_u8..=255,
+        ) {
+            let protector = record_protector(Zeroizing::new([0x31; KEY_BYTES]), CountingNonces::new());
+            let context = ReplayJournalProtectionContext::new(binding);
+            let mut protected = vec![0; body.len() + PROTECTION_OVERHEAD_BYTES];
+            protector.seal(&context, kind, &body, &mut protected)?;
+
+            let index = index.index(protected.len());
+            protected[index] ^= flip;
+            let mut recovered = vec![0xff; body.len()];
+
+            prop_assert_eq!(
+                protector.open(&context, kind, &protected, &mut recovered)?,
+                AuthenticationDecision::Rejected
+            );
+            prop_assert!(recovered.iter().all(|byte| *byte == 0));
+        }
+
+        /// A record sealed under one context or kind must never open under a
+        /// different one, whatever the body.
+        #[test]
+        fn no_body_opens_under_a_foreign_context_or_kind(
+            body in body(),
+            sealing in any::<[u8; DIGEST_BYTES]>(),
+            opening in any::<[u8; DIGEST_BYTES]>(),
+            kind in kind(),
+        ) {
+            prop_assume!(sealing != opening);
+            let protector = record_protector(Zeroizing::new([0x31; KEY_BYTES]), CountingNonces::new());
+            let mut protected = vec![0; body.len() + PROTECTION_OVERHEAD_BYTES];
+            protector.seal(
+                &ReplayJournalProtectionContext::new(sealing),
+                kind,
+                &body,
+                &mut protected,
+            )?;
+
+            let other_kind = match kind {
+                ReplayJournalRecordKind::CurrentStateV3 => {
+                    ReplayJournalRecordKind::ImmutableEntryV2
+                }
+                ReplayJournalRecordKind::ImmutableEntryV2 => {
+                    ReplayJournalRecordKind::CurrentStateV3
+                }
+            };
+            let foreign = [
+                (ReplayJournalProtectionContext::new(opening), kind),
+                (ReplayJournalProtectionContext::new(sealing), other_kind),
+            ];
+
+            for (context, kind) in foreign {
+                let mut recovered = vec![0xff; body.len()];
+                prop_assert_eq!(
+                    protector.open(&context, kind, &protected, &mut recovered)?,
+                    AuthenticationDecision::Rejected
+                );
+                prop_assert!(recovered.iter().all(|byte| *byte == 0));
+            }
+        }
+
+        /// Any buffer pair whose widths disagree with the fixed overhead must be
+        /// refused before the key is used at all.
+        #[test]
+        fn mismatched_widths_are_always_refused(
+            body in body(),
+            skew in 1_usize..=8,
+            binding in any::<[u8; DIGEST_BYTES]>(),
+            kind in kind(),
+        ) {
+            let protector = record_protector(Zeroizing::new([0x31; KEY_BYTES]), CountingNonces::new());
+            let context = ReplayJournalProtectionContext::new(binding);
+            let mut wrong = vec![0; body.len() + PROTECTION_OVERHEAD_BYTES + skew];
+
+            prop_assert_eq!(
+                protector.seal(&context, kind, &body, &mut wrong),
+                Err(ProtectionUnavailable)
+            );
+        }
     }
 }

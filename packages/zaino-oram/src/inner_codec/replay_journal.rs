@@ -161,7 +161,9 @@ impl fmt::Debug for ReplayJournalProtectionContext {
     }
 }
 
-#[derive(Clone, Copy)]
+// Debug and PartialEq carry no secret: the variants are the record's public
+// format tag, already written in the clear as part of every record header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReplayJournalRecordKind {
     CurrentStateV3,
     ImmutableEntryV2,
