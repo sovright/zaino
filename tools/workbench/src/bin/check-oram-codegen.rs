@@ -68,21 +68,32 @@ const FIXED_EXACT_UPSERT: &str = "fixed_exact_upsert";
 const FIXED_EXACT_UPSERT_SYMBOL: &str =
     "zaino_oram::layout::atomic_store::worker::rostl::fixed_exact_upsert";
 
-// Two instantiations, matching the two record monomorphizations the rest of
-// this guard already expects. Before the upstream sync the two record paths
-// shared a single `random_range` definition; afterwards each carries its own.
-// The dependency-graph change moved the disambiguators, so these were re-pinned
-// from the qualifying Linux x86_64 release build rather than carried over.
+// Re-pinned from the qualifying Linux x86_64 release build after the upstream
+// sync. Every `17h<hash>` disambiguator moved at once, which is what a
+// dependency-graph change does: cargo derives `-C metadata` from it.
+//
+// `read` and `write_or_insert` each had two instantiations before and have two
+// now, so for them this is churn. `random_range` is different: only one
+// identity was ever pinned while two are present, so the guard counted
+// addresses for the pinned symbol alone. Whether the second appeared with this
+// sync or was always there and unpinned is not decidable from what the guard
+// reports, so both are pinned here and the question is left open rather than
+// answered by assumption.
+//
+// The DIRECTORY/EVENT split in these names records the original qualification's
+// attribution. This re-pin cannot re-confirm it: the guard reports which
+// instantiations exist for a path, not which record type each serves, and both
+// map to the same target either way. Treat the suffix as historical.
 const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h3737605460051b15E";
 const RANDOM_RANGE_SECOND_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17hb9510b448ebef3c3E";
 const CIRCUIT_READ_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h7476e1361c793b48E";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h681ef66e9d04c538E";
 const CIRCUIT_EVENT_READ_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h66f54b80c4c5a7dbE";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17hb314dfa0f6912035E";
 const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h4d06f976a0b09474E";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h64bd35feec61c112E";
 const CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h0bc0fd51e177f34aE";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17haf4b8093684385e6E";
 const UNWIND_DYNAMIC_SYMBOL: &str = "_Unwind_Resume@GCC_3.0";
 
 const RANDOM_RANGE_RAW_SYMBOLS: &[&str] =
