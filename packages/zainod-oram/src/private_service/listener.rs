@@ -590,6 +590,9 @@ mod tests {
     }
 
     /// Seals a plaintext query with the bootstrap-released request key.
+    ///
+    /// Test-local XOR stand-in, not the production AEAD -- see
+    /// `keyed_transform`'s doc comment.
     fn seal_request<const N: usize>(
         key: &[u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
         plaintext: [u8; N],
@@ -598,6 +601,9 @@ mod tests {
     }
 
     /// Opens a sealed response with the bootstrap-released response key.
+    ///
+    /// Test-local XOR stand-in, not the production AEAD -- see
+    /// `keyed_transform`'s doc comment.
     fn open_response<const N: usize>(
         key: &[u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
         ciphertext: [u8; N],
@@ -611,16 +617,19 @@ mod tests {
 
     /// The page a correctly keyed handler must answer `sample_query()` with.
     ///
-    /// Bitwise NOT: deterministic, content-dependent, and independently
-    /// computable by both `KeyedEchoHandler` below and the test assertion, so
-    /// a match proves the query that reached the handler is the exact one
-    /// `seal_request` sealed -- not a fixed constant the handler could return
-    /// regardless of what it decoded.
+    /// Bitwise NOT of the *reversed* query, not a plain elementwise NOT:
+    /// reversal makes this transform not commute with `keyed_transform`'s
+    /// XOR, so it can no longer cancel out a key error the same way an
+    /// elementwise NOT would. It stays deterministic and content-dependent,
+    /// and is independently computable by both `KeyedEchoHandler` below and
+    /// the test assertion, so a match proves the query that reached the
+    /// handler is the exact one `seal_request` sealed -- not a fixed
+    /// constant the handler could return regardless of what it decoded.
     const fn expected_page_for(query: [u8; ENVELOPE_BYTES]) -> [u8; ENVELOPE_BYTES] {
         let mut page = query;
         let mut i = 0;
         while i < page.len() {
-            page[i] = !page[i];
+            page[i] = !query[query.len() - 1 - i];
             i += 1;
         }
         page
@@ -677,14 +686,27 @@ mod tests {
         })
     }
 
-    /// The capability #101's parity test has been waiting for: proof that a
-    /// wallet can bootstrap over the real `BootstrapSession` route, receive
-    /// usable key material, seal a query with it, and open the matching
-    /// response -- all driven through `PrivateQueryService::call`'s own
-    /// routing, not by calling the adapter's methods directly. This closes
-    /// the gap a task review noted: no prior test drove `BOOTSTRAP_ROUTE`'s
-    /// match arm through the service's own dispatch, so a typo in that route
-    /// string would have passed every existing test.
+    /// Proves the key-establishment leg #101's parity test needs: a wallet
+    /// can bootstrap over the real `BootstrapSession` route and receive the
+    /// exact key material the server released, driven through
+    /// `PrivateQueryService::call`'s own routing, not by calling the
+    /// adapter's methods directly. This closes the gap a task review noted:
+    /// no prior test drove `BOOTSTRAP_ROUTE`'s match arm through the
+    /// service's own dispatch, so a typo in that route string would have
+    /// passed every existing test.
+    ///
+    /// The "seal a query, open the response" half is a test-local XOR
+    /// stand-in (`seal_request`/`open_response`, backed by
+    /// `keyed_transform`), not the production AEAD -- that cipher is
+    /// crate-internal to `zaino-oram` by design and unreachable from a
+    /// listener-level test. So this test does *not* by itself close #101:
+    /// #101 still needs (a) these client helpers made reachable outside
+    /// `#[cfg(test)]`, (b) a public wallet-side seal/open a real
+    /// `EnvelopeProtector` will accept, and (c) a refreshed runtime, which
+    /// needs a live or mock chain subscriber. What this test does prove is
+    /// that the released `request_key`/`response_key` are exactly what the
+    /// server holds -- checked directly below, not just inferred from a
+    /// round trip.
     ///
     /// multi_thread required: the serve loop and the client run concurrently
     /// on separate tasks and the client blocks on responses the server must
@@ -694,8 +716,14 @@ mod tests {
         let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
         let address = listener.local_addr();
 
-        let request_key = [0x33; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES];
-        let response_key = [0x44; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES];
+        // Position-varying, not a uniform fill: a reversed, rotated, or
+        // partially garbled key must be detectable. A uniform `[0x33; 32]`
+        // fill would make byte position unobservable and let such an error
+        // through undetected.
+        let request_key: [u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES] =
+            std::array::from_fn(|i| 0x33 ^ i as u8);
+        let response_key: [u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES] =
+            std::array::from_fn(|i| 0x44 ^ i as u8);
         let handler = KeyedEchoHandler {
             request_key,
             response_key,
@@ -722,6 +750,18 @@ mod tests {
         let bootstrap = bootstrap_client(address).await?;
         assert_eq!(bootstrap.key_epoch, FIXTURE_KEY_EPOCH);
         let released = releasable_keys_from_wire(&bootstrap)?;
+
+        // Direct equality against the exact keys the handler was given,
+        // rather than relying on the round trip below to imply it. XOR is
+        // commutative, so with a plain elementwise transform the round trip
+        // alone would reduce to checking `request_key ^ response_key ==
+        // released.request_key ^ released.response_key` -- passing even for
+        // a bootstrap response that swapped the two keys, or offset both by
+        // the same delta. `expected_page_for`'s reversal breaks that
+        // cancellation, but these direct checks are the unambiguous
+        // verification and do not depend on that property holding.
+        assert_eq!(released.request_key, request_key);
+        assert_eq!(released.response_key, response_key);
 
         let sealed = seal_request(&released.request_key, sample_query());
         let response =
