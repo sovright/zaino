@@ -36,8 +36,9 @@ use zaino_oram::FixedEnvelopeRuntime;
 use super::tonic_body::PrivateTonicBodyAdapter;
 use crate::private_proto;
 
-/// The one method this surface answers.
+/// The two methods this surface answers.
 const QUERY_PAGE_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/QueryPage";
+const BOOTSTRAP_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/BootstrapSession";
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 1;
 
@@ -215,11 +216,19 @@ where
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let adapter = Arc::clone(&self.adapter);
         Box::pin(async move {
-            if request.uri().path() != QUERY_PAGE_ROUTE {
-                return Ok(unavailable_response());
+            match request.uri().path() {
+                QUERY_PAGE_ROUTE => {
+                    let mut adapter = adapter.lock().await;
+                    Ok(adapter.query_page(request).await)
+                }
+                BOOTSTRAP_ROUTE => {
+                    let mut adapter = adapter.lock().await;
+                    Ok(adapter.bootstrap(request).await)
+                }
+                // An unknown route answers exactly as a refused query does,
+                // so route probing cannot distinguish them.
+                _ => Ok(unavailable_response()),
             }
-            let mut adapter = adapter.lock().await;
-            Ok(adapter.query_page(request).await)
         })
     }
 }

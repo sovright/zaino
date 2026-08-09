@@ -113,6 +113,9 @@ impl<P, const N: usize> std::fmt::Debug for PrivateResponseEncoder<P, N> {
     }
 }
 
+/// `BootstrapRequest` carries no fields, so its wire-encoded body is empty.
+const BOOTSTRAP_REQUEST_BYTES: usize = 0;
+
 /// One synchronous adapter borrow presented to Tonic's unary machinery.
 struct PrivateUnary<'a, H, const N: usize> {
     adapter: &'a mut PrivateServiceAdapter<H, N>,
@@ -134,6 +137,41 @@ where
                 .map_err(coarsen_tonic_error),
         )
     }
+}
+
+/// Bootstrap has no runtime behind it yet: every decoded request is refused
+/// with the surface's one failure. Task 4 replaces this with a real handler;
+/// until then, the cap this file enforces is the only thing bootstrap does.
+struct RejectingBootstrap;
+
+impl UnaryService<private_proto::BootstrapRequest> for RejectingBootstrap {
+    type Response = private_proto::BootstrapResponse;
+    type Future = Ready<Result<Response<Self::Response>, Status>>;
+
+    fn call(&mut self, _request: Request<private_proto::BootstrapRequest>) -> Self::Future {
+        ready(Err(coarsen_tonic_error(())))
+    }
+}
+
+/// Drives one capped decode through Tonic, then rewrites the result to the
+/// private surface's uniform response shape. Shared by every route so the
+/// two routes' framing cannot drift apart even though each brings its own
+/// codec, cap, and unary service.
+async fn capped_unary_call<C, S, B>(
+    mut grpc: Grpc<C>,
+    service: S,
+    request: http::Request<B>,
+) -> http::Response<TonicBody>
+where
+    C: Codec,
+    S: UnaryService<C::Decode, Response = C::Encode>,
+    B: HttpBody + Send + 'static,
+    B::Error: Into<StdError> + Send,
+{
+    let mut response = grpc.unary(service, request).await;
+    coarsen_initial_status(&mut response);
+    let (parts, body) = response.into_parts();
+    http::Response::from_parts(parts, TonicBody::new(UniformStatusBody::new(body)))
 }
 
 /// Listener-free entry point that returns Tonic's lazily encoded response body.
@@ -163,12 +201,31 @@ where
         let service = PrivateUnary {
             adapter: &mut self.adapter,
         };
-        let mut grpc = Grpc::new(PrivateResponseCodec::<H::PendingResponse, N>::new())
+        let grpc = Grpc::new(PrivateResponseCodec::<H::PendingResponse, N>::new())
             .max_decoding_message_size(fixed_envelope_wire_size(N));
-        let mut response = grpc.unary(service, request).await;
-        coarsen_initial_status(&mut response);
-        let (parts, body) = response.into_parts();
-        http::Response::from_parts(parts, TonicBody::new(UniformStatusBody::new(body)))
+        capped_unary_call(grpc, service, request).await
+    }
+
+    /// Decodes and refuses a bootstrap request under its own cap.
+    ///
+    /// `BootstrapRequest` is empty on the wire, so its cap is
+    /// `fixed_envelope_wire_size(0)` — independent of `QueryPage`'s cap, which
+    /// is keyed to the application envelope size `N`. Sharing one cap across
+    /// both routes would let the larger of the two set the limit for both.
+    pub(super) async fn bootstrap<B>(
+        &mut self,
+        request: http::Request<B>,
+    ) -> http::Response<TonicBody>
+    where
+        B: HttpBody + Send + 'static,
+        B::Error: Into<StdError> + Send,
+    {
+        let grpc = Grpc::new(tonic_prost::ProstCodec::<
+            private_proto::BootstrapResponse,
+            private_proto::BootstrapRequest,
+        >::default())
+        .max_decoding_message_size(fixed_envelope_wire_size(BOOTSTRAP_REQUEST_BYTES));
+        capped_unary_call(grpc, RejectingBootstrap, request).await
     }
 }
 
@@ -403,12 +460,9 @@ mod tests {
         (PrivateTonicBodyAdapter::new(handler), state)
     }
 
-    fn request(bytes: &[u8]) -> http::Request<OneFrameBody> {
-        let message = private_proto::FixedEnvelope {
-            envelope: bytes.to_vec(),
-            key_epoch: 0,
-        }
-        .encode_to_vec();
+    /// Wraps an already-encoded protobuf message in the one-frame gRPC body
+    /// shape both routes' tests decode from.
+    fn encoded_frame(message: Vec<u8>) -> http::Request<OneFrameBody> {
         let length = u32::try_from(message.len())
             .expect("test protobuf request length fits the gRPC prefix");
         let mut frame = Vec::with_capacity(5 + message.len());
@@ -418,6 +472,16 @@ mod tests {
         http::Request::new(OneFrameBody {
             frame: Some(Bytes::from(frame)),
         })
+    }
+
+    fn request(bytes: &[u8]) -> http::Request<OneFrameBody> {
+        encoded_frame(
+            private_proto::FixedEnvelope {
+                envelope: bytes.to_vec(),
+                key_epoch: 0,
+            }
+            .encode_to_vec(),
+        )
     }
 
     async fn next_frame(body: &mut TonicBody) -> Option<Result<Frame<Bytes>, Status>> {
@@ -561,6 +625,53 @@ mod tests {
 
         assert_uniform_status(response.headers());
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        assert!(response.into_body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn each_route_is_capped_at_its_own_size() {
+        // A body sized well past bootstrap's empty cap must still be refused
+        // by QueryPage, whose cap is the fixed envelope. Sharing one cap
+        // across routes would let the larger of the two set the limit for
+        // both, letting an oversized QueryPage body slip through against
+        // bootstrap's ceiling.
+        let (mut adapter, state) = fixture();
+        let oversized_for_query = vec![0u8; ENVELOPE_BYTES + 64];
+        let response = adapter.query_page(request(&oversized_for_query)).await;
+
+        assert_uniform_status(response.headers());
+        assert_eq!(
+            state.calls.load(Ordering::SeqCst),
+            0,
+            "an oversized query body reached the runtime"
+        );
+        assert!(response.into_body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_within_its_empty_cap_is_refused_uniformly() {
+        // Bootstrap has no runtime behind it yet (Task 4), so even a
+        // within-cap request is refused -- but it must decode successfully
+        // under its own cap rather than being rejected by the transport.
+        let (mut adapter, _state) = fixture();
+        let response = adapter
+            .bootstrap(encoded_frame(
+                private_proto::BootstrapRequest {}.encode_to_vec(),
+            ))
+            .await;
+
+        assert_uniform_status(response.headers());
+        assert!(response.into_body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_over_its_empty_cap_is_refused_uniformly() {
+        // BootstrapRequest is empty on the wire, so any nonzero-length
+        // message exceeds its cap and must be refused before it is parsed.
+        let (mut adapter, _state) = fixture();
+        let response = adapter.bootstrap(encoded_frame(vec![0u8; 8])).await;
+
+        assert_uniform_status(response.headers());
         assert!(response.into_body().is_end_stream());
     }
 
