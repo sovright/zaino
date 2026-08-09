@@ -121,6 +121,14 @@ first deployment, not a decision that the work is unnecessary.
   gap between "runs in a TEE" and "hides the query from the host" is exactly
   where an overclaim happens, and an undocumented model cannot be reviewed.
 
+## Tracking
+
+The work this posture implies is tracked in issues sovright/zaino#101 through
+#108. Required for the claim: ROSTL serving swap with parity coverage (#101),
+client key establishment (#102), coarse data-independence in the engine (#103),
+and whole-round release timing (#104). Required for mainnet scale:
+`recent_snapshot_scan_slots` (#105) and replay-journal reclamation (#106).
+
 ## Revisiting
 
 This posture is superseded, not amended, when the deployment moves to an
