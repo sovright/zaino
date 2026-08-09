@@ -4,6 +4,42 @@
 pub struct FixedEnvelope {
     #[prost(bytes = "vec", tag = "1")]
     pub envelope: ::prost::alloc::vec::Vec<u8>,
+    /// The key epoch this envelope was sealed under. Cleartext on purpose: it is
+    /// per-generation and identical for every client, so it reveals nothing, and
+    /// sealing it inside would make a retired key indistinguishable from any
+    /// other refusal — leaving a wallet no way to learn it must re-bootstrap.
+    #[prost(uint64, tag = "2")]
+    pub key_epoch: u64,
+}
+/// Empty: bootstrap takes no client input. A field here would be an input to
+/// authenticate before the client holds any key material, which is exactly the
+/// surface this design avoids.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BootstrapRequest {}
+/// Everything a wallet needs to seal a query, and nothing else.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BootstrapResponse {
+    /// Identifies the key generation these keys belong to. Sent back in cleartext
+    /// on every QueryPage so a retired key is actionable rather than opaque.
+    #[prost(uint64, tag = "1")]
+    pub key_epoch: u64,
+    /// Seals request envelopes.
+    #[prost(bytes = "vec", tag = "2")]
+    pub request_key: ::prost::alloc::vec::Vec<u8>,
+    /// Opens response envelopes.
+    #[prost(bytes = "vec", tag = "3")]
+    pub response_key: ::prost::alloc::vec::Vec<u8>,
+    /// The compiled privacy profile these keys are valid under.
+    #[prost(string, tag = "4")]
+    pub profile_id: ::prost::alloc::string::String,
+    /// Exact envelope size class, so a wallet pads correctly without guessing.
+    #[prost(uint32, tag = "5")]
+    pub envelope_bytes: u32,
+    /// Reserved for a TDX quote binding the TLS identity to the measured binary.
+    /// Present and empty in this release; ADR 0010 defers verification, and
+    /// keeping the field means adding it later is not a breaking wire change.
+    #[prost(bytes = "vec", tag = "6")]
+    pub attestation: ::prost::alloc::vec::Vec<u8>,
 }
 /// Generated server implementations.
 pub mod private_compact_tx_streamer_server {
@@ -22,6 +58,10 @@ pub mod private_compact_tx_streamer_server {
             &self,
             request: tonic::Request<super::FixedEnvelope>,
         ) -> std::result::Result<tonic::Response<super::FixedEnvelope>, tonic::Status>;
+        async fn bootstrap_session(
+            &self,
+            request: tonic::Request<super::BootstrapRequest>,
+        ) -> std::result::Result<tonic::Response<super::BootstrapResponse>, tonic::Status>;
     }
     /// Independent private-query surface. This is not the legacy lightwallet API.
     #[derive(Debug)]
@@ -123,6 +163,49 @@ pub mod private_compact_tx_streamer_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = QueryPageSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zaino.private.v1.PrivateCompactTxStreamer/BootstrapSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct BootstrapSessionSvc<T: PrivateCompactTxStreamer>(pub Arc<T>);
+                    impl<T: PrivateCompactTxStreamer>
+                        tonic::server::UnaryService<super::BootstrapRequest>
+                        for BootstrapSessionSvc<T>
+                    {
+                        type Response = super::BootstrapResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BootstrapRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PrivateCompactTxStreamer>::bootstrap_session(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BootstrapSessionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

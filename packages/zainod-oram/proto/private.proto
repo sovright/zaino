@@ -5,9 +5,39 @@ package zaino.private.v1;
 // One fixed-size protected application envelope.
 message FixedEnvelope {
   bytes envelope = 1;
+  // The key epoch this envelope was sealed under. Cleartext on purpose: it is
+  // per-generation and identical for every client, so it reveals nothing, and
+  // sealing it inside would make a retired key indistinguishable from any
+  // other refusal — leaving a wallet no way to learn it must re-bootstrap.
+  uint64 key_epoch = 2;
+}
+
+// Empty: bootstrap takes no client input. A field here would be an input to
+// authenticate before the client holds any key material, which is exactly the
+// surface this design avoids.
+message BootstrapRequest {}
+
+// Everything a wallet needs to seal a query, and nothing else.
+message BootstrapResponse {
+  // Identifies the key generation these keys belong to. Sent back in cleartext
+  // on every QueryPage so a retired key is actionable rather than opaque.
+  uint64 key_epoch = 1;
+  // Seals request envelopes.
+  bytes request_key = 2;
+  // Opens response envelopes.
+  bytes response_key = 3;
+  // The compiled privacy profile these keys are valid under.
+  string profile_id = 4;
+  // Exact envelope size class, so a wallet pads correctly without guessing.
+  uint32 envelope_bytes = 5;
+  // Reserved for a TDX quote binding the TLS identity to the measured binary.
+  // Present and empty in this release; ADR 0010 defers verification, and
+  // keeping the field means adding it later is not a breaking wire change.
+  bytes attestation = 6;
 }
 
 // Independent private-query surface. This is not the legacy lightwallet API.
 service PrivateCompactTxStreamer {
   rpc QueryPage(FixedEnvelope) returns (FixedEnvelope);
+  rpc BootstrapSession(BootstrapRequest) returns (BootstrapResponse);
 }
