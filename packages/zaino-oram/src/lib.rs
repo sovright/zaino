@@ -89,8 +89,8 @@ pub use hybrid_sizing::{
 pub use inner_codec::private_service::{
     mainnet_private_query_runtime, private_mainnet_store_reads, FinalizedProjection,
     FinalizedProjectionBuilder, MainnetPrivateQueryRuntime, PrivateNetwork, PrivateProjectionShape,
-    PrivateRuntimeDeployment, PrivateRuntimeKeys, PRIVATE_MAINNET_ENVELOPE_BYTES,
-    PRIVATE_RUNTIME_KEY_BYTES,
+    PrivateRuntimeDeployment, PrivateRuntimeKeys, ReleasableSessionKeys,
+    PRIVATE_MAINNET_ENVELOPE_BYTES, PRIVATE_RUNTIME_KEY_BYTES,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use insertion_bound::{

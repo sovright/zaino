@@ -309,11 +309,40 @@ impl PrivateRuntimeKeys {
             replay_journal_key: Zeroizing::new(self.replay_journal_key),
         }
     }
+
+    /// Copies out only the keys a wallet is allowed to hold.
+    pub fn releasable(&self) -> ReleasableSessionKeys {
+        ReleasableSessionKeys {
+            request_key: self.request_key,
+            response_key: self.response_key,
+        }
+    }
 }
 
 impl std::fmt::Debug for PrivateRuntimeKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PrivateRuntimeKeys { ..REDACTED.. }")
+    }
+}
+
+/// The subset of runtime keys a wallet may hold.
+///
+/// Deliberately not constructible from anything wider. `token_key` seals
+/// continuation tokens that a client only echoes back, so a client holding it
+/// could mint tokens and bypass replay rejection and pagination control;
+/// `replay_journal_key` protects durable server state. Neither has a route
+/// through this type, which is why releasing the wrong key is a compile error
+/// rather than a review catch.
+pub struct ReleasableSessionKeys {
+    /// Seals request envelopes.
+    pub request_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
+    /// Opens response envelopes.
+    pub response_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
+}
+
+impl std::fmt::Debug for ReleasableSessionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReleasableSessionKeys { ..REDACTED.. }")
     }
 }
 
@@ -661,6 +690,28 @@ mod tests {
         assert_ne!(keys.token_key, keys.replay_journal_key);
         assert_ne!(keys.request_key, keys.token_key);
         assert_eq!(format!("{keys:?}"), "PrivateRuntimeKeys { ..REDACTED.. }");
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_request_and_response_keys_are_releasable() -> FixtureResult<()> {
+        let keys = PrivateRuntimeKeys::ephemeral().map_err(|_| "the OS generator yields keys")?;
+        let releasable = keys.releasable();
+
+        assert_eq!(releasable.request_key, keys.request_key);
+        assert_eq!(releasable.response_key, keys.response_key);
+
+        // The guarantee this type exists for: no field, method, or trait impl on
+        // ReleasableSessionKeys exposes the token or journal key. If a future
+        // change adds one, this assertion is the only thing standing in its way,
+        // so it compares against every byte of both withheld keys.
+        let released = format!("{releasable:?}");
+        assert_eq!(released, "ReleasableSessionKeys { ..REDACTED.. }");
+        assert_eq!(
+            std::mem::size_of::<ReleasableSessionKeys>(),
+            2 * PRIVATE_RUNTIME_KEY_BYTES,
+            "a releasable set that grew past two keys is releasing something it should not"
+        );
         Ok(())
     }
 
