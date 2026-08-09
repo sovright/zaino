@@ -348,7 +348,10 @@ mod tests {
         >::default();
         client
             .unary(
-                tonic::Request::new(private_proto::FixedEnvelope { envelope }),
+                tonic::Request::new(private_proto::FixedEnvelope {
+                    envelope,
+                    key_epoch: 0,
+                }),
                 http::uri::PathAndQuery::from_static(QUERY_PAGE_ROUTE),
                 codec,
             )

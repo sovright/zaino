@@ -406,6 +406,7 @@ mod tests {
     fn request(bytes: &[u8]) -> http::Request<OneFrameBody> {
         let message = private_proto::FixedEnvelope {
             envelope: bytes.to_vec(),
+            key_epoch: 0,
         }
         .encode_to_vec();
         let length = u32::try_from(message.len())
