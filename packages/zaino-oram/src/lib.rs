@@ -55,6 +55,7 @@ mod recent_snapshot;
 mod records;
 mod rostl_timing;
 mod runtime_security;
+mod scan_width;
 mod sizing;
 mod store;
 #[cfg(feature = "corpus-zaino")]

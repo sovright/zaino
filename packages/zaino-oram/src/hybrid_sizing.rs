@@ -15,6 +15,7 @@ use zaino_state::IndexedBlock;
 #[cfg(feature = "rostl-experimental")]
 use crate::fixed_page_capacity::SelectedFixedPageDemands;
 use crate::{
+    scan_width::{DeltaEventObservation, RecentSnapshotDemand},
     target_load::is_blake2s256_hex,
     zaino_corpus::{MainnetCorpusMeasurement, MainnetCorpusScanner},
 };
@@ -493,6 +494,46 @@ impl SourceBoundHybridSizingReport {
             spend_pages: selected.spend_pages,
             fixed_page_reads: selected.fixed_page_reads()?,
         })
+    }
+
+    /// Returns the recent-snapshot demand the selected interval imposes.
+    ///
+    /// The recent snapshot is one flat all-address array, so its capacity is
+    /// driven by the widest generation's *total* delta events, not by any
+    /// per-address statistic. This is the input `scan_width` sizes against.
+    pub(super) fn selected_recent_snapshot_demand(
+        &self,
+    ) -> Result<RecentSnapshotDemand, SourceBoundHybridSizingError> {
+        self.validate()?;
+        let interval = select_rebuild_interval(&self.rebuild_interval_reports)?;
+        Ok(RecentSnapshotDemand::new(
+            interval.interval_blocks,
+            interval.max_total_delta_events,
+        ))
+    }
+
+    /// Returns the selected interval's per-address delta-event distribution.
+    ///
+    /// Empty means the capture predates the field, which the sizing consumer
+    /// must treat as unmeasured rather than as an absence of deltas.
+    pub(super) fn selected_per_address_delta_distribution(
+        &self,
+    ) -> Result<Vec<DeltaEventObservation>, SourceBoundHybridSizingError> {
+        self.validate()?;
+        let interval = select_rebuild_interval(&self.rebuild_interval_reports)?;
+        let mut observations = Vec::new();
+        observations
+            .try_reserve_exact(interval.per_address_delta_event_histogram.len())
+            .map_err(|_| SourceBoundHybridSizingError::AllocationFailed)?;
+        observations.extend(
+            interval
+                .per_address_delta_event_histogram
+                .iter()
+                .map(|bucket| {
+                    DeltaEventObservation::new(bucket.delta_events, bucket.address_count)
+                }),
+        );
+        Ok(observations)
     }
 
     fn selected_sizing_demands_unvalidated(
@@ -2547,6 +2588,10 @@ mod tests {
 
     use crate::{
         canonical_chain::CanonicalNetwork,
+        scan_width::{
+            per_address_pagination_coverage, recent_snapshot_scan_width, ScanWidthDecision,
+            ScanWidthError, ScanWidthPolicy,
+        },
         zaino_corpus::MainnetCorpusScanner,
         zaino_fixtures::{indexed_block, output, transaction},
     };
@@ -3233,6 +3278,104 @@ mod tests {
         assert_eq!(
             report.validate(),
             Err(SourceBoundHybridSizingError::InvalidReport)
+        );
+        Ok(())
+    }
+
+    /// The scan width must come from the total, not the per-address, marginal.
+    ///
+    /// The recent snapshot is one flat all-address array, so a per-address
+    /// statistic understates its capacity by however many addresses appear in a
+    /// generation. This pins the demand to the interval's total.
+    #[test]
+    fn recent_snapshot_demand_uses_the_total_not_the_per_address_maximum(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let report = source_report(&blocks, &measurement)?;
+        let interval = select_rebuild_interval(&report.rebuild_interval_reports)?;
+        let demand = report.selected_recent_snapshot_demand()?;
+
+        assert_eq!(
+            demand.interval_blocks(),
+            SELECTED_GENERATION_INTERVAL_BLOCKS
+        );
+        assert_eq!(
+            demand.max_total_delta_events(),
+            interval.max_total_delta_events
+        );
+        assert!(demand.max_total_delta_events() >= interval.max_per_address_delta_events);
+        Ok(())
+    }
+
+    /// A wider measured generation must widen the sized width, not be ignored.
+    #[test]
+    fn a_wider_measured_generation_widens_the_sized_scan_width(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let report = source_report(&blocks, &measurement)?;
+        let measured = report.selected_recent_snapshot_demand()?;
+        let policy = ScanWidthPolicy::new(4, 1_000_000, 0)?;
+
+        let narrow = recent_snapshot_scan_width(measured, policy)?;
+        let doubled = recent_snapshot_scan_width(
+            RecentSnapshotDemand::new(
+                measured.interval_blocks(),
+                measured
+                    .max_total_delta_events()
+                    .checked_mul(2)
+                    .ok_or("doubled fixture demand overflowed")?,
+            ),
+            policy,
+        )?;
+
+        let (ScanWidthDecision::Serviceable(narrow), ScanWidthDecision::Serviceable(doubled)) =
+            (narrow, doubled)
+        else {
+            return Err("the fixture's demand fits a one-million-comparison budget".into());
+        };
+        assert!(doubled.slots() > narrow.slots());
+        Ok(())
+    }
+
+    /// PR #96's histogram reaches its correct consumer: response-slot coverage.
+    #[test]
+    fn the_per_address_distribution_feeds_pagination_coverage(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let report = source_report(&blocks, &measurement)?;
+        let distribution = report.selected_per_address_delta_distribution()?;
+        let interval = select_rebuild_interval(&report.rebuild_interval_reports)?;
+        let maximum = interval.max_per_address_delta_events;
+
+        let coverage = per_address_pagination_coverage(&distribution, maximum)?;
+        assert_eq!(coverage.maximum_delta_events(), maximum);
+        // A width at the observed maximum covers the whole measured population.
+        assert_eq!(coverage.covered_addresses(), coverage.total_addresses());
+        assert_eq!(coverage.coverage_basis_points(), 10_000);
+
+        // Narrowing below the maximum must drop at least the tail bucket.
+        if maximum > 1 {
+            let narrowed = per_address_pagination_coverage(&distribution, maximum - 1)?;
+            assert!(narrowed.covered_addresses() < coverage.covered_addresses());
+        }
+        Ok(())
+    }
+
+    /// An unmeasured capture must not read as full coverage.
+    #[test]
+    fn a_capture_predating_the_histogram_yields_no_coverage_answer(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let mut report = source_report(&blocks, &measurement)?;
+        for interval in &mut report.rebuild_interval_reports {
+            interval.per_address_delta_event_histogram.clear();
+        }
+
+        let distribution = report.selected_per_address_delta_distribution()?;
+        assert!(distribution.is_empty());
+        assert_eq!(
+            per_address_pagination_coverage(&distribution, 256),
+            Err(ScanWidthError::UnmeasuredDistribution)
         );
         Ok(())
     }
