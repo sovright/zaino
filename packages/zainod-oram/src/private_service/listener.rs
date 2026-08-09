@@ -6,8 +6,18 @@
 //! detail to be relaxed later. Serving two rounds concurrently would let the
 //! observable completion order depend on which address was queried.
 //!
-//! Every route other than the one private method answers with the same status
-//! as a failed query, so probing the surface reveals no more than calling it.
+//! This surface answers two routes. `QueryPage` is the private method the
+//! mutex above guards. `BootstrapSession` is the deliberate exemption: it hands
+//! a wallet the current key epoch and its two releasable keys, it takes no
+//! client input, and it is answered from material prepared at construction --
+//! never through the handler mutex, because a route whose latency depended on
+//! whether a query round is in flight would time the surface against the
+//! runtime's occupancy, which is exactly what the fixed schedule hides.
+//!
+//! Every *other* route answers with the same status as a failed query, so
+//! probing beyond these two reveals no more than calling them. Bootstrap is the
+//! one intended departure from that uniformity: its response is identical for
+//! every caller and reveals nothing about any query.
 
 use std::{
     convert::Infallible,
@@ -33,11 +43,12 @@ use tonic::{
 
 use zaino_oram::{FixedEnvelopeRuntime, SessionBootstrap};
 
-use super::tonic_body::PrivateTonicBodyAdapter;
+use super::tonic_body::{PrivateSessionBootstrap, PrivateTonicBodyAdapter};
 use crate::private_proto;
 
-/// The two methods this surface answers.
+/// The private method, answered under the single-admission mutex.
 const QUERY_PAGE_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/QueryPage";
+/// The key-establishment method, answered without it.
 const BOOTSTRAP_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/BootstrapSession";
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 1;
@@ -169,9 +180,16 @@ impl fmt::Debug for PrivateQueryListener {
     }
 }
 
-/// Routes the one private method through the single-admission adapter.
+/// Routes the private method through the single-admission adapter, and the
+/// bootstrap method around it.
 struct PrivateQueryService<H, const N: usize> {
     adapter: Arc<Mutex<PrivateTonicBodyAdapter<H, N>>>,
+    /// Held beside the mutex, not inside it. The bootstrap answer is fixed for
+    /// the runtime's process lifetime and identical for every caller, so it
+    /// needs no exclusion; putting it behind the handler lock would make a
+    /// cheap unauthenticated route's latency an occupancy probe against the
+    /// query round the lock is guarding.
+    bootstrap: Arc<PrivateSessionBootstrap>,
 }
 
 impl<H, const N: usize> PrivateQueryService<H, N>
@@ -183,18 +201,20 @@ where
         Self {
             adapter: Arc::new(Mutex::new(PrivateTonicBodyAdapter::new(
                 handler,
-                session_bootstrap,
+                session_bootstrap.key_epoch,
             ))),
+            bootstrap: Arc::new(PrivateSessionBootstrap::from_session(&session_bootstrap, N)),
         }
     }
 }
 
-// Derived `Clone` would demand `H: Clone`; the handler is never cloned, only
-// the shared handle to it.
+// Derived `Clone` would demand `H: Clone`; neither the handler nor the
+// bootstrap material is ever cloned, only the shared handles to them.
 impl<H, const N: usize> Clone for PrivateQueryService<H, N> {
     fn clone(&self) -> Self {
         Self {
             adapter: Arc::clone(&self.adapter),
+            bootstrap: Arc::clone(&self.bootstrap),
         }
     }
 }
@@ -223,16 +243,16 @@ where
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let adapter = Arc::clone(&self.adapter);
+        let bootstrap = Arc::clone(&self.bootstrap);
         Box::pin(async move {
             match request.uri().path() {
                 QUERY_PAGE_ROUTE => {
                     let mut adapter = adapter.lock().await;
                     Ok(adapter.query_page(request).await)
                 }
-                BOOTSTRAP_ROUTE => {
-                    let mut adapter = adapter.lock().await;
-                    Ok(adapter.bootstrap(request).await)
-                }
+                // Deliberately does not take the handler lock: see this
+                // module's header and `PrivateSessionBootstrap`.
+                BOOTSTRAP_ROUTE => Ok(bootstrap.answer(request).await),
                 // An unknown route answers exactly as a refused query does,
                 // so route probing cannot distinguish them.
                 _ => Ok(unavailable_response()),
@@ -281,7 +301,7 @@ mod tests {
                 request_key: [0x11; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
                 response_key: [0x22; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
             },
-            profile_id: "test-profile",
+            profile_label: "test-profile",
         }
     }
 
@@ -498,8 +518,9 @@ mod tests {
         };
         let runtime = zaino_oram::mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
             &deployment,
-            zaino_oram::PrivateRuntimeKeys::ephemeral()
-                .map_err(|_| "the OS generator yields four keys")?,
+            zaino_oram::EphemeralKeyGeneration::draw()
+                .map_err(|_| "the OS generator yields four keys")?
+                .keys,
         )
         .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
         let session_bootstrap = runtime.session_bootstrap();
@@ -735,7 +756,7 @@ mod tests {
                 request_key,
                 response_key,
             },
-            profile_id: "test-profile",
+            profile_label: "test-profile",
         };
 
         let (stop, stopped) = tokio::sync::oneshot::channel();

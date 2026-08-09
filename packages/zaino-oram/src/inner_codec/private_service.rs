@@ -12,6 +12,9 @@
 //! 1. [`PrivateRuntimeDeployment`] / [`PrivateRuntimeKeys`] — the inputs a
 //!    deployment must supply. Key custody is still the caller's problem; the
 //!    keys arrive already derived, exactly as [`crate::inner_codec`] requires.
+//!    A deployment without a custodian draws both the keys and the epoch that
+//!    names them from [`EphemeralKeyGeneration::draw`], which yields the two
+//!    together so they cannot drift apart across a restart.
 //! 2. [`FinalizedProjectionBuilder`] → [`FinalizedProjection`] — the only way
 //!    to obtain the read-only serving generation that a first refresh needs.
 //!    Before this, a finalized serving store could be built only inside the
@@ -276,31 +279,6 @@ pub struct PrivateRuntimeKeys {
 }
 
 impl PrivateRuntimeKeys {
-    /// Draws four fresh keys from the operating-system generator.
-    ///
-    /// Process-lifetime only, and that is the point: this crate has no key
-    /// custody, so rather than invent one, a deployment without an external
-    /// custodian gets keys that die with the process. Every continuation token
-    /// and journal record sealed under them becomes unreadable at restart,
-    /// which fails closed rather than silently reusing material whose
-    /// provenance nobody can state.
-    pub fn ephemeral() -> Result<Self, PrivateQueryUnavailable> {
-        let mut entropy = OsEntropy;
-        let mut key = || -> Result<[u8; PRIVATE_RUNTIME_KEY_BYTES], PrivateQueryUnavailable> {
-            let mut bytes = [0; PRIVATE_RUNTIME_KEY_BYTES];
-            entropy
-                .fill(&mut bytes)
-                .map_err(|_| PrivateQueryUnavailable)?;
-            Ok(bytes)
-        };
-        Ok(Self {
-            request_key: key()?,
-            response_key: key()?,
-            token_key: key()?,
-            replay_journal_key: key()?,
-        })
-    }
-
     fn material(self) -> RuntimeKeyMaterial {
         RuntimeKeyMaterial {
             request_key: Zeroizing::new(self.request_key),
@@ -322,6 +300,70 @@ impl PrivateRuntimeKeys {
 impl std::fmt::Debug for PrivateRuntimeKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PrivateRuntimeKeys { ..REDACTED.. }")
+    }
+}
+
+/// One draw of process-lifetime runtime keys, together with the epoch naming it.
+///
+/// The pair is drawn as a unit and there is no way to obtain either half alone,
+/// which is the point: the key epoch is the only thing a wallet can use to tell
+/// one draw from another, so a deployment that could pick an epoch independently
+/// of the draw would eventually serve fresh keys under a stale epoch. A wallet
+/// holding retired keys would then see its query refused with no indication that
+/// re-bootstrapping is what it needs.
+pub struct EphemeralKeyGeneration {
+    /// Nonzero epoch naming exactly this draw.
+    pub key_epoch: u64,
+    /// The four keys drawn under it.
+    pub keys: PrivateRuntimeKeys,
+}
+
+impl EphemeralKeyGeneration {
+    /// Draws four fresh keys from the operating-system generator, plus the
+    /// epoch that names them.
+    ///
+    /// Process-lifetime only, and that is the point: this crate has no key
+    /// custody, so rather than invent one, a deployment without an external
+    /// custodian gets keys that die with the process. Every continuation token
+    /// and journal record sealed under them becomes unreadable at restart,
+    /// which fails closed rather than silently reusing material whose
+    /// provenance nobody can state.
+    ///
+    /// The epoch comes from the same generator as the keys rather than from the
+    /// clock. Nothing orders key epochs — every consumer compares them for
+    /// equality only, and the layout requires just that they be nonzero — so a
+    /// counter or timestamp would buy no ordering while making two draws inside
+    /// one clock tick collide. The low bit is forced to satisfy the layout's
+    /// nonzero requirement.
+    pub fn draw() -> Result<Self, PrivateQueryUnavailable> {
+        let mut entropy = OsEntropy;
+        let mut key = || -> Result<[u8; PRIVATE_RUNTIME_KEY_BYTES], PrivateQueryUnavailable> {
+            let mut bytes = [0; PRIVATE_RUNTIME_KEY_BYTES];
+            entropy
+                .fill(&mut bytes)
+                .map_err(|_| PrivateQueryUnavailable)?;
+            Ok(bytes)
+        };
+        let keys = PrivateRuntimeKeys {
+            request_key: key()?,
+            response_key: key()?,
+            token_key: key()?,
+            replay_journal_key: key()?,
+        };
+        let mut epoch = [0; 8];
+        entropy
+            .fill(&mut epoch)
+            .map_err(|_| PrivateQueryUnavailable)?;
+        Ok(Self {
+            key_epoch: u64::from_be_bytes(epoch) | 1,
+            keys,
+        })
+    }
+}
+
+impl std::fmt::Debug for EphemeralKeyGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EphemeralKeyGeneration { ..REDACTED.. }")
     }
 }
 
@@ -362,8 +404,17 @@ pub struct SessionBootstrap {
     pub key_epoch: u64,
     /// The two keys a wallet may hold: request and response, and nothing else.
     pub keys: ReleasableSessionKeys,
-    /// The compiled privacy profile these keys are valid under.
-    pub profile_id: &'static str,
+    /// Human-readable name of the compiled privacy profile, for diagnostics.
+    ///
+    /// Deliberately the profile's *label*, not its authoritative identifier.
+    /// The authoritative identifier is a digest over every logical budget
+    /// dimension, and it is already bound into protected request state, so a
+    /// wallet sealing a query against the wrong profile is rejected
+    /// cryptographically rather than by comparing a string. Publishing the
+    /// digest here would add a second thing to pin without adding a check the
+    /// envelope does not already make, so this field stays a label a human can
+    /// read in a log and nothing pins on.
+    pub profile_label: &'static str,
 }
 
 impl std::fmt::Debug for SessionBootstrap {
@@ -542,9 +593,9 @@ where
     // the two keys a wallet may hold, and this is the one place that copy can
     // be made -- once `.material()` runs, the request and response keys live
     // only inside the composed envelope protector.
-    let releasable = keys.releasable();
+    let session_keys = keys.releasable();
     let key_epoch = deployment.projection.key_epoch;
-    let profile_id = profile.label();
+    let profile_label = profile.label();
     let shape = CompiledQueryShape::<MAINNET_QUERY_SLOTS, MAINNET_ENVELOPE_BYTES>::new(profile)
         .map_err(|_| PrivateQueryUnavailable)?;
     let inner = finalized_runtime_owner::<
@@ -564,9 +615,8 @@ where
     Ok(MainnetRuntime {
         inner,
         key_epoch,
-        request_key: releasable.request_key,
-        response_key: releasable.response_key,
-        profile_id,
+        session_keys,
+        profile_label,
     })
 }
 
@@ -593,9 +643,21 @@ where
         MAINNET_QUERY_SLOTS,
     >,
     key_epoch: u64,
-    request_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
-    response_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
-    profile_id: &'static str,
+    /// Held whole rather than decomposed into two arrays: `ReleasableSessionKeys`
+    /// exists so that releasing the wrong key is a compile error, and a pair of
+    /// bare `[u8; 32]` fields here would give that back up. Keeping the type also
+    /// keeps its redacting `Debug`, which this struct's own `Debug` defers to.
+    session_keys: ReleasableSessionKeys,
+    profile_label: &'static str,
+}
+
+impl<Source, E, T, R, N> std::fmt::Debug for MainnetRuntime<Source, E, T, R, N>
+where
+    Source: BlockchainSource,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MainnetRuntime { ..REDACTED.. }")
+    }
 }
 
 impl<Source, E, T, R, N> FixedEnvelopeRuntime<PRIVATE_MAINNET_ENVELOPE_BYTES>
@@ -638,10 +700,10 @@ where
         SessionBootstrap {
             key_epoch: self.key_epoch,
             keys: ReleasableSessionKeys {
-                request_key: self.request_key,
-                response_key: self.response_key,
+                request_key: self.session_keys.request_key,
+                response_key: self.session_keys.response_key,
             },
-            profile_id: self.profile_id,
+            profile_label: self.profile_label,
         }
     }
 
@@ -774,7 +836,9 @@ mod tests {
 
         let mut runtime = mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
             &deployment,
-            PrivateRuntimeKeys::ephemeral().map_err(|_| "the OS generator yields four keys")?,
+            EphemeralKeyGeneration::draw()
+                .map_err(|_| "the OS generator yields four keys")?
+                .keys,
         )
         .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
 
@@ -800,7 +864,9 @@ mod tests {
             projection: shape(private_mainnet_store_reads()?),
         };
         deployment.projection.key_epoch = 42;
-        let keys = PrivateRuntimeKeys::ephemeral().map_err(|_| "the OS generator yields keys")?;
+        let keys = EphemeralKeyGeneration::draw()
+            .map_err(|_| "the OS generator yields keys")?
+            .keys;
         let releasable_request_key = keys.request_key;
         let releasable_response_key = keys.response_key;
 
@@ -812,7 +878,7 @@ mod tests {
         assert_eq!(bootstrap.key_epoch, 42);
         assert_eq!(bootstrap.keys.request_key, releasable_request_key);
         assert_eq!(bootstrap.keys.response_key, releasable_response_key);
-        assert!(!bootstrap.profile_id.is_empty());
+        assert!(!bootstrap.profile_label.is_empty());
         assert_eq!(
             format!("{bootstrap:?}"),
             "SessionBootstrap { ..REDACTED.. }"
@@ -824,18 +890,74 @@ mod tests {
     /// cross-authenticate two protection domains that are meant to be separate.
     #[test]
     fn ephemeral_keys_are_drawn_independently() -> FixtureResult<()> {
-        let keys = PrivateRuntimeKeys::ephemeral().map_err(|_| "the OS generator yields keys")?;
+        let generation =
+            EphemeralKeyGeneration::draw().map_err(|_| "the OS generator yields keys")?;
+        let keys = &generation.keys;
 
         assert_ne!(keys.request_key, keys.response_key);
         assert_ne!(keys.token_key, keys.replay_journal_key);
         assert_ne!(keys.request_key, keys.token_key);
         assert_eq!(format!("{keys:?}"), "PrivateRuntimeKeys { ..REDACTED.. }");
+        assert_eq!(
+            format!("{generation:?}"),
+            "EphemeralKeyGeneration { ..REDACTED.. }"
+        );
+        Ok(())
+    }
+
+    /// Two separately composed runtimes must name their key draws differently.
+    ///
+    /// This is the whole mechanism the cleartext `key_epoch` rests on: a restart
+    /// draws new keys, and a wallet holding the old ones can only learn that
+    /// from an epoch that moved with them. An epoch fixed at composition time --
+    /// a constant, or anything else independent of the draw -- would leave the
+    /// wallet with the uniform refusal and no way to tell "re-bootstrap" from
+    /// "the service is down", which is exactly what the epoch was added to
+    /// prevent. Asserting on the composed runtime's own bootstrap material, not
+    /// just on the draw, pins the whole path from draw to wire.
+    #[test]
+    fn separately_composed_runtimes_do_not_share_a_key_epoch() -> FixtureResult<()> {
+        let projection = shape(private_mainnet_store_reads()?);
+        let compose = || -> Result<u64, Box<dyn std::error::Error>> {
+            let root = tempfile::TempDir::new()?;
+            let generation =
+                EphemeralKeyGeneration::draw().map_err(|_| "the OS generator yields keys")?;
+            let mut deployment = PrivateRuntimeDeployment {
+                service_namespace_id: [0x55; 16],
+                owner_generation: 1,
+                replay_journal_root: root.path().join("replay"),
+                projection,
+            };
+            // Exactly what a runner does: the shape's key epoch comes from the
+            // draw, never from a constant.
+            deployment.projection.key_epoch = generation.key_epoch;
+            let runtime = mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
+                &deployment,
+                generation.keys,
+            )
+            .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
+            Ok(runtime.session_bootstrap().key_epoch)
+        };
+
+        let first = compose()?;
+        let second = compose()?;
+
+        assert_ne!(
+            first, second,
+            "two key draws named by the same epoch leave a stale wallet no signal to re-bootstrap"
+        );
+        // The layout refuses a zero epoch, so a draw that produced one would
+        // fail composition rather than serve; assert it directly anyway.
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
         Ok(())
     }
 
     #[test]
     fn only_the_request_and_response_keys_are_releasable() -> FixtureResult<()> {
-        let keys = PrivateRuntimeKeys::ephemeral().map_err(|_| "the OS generator yields keys")?;
+        let keys = EphemeralKeyGeneration::draw()
+            .map_err(|_| "the OS generator yields keys")?
+            .keys;
         let releasable = keys.releasable();
 
         assert_eq!(releasable.request_key, keys.request_key);

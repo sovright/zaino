@@ -37,9 +37,9 @@ use zaino_oram::{
 };
 #[cfg(feature = "private-service")]
 use zaino_oram::{
-    mainnet_private_query_runtime, FinalizedProjectionBuilder, MainnetPrivateQueryRuntime,
-    PrivateNetwork, PrivateProjectionShape, PrivateRuntimeDeployment, PrivateRuntimeKeys,
-    PRIVATE_MAINNET_ENVELOPE_BYTES,
+    mainnet_private_query_runtime, EphemeralKeyGeneration, FinalizedProjectionBuilder,
+    MainnetPrivateQueryRuntime, PrivateNetwork, PrivateProjectionShape, PrivateRuntimeDeployment,
+    PrivateRuntimeKeys, PRIVATE_MAINNET_ENVELOPE_BYTES,
 };
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_oram::{
@@ -1368,15 +1368,16 @@ async fn analyze_hybrid_sizing_fixed_snapshot(
     .await
 }
 
-/// Record-schema and key-epoch version this runner composes runtimes at.
+/// Record-schema version this runner composes runtimes at.
 ///
-/// Fixed rather than configurable: both are bound into the serving identity a
-/// refresh pins, so a runner that let them drift would produce projections no
-/// runtime could recognise.
+/// Fixed rather than configurable: it is bound into the serving identity a
+/// refresh pins, so a runner that let it drift would produce projections no
+/// runtime could recognise. The key epoch beside it in the shape is the
+/// opposite kind of value -- it must move whenever the keys do -- and so is
+/// drawn per process by [`EphemeralKeyGeneration::draw`] rather than fixed
+/// here.
 #[cfg(feature = "private-service")]
 const PRIVATE_SCHEMA_VERSION: u32 = 1;
-#[cfg(feature = "private-service")]
-const PRIVATE_KEY_EPOCH: u64 = 1;
 
 /// Rebuilds the projection this process will serve, then serves it.
 ///
@@ -1401,7 +1402,12 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         .into());
     }
     let source_backend = backend_kind(config.backend);
-    let shape = private_projection_shape(&capture, &sizing)?;
+    // Drawn here, before anything else needs either half, so the shape's key
+    // epoch and the keys the runtime is composed with come from one draw.
+    // Restart is rotation: new keys, and an epoch that says so.
+    let key_generation =
+        EphemeralKeyGeneration::draw().map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
+    let shape = private_projection_shape(&capture, &sizing, key_generation.key_epoch)?;
 
     let listener = PrivateQueryListener::bind(args.listen_address).await?;
     let listening_on = listener.local_addr();
@@ -1416,6 +1422,7 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         source_backend,
         args.progress_interval,
         shape,
+        key_generation.keys,
         &args.replay_journal_dir,
     )
     .await;
@@ -1441,6 +1448,7 @@ fn require_private_listener_opt_in(enabled: bool) -> RunnerResult<()> {
 fn private_projection_shape(
     capture: &ValidatedCapture,
     sizing: &ValidatedSizing,
+    key_epoch: u64,
 ) -> RunnerResult<PrivateProjectionShape> {
     let model = sizing.qualification().model();
     let outputs = usize::try_from(capture.measurement().output_count())
@@ -1452,7 +1460,7 @@ fn private_projection_shape(
     Ok(PrivateProjectionShape {
         network: PrivateNetwork::Mainnet,
         schema_version: PRIVATE_SCHEMA_VERSION,
-        key_epoch: PRIVATE_KEY_EPOCH,
+        key_epoch,
         projection_epoch: fresh_private_epoch()?,
         max_seen_outputs: outputs,
         max_live_outputs: outputs,
@@ -1495,6 +1503,7 @@ async fn serve_private_surface(
     source_backend: BackendKind,
     progress_interval: NonZeroU32,
     shape: PrivateProjectionShape,
+    keys: PrivateRuntimeKeys,
     replay_journal_dir: &Path,
 ) -> RunnerResult<()> {
     let (projection, _source_snapshot) = replay_preverified_snapshot(
@@ -1530,11 +1539,11 @@ async fn serve_private_surface(
         replay_journal_root: replay_journal_dir.to_path_buf(),
         projection: shape,
     };
-    let mut runtime = mainnet_private_query_runtime::<ValidatorConnector>(
-        &deployment,
-        PrivateRuntimeKeys::ephemeral().map_err(|_| RunnerError::PrivateRuntimeUnavailable)?,
-    )
-    .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
+    // `shape.key_epoch` was taken from the same draw as `keys`; the runtime's
+    // bootstrap material reports that epoch, so a wallet holding a predecessor
+    // process's keys sees a mismatch rather than the uniform refusal.
+    let mut runtime = mainnet_private_query_runtime::<ValidatorConnector>(&deployment, keys)
+        .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
 
     let subscriber = service.get_subscriber().inner();
     runtime

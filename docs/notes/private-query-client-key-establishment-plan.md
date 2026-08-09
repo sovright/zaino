@@ -162,8 +162,12 @@ message BootstrapResponse {
   bytes request_key = 2;
   // Opens response envelopes.
   bytes response_key = 3;
-  // The compiled privacy profile these keys are valid under.
-  string profile_id = 4;
+  // Human-readable name of the compiled privacy profile, for logs and support.
+  // Diagnostic, NOT authoritative: the authoritative profile identifier is a
+  // digest over every logical budget dimension and is already bound into
+  // protected request state, so a query sealed against the wrong profile fails
+  // to open regardless of what this string says.
+  string profile_label = 4;
   // Exact envelope size class, so a wallet pads correctly without guessing.
   uint32 envelope_bytes = 5;
   // Reserved for a TDX quote binding the TLS identity to the measured binary.
@@ -301,9 +305,13 @@ git commit -m "Cap each private route at its own fixed size"
 **Interfaces:**
 - Consumes: `ReleasableSessionKeys` (Task 1), `BootstrapResponse` (Task 2)
 - Produces:
-  - `SessionBootstrap { key_epoch: u64, keys: ReleasableSessionKeys, profile_id: &'static str, envelope_bytes: usize }`
-    — a named struct rather than a tuple, because four positional fields of
-    which two are integers is exactly where a caller silently swaps them.
+  - `SessionBootstrap { key_epoch: u64, keys: ReleasableSessionKeys, profile_label: &'static str }`
+    — a named struct rather than a tuple, because positional fields of which
+    one is an integer are exactly where a caller silently swaps them.
+    Deliberately *no* `envelope_bytes` field: the envelope width is already
+    determined by the runtime's fixed-envelope const generic `N`, and a second
+    copy here could disagree with it. Every place that reports an envelope
+    width — the bootstrap response and both decode caps — derives it from `N`.
   - `fn session_bootstrap(&self) -> SessionBootstrap` on the runtime trait.
   - `PrivateQueryOutcome::StaleKeyEpoch` — a new variant, distinguishable from
     the uniform refusal.

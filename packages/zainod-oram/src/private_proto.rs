@@ -29,9 +29,16 @@ pub struct BootstrapResponse {
     /// Opens response envelopes.
     #[prost(bytes = "vec", tag = "3")]
     pub response_key: ::prost::alloc::vec::Vec<u8>,
-    /// The compiled privacy profile these keys are valid under.
+    /// Human-readable name of the compiled privacy profile, for logs and support.
+    ///
+    /// Diagnostic, NOT authoritative: do not pin on it. The authoritative profile
+    /// identifier is a digest over every logical budget dimension and is already
+    /// bound into protected request state, so a query sealed against the wrong
+    /// profile fails to open regardless of what this string says. It is named
+    /// `profile_label` rather than `profile_id` precisely so it cannot be mistaken
+    /// for that identifier.
     #[prost(string, tag = "4")]
-    pub profile_id: ::prost::alloc::string::String,
+    pub profile_label: ::prost::alloc::string::String,
     /// Exact envelope size class, so a wallet pads correctly without guessing.
     #[prost(uint32, tag = "5")]
     pub envelope_bytes: u32,

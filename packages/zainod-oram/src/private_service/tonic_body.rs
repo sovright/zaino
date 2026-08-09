@@ -217,20 +217,17 @@ where
     }
 }
 
-/// Answers a bootstrap request with the runtime's current session material.
+/// Answers a bootstrap request with the material precomputed at construction.
 ///
-/// `BootstrapRequest` is empty on the wire, so the only work here is building
-/// the response; the cap on the request itself is enforced by the codec's
-/// `max_decoding_message_size` before this service is ever called.
-///
-/// `envelope_bytes` is carried separately from `session_bootstrap` rather
-/// than as one of its fields: `SessionBootstrap` deliberately does not carry
-/// the envelope width, so there is exactly one source of that number -- the
-/// adapter's own const generic `N` -- and no second copy that could disagree
-/// with it.
+/// `BootstrapRequest` is empty on the wire and the answer is fixed for the
+/// runtime's process lifetime, so there is no work to do here beyond handing
+/// back a clone; the cap on the request itself is enforced by the codec's
+/// `max_decoding_message_size` before this service is ever called. Holding a
+/// borrow of the finished response, rather than of the runtime's session
+/// material, is what lets this route be answered without touching the
+/// single-admission lock -- see [`PrivateSessionBootstrap`].
 struct RespondBootstrap<'a> {
-    session_bootstrap: &'a SessionBootstrap,
-    envelope_bytes: usize,
+    response: &'a private_proto::BootstrapResponse,
 }
 
 impl UnaryService<private_proto::BootstrapRequest> for RespondBootstrap<'_> {
@@ -238,31 +235,80 @@ impl UnaryService<private_proto::BootstrapRequest> for RespondBootstrap<'_> {
     type Future = Ready<Result<Response<Self::Response>, Status>>;
 
     fn call(&mut self, _request: Request<private_proto::BootstrapRequest>) -> Self::Future {
-        ready(Ok(Response::new(session_bootstrap_to_wire(
-            self.session_bootstrap,
-            self.envelope_bytes,
-        ))))
+        ready(Ok(Response::new(self.response.clone())))
     }
 }
 
-/// Encodes bootstrap material as the wire response, named rather than a
-/// `From`/`TryFrom` impl per this crate's boundary-conversion convention.
-/// `SessionBootstrap` is foreign to this crate, so this is a plain function
-/// rather than an inherent method. `envelope_bytes` is supplied by the
-/// caller (derived from the adapter's `N`) rather than read off `bootstrap`,
-/// since `SessionBootstrap` does not carry it.
-fn session_bootstrap_to_wire(
-    bootstrap: &SessionBootstrap,
-    envelope_bytes: usize,
-) -> private_proto::BootstrapResponse {
-    private_proto::BootstrapResponse {
-        key_epoch: bootstrap.key_epoch,
-        request_key: bootstrap.keys.request_key.to_vec(),
-        response_key: bootstrap.keys.response_key.to_vec(),
-        profile_id: bootstrap.profile_id.to_owned(),
-        envelope_bytes: u32::try_from(envelope_bytes).unwrap_or(u32::MAX),
-        // Reserved for a future TDX quote; present and empty in this release.
-        attestation: Vec::new(),
+/// The finished bootstrap answer, built once and served without any lock.
+///
+/// A named wrapper rather than a bare `private_proto::BootstrapResponse` for
+/// two reasons. First, prost derives `Debug` on generated messages, and the
+/// derived one prints both released keys byte for byte; `SessionBootstrap`
+/// redacts its own `Debug`, and that redaction must survive the reshaping into
+/// wire form. Second, the type is the place to state why this material is held
+/// outside the handler mutex at all: the bootstrap route is cheap,
+/// unauthenticated, and exempt from the uniform-shape discipline, so if
+/// answering it required the single-admission lock its latency would report
+/// whether a query round is in flight -- exactly the occupancy signal
+/// `poll_ready` refuses to leak.
+pub(super) struct PrivateSessionBootstrap {
+    response: private_proto::BootstrapResponse,
+}
+
+impl PrivateSessionBootstrap {
+    /// Encodes bootstrap material as the wire response, a named method rather
+    /// than a `From`/`TryFrom` impl per this crate's boundary-conversion
+    /// convention. `envelope_bytes` is supplied by the caller (derived from the
+    /// listener's const generic `N`) rather than read off `bootstrap`, since
+    /// `SessionBootstrap` deliberately does not carry it: there is exactly one
+    /// source of that number and no second copy that could disagree with it.
+    pub(super) fn from_session(bootstrap: &SessionBootstrap, envelope_bytes: usize) -> Self {
+        Self {
+            response: private_proto::BootstrapResponse {
+                key_epoch: bootstrap.key_epoch,
+                request_key: bootstrap.keys.request_key.to_vec(),
+                response_key: bootstrap.keys.response_key.to_vec(),
+                profile_label: bootstrap.profile_label.to_owned(),
+                envelope_bytes: u32::try_from(envelope_bytes).unwrap_or(u32::MAX),
+                // Reserved for a future TDX quote; present and empty in this release.
+                attestation: Vec::new(),
+            },
+        }
+    }
+
+    /// Decodes and answers a bootstrap request under its own cap.
+    ///
+    /// `BootstrapRequest` is empty on the wire, so its cap is
+    /// `fixed_envelope_wire_size(0)` — independent of `QueryPage`'s cap, which
+    /// is keyed to the application envelope size `N`. Sharing one cap across
+    /// both routes would let the larger of the two set the limit for both.
+    ///
+    /// Takes `&self`, not `&mut self`: answering this route must not need the
+    /// handler mutex, or its latency becomes an occupancy probe.
+    pub(super) async fn answer<B>(&self, request: http::Request<B>) -> http::Response<TonicBody>
+    where
+        B: HttpBody + Send + 'static,
+        B::Error: Into<StdError> + Send,
+    {
+        let grpc = Grpc::new(tonic_prost::ProstCodec::<
+            private_proto::BootstrapResponse,
+            private_proto::BootstrapRequest,
+        >::default())
+        .max_decoding_message_size(fixed_envelope_wire_size(BOOTSTRAP_REQUEST_BYTES));
+        capped_unary_call(
+            grpc,
+            RespondBootstrap {
+                response: &self.response,
+            },
+            request,
+        )
+        .await
+    }
+}
+
+impl std::fmt::Debug for PrivateSessionBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrivateSessionBootstrap { ..REDACTED.. }")
     }
 }
 
@@ -290,7 +336,7 @@ where
 /// Listener-free entry point that returns Tonic's lazily encoded response body.
 pub(super) struct PrivateTonicBodyAdapter<H, const N: usize> {
     adapter: PrivateServiceAdapter<H, N>,
-    session_bootstrap: SessionBootstrap,
+    current_key_epoch: u64,
 }
 
 impl<H, const N: usize> PrivateTonicBodyAdapter<H, N>
@@ -298,20 +344,18 @@ where
     H: FixedEnvelopeRuntime<N>,
     H::PendingResponse: Send + 'static,
 {
-    /// `session_bootstrap` is captured once at construction rather than
-    /// re-derived per request: the epoch, keys, and profile are fixed for a
-    /// runtime's process lifetime, and this is also the one live epoch the
-    /// query-page route checks every request's envelope against.
+    /// `current_key_epoch` is captured once at construction rather than
+    /// re-derived per request: it is fixed for a runtime's process lifetime,
+    /// and it is the one live epoch this route checks every request's envelope
+    /// against.
     ///
-    /// `SessionBootstrap` does not carry the envelope width -- see its own
-    /// doc comment -- so there is no second copy of `N` here that could
-    /// disagree with it; every place this adapter reports an envelope width
-    /// (the bootstrap response, both decode caps) derives it from `N`
-    /// directly.
-    pub(super) const fn new(handler: H, session_bootstrap: SessionBootstrap) -> Self {
+    /// Only the epoch is held here, not the whole `SessionBootstrap`: the keys
+    /// belong to the lock-free bootstrap route ([`PrivateSessionBootstrap`]),
+    /// and this type has no use for them.
+    pub(super) const fn new(handler: H, current_key_epoch: u64) -> Self {
         Self {
             adapter: PrivateServiceAdapter::new(handler),
-            session_bootstrap,
+            current_key_epoch,
         }
     }
 
@@ -323,7 +367,7 @@ where
         B: HttpBody + Send + 'static,
         B::Error: Into<StdError> + Send,
     {
-        let current_key_epoch = self.session_bootstrap.key_epoch;
+        let current_key_epoch = self.current_key_epoch;
         let service = PrivateUnary {
             adapter: &mut self.adapter,
             current_key_epoch,
@@ -332,32 +376,6 @@ where
             current_key_epoch,
         ))
         .max_decoding_message_size(fixed_envelope_request_wire_size(N));
-        capped_unary_call(grpc, service, request).await
-    }
-
-    /// Decodes and answers a bootstrap request under its own cap.
-    ///
-    /// `BootstrapRequest` is empty on the wire, so its cap is
-    /// `fixed_envelope_wire_size(0)` — independent of `QueryPage`'s cap, which
-    /// is keyed to the application envelope size `N`. Sharing one cap across
-    /// both routes would let the larger of the two set the limit for both.
-    pub(super) async fn bootstrap<B>(
-        &mut self,
-        request: http::Request<B>,
-    ) -> http::Response<TonicBody>
-    where
-        B: HttpBody + Send + 'static,
-        B::Error: Into<StdError> + Send,
-    {
-        let grpc = Grpc::new(tonic_prost::ProstCodec::<
-            private_proto::BootstrapResponse,
-            private_proto::BootstrapRequest,
-        >::default())
-        .max_decoding_message_size(fixed_envelope_wire_size(BOOTSTRAP_REQUEST_BYTES));
-        let service = RespondBootstrap {
-            session_bootstrap: &self.session_bootstrap,
-            envelope_bytes: N,
-        };
         capped_unary_call(grpc, service, request).await
     }
 }
@@ -652,8 +670,15 @@ mod tests {
                 request_key: [0x11; PRIVATE_RUNTIME_KEY_BYTES],
                 response_key: [0x22; PRIVATE_RUNTIME_KEY_BYTES],
             },
-            profile_id: "test-profile",
+            profile_label: "test-profile",
         }
+    }
+
+    /// The bootstrap half of the surface, built exactly as the listener builds
+    /// it. Separate from [`fixture`] because it is separate in production: the
+    /// bootstrap route is answered without the handler or its mutex.
+    fn bootstrap_fixture() -> PrivateSessionBootstrap {
+        PrivateSessionBootstrap::from_session(&session_bootstrap_fixture(), ENVELOPE_BYTES)
     }
 
     fn fixture() -> (
@@ -666,7 +691,7 @@ mod tests {
             state: state.clone(),
         };
         (
-            PrivateTonicBodyAdapter::new(handler, session_bootstrap_fixture()),
+            PrivateTonicBodyAdapter::new(handler, FIXTURE_KEY_EPOCH),
             state,
         )
     }
@@ -905,9 +930,9 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_returns_the_current_epoch_and_exactly_two_keys(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut adapter, _state) = fixture();
-        let response = adapter
-            .bootstrap(encoded_frame(
+        let bootstrap = bootstrap_fixture();
+        let response = bootstrap
+            .answer(encoded_frame(
                 private_proto::BootstrapRequest {}.encode_to_vec(),
             ))
             .await;
@@ -932,8 +957,9 @@ mod tests {
     async fn bootstrap_over_its_empty_cap_is_refused_uniformly() {
         // BootstrapRequest is empty on the wire, so any nonzero-length
         // message exceeds its cap and must be refused before it is parsed.
-        let (mut adapter, _state) = fixture();
-        let response = adapter.bootstrap(encoded_frame(vec![0u8; 8])).await;
+        let response = bootstrap_fixture()
+            .answer(encoded_frame(vec![0u8; 8]))
+            .await;
 
         assert_uniform_status(response.headers());
         assert!(response.into_body().is_end_stream());

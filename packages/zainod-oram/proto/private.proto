@@ -26,8 +26,15 @@ message BootstrapResponse {
   bytes request_key = 2;
   // Opens response envelopes.
   bytes response_key = 3;
-  // The compiled privacy profile these keys are valid under.
-  string profile_id = 4;
+  // Human-readable name of the compiled privacy profile, for logs and support.
+  //
+  // Diagnostic, NOT authoritative: do not pin on it. The authoritative profile
+  // identifier is a digest over every logical budget dimension and is already
+  // bound into protected request state, so a query sealed against the wrong
+  // profile fails to open regardless of what this string says. It is named
+  // `profile_label` rather than `profile_id` precisely so it cannot be mistaken
+  // for that identifier.
+  string profile_label = 4;
   // Exact envelope size class, so a wallet pads correctly without guessing.
   uint32 envelope_bytes = 5;
   // Reserved for a TDX quote binding the TLS identity to the measured binary.
