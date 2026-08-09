@@ -90,6 +90,13 @@ own posture, since an honest-but-curious operator is assumed to look.
 Because each restart draws fresh keys, this is **not** an AEAD nonce-reuse
 hazard.
 
+The key epoch is drawn *with* the keys, from the same generator, by
+`EphemeralKeyGeneration::draw`. Neither half can be obtained alone. A fixed or
+independently chosen epoch would make restart-is-rotation inert: the keys would
+change while the epoch stood still, and a wallet holding retired keys would see
+the uniform refusal instead of `StaleKeyEpoch` — the exact opaque outcome the
+cleartext epoch exists to prevent.
+
 ### The key epoch travels in cleartext
 
 The wallet sends `key_epoch` beside the sealed envelope, not inside it.
@@ -111,8 +118,16 @@ A second route,
 `/zaino.private.v1.PrivateCompactTxStreamer/BootstrapSession`, beside
 `/zaino.private.v1.PrivateCompactTxStreamer/QueryPage`, which today is the
 listener's only one. Its response carries the key epoch, the two releasable
-keys, the profile identifier, the envelope size class, and the empty
-attestation field.
+keys, the profile *label*, the envelope size class, and the empty attestation
+field.
+
+The label is diagnostic and explicitly not authoritative — the field is named
+`profile_label` so no wallet author pins on it. The authoritative profile
+identifier is a digest over every logical budget dimension and is already bound
+into protected request state, so a query sealed against the wrong profile fails
+to open regardless of what the label says. Publishing the digest here would add
+a second thing to pin without adding a check the envelope does not already
+make.
 
 ADR 0007 already lists "method class if exposed as separate RPCs" among
 permitted observations, so a distinguishable bootstrap method sits inside the

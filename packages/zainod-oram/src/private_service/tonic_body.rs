@@ -18,7 +18,7 @@ use tonic::{
 use tonic_prost::{ProstDecoder, ProstEncoder};
 #[cfg(test)]
 use zaino_oram::PrivateQueryUnavailable;
-use zaino_oram::{FixedEnvelopeRuntime, PendingFixedEnvelope};
+use zaino_oram::{FixedEnvelopeRuntime, PendingFixedEnvelope, SessionBootstrap};
 
 use super::{PendingQueryPage, PrivateServiceAdapter, ValidatedFixedEnvelope};
 use crate::private_proto;
@@ -27,12 +27,14 @@ const UNIFORM_GRPC_MESSAGE: &str = "private%20query%20unavailable";
 
 /// Codec that delays response-byte access until Tonic polls the response body.
 struct PrivateResponseCodec<P, const N: usize> {
+    current_key_epoch: u64,
     _pending: PhantomData<P>,
 }
 
 impl<P, const N: usize> PrivateResponseCodec<P, N> {
-    const fn new() -> Self {
+    const fn new(current_key_epoch: u64) -> Self {
         Self {
+            current_key_epoch,
             _pending: PhantomData,
         }
     }
@@ -48,7 +50,7 @@ where
     type Decoder = ProstDecoder<private_proto::FixedEnvelope>;
 
     fn encoder(&mut self) -> Self::Encoder {
-        PrivateResponseEncoder::new()
+        PrivateResponseEncoder::new(self.current_key_epoch)
     }
 
     fn decoder(&mut self) -> Self::Decoder {
@@ -65,13 +67,15 @@ impl<P, const N: usize> std::fmt::Debug for PrivateResponseCodec<P, N> {
 /// Encodes only after the pending runtime value accepts release-time currentness.
 struct PrivateResponseEncoder<P, const N: usize> {
     inner: ProstEncoder<private_proto::FixedEnvelope>,
+    current_key_epoch: u64,
     _pending: PhantomData<P>,
 }
 
 impl<P, const N: usize> PrivateResponseEncoder<P, N> {
-    fn new() -> Self {
+    fn new(current_key_epoch: u64) -> Self {
         Self {
             inner: ProstEncoder::default(),
+            current_key_epoch,
             _pending: PhantomData,
         }
     }
@@ -93,7 +97,7 @@ where
             .pending_response
             .try_release_bytes()
             .map_err(coarsen_tonic_error)?;
-        let response = ValidatedFixedEnvelope::from_array(*bytes).to_wire();
+        let response = ValidatedFixedEnvelope::from_array(*bytes).to_wire(self.current_key_epoch);
         let result = self
             .inner
             .encode(response, destination)
@@ -113,9 +117,82 @@ impl<P, const N: usize> std::fmt::Debug for PrivateResponseEncoder<P, N> {
     }
 }
 
+/// `BootstrapRequest` carries no fields, so its wire-encoded body is empty.
+const BOOTSTRAP_REQUEST_BYTES: usize = 0;
+
+/// Distinguishable pre-open classification of one query-page request's epoch.
+///
+/// The epoch comparison is on public data -- the same value for every client
+/// -- so an ordinary `==` is correct; the constant-time helpers elsewhere in
+/// this crate exist for secret comparisons and would misstate this one as
+/// sensitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateQueryOutcome {
+    /// The request's key epoch does not match the runtime's live epoch.
+    StaleKeyEpoch,
+}
+
+/// Classifies a request's key epoch against the runtime's live epoch before
+/// any attempt to open its envelope. `None` means the epoch matches and
+/// ordinary handling should proceed; under a retired key the open would fail
+/// anyway, so this check exists to answer with something a wallet can act on
+/// instead of an opaque refusal.
+const fn classify_request_epoch(
+    current_epoch: u64,
+    request_epoch: u64,
+) -> Option<PrivateQueryOutcome> {
+    if request_epoch == current_epoch {
+        None
+    } else {
+        Some(PrivateQueryOutcome::StaleKeyEpoch)
+    }
+}
+
+/// gRPC message distinguishing a stale-epoch refusal from the uniform one.
+///
+/// Deliberately not folded into [`UNIFORM_GRPC_MESSAGE`]: the epoch is
+/// per-generation and identical for every client, so reporting that a request
+/// used a retired one leaks nothing, and a wallet has no other way to learn
+/// it must re-bootstrap.
+const STALE_KEY_EPOCH_GRPC_MESSAGE: &str = "stale-key-epoch";
+
+/// gRPC status code for the stale-key-epoch refusal (`Code::FailedPrecondition`).
+const STALE_KEY_EPOCH_GRPC_STATUS: &str = "9";
+
+/// Marks a `Status` as the stale-key-epoch outcome, carried through its error
+/// source rather than through its code or message text.
+///
+/// [`coarsen_initial_status`] keys its one exemption off this type rather
+/// than off re-parsing the serialized `grpc-status`/`grpc-message` headers.
+/// The marker never reaches the wire -- `Status::source` is not part of
+/// `to_header_map` -- so any future `Status::failed_precondition` with this
+/// same code and message, from this file or a dependency, would not also
+/// carry this marker and would still be coarsened uniformly.
+#[derive(Debug)]
+struct StaleKeyEpochMarker;
+
+impl std::fmt::Display for StaleKeyEpochMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stale key epoch")
+    }
+}
+
+impl std::error::Error for StaleKeyEpochMarker {}
+
+fn status_for_query_outcome(outcome: PrivateQueryOutcome) -> Status {
+    match outcome {
+        PrivateQueryOutcome::StaleKeyEpoch => {
+            let mut status = Status::failed_precondition(STALE_KEY_EPOCH_GRPC_MESSAGE);
+            status.set_source(std::sync::Arc::new(StaleKeyEpochMarker));
+            status
+        }
+    }
+}
+
 /// One synchronous adapter borrow presented to Tonic's unary machinery.
 struct PrivateUnary<'a, H, const N: usize> {
     adapter: &'a mut PrivateServiceAdapter<H, N>,
+    current_key_epoch: u64,
 }
 
 impl<H, const N: usize> UnaryService<private_proto::FixedEnvelope> for PrivateUnary<'_, H, N>
@@ -127,18 +204,139 @@ where
     type Future = Ready<Result<Response<Self::Response>, Status>>;
 
     fn call(&mut self, request: Request<private_proto::FixedEnvelope>) -> Self::Future {
+        let envelope = request.into_inner();
+        if let Some(outcome) = classify_request_epoch(self.current_key_epoch, envelope.key_epoch) {
+            return ready(Err(status_for_query_outcome(outcome)));
+        }
         ready(
             self.adapter
-                .query_page(request.into_inner())
+                .query_page(envelope)
                 .map(Response::new)
                 .map_err(coarsen_tonic_error),
         )
     }
 }
 
+/// Answers a bootstrap request with the material precomputed at construction.
+///
+/// `BootstrapRequest` is empty on the wire and the answer is fixed for the
+/// runtime's process lifetime, so there is no work to do here beyond handing
+/// back a clone; the cap on the request itself is enforced by the codec's
+/// `max_decoding_message_size` before this service is ever called. Holding a
+/// borrow of the finished response, rather than of the runtime's session
+/// material, is what lets this route be answered without touching the
+/// single-admission lock -- see [`PrivateSessionBootstrap`].
+struct RespondBootstrap<'a> {
+    response: &'a private_proto::BootstrapResponse,
+}
+
+impl UnaryService<private_proto::BootstrapRequest> for RespondBootstrap<'_> {
+    type Response = private_proto::BootstrapResponse;
+    type Future = Ready<Result<Response<Self::Response>, Status>>;
+
+    fn call(&mut self, _request: Request<private_proto::BootstrapRequest>) -> Self::Future {
+        ready(Ok(Response::new(self.response.clone())))
+    }
+}
+
+/// The finished bootstrap answer, built once and served without any lock.
+///
+/// A named wrapper rather than a bare `private_proto::BootstrapResponse` for
+/// two reasons. First, prost derives `Debug` on generated messages, and the
+/// derived one prints both released keys byte for byte; `SessionBootstrap`
+/// redacts its own `Debug`, and that redaction must survive the reshaping into
+/// wire form. Second, the type is the place to state why this material is held
+/// outside the handler mutex at all: the bootstrap route is cheap,
+/// unauthenticated, and exempt from the uniform-shape discipline, so if
+/// answering it required the single-admission lock its latency would report
+/// whether a query round is in flight -- exactly the occupancy signal
+/// `poll_ready` refuses to leak.
+pub(super) struct PrivateSessionBootstrap {
+    response: private_proto::BootstrapResponse,
+}
+
+impl PrivateSessionBootstrap {
+    /// Encodes bootstrap material as the wire response, a named method rather
+    /// than a `From`/`TryFrom` impl per this crate's boundary-conversion
+    /// convention. `envelope_bytes` is supplied by the caller (derived from the
+    /// listener's const generic `N`) rather than read off `bootstrap`, since
+    /// `SessionBootstrap` deliberately does not carry it: there is exactly one
+    /// source of that number and no second copy that could disagree with it.
+    pub(super) fn from_session(bootstrap: &SessionBootstrap, envelope_bytes: usize) -> Self {
+        Self {
+            response: private_proto::BootstrapResponse {
+                key_epoch: bootstrap.key_epoch,
+                request_key: bootstrap.keys.request_key.to_vec(),
+                response_key: bootstrap.keys.response_key.to_vec(),
+                profile_label: bootstrap.profile_label.to_owned(),
+                envelope_bytes: u32::try_from(envelope_bytes).unwrap_or(u32::MAX),
+                // Reserved for a future TDX quote; present and empty in this release.
+                attestation: Vec::new(),
+            },
+        }
+    }
+
+    /// Decodes and answers a bootstrap request under its own cap.
+    ///
+    /// `BootstrapRequest` is empty on the wire, so its cap is
+    /// `fixed_envelope_wire_size(0)` — independent of `QueryPage`'s cap, which
+    /// is keyed to the application envelope size `N`. Sharing one cap across
+    /// both routes would let the larger of the two set the limit for both.
+    ///
+    /// Takes `&self`, not `&mut self`: answering this route must not need the
+    /// handler mutex, or its latency becomes an occupancy probe.
+    pub(super) async fn answer<B>(&self, request: http::Request<B>) -> http::Response<TonicBody>
+    where
+        B: HttpBody + Send + 'static,
+        B::Error: Into<StdError> + Send,
+    {
+        let grpc = Grpc::new(tonic_prost::ProstCodec::<
+            private_proto::BootstrapResponse,
+            private_proto::BootstrapRequest,
+        >::default())
+        .max_decoding_message_size(fixed_envelope_wire_size(BOOTSTRAP_REQUEST_BYTES));
+        capped_unary_call(
+            grpc,
+            RespondBootstrap {
+                response: &self.response,
+            },
+            request,
+        )
+        .await
+    }
+}
+
+impl std::fmt::Debug for PrivateSessionBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrivateSessionBootstrap { ..REDACTED.. }")
+    }
+}
+
+/// Drives one capped decode through Tonic, then rewrites the result to the
+/// private surface's uniform response shape. Shared by every route so the
+/// two routes' framing cannot drift apart even though each brings its own
+/// codec, cap, and unary service.
+async fn capped_unary_call<C, S, B>(
+    mut grpc: Grpc<C>,
+    service: S,
+    request: http::Request<B>,
+) -> http::Response<TonicBody>
+where
+    C: Codec,
+    S: UnaryService<C::Decode, Response = C::Encode>,
+    B: HttpBody + Send + 'static,
+    B::Error: Into<StdError> + Send,
+{
+    let mut response = grpc.unary(service, request).await;
+    coarsen_initial_status(&mut response);
+    let (parts, body) = response.into_parts();
+    http::Response::from_parts(parts, TonicBody::new(UniformStatusBody::new(body)))
+}
+
 /// Listener-free entry point that returns Tonic's lazily encoded response body.
 pub(super) struct PrivateTonicBodyAdapter<H, const N: usize> {
     adapter: PrivateServiceAdapter<H, N>,
+    current_key_epoch: u64,
 }
 
 impl<H, const N: usize> PrivateTonicBodyAdapter<H, N>
@@ -146,9 +344,18 @@ where
     H: FixedEnvelopeRuntime<N>,
     H::PendingResponse: Send + 'static,
 {
-    pub(super) const fn new(handler: H) -> Self {
+    /// `current_key_epoch` is captured once at construction rather than
+    /// re-derived per request: it is fixed for a runtime's process lifetime,
+    /// and it is the one live epoch this route checks every request's envelope
+    /// against.
+    ///
+    /// Only the epoch is held here, not the whole `SessionBootstrap`: the keys
+    /// belong to the lock-free bootstrap route ([`PrivateSessionBootstrap`]),
+    /// and this type has no use for them.
+    pub(super) const fn new(handler: H, current_key_epoch: u64) -> Self {
         Self {
             adapter: PrivateServiceAdapter::new(handler),
+            current_key_epoch,
         }
     }
 
@@ -160,20 +367,36 @@ where
         B: HttpBody + Send + 'static,
         B::Error: Into<StdError> + Send,
     {
+        let current_key_epoch = self.current_key_epoch;
         let service = PrivateUnary {
             adapter: &mut self.adapter,
+            current_key_epoch,
         };
-        let mut grpc = Grpc::new(PrivateResponseCodec::<H::PendingResponse, N>::new())
-            .max_decoding_message_size(fixed_envelope_wire_size(N));
-        let mut response = grpc.unary(service, request).await;
-        coarsen_initial_status(&mut response);
-        let (parts, body) = response.into_parts();
-        http::Response::from_parts(parts, TonicBody::new(UniformStatusBody::new(body)))
+        let grpc = Grpc::new(PrivateResponseCodec::<H::PendingResponse, N>::new(
+            current_key_epoch,
+        ))
+        .max_decoding_message_size(fixed_envelope_request_wire_size(N));
+        capped_unary_call(grpc, service, request).await
     }
 }
 
+/// Worst-case wire bytes for the `key_epoch` field: a 1-byte tag plus the
+/// widest a `uint64` varint can ever encode (10 bytes, for `u64::MAX`).
+const KEY_EPOCH_FIELD_WIRE_BYTES: usize = 1 + 10;
+
 fn fixed_envelope_wire_size(envelope_bytes: usize) -> usize {
     1 + prost::length_delimiter_len(envelope_bytes) + envelope_bytes
+}
+
+/// Decode cap for one `FixedEnvelope` request, including its `key_epoch`
+/// field.
+///
+/// Requests now echo the epoch they were sealed under, so a cap sized for
+/// `envelope` alone would reject a legitimate nonzero epoch as oversized.
+/// `BootstrapRequest` carries no such field, so [`fixed_envelope_wire_size`]
+/// alone is still correct for that route's cap.
+fn fixed_envelope_request_wire_size(envelope_bytes: usize) -> usize {
+    fixed_envelope_wire_size(envelope_bytes) + KEY_EPOCH_FIELD_WIRE_BYTES
 }
 
 impl<H, const N: usize> std::fmt::Debug for PrivateTonicBodyAdapter<H, N> {
@@ -247,15 +470,61 @@ fn status_is_failure(headers: &http::HeaderMap) -> bool {
         .is_some_and(|status| status.as_bytes() != b"0")
 }
 
+/// Rewrites every failure's headers to one of exactly two fixed sets, then
+/// clears extensions on both paths.
+///
+/// The stale-key-epoch outcome is the one response this file deliberately
+/// does *not* coarsen to the uniform refusal -- which is exactly why it gets
+/// scrubbed the same as everything else: its own fixed minimal header set,
+/// and no leftover extensions (including the marker read below) riding out
+/// to the caller. Every other failure -- transport errors, handler refusals,
+/// cap violations -- still collapses to the one uniform response.
 fn coarsen_initial_status(response: &mut http::Response<TonicBody>) {
     if status_is_failure(response.headers()) {
-        *response.headers_mut() = uniform_initial_status_headers();
-        response.extensions_mut().clear();
+        *response.headers_mut() = if extensions_carry_stale_key_epoch(response.extensions()) {
+            stale_key_epoch_initial_headers()
+        } else {
+            uniform_initial_status_headers()
+        };
     }
+    response.extensions_mut().clear();
+}
+
+/// Recognizes the stale-key-epoch outcome structurally: by the
+/// [`StaleKeyEpochMarker`] attached to the `Status` tonic inserted into
+/// `response.extensions()`, not by re-deriving the decision from serialized
+/// header bytes.
+fn extensions_carry_stale_key_epoch(extensions: &http::Extensions) -> bool {
+    extensions
+        .get::<Status>()
+        .and_then(|status| std::error::Error::source(status))
+        .is_some_and(|source| source.is::<StaleKeyEpochMarker>())
 }
 
 fn uniform_initial_status_headers() -> http::HeaderMap {
-    let mut headers = uniform_status_headers();
+    fixed_initial_status_headers("14", UNIFORM_GRPC_MESSAGE)
+}
+
+/// The stale-key-epoch outcome's own fixed minimal header set -- parallel to
+/// [`uniform_initial_status_headers`], not a preserved copy of whatever
+/// `Status::into_http` happened to produce.
+fn stale_key_epoch_initial_headers() -> http::HeaderMap {
+    fixed_initial_status_headers(STALE_KEY_EPOCH_GRPC_STATUS, STALE_KEY_EPOCH_GRPC_MESSAGE)
+}
+
+fn fixed_initial_status_headers(
+    grpc_status: &'static str,
+    grpc_message: &'static str,
+) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        Status::GRPC_STATUS,
+        http::HeaderValue::from_static(grpc_status),
+    );
+    headers.insert(
+        Status::GRPC_MESSAGE,
+        http::HeaderValue::from_static(grpc_message),
+    );
     headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/grpc"),
@@ -291,7 +560,10 @@ mod tests {
     use prost::Message;
 
     use super::*;
+    use zaino_oram::{ReleasableSessionKeys, PRIVATE_RUNTIME_KEY_BYTES};
+
     const ENVELOPE_BYTES: usize = 4;
+    const FIXTURE_KEY_EPOCH: u64 = 0;
 
     #[derive(Clone)]
     struct MockState {
@@ -391,6 +663,24 @@ mod tests {
         }
     }
 
+    fn session_bootstrap_fixture() -> SessionBootstrap {
+        SessionBootstrap {
+            key_epoch: FIXTURE_KEY_EPOCH,
+            keys: ReleasableSessionKeys {
+                request_key: [0x11; PRIVATE_RUNTIME_KEY_BYTES],
+                response_key: [0x22; PRIVATE_RUNTIME_KEY_BYTES],
+            },
+            profile_label: "test-profile",
+        }
+    }
+
+    /// The bootstrap half of the surface, built exactly as the listener builds
+    /// it. Separate from [`fixture`] because it is separate in production: the
+    /// bootstrap route is answered without the handler or its mutex.
+    fn bootstrap_fixture() -> PrivateSessionBootstrap {
+        PrivateSessionBootstrap::from_session(&session_bootstrap_fixture(), ENVELOPE_BYTES)
+    }
+
     fn fixture() -> (
         PrivateTonicBodyAdapter<MockHandler, ENVELOPE_BYTES>,
         MockState,
@@ -400,14 +690,15 @@ mod tests {
             response: [9, 8, 7, 6],
             state: state.clone(),
         };
-        (PrivateTonicBodyAdapter::new(handler), state)
+        (
+            PrivateTonicBodyAdapter::new(handler, FIXTURE_KEY_EPOCH),
+            state,
+        )
     }
 
-    fn request(bytes: &[u8]) -> http::Request<OneFrameBody> {
-        let message = private_proto::FixedEnvelope {
-            envelope: bytes.to_vec(),
-        }
-        .encode_to_vec();
+    /// Wraps an already-encoded protobuf message in the one-frame gRPC body
+    /// shape both routes' tests decode from.
+    fn encoded_frame(message: Vec<u8>) -> http::Request<OneFrameBody> {
         let length = u32::try_from(message.len())
             .expect("test protobuf request length fits the gRPC prefix");
         let mut frame = Vec::with_capacity(5 + message.len());
@@ -417,6 +708,20 @@ mod tests {
         http::Request::new(OneFrameBody {
             frame: Some(Bytes::from(frame)),
         })
+    }
+
+    fn request(bytes: &[u8]) -> http::Request<OneFrameBody> {
+        request_with_epoch(bytes, FIXTURE_KEY_EPOCH)
+    }
+
+    fn request_with_epoch(bytes: &[u8], key_epoch: u64) -> http::Request<OneFrameBody> {
+        encoded_frame(
+            private_proto::FixedEnvelope {
+                envelope: bytes.to_vec(),
+                key_epoch,
+            }
+            .encode_to_vec(),
+        )
     }
 
     async fn next_frame(body: &mut TonicBody) -> Option<Result<Frame<Bytes>, Status>> {
@@ -431,6 +736,20 @@ mod tests {
         assert_eq!(
             headers.get(Status::GRPC_MESSAGE),
             Some(&http::HeaderValue::from_static(UNIFORM_GRPC_MESSAGE))
+        );
+        assert!(!headers.contains_key(Status::GRPC_STATUS_DETAILS));
+    }
+
+    fn assert_stale_key_epoch_status(headers: &http::HeaderMap) {
+        assert_eq!(
+            headers.get(Status::GRPC_STATUS),
+            Some(&http::HeaderValue::from_static(STALE_KEY_EPOCH_GRPC_STATUS))
+        );
+        assert_eq!(
+            headers.get(Status::GRPC_MESSAGE),
+            Some(&http::HeaderValue::from_static(
+                STALE_KEY_EPOCH_GRPC_MESSAGE
+            ))
         );
         assert!(!headers.contains_key(Status::GRPC_STATUS_DETAILS));
     }
@@ -555,11 +874,160 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_body_is_rejected_with_the_uniform_refusal() {
+        // Sized past `fixed_envelope_request_wire_size(ENVELOPE_BYTES)` (17
+        // bytes: 6 for the envelope field plus the 11-byte key_epoch
+        // allowance), so this still exercises the transport-level cap
+        // rejection rather than `try_from_wire`'s length check -- a body
+        // merely one byte over `ENVELOPE_BYTES` now fits comfortably inside
+        // the wider cap and reaches the handler's own length validation
+        // instead (see `boundary_failure_is_uniform_before_body_creation`).
         let (mut adapter, state) = fixture();
-        let response = adapter.query_page(request(&[1, 2, 3, 4, 5])).await;
+        let oversized = vec![0u8; ENVELOPE_BYTES + 20];
+        let response = adapter.query_page(request(&oversized)).await;
 
         assert_uniform_status(response.headers());
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        assert!(response.into_body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn each_route_is_capped_at_its_own_size() {
+        // A body sized well past bootstrap's empty cap must still be refused
+        // by QueryPage, whose cap is the fixed envelope. Sharing one cap
+        // across routes would let the larger of the two set the limit for
+        // both, letting an oversized QueryPage body slip through against
+        // bootstrap's ceiling.
+        let (mut adapter, state) = fixture();
+        let oversized_for_query = vec![0u8; ENVELOPE_BYTES + 64];
+        let response = adapter.query_page(request(&oversized_for_query)).await;
+
+        assert_uniform_status(response.headers());
+        assert_eq!(
+            state.calls.load(Ordering::SeqCst),
+            0,
+            "an oversized query body reached the runtime"
+        );
+        assert!(response.into_body().is_end_stream());
+    }
+
+    async fn decode_bootstrap(
+        response: http::Response<TonicBody>,
+    ) -> Result<private_proto::BootstrapResponse, Box<dyn std::error::Error>> {
+        let mut body = response.into_body();
+        let frame = next_frame(&mut body)
+            .await
+            .expect("a served bootstrap response emits one data frame")?;
+        let data = frame
+            .into_data()
+            .expect("the first bootstrap frame is data, not trailers");
+        // Strip the 5-byte gRPC length-prefixed-message header (compression
+        // flag + big-endian length) that precedes the protobuf payload on the
+        // wire; see `first_body_poll_checks_releases_and_emits_one_exact_data_frame`
+        // for the same framing on the query-page route.
+        Ok(private_proto::BootstrapResponse::decode(&data[5..])?)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_returns_the_current_epoch_and_exactly_two_keys(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bootstrap = bootstrap_fixture();
+        let response = bootstrap
+            .answer(encoded_frame(
+                private_proto::BootstrapRequest {}.encode_to_vec(),
+            ))
+            .await;
+
+        assert!(!status_is_failure(response.headers()));
+        let decoded = decode_bootstrap(response).await?;
+
+        assert_eq!(decoded.key_epoch, FIXTURE_KEY_EPOCH);
+        assert_eq!(decoded.request_key.len(), PRIVATE_RUNTIME_KEY_BYTES);
+        assert_eq!(decoded.response_key.len(), PRIVATE_RUNTIME_KEY_BYTES);
+        assert_eq!(decoded.envelope_bytes as usize, ENVELOPE_BYTES);
+        assert!(
+            decoded.attestation.is_empty(),
+            "attestation is deferred, not populated"
+        );
+        // The keys served must be the releasable pair and nothing else.
+        assert_ne!(decoded.request_key, decoded.response_key);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_over_its_empty_cap_is_refused_uniformly() {
+        // BootstrapRequest is empty on the wire, so any nonzero-length
+        // message exceeds its cap and must be refused before it is parsed.
+        let response = bootstrap_fixture()
+            .answer(encoded_frame(vec![0u8; 8]))
+            .await;
+
+        assert_uniform_status(response.headers());
+        assert!(response.into_body().is_end_stream());
+    }
+
+    /// Pure classification, independent of the wire: the epoch comparison is
+    /// on public data, so an ordinary `==` decides it.
+    #[test]
+    fn a_request_under_a_retired_epoch_is_distinguishable() {
+        const CURRENT_EPOCH: u64 = 7;
+
+        let outcome = classify_request_epoch(CURRENT_EPOCH, CURRENT_EPOCH - 1);
+        assert_eq!(outcome, Some(PrivateQueryOutcome::StaleKeyEpoch));
+        assert_eq!(classify_request_epoch(CURRENT_EPOCH, CURRENT_EPOCH), None);
+    }
+
+    #[tokio::test]
+    async fn a_stale_key_epoch_is_refused_before_the_handler_and_stays_distinguishable() {
+        let (mut adapter, state) = fixture();
+
+        let response = adapter
+            .query_page(request_with_epoch(&[1, 2, 3, 4], FIXTURE_KEY_EPOCH + 1))
+            .await;
+
+        assert_stale_key_epoch_status(response.headers());
+        assert_eq!(
+            state.calls.load(Ordering::SeqCst),
+            0,
+            "the handler must not be invoked before the epoch check"
+        );
+        // The marker that distinguishes this response must not ride out as a
+        // caller-visible extension once the coarsener has read it.
+        assert!(response.extensions().is_empty());
+        assert!(response.into_body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn a_matching_key_epoch_reaches_the_handler() {
+        let (mut adapter, state) = fixture();
+
+        let response = adapter
+            .query_page(request_with_epoch(&[1, 2, 3, 4], FIXTURE_KEY_EPOCH))
+            .await;
+
+        assert!(!status_is_failure(response.headers()));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The 10-byte-varint case is the entire reason
+    /// `KEY_EPOCH_FIELD_WIRE_BYTES` exists: if the cap under-counted it, this
+    /// request would be rejected by the transport before ever reaching the
+    /// epoch check, and would surface as the uniform refusal instead of the
+    /// distinguishable stale-epoch one. Reaching that distinguishable status
+    /// is exactly the evidence that decoding succeeded within the cap.
+    #[tokio::test]
+    async fn a_request_epoch_of_u64_max_fits_the_decode_cap() {
+        let (mut adapter, state) = fixture();
+
+        let response = adapter
+            .query_page(request_with_epoch(&[1, 2, 3, 4], u64::MAX))
+            .await;
+
+        assert_stale_key_epoch_status(response.headers());
+        assert_eq!(
+            state.calls.load(Ordering::SeqCst),
+            0,
+            "a u64::MAX epoch mismatches the fixture and must not reach the handler"
+        );
         assert!(response.into_body().is_end_stream());
     }
 
@@ -608,8 +1076,10 @@ mod tests {
     #[test]
     fn tonic_body_debug_surfaces_are_redacted() {
         let (adapter, _) = fixture();
-        let codec = PrivateResponseCodec::<MockPendingResponse, ENVELOPE_BYTES>::new();
-        let encoder = PrivateResponseEncoder::<MockPendingResponse, ENVELOPE_BYTES>::new();
+        let codec =
+            PrivateResponseCodec::<MockPendingResponse, ENVELOPE_BYTES>::new(FIXTURE_KEY_EPOCH);
+        let encoder =
+            PrivateResponseEncoder::<MockPendingResponse, ENVELOPE_BYTES>::new(FIXTURE_KEY_EPOCH);
 
         assert_eq!(
             format!("{adapter:?}"),

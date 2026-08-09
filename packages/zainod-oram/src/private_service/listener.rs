@@ -6,8 +6,18 @@
 //! detail to be relaxed later. Serving two rounds concurrently would let the
 //! observable completion order depend on which address was queried.
 //!
-//! Every route other than the one private method answers with the same status
-//! as a failed query, so probing the surface reveals no more than calling it.
+//! This surface answers two routes. `QueryPage` is the private method the
+//! mutex above guards. `BootstrapSession` is the deliberate exemption: it hands
+//! a wallet the current key epoch and its two releasable keys, it takes no
+//! client input, and it is answered from material prepared at construction --
+//! never through the handler mutex, because a route whose latency depended on
+//! whether a query round is in flight would time the surface against the
+//! runtime's occupancy, which is exactly what the fixed schedule hides.
+//!
+//! Every *other* route answers with the same status as a failed query, so
+//! probing beyond these two reveals no more than calling them. Bootstrap is the
+//! one intended departure from that uniformity: its response is identical for
+//! every caller and reveals nothing about any query.
 
 use std::{
     convert::Infallible,
@@ -31,13 +41,15 @@ use tonic::{
     transport::server::{Connected, Server},
 };
 
-use zaino_oram::FixedEnvelopeRuntime;
+use zaino_oram::{FixedEnvelopeRuntime, SessionBootstrap};
 
-use super::tonic_body::PrivateTonicBodyAdapter;
+use super::tonic_body::{PrivateSessionBootstrap, PrivateTonicBodyAdapter};
 use crate::private_proto;
 
-/// The one method this surface answers.
+/// The private method, answered under the single-admission mutex.
 const QUERY_PAGE_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/QueryPage";
+/// The key-establishment method, answered without it.
+const BOOTSTRAP_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/BootstrapSession";
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 1;
 
@@ -66,16 +78,21 @@ impl PrivateQueryListener {
     }
 
     /// Serves the private surface until `shutdown` resolves.
+    ///
+    /// `session_bootstrap` is captured once here rather than re-derived per
+    /// request: it is fixed for `handler`'s process lifetime, and it is also
+    /// the one live epoch the query-page route checks every request against.
     pub(crate) async fn serve<H, const N: usize>(
         self,
         handler: H,
+        session_bootstrap: SessionBootstrap,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
     where
         H: FixedEnvelopeRuntime<N> + Send + 'static,
         H::PendingResponse: Send + 'static,
     {
-        let service = PrivateQueryService::<H, N>::new(handler);
+        let service = PrivateQueryService::<H, N>::new(handler, session_bootstrap);
         Server::builder()
             .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
             .add_service(service)
@@ -163,9 +180,16 @@ impl fmt::Debug for PrivateQueryListener {
     }
 }
 
-/// Routes the one private method through the single-admission adapter.
+/// Routes the private method through the single-admission adapter, and the
+/// bootstrap method around it.
 struct PrivateQueryService<H, const N: usize> {
     adapter: Arc<Mutex<PrivateTonicBodyAdapter<H, N>>>,
+    /// Held beside the mutex, not inside it. The bootstrap answer is fixed for
+    /// the runtime's process lifetime and identical for every caller, so it
+    /// needs no exclusion; putting it behind the handler lock would make a
+    /// cheap unauthenticated route's latency an occupancy probe against the
+    /// query round the lock is guarding.
+    bootstrap: Arc<PrivateSessionBootstrap>,
 }
 
 impl<H, const N: usize> PrivateQueryService<H, N>
@@ -173,19 +197,24 @@ where
     H: FixedEnvelopeRuntime<N>,
     H::PendingResponse: Send + 'static,
 {
-    fn new(handler: H) -> Self {
+    fn new(handler: H, session_bootstrap: SessionBootstrap) -> Self {
         Self {
-            adapter: Arc::new(Mutex::new(PrivateTonicBodyAdapter::new(handler))),
+            adapter: Arc::new(Mutex::new(PrivateTonicBodyAdapter::new(
+                handler,
+                session_bootstrap.key_epoch,
+            ))),
+            bootstrap: Arc::new(PrivateSessionBootstrap::from_session(&session_bootstrap, N)),
         }
     }
 }
 
-// Derived `Clone` would demand `H: Clone`; the handler is never cloned, only
-// the shared handle to it.
+// Derived `Clone` would demand `H: Clone`; neither the handler nor the
+// bootstrap material is ever cloned, only the shared handles to them.
 impl<H, const N: usize> Clone for PrivateQueryService<H, N> {
     fn clone(&self) -> Self {
         Self {
             adapter: Arc::clone(&self.adapter),
+            bootstrap: Arc::clone(&self.bootstrap),
         }
     }
 }
@@ -214,12 +243,20 @@ where
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let adapter = Arc::clone(&self.adapter);
+        let bootstrap = Arc::clone(&self.bootstrap);
         Box::pin(async move {
-            if request.uri().path() != QUERY_PAGE_ROUTE {
-                return Ok(unavailable_response());
+            match request.uri().path() {
+                QUERY_PAGE_ROUTE => {
+                    let mut adapter = adapter.lock().await;
+                    Ok(adapter.query_page(request).await)
+                }
+                // Deliberately does not take the handler lock: see this
+                // module's header and `PrivateSessionBootstrap`.
+                BOOTSTRAP_ROUTE => Ok(bootstrap.answer(request).await),
+                // An unknown route answers exactly as a refused query does,
+                // so route probing cannot distinguish them.
+                _ => Ok(unavailable_response()),
             }
-            let mut adapter = adapter.lock().await;
-            Ok(adapter.query_page(request).await)
         })
     }
 }
@@ -246,25 +283,43 @@ mod tests {
     };
 
     use futures::StreamExt;
-    use zaino_oram::{PendingFixedEnvelope, PrivateQueryUnavailable};
+    use zaino_oram::{
+        MainnetPrivateQueryRuntime, PendingFixedEnvelope, PrivateQueryUnavailable,
+        ReleasableSessionKeys,
+    };
 
     use super::*;
 
     const ENVELOPE_BYTES: usize = 4;
     const RESPONSE: [u8; ENVELOPE_BYTES] = [9, 8, 7, 6];
+    const FIXTURE_KEY_EPOCH: u64 = 0;
 
-    struct EchoPending {
-        response: [u8; ENVELOPE_BYTES],
+    fn session_bootstrap_fixture(key_epoch: u64) -> SessionBootstrap {
+        SessionBootstrap {
+            key_epoch,
+            keys: ReleasableSessionKeys {
+                request_key: [0x11; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+                response_key: [0x22; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+            },
+            profile_label: "test-profile",
+        }
+    }
+
+    /// One pending response, generic over its width. Shared by every handler
+    /// double in this file's tests: only what each handler answers with
+    /// differs, never the admission-release shape around it.
+    struct FixedPending<const N: usize> {
+        response: [u8; N],
         busy: Arc<AtomicBool>,
     }
 
-    impl PendingFixedEnvelope<ENVELOPE_BYTES> for EchoPending {
-        fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], PrivateQueryUnavailable> {
+    impl<const N: usize> PendingFixedEnvelope<N> for FixedPending<N> {
+        fn try_release_bytes(&self) -> Result<&[u8; N], PrivateQueryUnavailable> {
             Ok(&self.response)
         }
     }
 
-    impl Drop for EchoPending {
+    impl<const N: usize> Drop for FixedPending<N> {
         fn drop(&mut self) {
             self.busy.store(false, Ordering::SeqCst);
         }
@@ -275,7 +330,7 @@ mod tests {
     }
 
     impl FixedEnvelopeRuntime<ENVELOPE_BYTES> for EchoHandler {
-        type PendingResponse = EchoPending;
+        type PendingResponse = FixedPending<ENVELOPE_BYTES>;
 
         fn query_page(
             &mut self,
@@ -284,7 +339,7 @@ mod tests {
             if self.busy.swap(true, Ordering::SeqCst) {
                 return Err(PrivateQueryUnavailable);
             }
-            Ok(EchoPending {
+            Ok(FixedPending {
                 response: RESPONSE,
                 busy: Arc::clone(&self.busy),
             })
@@ -323,15 +378,14 @@ mod tests {
         Ok(())
     }
 
-    /// Drives one real gRPC unary call against the bound address.
+    /// Connects and readies one real gRPC client against the bound address.
     ///
-    /// Built on `tonic::client::Grpc` rather than a generated stub: the build
-    /// deliberately emits server code only, and a server binary has no reason
-    /// to ship a client.
-    async fn query_page_over_the_wire(
+    /// Factored out of `query_page_over_the_wire` and `bootstrap_client`:
+    /// both routes need the identical connect-then-ready sequence, and only
+    /// the codec and route path differ between them.
+    async fn connected_private_client(
         address: SocketAddr,
-        envelope: Vec<u8>,
-    ) -> Result<private_proto::FixedEnvelope, tonic::Status> {
+    ) -> Result<tonic::client::Grpc<tonic::transport::Channel>, tonic::Status> {
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
             .map_err(|_| tonic::Status::internal("endpoint"))?
             .connect()
@@ -342,14 +396,55 @@ mod tests {
             .ready()
             .await
             .map_err(|_| tonic::Status::internal("ready"))?;
+        Ok(client)
+    }
+
+    /// Drives one real gRPC unary call against the bound address.
+    ///
+    /// Built on `tonic::client::Grpc` rather than a generated stub: the build
+    /// deliberately emits server code only, and a server binary has no reason
+    /// to ship a client.
+    async fn query_page_over_the_wire(
+        address: SocketAddr,
+        envelope: Vec<u8>,
+        key_epoch: u64,
+    ) -> Result<private_proto::FixedEnvelope, tonic::Status> {
+        let mut client = connected_private_client(address).await?;
         let codec = tonic_prost::ProstCodec::<
             private_proto::FixedEnvelope,
             private_proto::FixedEnvelope,
         >::default();
         client
             .unary(
-                tonic::Request::new(private_proto::FixedEnvelope { envelope }),
+                tonic::Request::new(private_proto::FixedEnvelope {
+                    envelope,
+                    key_epoch,
+                }),
                 http::uri::PathAndQuery::from_static(QUERY_PAGE_ROUTE),
+                codec,
+            )
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Drives one real `BootstrapSession` unary call against the bound
+    /// address.
+    ///
+    /// This is the client half of the route a task review noted had no test
+    /// driving it through `PrivateQueryService::call`'s own routing -- every
+    /// prior bootstrap test called the adapter's `bootstrap` method directly.
+    async fn bootstrap_client(
+        address: SocketAddr,
+    ) -> Result<private_proto::BootstrapResponse, tonic::Status> {
+        let mut client = connected_private_client(address).await?;
+        let codec = tonic_prost::ProstCodec::<
+            private_proto::BootstrapRequest,
+            private_proto::BootstrapResponse,
+        >::default();
+        client
+            .unary(
+                tonic::Request::new(private_proto::BootstrapRequest {}),
+                http::uri::PathAndQuery::from_static(BOOTSTRAP_ROUTE),
                 codec,
             )
             .await
@@ -367,13 +462,18 @@ mod tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let served = tokio::spawn(async move {
             listener
-                .serve::<_, ENVELOPE_BYTES>(handler(), async {
-                    let _ = stopped.await;
-                })
+                .serve::<_, ENVELOPE_BYTES>(
+                    handler(),
+                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
                 .await
         });
 
-        let response = query_page_over_the_wire(address, vec![1, 2, 3, 4]).await?;
+        let response =
+            query_page_over_the_wire(address, vec![1, 2, 3, 4], FIXTURE_KEY_EPOCH).await?;
 
         assert_eq!(response.envelope, RESPONSE);
 
@@ -418,26 +518,36 @@ mod tests {
         };
         let runtime = zaino_oram::mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
             &deployment,
-            zaino_oram::PrivateRuntimeKeys::ephemeral()
-                .map_err(|_| "the OS generator yields four keys")?,
+            zaino_oram::EphemeralKeyGeneration::draw()
+                .map_err(|_| "the OS generator yields four keys")?
+                .keys,
         )
         .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
+        let session_bootstrap = runtime.session_bootstrap();
+        let key_epoch = session_bootstrap.key_epoch;
 
         let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
         let address = listener.local_addr();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let served = tokio::spawn(async move {
             listener
-                .serve::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(runtime, async {
-                    let _ = stopped.await;
-                })
+                .serve::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(
+                    runtime,
+                    session_bootstrap,
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
                 .await
         });
 
-        let status =
-            query_page_over_the_wire(address, vec![0; zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES])
-                .await
-                .expect_err("an unrefreshed runtime has no serving epoch to answer from");
+        let status = query_page_over_the_wire(
+            address,
+            vec![0; zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES],
+            key_epoch,
+        )
+        .await
+        .expect_err("an unrefreshed runtime has no serving epoch to answer from");
 
         assert_eq!(status.message(), "private query unavailable");
 
@@ -456,17 +566,274 @@ mod tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let served = tokio::spawn(async move {
             listener
-                .serve::<_, ENVELOPE_BYTES>(handler(), async {
+                .serve::<_, ENVELOPE_BYTES>(
+                    handler(),
+                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+        });
+
+        let status = query_page_over_the_wire(address, vec![1, 2, 3], FIXTURE_KEY_EPOCH)
+            .await
+            .expect_err("a short envelope is refused");
+
+        assert_eq!(status.message(), "private query unavailable");
+
+        let _ = stop.send(());
+        served.await??;
+        Ok(())
+    }
+
+    /// Test-only symmetric transform standing in for the crate-private AEAD a
+    /// production wallet will eventually use to seal and open envelopes.
+    ///
+    /// Real envelope protection (`EnvelopeProtector`) is crate-internal to
+    /// `zaino-oram` by design and unreachable from a listener-level test;
+    /// exercising it end to end also needs a live chain subscriber to pin a
+    /// serving epoch, which `a_real_composed_runtime_serves_the_bound_surface`
+    /// above notes no unit test can stand up. XOR is self-inverse, so this one
+    /// function backs both `seal_request` and `open_response` below; it exists
+    /// only to prove that the exact key material a real `BootstrapSession`
+    /// call releases is the same material a matching handler needs, driven
+    /// over the real wire and the real route dispatch -- it makes no claim to
+    /// stand in for the production cipher.
+    fn keyed_transform<const N: usize>(
+        key: &[u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+        mut bytes: [u8; N],
+    ) -> [u8; N] {
+        for (byte, key_byte) in bytes.iter_mut().zip(key.iter().cycle()) {
+            *byte ^= key_byte;
+        }
+        bytes
+    }
+
+    /// Seals a plaintext query with the bootstrap-released request key.
+    ///
+    /// Test-local XOR stand-in, not the production AEAD -- see
+    /// `keyed_transform`'s doc comment.
+    fn seal_request<const N: usize>(
+        key: &[u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+        plaintext: [u8; N],
+    ) -> [u8; N] {
+        keyed_transform(key, plaintext)
+    }
+
+    /// Opens a sealed response with the bootstrap-released response key.
+    ///
+    /// Test-local XOR stand-in, not the production AEAD -- see
+    /// `keyed_transform`'s doc comment.
+    fn open_response<const N: usize>(
+        key: &[u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+        ciphertext: [u8; N],
+    ) -> [u8; N] {
+        keyed_transform(key, ciphertext)
+    }
+
+    const fn sample_query() -> [u8; ENVELOPE_BYTES] {
+        [0xAA, 0x55, 0x0F, 0xF0]
+    }
+
+    /// The page a correctly keyed handler must answer `sample_query()` with.
+    ///
+    /// Bitwise NOT of the *reversed* query, not a plain elementwise NOT:
+    /// reversal makes this transform not commute with `keyed_transform`'s
+    /// XOR, so it can no longer cancel out a key error the same way an
+    /// elementwise NOT would. It stays deterministic and content-dependent,
+    /// and is independently computable by both `KeyedEchoHandler` below and
+    /// the test assertion, so a match proves the query that reached the
+    /// handler is the exact one `seal_request` sealed -- not a fixed
+    /// constant the handler could return regardless of what it decoded.
+    const fn expected_page_for(query: [u8; ENVELOPE_BYTES]) -> [u8; ENVELOPE_BYTES] {
+        let mut page = query;
+        let mut i = 0;
+        while i < page.len() {
+            page[i] = !query[query.len() - 1 - i];
+            i += 1;
+        }
+        page
+    }
+
+    /// A handler double that opens each request with `request_key`, answers
+    /// with `expected_page_for` the opened query, and seals that answer with
+    /// `response_key` -- standing in for the real runtime's envelope
+    /// protector, which cannot be driven end to end without a live chain
+    /// subscriber (see `a_real_composed_runtime_serves_the_bound_surface`).
+    struct KeyedEchoHandler {
+        request_key: [u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+        response_key: [u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+        busy: Arc<AtomicBool>,
+    }
+
+    impl FixedEnvelopeRuntime<ENVELOPE_BYTES> for KeyedEchoHandler {
+        type PendingResponse = FixedPending<ENVELOPE_BYTES>;
+
+        fn query_page(
+            &mut self,
+            request: [u8; ENVELOPE_BYTES],
+        ) -> Result<Self::PendingResponse, PrivateQueryUnavailable> {
+            if self.busy.swap(true, Ordering::SeqCst) {
+                return Err(PrivateQueryUnavailable);
+            }
+            let opened_request = keyed_transform(&self.request_key, request);
+            let response = keyed_transform(&self.response_key, expected_page_for(opened_request));
+            Ok(FixedPending {
+                response,
+                busy: Arc::clone(&self.busy),
+            })
+        }
+    }
+
+    /// Copies a wire-delivered bootstrap response's keys into fixed-width
+    /// arrays a wallet can seal and open with.
+    fn releasable_keys_from_wire(
+        response: &private_proto::BootstrapResponse,
+    ) -> Result<ReleasableSessionKeys, Box<dyn std::error::Error>> {
+        let request_key = response
+            .request_key
+            .clone()
+            .try_into()
+            .map_err(|_| "wire request_key is not the expected key length")?;
+        let response_key = response
+            .response_key
+            .clone()
+            .try_into()
+            .map_err(|_| "wire response_key is not the expected key length")?;
+        Ok(ReleasableSessionKeys {
+            request_key,
+            response_key,
+        })
+    }
+
+    /// Proves the key-establishment leg #101's parity test needs: a wallet
+    /// can bootstrap over the real `BootstrapSession` route and receive the
+    /// exact key material the server released, driven through
+    /// `PrivateQueryService::call`'s own routing, not by calling the
+    /// adapter's methods directly. This closes the gap a task review noted:
+    /// no prior test drove `BOOTSTRAP_ROUTE`'s match arm through the
+    /// service's own dispatch, so a typo in that route string would have
+    /// passed every existing test.
+    ///
+    /// The "seal a query, open the response" half is a test-local XOR
+    /// stand-in (`seal_request`/`open_response`, backed by
+    /// `keyed_transform`), not the production AEAD -- that cipher is
+    /// crate-internal to `zaino-oram` by design and unreachable from a
+    /// listener-level test. So this test does *not* by itself close #101:
+    /// #101 still needs (a) these client helpers made reachable outside
+    /// `#[cfg(test)]`, (b) a public wallet-side seal/open a real
+    /// `EnvelopeProtector` will accept, and (c) a refreshed runtime, which
+    /// needs a live or mock chain subscriber. What this test does prove is
+    /// that the released `request_key`/`response_key` are exactly what the
+    /// server holds -- checked directly below, not just inferred from a
+    /// round trip.
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently
+    /// on separate tasks and the client blocks on responses the server must
+    /// send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wallet_bootstraps_then_queries() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+        let address = listener.local_addr();
+
+        // Position-varying, not a uniform fill: a reversed, rotated, or
+        // partially garbled key must be detectable. A uniform `[0x33; 32]`
+        // fill would make byte position unobservable and let such an error
+        // through undetected.
+        let request_key: [u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES] =
+            std::array::from_fn(|i| 0x33 ^ i as u8);
+        let response_key: [u8; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES] =
+            std::array::from_fn(|i| 0x44 ^ i as u8);
+        let handler = KeyedEchoHandler {
+            request_key,
+            response_key,
+            busy: Arc::new(AtomicBool::new(false)),
+        };
+        let session_bootstrap = SessionBootstrap {
+            key_epoch: FIXTURE_KEY_EPOCH,
+            keys: ReleasableSessionKeys {
+                request_key,
+                response_key,
+            },
+            profile_label: "test-profile",
+        };
+
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            listener
+                .serve::<_, ENVELOPE_BYTES>(handler, session_bootstrap, async {
                     let _ = stopped.await;
                 })
                 .await
         });
 
-        let status = query_page_over_the_wire(address, vec![1, 2, 3])
-            .await
-            .expect_err("a short envelope is refused");
+        let bootstrap = bootstrap_client(address).await?;
+        assert_eq!(bootstrap.key_epoch, FIXTURE_KEY_EPOCH);
+        let released = releasable_keys_from_wire(&bootstrap)?;
 
-        assert_eq!(status.message(), "private query unavailable");
+        // Direct equality against the exact keys the handler was given,
+        // rather than relying on the round trip below to imply it. XOR is
+        // commutative, so with a plain elementwise transform the round trip
+        // alone would reduce to checking `request_key ^ response_key ==
+        // released.request_key ^ released.response_key` -- passing even for
+        // a bootstrap response that swapped the two keys, or offset both by
+        // the same delta. `expected_page_for`'s reversal breaks that
+        // cancellation, but these direct checks are the unambiguous
+        // verification and do not depend on that property holding.
+        assert_eq!(released.request_key, request_key);
+        assert_eq!(released.response_key, response_key);
+
+        let sealed = seal_request(&released.request_key, sample_query());
+        let response =
+            query_page_over_the_wire(address, sealed.to_vec(), bootstrap.key_epoch).await?;
+        let sealed_response: [u8; ENVELOPE_BYTES] = response
+            .envelope
+            .try_into()
+            .map_err(|_| "query response envelope is not the expected width")?;
+        let opened = open_response(&released.response_key, sealed_response);
+
+        assert_eq!(opened, expected_page_for(sample_query()));
+
+        let _ = stop.send(());
+        served.await??;
+        Ok(())
+    }
+
+    /// A wallet that keeps querying under a retired key must learn to
+    /// re-bootstrap. If this returned the uniform refusal instead, the epoch
+    /// would have stopped being cleartext and the client would be stuck
+    /// guessing. Driven through the real listener and routing, not the
+    /// adapter directly.
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently
+    /// on separate tasks and the client blocks on a response the server must
+    /// send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retired_epoch_is_actionable_rather_than_opaque(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+        let address = listener.local_addr();
+
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            listener
+                .serve::<_, ENVELOPE_BYTES>(
+                    handler(),
+                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+        });
+
+        let status = query_page_over_the_wire(address, vec![1, 2, 3, 4], FIXTURE_KEY_EPOCH + 1)
+            .await
+            .expect_err("a stale key epoch must be refused");
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "stale-key-epoch");
 
         let _ = stop.send(());
         served.await??;

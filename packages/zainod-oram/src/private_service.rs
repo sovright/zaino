@@ -34,10 +34,12 @@ impl<const N: usize> ValidatedFixedEnvelope<N> {
         Ok(Self { bytes })
     }
 
-    /// Encodes one already exact business response as the private protobuf type.
-    pub fn to_wire(&self) -> private_proto::FixedEnvelope {
+    /// Encodes one already exact business response as the private protobuf
+    /// type, stamped with the epoch it was sealed under.
+    pub fn to_wire(&self, key_epoch: u64) -> private_proto::FixedEnvelope {
         private_proto::FixedEnvelope {
             envelope: self.bytes.to_vec(),
+            key_epoch,
         }
     }
 
@@ -226,6 +228,7 @@ mod tests {
     fn wire(bytes: &[u8]) -> private_proto::FixedEnvelope {
         private_proto::FixedEnvelope {
             envelope: bytes.to_vec(),
+            key_epoch: 0,
         }
     }
 
@@ -241,16 +244,55 @@ mod tests {
                 "// One fixed-size protected application envelope.\n",
                 "message FixedEnvelope {\n",
                 "  bytes envelope = 1;\n",
+                "  // The key epoch this envelope was sealed under. Cleartext on purpose: it is\n",
+                "  // per-generation and identical for every client, so it reveals nothing, and\n",
+                "  // sealing it inside would make a retired key indistinguishable from any\n",
+                "  // other refusal — leaving a wallet no way to learn it must re-bootstrap.\n",
+                "  uint64 key_epoch = 2;\n",
+                "}\n",
+                "\n",
+                "// Empty: bootstrap takes no client input. A field here would be an input to\n",
+                "// authenticate before the client holds any key material, which is exactly the\n",
+                "// surface this design avoids.\n",
+                "message BootstrapRequest {}\n",
+                "\n",
+                "// Everything a wallet needs to seal a query, and nothing else.\n",
+                "message BootstrapResponse {\n",
+                "  // Identifies the key generation these keys belong to. Sent back in cleartext\n",
+                "  // on every QueryPage so a retired key is actionable rather than opaque.\n",
+                "  uint64 key_epoch = 1;\n",
+                "  // Seals request envelopes.\n",
+                "  bytes request_key = 2;\n",
+                "  // Opens response envelopes.\n",
+                "  bytes response_key = 3;\n",
+                "  // Human-readable name of the compiled privacy profile, for logs and support.\n",
+                "  //\n",
+                "  // Diagnostic, NOT authoritative: do not pin on it. The authoritative profile\n",
+                "  // identifier is a digest over every logical budget dimension and is already\n",
+                "  // bound into protected request state, so a query sealed against the wrong\n",
+                "  // profile fails to open regardless of what this string says. It is named\n",
+                "  // `profile_label` rather than `profile_id` precisely so it cannot be mistaken\n",
+                "  // for that identifier.\n",
+                "  string profile_label = 4;\n",
+                "  // Exact envelope size class, so a wallet pads correctly without guessing.\n",
+                "  uint32 envelope_bytes = 5;\n",
+                "  // Reserved for a TDX quote binding the TLS identity to the measured binary.\n",
+                "  // Present and empty in this release; ADR 0010 defers verification, and\n",
+                "  // keeping the field means adding it later is not a breaking wire change.\n",
+                "  bytes attestation = 6;\n",
                 "}\n",
                 "\n",
                 "// Independent private-query surface. This is not the legacy lightwallet API.\n",
                 "service PrivateCompactTxStreamer {\n",
                 "  rpc QueryPage(FixedEnvelope) returns (FixedEnvelope);\n",
+                "  rpc BootstrapSession(BootstrapRequest) returns (BootstrapResponse);\n",
                 "}\n",
             )
         );
         assert!(include_str!("private_proto.rs")
             .contains("\"/zaino.private.v1.PrivateCompactTxStreamer/QueryPage\""));
+        assert!(include_str!("private_proto.rs")
+            .contains("\"/zaino.private.v1.PrivateCompactTxStreamer/BootstrapSession\""));
     }
 
     #[test]
@@ -258,7 +300,7 @@ mod tests {
     {
         let validated =
             ValidatedFixedEnvelope::<ENVELOPE_BYTES>::try_from_wire(wire(&[1, 2, 3, 4]))?;
-        let encoded = validated.to_wire().encode_to_vec();
+        let encoded = validated.to_wire(0).encode_to_vec();
         assert_eq!(encoded, [0x0a, 0x04, 1, 2, 3, 4]);
 
         let decoded = private_proto::FixedEnvelope::decode(encoded.as_slice())?;
