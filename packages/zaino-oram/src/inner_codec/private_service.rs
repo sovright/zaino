@@ -362,11 +362,15 @@ impl FinalizedProjectionBuilder {
         if shape.max_events_per_address < private_mainnet_store_reads()? {
             return Err(PrivateQueryUnavailable);
         }
-        let owner = OfflineProjectionOwner::new_on_qualification_memory(
+        // The typed ORAM backend, never the qualification table. The
+        // qualification table indexes at secret-derived positions and offers no
+        // obliviousness, so a served generation must not be able to reach it:
+        // construction fails closed when the backend is unavailable rather than
+        // silently degrading a surface that claims privacy. Capacities come
+        // from the layout the shape already builds.
+        let owner = OfflineProjectionOwner::new(
             shape.projection_config()?,
             shape.layout()?,
-            usize::try_from(shape.directory_capacity).map_err(|_| PrivateQueryUnavailable)?,
-            usize::try_from(shape.event_capacity).map_err(|_| PrivateQueryUnavailable)?,
             QUEUE_CAPACITY,
         )
         .map_err(|_| PrivateQueryUnavailable)?;
@@ -534,7 +538,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zaino_fixtures::{projection_chain, FixtureResult};
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    use crate::zaino_fixtures::projection_chain;
+    use crate::zaino_fixtures::FixtureResult;
 
     /// A regtest shape wide enough for one compiled mainnet query.
     ///
@@ -562,6 +572,28 @@ mod tests {
         }
     }
 
+    /// Without the typed ORAM backend there is no generation to serve.
+    ///
+    /// The refusal is the point: the qualification table is still linked and
+    /// still constructible, so the guarantee that a served generation cannot be
+    /// built on it has to be asserted rather than assumed. This fails if
+    /// `start` is ever pointed back at a non-oblivious backend.
+    #[cfg(not(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    #[test]
+    fn a_builder_refuses_to_start_without_the_typed_backend() -> FixtureResult<()> {
+        assert!(FinalizedProjectionBuilder::start(&shape(private_mainnet_store_reads()?)).is_err());
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
     #[test]
     fn a_builder_seals_a_chain_into_a_serving_generation() -> FixtureResult<()> {
         let blocks = projection_chain()?;
@@ -633,6 +665,11 @@ mod tests {
     }
 
     /// Finishing without a single applied block has no checkpoint to seal at.
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
     #[test]
     fn an_empty_builder_cannot_seal_a_generation() -> FixtureResult<()> {
         let builder = FinalizedProjectionBuilder::start(&shape(private_mainnet_store_reads()?))

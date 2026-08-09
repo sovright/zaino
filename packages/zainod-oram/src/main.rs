@@ -165,9 +165,9 @@ enum PrivateSubcommand {
 #[cfg(feature = "private-service")]
 #[derive(Debug, Args)]
 struct PrivateServeArgs {
-    /// Explicitly allow the qualification-only, non-oblivious backend to listen.
+    /// Acknowledge that the ORAM backend is an unaudited alpha revision.
     #[arg(long)]
-    allow_qualification_backend: bool,
+    allow_unaudited_oram: bool,
 
     /// Mainnet Zainod TOML config used to open the canonical indexed source.
     #[arg(long, value_name = "FILE")]
@@ -1384,9 +1384,12 @@ const PRIVATE_KEY_EPOCH: u64 = 1;
 /// reported as such rather than after a full chain replay has been paid for.
 #[cfg(feature = "private-service")]
 async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
-    require_private_listener_opt_in(args.allow_qualification_backend)?;
+    require_private_listener_opt_in(args.allow_unaudited_oram)?;
     eprintln!(
-        "WARNING: private-query listener uses a qualification-only backend; it provides no physical obliviousness"
+        "WARNING: the ORAM backend is an unaudited alpha revision of rostl, and this \
+         deployment assumes an honest-but-curious operator inside an attested TEE \
+         (docs/adr/0010). It does not withstand a host that modifies the workload, \
+         induces page faults, or rolls back state."
     );
     let capture = load_capture(&args.capture_dir)?;
     let sizing = load_sizing(&args.sizing_dir, &capture)?;
@@ -2010,7 +2013,7 @@ impl fmt::Display for RunnerError {
             }
             #[cfg(feature = "private-service")]
             Self::PrivateListenerOptInRequired => f.write_str(
-                "private listener refused: pass --allow-qualification-backend to acknowledge that the qualification-only backend provides no physical obliviousness",
+                "private listener refused: pass --allow-unaudited-oram to acknowledge that the ORAM backend is an unaudited alpha revision of rostl",
             ),
             Self::IncompleteCheckpoint => {
                 f.write_str("target height and target hash must be supplied together")
@@ -2059,12 +2062,12 @@ mod tests {
 
     #[cfg(feature = "private-service")]
     #[test]
-    fn private_listener_requires_explicit_qualification_backend_opt_in() {
+    fn private_listener_requires_explicit_unaudited_oram_opt_in() {
         let error = require_private_listener_opt_in(false)
             .expect_err("the private listener is gated off by default");
         assert_eq!(
             error.to_string(),
-            "private listener refused: pass --allow-qualification-backend to acknowledge that the qualification-only backend provides no physical obliviousness"
+            "private listener refused: pass --allow-unaudited-oram to acknowledge that the ORAM backend is an unaudited alpha revision of rostl"
         );
         assert!(require_private_listener_opt_in(true).is_ok());
     }
