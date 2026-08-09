@@ -346,6 +346,28 @@ impl std::fmt::Debug for ReleasableSessionKeys {
     }
 }
 
+/// Everything a wallet needs to seal a query, and nothing else.
+///
+/// A named struct rather than a tuple: four positional fields, two of them
+/// integers, is exactly where a caller could silently swap `key_epoch` and
+/// `envelope_bytes`.
+pub struct SessionBootstrap {
+    /// Identifies the key generation `keys` belongs to.
+    pub key_epoch: u64,
+    /// The two keys a wallet may hold: request and response, and nothing else.
+    pub keys: ReleasableSessionKeys,
+    /// The compiled privacy profile these keys are valid under.
+    pub profile_id: &'static str,
+    /// Exact application-envelope width every request and response must carry.
+    pub envelope_bytes: usize,
+}
+
+impl std::fmt::Debug for SessionBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionBootstrap { ..REDACTED.. }")
+    }
+}
+
 /// One completed, read-only finalized projection generation.
 ///
 /// Opaque on purpose: it exists to be handed to
@@ -482,6 +504,14 @@ where
 
     /// Stops serving once every in-flight response has been released.
     fn shutdown(&mut self) -> Result<(), PrivateQueryUnavailable>;
+
+    /// Returns the material a wallet needs to seal and open envelopes against
+    /// this runtime's live key epoch.
+    ///
+    /// Available whether or not an epoch has been pinned: the keys and
+    /// profile are fixed at composition time, independent of the serving
+    /// generation `refresh` publishes.
+    fn session_bootstrap(&self) -> SessionBootstrap;
 }
 
 /// Composes one process-lifetime runtime over the compiled mainnet profile.
@@ -504,9 +534,16 @@ where
     Source: BlockchainSource,
 {
     let profile = mainnet_utxo_history_profile().map_err(|_| PrivateQueryUnavailable)?;
+    // Captured before `keys` is consumed below: `releasable` copies out only
+    // the two keys a wallet may hold, and this is the one place that copy can
+    // be made -- once `.material()` runs, the request and response keys live
+    // only inside the composed envelope protector.
+    let releasable = keys.releasable();
+    let key_epoch = deployment.projection.key_epoch;
+    let profile_id = profile.label();
     let shape = CompiledQueryShape::<MAINNET_QUERY_SLOTS, MAINNET_ENVELOPE_BYTES>::new(profile)
         .map_err(|_| PrivateQueryUnavailable)?;
-    finalized_runtime_owner::<
+    let inner = finalized_runtime_owner::<
         Source,
         MAINNET_QUERY_SLOTS,
         MAINNET_ENVELOPE_BYTES,
@@ -519,11 +556,29 @@ where
         shape,
         keys.material(),
     )
-    .map_err(|_| PrivateQueryUnavailable)
+    .map_err(|_| PrivateQueryUnavailable)?;
+    Ok(MainnetRuntime {
+        inner,
+        key_epoch,
+        request_key: releasable.request_key,
+        response_key: releasable.response_key,
+        profile_id,
+    })
 }
 
-impl<Source, E, T, R, N> MainnetPrivateQueryRuntime<Source>
-    for FinalizedRuntimeOwner<
+/// Bundles the composed mainnet runtime with the session-bootstrap material
+/// captured at composition time, before the raw keys are consumed into
+/// envelope protectors.
+///
+/// The engine underneath (`FinalizedRuntimeOwner`) stays unaware of wallet
+/// key release entirely: it is a reusable primitive shared by every profile,
+/// and `token_key` / `replay_journal_key` never reach this type, so there is
+/// no path from here back to either.
+struct MainnetRuntime<Source, E, T, R, N>
+where
+    Source: BlockchainSource,
+{
+    inner: FinalizedRuntimeOwner<
         Source,
         E,
         T,
@@ -532,7 +587,42 @@ impl<Source, E, T, R, N> MainnetPrivateQueryRuntime<Source>
         MAINNET_QUERY_SLOTS,
         MAINNET_ENVELOPE_BYTES,
         MAINNET_QUERY_SLOTS,
-    >
+    >,
+    key_epoch: u64,
+    request_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
+    response_key: [u8; PRIVATE_RUNTIME_KEY_BYTES],
+    profile_id: &'static str,
+}
+
+impl<Source, E, T, R, N> FixedEnvelopeRuntime<PRIVATE_MAINNET_ENVELOPE_BYTES>
+    for MainnetRuntime<Source, E, T, R, N>
+where
+    Source: BlockchainSource,
+    E: EnvelopeProtector,
+    T: ContinuationTokenProtector,
+    R: ContinuationReplayGuard,
+    N: RoundMaterialSource,
+{
+    type PendingResponse = <FinalizedRuntimeOwner<
+        Source,
+        E,
+        T,
+        R,
+        N,
+        MAINNET_QUERY_SLOTS,
+        MAINNET_ENVELOPE_BYTES,
+        MAINNET_QUERY_SLOTS,
+    > as FixedEnvelopeRuntime<PRIVATE_MAINNET_ENVELOPE_BYTES>>::PendingResponse;
+
+    fn query_page(
+        &mut self,
+        request: [u8; PRIVATE_MAINNET_ENVELOPE_BYTES],
+    ) -> Result<Self::PendingResponse, PrivateQueryUnavailable> {
+        self.inner.query_page(request)
+    }
+}
+
+impl<Source, E, T, R, N> MainnetPrivateQueryRuntime<Source> for MainnetRuntime<Source, E, T, R, N>
 where
     Source: BlockchainSource,
     E: EnvelopeProtector + Send,
@@ -540,6 +630,18 @@ where
     R: ContinuationReplayGuard + Send,
     N: RoundMaterialSource + Send,
 {
+    fn session_bootstrap(&self) -> SessionBootstrap {
+        SessionBootstrap {
+            key_epoch: self.key_epoch,
+            keys: ReleasableSessionKeys {
+                request_key: self.request_key,
+                response_key: self.response_key,
+            },
+            profile_id: self.profile_id,
+            envelope_bytes: PRIVATE_MAINNET_ENVELOPE_BYTES,
+        }
+    }
+
     // Written as an explicit `impl Future` rather than `async fn`: the trait
     // promises a `Send` future so a server can drive the refresh from a
     // spawned task, and `async fn` in a trait cannot state that bound.
@@ -553,14 +655,15 @@ where
         projection: FinalizedProjection,
     ) -> impl Future<Output = Result<(), PrivateQueryUnavailable>> + Send + 'runtime {
         async move {
-            Self::refresh(self, subscriber, projection.store)
+            self.inner
+                .refresh(subscriber, projection.store)
                 .await
                 .map_err(|_| PrivateQueryUnavailable)
         }
     }
 
     fn shutdown(&mut self) -> Result<(), PrivateQueryUnavailable> {
-        Self::shutdown(self).map_err(|_| PrivateQueryUnavailable)
+        self.inner.shutdown().map_err(|_| PrivateQueryUnavailable)
     }
 }
 
@@ -677,6 +780,41 @@ mod tests {
             .is_err());
         MainnetPrivateQueryRuntime::<zaino_state::ValidatorConnector>::shutdown(&mut runtime)
             .map_err(|_| "an idle runtime stops cleanly")?;
+        Ok(())
+    }
+
+    /// Bootstrap material must be available even before the first refresh --
+    /// a wallet needs to seal a query before any epoch has been pinned -- and
+    /// it must carry the exact epoch and keys the deployment was composed
+    /// with, not a placeholder.
+    #[test]
+    fn session_bootstrap_carries_the_composed_epoch_and_releasable_keys() -> FixtureResult<()> {
+        let root = tempfile::TempDir::new()?;
+        let mut deployment = PrivateRuntimeDeployment {
+            service_namespace_id: [0x55; 16],
+            owner_generation: 1,
+            replay_journal_root: root.path().join("replay"),
+            projection: shape(private_mainnet_store_reads()?),
+        };
+        deployment.projection.key_epoch = 42;
+        let keys = PrivateRuntimeKeys::ephemeral().map_err(|_| "the OS generator yields keys")?;
+        let releasable_request_key = keys.request_key;
+        let releasable_response_key = keys.response_key;
+
+        let runtime =
+            mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(&deployment, keys)
+                .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
+        let bootstrap = runtime.session_bootstrap();
+
+        assert_eq!(bootstrap.key_epoch, 42);
+        assert_eq!(bootstrap.keys.request_key, releasable_request_key);
+        assert_eq!(bootstrap.keys.response_key, releasable_response_key);
+        assert_eq!(bootstrap.envelope_bytes, PRIVATE_MAINNET_ENVELOPE_BYTES);
+        assert!(!bootstrap.profile_id.is_empty());
+        assert_eq!(
+            format!("{bootstrap:?}"),
+            "SessionBootstrap { ..REDACTED.. }"
+        );
         Ok(())
     }
 

@@ -1541,12 +1541,13 @@ async fn serve_private_surface(
         .refresh(&subscriber.indexer, projection)
         .await
         .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
+    let session_bootstrap = runtime.session_bootstrap();
 
     println!(
         "private_surface_listening={listening_on},committed_height:{committed_height},envelope_bytes:{PRIVATE_MAINNET_ENVELOPE_BYTES}"
     );
     listener
-        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(runtime, async {
+        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(runtime, session_bootstrap, async {
             // A failed signal registration must stop the server rather than
             // leave it serving with no way to be asked to stop.
             if let Err(error) = tokio::signal::ctrl_c().await {

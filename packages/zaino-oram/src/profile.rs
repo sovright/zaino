@@ -211,7 +211,12 @@ impl PrivacyProfile {
     }
 
     /// Returns the human-readable, non-authoritative profile label.
-    const fn label(&self) -> &'static str {
+    ///
+    /// Surfaced on the wire as a bootstrap response's `profile_id` string --
+    /// the compiled profile these keys are valid under -- but it stays
+    /// diagnostic rather than authoritative; [`Self::profile_id`] is the value
+    /// bound into protected request state.
+    pub(super) const fn label(&self) -> &'static str {
         self.label
     }
 

@@ -31,7 +31,7 @@ use tonic::{
     transport::server::{Connected, Server},
 };
 
-use zaino_oram::FixedEnvelopeRuntime;
+use zaino_oram::{FixedEnvelopeRuntime, SessionBootstrap};
 
 use super::tonic_body::PrivateTonicBodyAdapter;
 use crate::private_proto;
@@ -67,16 +67,21 @@ impl PrivateQueryListener {
     }
 
     /// Serves the private surface until `shutdown` resolves.
+    ///
+    /// `session_bootstrap` is captured once here rather than re-derived per
+    /// request: it is fixed for `handler`'s process lifetime, and it is also
+    /// the one live epoch the query-page route checks every request against.
     pub(crate) async fn serve<H, const N: usize>(
         self,
         handler: H,
+        session_bootstrap: SessionBootstrap,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
     where
         H: FixedEnvelopeRuntime<N> + Send + 'static,
         H::PendingResponse: Send + 'static,
     {
-        let service = PrivateQueryService::<H, N>::new(handler);
+        let service = PrivateQueryService::<H, N>::new(handler, session_bootstrap);
         Server::builder()
             .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
             .add_service(service)
@@ -174,9 +179,12 @@ where
     H: FixedEnvelopeRuntime<N>,
     H::PendingResponse: Send + 'static,
 {
-    fn new(handler: H) -> Self {
+    fn new(handler: H, session_bootstrap: SessionBootstrap) -> Self {
         Self {
-            adapter: Arc::new(Mutex::new(PrivateTonicBodyAdapter::new(handler))),
+            adapter: Arc::new(Mutex::new(PrivateTonicBodyAdapter::new(
+                handler,
+                session_bootstrap,
+            ))),
         }
     }
 }
@@ -255,12 +263,28 @@ mod tests {
     };
 
     use futures::StreamExt;
-    use zaino_oram::{PendingFixedEnvelope, PrivateQueryUnavailable};
+    use zaino_oram::{
+        MainnetPrivateQueryRuntime, PendingFixedEnvelope, PrivateQueryUnavailable,
+        ReleasableSessionKeys,
+    };
 
     use super::*;
 
     const ENVELOPE_BYTES: usize = 4;
     const RESPONSE: [u8; ENVELOPE_BYTES] = [9, 8, 7, 6];
+    const FIXTURE_KEY_EPOCH: u64 = 0;
+
+    fn session_bootstrap_fixture(key_epoch: u64) -> SessionBootstrap {
+        SessionBootstrap {
+            key_epoch,
+            keys: ReleasableSessionKeys {
+                request_key: [0x11; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+                response_key: [0x22; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+            },
+            profile_id: "test-profile",
+            envelope_bytes: ENVELOPE_BYTES,
+        }
+    }
 
     struct EchoPending {
         response: [u8; ENVELOPE_BYTES],
@@ -340,6 +364,7 @@ mod tests {
     async fn query_page_over_the_wire(
         address: SocketAddr,
         envelope: Vec<u8>,
+        key_epoch: u64,
     ) -> Result<private_proto::FixedEnvelope, tonic::Status> {
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
             .map_err(|_| tonic::Status::internal("endpoint"))?
@@ -359,7 +384,7 @@ mod tests {
             .unary(
                 tonic::Request::new(private_proto::FixedEnvelope {
                     envelope,
-                    key_epoch: 0,
+                    key_epoch,
                 }),
                 http::uri::PathAndQuery::from_static(QUERY_PAGE_ROUTE),
                 codec,
@@ -379,13 +404,18 @@ mod tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let served = tokio::spawn(async move {
             listener
-                .serve::<_, ENVELOPE_BYTES>(handler(), async {
-                    let _ = stopped.await;
-                })
+                .serve::<_, ENVELOPE_BYTES>(
+                    handler(),
+                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
                 .await
         });
 
-        let response = query_page_over_the_wire(address, vec![1, 2, 3, 4]).await?;
+        let response =
+            query_page_over_the_wire(address, vec![1, 2, 3, 4], FIXTURE_KEY_EPOCH).await?;
 
         assert_eq!(response.envelope, RESPONSE);
 
@@ -434,22 +464,31 @@ mod tests {
                 .map_err(|_| "the OS generator yields four keys")?,
         )
         .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
+        let session_bootstrap = runtime.session_bootstrap();
+        let key_epoch = session_bootstrap.key_epoch;
 
         let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
         let address = listener.local_addr();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let served = tokio::spawn(async move {
             listener
-                .serve::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(runtime, async {
-                    let _ = stopped.await;
-                })
+                .serve::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(
+                    runtime,
+                    session_bootstrap,
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
                 .await
         });
 
-        let status =
-            query_page_over_the_wire(address, vec![0; zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES])
-                .await
-                .expect_err("an unrefreshed runtime has no serving epoch to answer from");
+        let status = query_page_over_the_wire(
+            address,
+            vec![0; zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES],
+            key_epoch,
+        )
+        .await
+        .expect_err("an unrefreshed runtime has no serving epoch to answer from");
 
         assert_eq!(status.message(), "private query unavailable");
 
@@ -468,13 +507,17 @@ mod tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let served = tokio::spawn(async move {
             listener
-                .serve::<_, ENVELOPE_BYTES>(handler(), async {
-                    let _ = stopped.await;
-                })
+                .serve::<_, ENVELOPE_BYTES>(
+                    handler(),
+                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
                 .await
         });
 
-        let status = query_page_over_the_wire(address, vec![1, 2, 3])
+        let status = query_page_over_the_wire(address, vec![1, 2, 3], FIXTURE_KEY_EPOCH)
             .await
             .expect_err("a short envelope is refused");
 

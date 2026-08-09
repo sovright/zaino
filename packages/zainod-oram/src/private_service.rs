@@ -34,11 +34,12 @@ impl<const N: usize> ValidatedFixedEnvelope<N> {
         Ok(Self { bytes })
     }
 
-    /// Encodes one already exact business response as the private protobuf type.
-    pub fn to_wire(&self) -> private_proto::FixedEnvelope {
+    /// Encodes one already exact business response as the private protobuf
+    /// type, stamped with the epoch it was sealed under.
+    pub fn to_wire(&self, key_epoch: u64) -> private_proto::FixedEnvelope {
         private_proto::FixedEnvelope {
             envelope: self.bytes.to_vec(),
-            key_epoch: 0, // Task 4 supplies the live epoch; 0 preserves today's behaviour.
+            key_epoch,
         }
     }
 
@@ -292,7 +293,7 @@ mod tests {
     {
         let validated =
             ValidatedFixedEnvelope::<ENVELOPE_BYTES>::try_from_wire(wire(&[1, 2, 3, 4]))?;
-        let encoded = validated.to_wire().encode_to_vec();
+        let encoded = validated.to_wire(0).encode_to_vec();
         assert_eq!(encoded, [0x0a, 0x04, 1, 2, 3, 4]);
 
         let decoded = private_proto::FixedEnvelope::decode(encoded.as_slice())?;
