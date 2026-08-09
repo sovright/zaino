@@ -8,14 +8,17 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::layout::AtomicQualificationSnapshot;
 use crate::{
     layout::{
         spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
-        AtomicQualificationAppendResult, AtomicQualificationSnapshot, AtomicQueueCapacity,
-        AtomicWorker, AtomicWorkerBuildError, DirectoryTableConfiguration, EventTableConfiguration,
-        FixedProbeLayout, LayoutIdentity, LayoutNetwork, StandardAddress, StandardScriptKind,
+        AtomicQualificationAppendResult, AtomicQueueCapacity, AtomicWorker, AtomicWorkerBuildError,
+        DirectoryTableConfiguration, EventTableConfiguration, FixedProbeLayout, LayoutIdentity,
+        LayoutNetwork, StandardAddress, StandardScriptKind,
     },
     records::{UtxoEvent, UtxoScriptClass},
+    trace::WorkerTrace,
 };
 
 const SCENARIO: &str = "typed-worker-deterministic-v1";
@@ -283,62 +286,22 @@ const fn derive_scenario_evidence() -> ScenarioEvidence {
 
 const EXPECTED_SCENARIO_EVIDENCE: ScenarioEvidence = derive_scenario_evidence();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QualificationWorkerTrace {
-    queue_capacity: u64,
-    queued_at_shutdown: u64,
-    in_flight_at_shutdown: u64,
-    queue_high_water: u64,
-    accepted: u64,
-    completed: u64,
-    failed: u64,
-    full_rejected: u64,
-    not_running_rejected: u64,
-    reply_delivery_failed: u64,
-    stopped: bool,
-    faulted: bool,
-}
-
-impl QualificationWorkerTrace {
-    const EXPECTED: Self = Self {
-        queue_capacity: QUEUE_CAPACITY_U64,
-        queued_at_shutdown: 0,
-        in_flight_at_shutdown: 0,
-        queue_high_water: 1,
-        accepted: EXPECTED_SCENARIO_EVIDENCE.summary.commands,
-        completed: EXPECTED_SCENARIO_EVIDENCE.summary.commands,
-        failed: 0,
-        full_rejected: 0,
-        not_running_rejected: 0,
-        reply_delivery_failed: 0,
-        stopped: true,
-        faulted: false,
-    };
-
-    fn try_from_snapshot(
-        snapshot: AtomicQualificationSnapshot,
-    ) -> Result<Self, TypedWorkerQualificationError> {
-        Ok(Self {
-            queue_capacity: u64::try_from(snapshot.queue_capacity)
-                .map_err(|_| TypedWorkerQualificationError::InvalidReport)?,
-            queued_at_shutdown: u64::try_from(snapshot.queued)
-                .map_err(|_| TypedWorkerQualificationError::InvalidReport)?,
-            in_flight_at_shutdown: u64::try_from(snapshot.in_flight)
-                .map_err(|_| TypedWorkerQualificationError::InvalidReport)?,
-            queue_high_water: u64::try_from(snapshot.queue_high_water)
-                .map_err(|_| TypedWorkerQualificationError::InvalidReport)?,
-            accepted: snapshot.accepted,
-            completed: snapshot.completed,
-            failed: snapshot.failed,
-            full_rejected: snapshot.full_rejected,
-            not_running_rejected: snapshot.not_running_rejected,
-            reply_delivery_failed: snapshot.reply_delivery_failed,
-            stopped: snapshot.stopped,
-            faulted: snapshot.faulted,
-        })
-    }
-}
+/// The one worker trace a fully successful, uncontended qualification run can
+/// produce.
+const EXPECTED_QUALIFICATION_WORKER_TRACE: WorkerTrace = WorkerTrace {
+    queue_capacity: QUEUE_CAPACITY_U64,
+    queued_at_shutdown: 0,
+    in_flight_at_shutdown: 0,
+    queue_high_water: 1,
+    accepted: EXPECTED_SCENARIO_EVIDENCE.summary.commands,
+    completed: EXPECTED_SCENARIO_EVIDENCE.summary.commands,
+    failed: 0,
+    full_rejected: 0,
+    not_running_rejected: 0,
+    reply_delivery_failed: 0,
+    stopped: true,
+    faulted: false,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -381,7 +344,7 @@ pub struct TypedWorkerQualificationReport {
     backend_shape: QualificationBackendShape,
     command_summary: QualificationCommandSummary,
     command_trace: [QualificationStep; 9],
-    worker_trace: QualificationWorkerTrace,
+    worker_trace: WorkerTrace,
     evidence_scope: QualificationEvidenceScope,
 }
 
@@ -393,7 +356,7 @@ impl TypedWorkerQualificationReport {
             || self.backend_shape != QualificationBackendShape::EXPECTED
             || self.command_summary != EXPECTED_SCENARIO_EVIDENCE.summary
             || self.command_trace != EXPECTED_SCENARIO_EVIDENCE.trace
-            || self.worker_trace != QualificationWorkerTrace::EXPECTED
+            || self.worker_trace != EXPECTED_QUALIFICATION_WORKER_TRACE
             || self.evidence_scope != QualificationEvidenceScope::EXPECTED
         {
             return Err(TypedWorkerQualificationError::InvalidReport);
@@ -521,7 +484,8 @@ pub fn run_typed_worker_qualification(
         backend_shape: QualificationBackendShape::EXPECTED,
         command_summary: scenario_evidence.summary,
         command_trace: scenario_evidence.trace,
-        worker_trace: QualificationWorkerTrace::try_from_snapshot(snapshot)?,
+        worker_trace: WorkerTrace::try_from_snapshot(snapshot)
+            .map_err(|_| TypedWorkerQualificationError::InvalidReport)?,
         evidence_scope: QualificationEvidenceScope::EXPECTED,
     };
     report.validate()?;
@@ -649,7 +613,7 @@ mod tests {
             backend_shape: QualificationBackendShape::EXPECTED,
             command_summary: EXPECTED_SCENARIO_EVIDENCE.summary,
             command_trace: EXPECTED_SCENARIO_EVIDENCE.trace,
-            worker_trace: QualificationWorkerTrace::try_from_snapshot(expected_snapshot())?,
+            worker_trace: WorkerTrace::try_from_snapshot(expected_snapshot())?,
             evidence_scope: QualificationEvidenceScope::EXPECTED,
         };
         report.validate()?;

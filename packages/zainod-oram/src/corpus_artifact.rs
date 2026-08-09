@@ -1542,6 +1542,292 @@ pub(super) fn artifact_blake2s256_hex(bytes: &[u8]) -> String {
     blake2s256_hex(bytes)
 }
 
+/// The one execution target every OS-attested provenance record in the
+/// evidence-artifact family requires. Shared by every `*ProvenanceV1::new` and
+/// `*ProvenanceV1::validate` that binds `target_os`/`target_arch` fields (and by
+/// their `publication_target_is_strictly_linux_x86_64` unit tests).
+#[cfg(feature = "typed-qualification")]
+pub(super) fn is_supported_execution_target(target_os: &str, target_arch: &str) -> bool {
+    target_os == "linux" && target_arch == "x86_64"
+}
+
+/// Fails unless a runner version was actually supplied. Shared by every
+/// `*ProvenanceV1::new` constructor in the evidence-artifact family.
+pub(super) fn ensure_runner_version_present(runner_version: &str) -> Result<(), ArtifactError> {
+    if runner_version.is_empty() {
+        Err(ArtifactError::InvalidArtifact {
+            reason: "runner version is empty",
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Fails with `mismatch_reason` unless `actual` equals `expected`. Shared by
+/// every `*ProvenanceV1::validate` digest-binding check in the evidence-artifact
+/// family.
+pub(super) fn ensure_matching_digest(
+    actual: &str,
+    expected: &str,
+    mismatch_reason: &'static str,
+) -> Result<(), ArtifactError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ArtifactError::InvalidArtifact {
+            reason: mismatch_reason,
+        })
+    }
+}
+
+/// Builds the runner/target-platform envelope shared by every OS-attested
+/// `*ProvenanceV1::new` constructor in the evidence-artifact family (target-load,
+/// qualification, full-map-saturation, cold-rebuild, stress-qualification):
+/// checks the execution target and the runner version, then hands the
+/// runner/OS/arch/digest quadruple to `build`, which assembles the concrete,
+/// differently-shaped provenance struct.
+#[cfg(feature = "typed-qualification")]
+pub(super) fn new_os_attested_provenance<P>(
+    runner_version: &str,
+    digest: Result<String, ArtifactError>,
+    unsupported_target_reason: &'static str,
+    build: impl FnOnce(String, String, String, String) -> P,
+) -> Result<P, ArtifactError> {
+    if !is_supported_execution_target(std::env::consts::OS, std::env::consts::ARCH) {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: unsupported_target_reason,
+        });
+    }
+    ensure_runner_version_present(runner_version)?;
+    Ok(build(
+        runner_version.to_owned(),
+        std::env::consts::OS.to_owned(),
+        std::env::consts::ARCH.to_owned(),
+        digest?,
+    ))
+}
+
+/// Validates the runner/target-platform envelope shared by every OS-attested
+/// `*ProvenanceV1::validate` in the evidence-artifact family, then checks the
+/// bound digest. Shared by every OS-attested provenance record; callers differ
+/// only in the reasons reported and in which digest is being bound.
+#[cfg(feature = "typed-qualification")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_os_attested_provenance(
+    schema_matches: bool,
+    runner_version: &str,
+    target_os: &str,
+    target_arch: &str,
+    invalid_envelope_reason: &'static str,
+    actual_digest: &str,
+    expected_digest: &str,
+    digest_mismatch_reason: &'static str,
+) -> Result<(), ArtifactError> {
+    if !schema_matches
+        || runner_version.is_empty()
+        || !is_supported_execution_target(target_os, target_arch)
+    {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: invalid_envelope_reason,
+        });
+    }
+    ensure_matching_digest(actual_digest, expected_digest, digest_mismatch_reason)
+}
+
+/// Reads back a staged `{json_name}` + `{text_name}` evidence pair alongside its
+/// `{provenance_json_name}`, revalidates the artifact and provenance, confirms
+/// the rendered text matches the typed report, and confirms the read-back
+/// artifact and provenance are exactly what was just computed. Shared by every
+/// staged read-back check in the evidence-artifact family: callers differ only
+/// in the file names/limits and in how the artifact and provenance are
+/// (re)validated.
+#[allow(clippy::too_many_arguments)]
+fn validate_staged_evidence<A, P>(
+    stage: &ArtifactDirectory,
+    json_name: &'static str,
+    json_max_bytes: usize,
+    text_name: &'static str,
+    text_max_bytes: usize,
+    provenance_json_name: &'static str,
+    provenance_max_bytes: usize,
+    validate_artifact: impl FnOnce(&A) -> Result<(), ArtifactError>,
+    validate_provenance: impl FnOnce(&P, &A) -> Result<(), ArtifactError>,
+    rendered_text: impl FnOnce(&A) -> Vec<u8>,
+    text_mismatch_reason: &'static str,
+    artifact_mismatch_reason: &'static str,
+    provenance_mismatch_reason: &'static str,
+    expected_artifact: &A,
+    expected_provenance: &P,
+) -> Result<(), ArtifactError>
+where
+    A: serde::de::DeserializeOwned + PartialEq,
+    P: serde::de::DeserializeOwned + PartialEq,
+{
+    let json_bytes = read_artifact_file(stage, json_name, json_max_bytes)?;
+    let text_bytes = read_artifact_file(stage, text_name, text_max_bytes)?;
+    let provenance_json = read_artifact_file(stage, provenance_json_name, provenance_max_bytes)?;
+
+    let artifact: A = serde_json::from_slice(&json_bytes).map_err(ArtifactError::Json)?;
+    validate_artifact(&artifact)?;
+    let provenance: P = serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
+    validate_provenance(&provenance, &artifact)?;
+    if text_bytes != rendered_text(&artifact) {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: text_mismatch_reason,
+        });
+    }
+    if artifact != *expected_artifact {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: artifact_mismatch_reason,
+        });
+    }
+    if provenance != *expected_provenance {
+        return Err(ArtifactError::InvalidArtifact {
+            reason: provenance_mismatch_reason,
+        });
+    }
+    Ok(())
+}
+
+/// Builds, provenance-binds, and publishes a two-file evidence artifact (JSON +
+/// rendered text) that carries no source lineage, verifying that the freshly
+/// published files read back to exactly what was computed. Shared by every
+/// `publish_*` entry point over an unwrapped report (qualification,
+/// full-map-saturation, stress-qualification); callers differ only in the
+/// artifact/provenance construction, file names/limits, and validation
+/// closures.
+#[cfg(feature = "typed-qualification")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn publish_unwrapped_evidence<A, P>(
+    output_dir: &Path,
+    build_artifact: impl FnOnce() -> Result<A, ArtifactError>,
+    build_provenance: impl FnOnce(&A) -> Result<P, ArtifactError>,
+    json_name: &'static str,
+    json_max_bytes: usize,
+    text_name: &'static str,
+    text_max_bytes: usize,
+    provenance_json_name: &'static str,
+    provenance_max_bytes: usize,
+    rendered_text: impl Fn(&A) -> Vec<u8>,
+    validate_artifact: impl Fn(&A) -> Result<(), ArtifactError>,
+    validate_provenance: impl Fn(&P, &A) -> Result<(), ArtifactError>,
+    text_mismatch_reason: &'static str,
+    artifact_mismatch_reason: &'static str,
+    provenance_mismatch_reason: &'static str,
+) -> Result<(), ArtifactError>
+where
+    A: Serialize + serde::de::DeserializeOwned + PartialEq,
+    P: Serialize + serde::de::DeserializeOwned + PartialEq,
+{
+    let artifact = build_artifact()?;
+    let provenance = build_provenance(&artifact)?;
+    validate_provenance(&provenance, &artifact)?;
+
+    let files = [
+        ArtifactFile::new(
+            json_name,
+            serde_json::to_vec_pretty(&artifact).map_err(ArtifactError::Json)?,
+        ),
+        ArtifactFile::new(text_name, rendered_text(&artifact)),
+        ArtifactFile::new(
+            provenance_json_name,
+            serde_json::to_vec_pretty(&provenance).map_err(ArtifactError::Json)?,
+        ),
+    ];
+
+    publish_verified_artifact(output_dir, &files, |stage| {
+        validate_staged_evidence(
+            stage,
+            json_name,
+            json_max_bytes,
+            text_name,
+            text_max_bytes,
+            provenance_json_name,
+            provenance_max_bytes,
+            |a| validate_artifact(a),
+            |p, a| validate_provenance(p, a),
+            |a| rendered_text(a),
+            text_mismatch_reason,
+            artifact_mismatch_reason,
+            provenance_mismatch_reason,
+            &artifact,
+            &provenance,
+        )
+    })
+}
+
+/// Builds, provenance-binds, and publishes a two-file source-derived evidence
+/// artifact (JSON + rendered text), revalidating source lineage both before
+/// construction and again on staged read-back, and verifying that the freshly
+/// published files read back to exactly what was computed. Shared by every
+/// `publish_*` entry point over a source-bound report (target-load,
+/// cold-rebuild, insertion-bound); callers differ only in the artifact/
+/// provenance construction, file names/limits, and validation closures.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn publish_derived_evidence<A, P>(
+    output_dir: &Path,
+    capture: &ValidatedCapture,
+    sizing: &ValidatedSizing,
+    build_artifact: impl FnOnce() -> Result<A, ArtifactError>,
+    build_provenance: impl FnOnce(&A) -> Result<P, ArtifactError>,
+    json_name: &'static str,
+    json_max_bytes: usize,
+    text_name: &'static str,
+    text_max_bytes: usize,
+    provenance_json_name: &'static str,
+    provenance_max_bytes: usize,
+    rendered_text: impl Fn(&A) -> Vec<u8>,
+    revalidate_artifact: impl Fn(&A) -> Result<(), ArtifactError>,
+    validate_provenance: impl Fn(&P, &A) -> Result<(), ArtifactError>,
+    text_mismatch_reason: &'static str,
+    artifact_mismatch_reason: &'static str,
+    provenance_mismatch_reason: &'static str,
+) -> Result<(), ArtifactError>
+where
+    A: Serialize + serde::de::DeserializeOwned + PartialEq,
+    P: Serialize + serde::de::DeserializeOwned + PartialEq,
+{
+    validate_derived_source_lineage(capture, sizing)?;
+    let artifact = build_artifact()?;
+    let provenance = build_provenance(&artifact)?;
+    validate_provenance(&provenance, &artifact)?;
+
+    let files = [
+        ArtifactFile::new(
+            json_name,
+            serde_json::to_vec_pretty(&artifact).map_err(ArtifactError::Json)?,
+        ),
+        ArtifactFile::new(text_name, rendered_text(&artifact)),
+        ArtifactFile::new(
+            provenance_json_name,
+            serde_json::to_vec_pretty(&provenance).map_err(ArtifactError::Json)?,
+        ),
+    ];
+
+    publish_verified_derived_artifact(output_dir, capture, sizing, &files, |stage| {
+        validate_staged_evidence(
+            stage,
+            json_name,
+            json_max_bytes,
+            text_name,
+            text_max_bytes,
+            provenance_json_name,
+            provenance_max_bytes,
+            |a| {
+                validate_derived_source_lineage(capture, sizing)?;
+                revalidate_artifact(a)
+            },
+            |p, a| validate_provenance(p, a),
+            |a| rendered_text(a),
+            text_mismatch_reason,
+            artifact_mismatch_reason,
+            provenance_mismatch_reason,
+            &artifact,
+            &provenance,
+        )
+    })
+}
+
 /// Artifact construction or atomic-publication failure.
 #[derive(Debug)]
 pub(super) enum ArtifactError {

@@ -5,9 +5,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use zaino_oram::TypedWorkerStressQualificationReport;
 
+#[cfg(test)]
+use crate::corpus_artifact::is_supported_execution_target;
 use crate::corpus_artifact::{
-    artifact_blake2s256_hex, publish_verified_artifact, read_artifact_file, ArtifactDirectory,
-    ArtifactError, ArtifactFile,
+    artifact_blake2s256_hex, new_os_attested_provenance, publish_unwrapped_evidence,
+    validate_os_attested_provenance, ArtifactError,
 };
 
 const STRESS_QUALIFICATION_SCHEMA: &str = "zaino-oram-typed-worker-stress-qualification-v1";
@@ -18,20 +20,6 @@ const PROVENANCE_JSON: &str = "provenance.json";
 const MAX_STRESS_QUALIFICATION_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STRESS_QUALIFICATION_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVENANCE_JSON_BYTES: usize = 64 * 1024;
-
-fn ensure_supported_execution_target() -> Result<(), ArtifactError> {
-    if is_supported_execution_target(std::env::consts::OS, std::env::consts::ARCH) {
-        Ok(())
-    } else {
-        Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker stress qualification publication requires Linux x86_64 execution",
-        })
-    }
-}
-
-fn is_supported_execution_target(target_os: &str, target_arch: &str) -> bool {
-    target_os == "linux" && target_arch == "x86_64"
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,36 +70,31 @@ impl StressQualificationProvenanceV1 {
         runner_version: &str,
         artifact: &StressQualificationArtifactV1,
     ) -> Result<Self, ArtifactError> {
-        ensure_supported_execution_target()?;
-        if runner_version.is_empty() {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "runner version is empty",
-            });
-        }
-        Ok(Self {
-            schema: STRESS_PROVENANCE_SCHEMA.to_owned(),
-            runner_version: runner_version.to_owned(),
-            target_os: std::env::consts::OS.to_owned(),
-            target_arch: std::env::consts::ARCH.to_owned(),
-            stress_qualification_blake2s256: artifact.digest()?,
-        })
+        new_os_attested_provenance(
+            runner_version,
+            artifact.digest(),
+            "typed-worker stress qualification publication requires Linux x86_64 execution",
+            |runner_version, target_os, target_arch, stress_qualification_blake2s256| Self {
+                schema: STRESS_PROVENANCE_SCHEMA.to_owned(),
+                runner_version,
+                target_os,
+                target_arch,
+                stress_qualification_blake2s256,
+            },
+        )
     }
 
     fn validate(&self, artifact: &StressQualificationArtifactV1) -> Result<(), ArtifactError> {
-        if self.schema != STRESS_PROVENANCE_SCHEMA
-            || self.runner_version.is_empty()
-            || !is_supported_execution_target(&self.target_os, &self.target_arch)
-        {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker stress qualification provenance is invalid",
-            });
-        }
-        if self.stress_qualification_blake2s256 != artifact.digest()? {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker stress qualification digest mismatch",
-            });
-        }
-        Ok(())
+        validate_os_attested_provenance(
+            self.schema == STRESS_PROVENANCE_SCHEMA,
+            &self.runner_version,
+            &self.target_os,
+            &self.target_arch,
+            "typed-worker stress qualification provenance is invalid",
+            &self.stress_qualification_blake2s256,
+            &artifact.digest()?,
+            "typed-worker stress qualification digest mismatch",
+        )
     }
 }
 
@@ -131,69 +114,23 @@ pub(super) fn publish_stress_qualification(
     qualification: &TypedWorkerStressQualificationReport,
     runner_version: &str,
 ) -> Result<(), ArtifactError> {
-    let artifact = StressQualificationArtifactV1::new(qualification)?;
-    let provenance = StressQualificationProvenanceV1::new(runner_version, &artifact)?;
-    provenance.validate(&artifact)?;
-
-    let files = [
-        ArtifactFile::new(
-            STRESS_QUALIFICATION_JSON,
-            serde_json::to_vec_pretty(&artifact).map_err(ArtifactError::Json)?,
-        ),
-        ArtifactFile::new(
-            STRESS_QUALIFICATION_TEXT,
-            qualification.to_string().into_bytes(),
-        ),
-        ArtifactFile::new(
-            PROVENANCE_JSON,
-            serde_json::to_vec_pretty(&provenance).map_err(ArtifactError::Json)?,
-        ),
-    ];
-
-    publish_verified_artifact(output_dir, &files, |stage| {
-        validate_staged_qualification(stage, &artifact, &provenance)
-    })
-}
-
-fn validate_staged_qualification(
-    stage: &ArtifactDirectory,
-    expected_artifact: &StressQualificationArtifactV1,
-    expected_provenance: &StressQualificationProvenanceV1,
-) -> Result<(), ArtifactError> {
-    let qualification_json = read_artifact_file(
-        stage,
+    publish_unwrapped_evidence(
+        output_dir,
+        || StressQualificationArtifactV1::new(qualification),
+        |artifact| StressQualificationProvenanceV1::new(runner_version, artifact),
         STRESS_QUALIFICATION_JSON,
         MAX_STRESS_QUALIFICATION_JSON_BYTES,
-    )?;
-    let qualification_text = read_artifact_file(
-        stage,
         STRESS_QUALIFICATION_TEXT,
         MAX_STRESS_QUALIFICATION_TEXT_BYTES,
-    )?;
-    let provenance_json = read_artifact_file(stage, PROVENANCE_JSON, MAX_PROVENANCE_JSON_BYTES)?;
-
-    let artifact: StressQualificationArtifactV1 =
-        serde_json::from_slice(&qualification_json).map_err(ArtifactError::Json)?;
-    artifact.validate()?;
-    let provenance: StressQualificationProvenanceV1 =
-        serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
-    provenance.validate(&artifact)?;
-    if qualification_text != artifact.qualification.to_string().as_bytes() {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker stress qualification text does not match the typed report",
-        });
-    }
-    if artifact != *expected_artifact {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker stress qualification read-back differs from the computed report",
-        });
-    }
-    if provenance != *expected_provenance {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker stress provenance read-back differs from the expected provenance",
-        });
-    }
-    Ok(())
+        PROVENANCE_JSON,
+        MAX_PROVENANCE_JSON_BYTES,
+        |artifact| artifact.qualification.to_string().into_bytes(),
+        |artifact| artifact.validate(),
+        |provenance, artifact| provenance.validate(artifact),
+        "typed-worker stress qualification text does not match the typed report",
+        "typed-worker stress qualification read-back differs from the computed report",
+        "typed-worker stress provenance read-back differs from the expected provenance",
+    )
 }
 
 #[cfg(test)]

@@ -739,6 +739,53 @@ fn validate_dimension(
     Ok(())
 }
 
+/// Canonical worker-trace counters shared by every typed-worker report
+/// (qualification, target-load, full-map-saturation, stress-qualification):
+/// each report embeds this same trace shape, so there is exactly one
+/// definition and one `try_from_snapshot` to keep in sync with the atomic
+/// worker's counters, rather than one near-identical copy per report.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkerTrace {
+    pub(super) queue_capacity: u64,
+    pub(super) queued_at_shutdown: u64,
+    pub(super) in_flight_at_shutdown: u64,
+    pub(super) queue_high_water: u64,
+    pub(super) accepted: u64,
+    pub(super) completed: u64,
+    pub(super) failed: u64,
+    pub(super) full_rejected: u64,
+    pub(super) not_running_rejected: u64,
+    pub(super) reply_delivery_failed: u64,
+    pub(super) stopped: bool,
+    pub(super) faulted: bool,
+}
+
+#[cfg(feature = "corpus-zaino")]
+impl WorkerTrace {
+    /// Converts an atomic worker snapshot into the canonical trace shape,
+    /// rejecting any counter that cannot be widened losslessly into `u64`.
+    pub(super) fn try_from_snapshot(
+        snapshot: crate::layout::AtomicQualificationSnapshot,
+    ) -> Result<Self, std::num::TryFromIntError> {
+        Ok(Self {
+            queue_capacity: u64::try_from(snapshot.queue_capacity)?,
+            queued_at_shutdown: u64::try_from(snapshot.queued)?,
+            in_flight_at_shutdown: u64::try_from(snapshot.in_flight)?,
+            queue_high_water: u64::try_from(snapshot.queue_high_water)?,
+            accepted: snapshot.accepted,
+            completed: snapshot.completed,
+            failed: snapshot.failed,
+            full_rejected: snapshot.full_rejected,
+            not_running_rejected: snapshot.not_running_rejected,
+            reply_delivery_failed: snapshot.reply_delivery_failed,
+            stopped: snapshot.stopped,
+            faulted: snapshot.faulted,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,10 +7,12 @@ use zaino_oram::{
     MainnetCorpusMeasurement, MainnetSizingQualification, TypedWorkerColdRebuildReport,
 };
 
+#[cfg(test)]
+use crate::corpus_artifact::is_supported_execution_target;
 use crate::corpus_artifact::{
-    artifact_blake2s256_hex, publish_verified_derived_artifact, read_artifact_file,
-    validate_derived_source_lineage, ArtifactDirectory, ArtifactError, ArtifactFile,
-    PreverifiedSourceSnapshotV1, ValidatedCapture, ValidatedSizing,
+    artifact_blake2s256_hex, new_os_attested_provenance, publish_derived_evidence,
+    validate_os_attested_provenance, ArtifactError, PreverifiedSourceSnapshotV1, ValidatedCapture,
+    ValidatedSizing,
 };
 
 const COLD_REBUILD_SCHEMA: &str = "zaino-oram-typed-worker-cold-rebuild-v1";
@@ -21,20 +23,6 @@ const PROVENANCE_JSON: &str = "provenance.json";
 const MAX_COLD_REBUILD_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COLD_REBUILD_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVENANCE_JSON_BYTES: usize = 64 * 1024;
-
-fn ensure_supported_execution_target() -> Result<(), ArtifactError> {
-    if is_supported_execution_target(std::env::consts::OS, std::env::consts::ARCH) {
-        Ok(())
-    } else {
-        Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker cold-rebuild publication requires Linux x86_64 execution",
-        })
-    }
-}
-
-fn is_supported_execution_target(target_os: &str, target_arch: &str) -> bool {
-    target_os == "linux" && target_arch == "x86_64"
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,36 +117,31 @@ struct ColdRebuildProvenanceV1 {
 
 impl ColdRebuildProvenanceV1 {
     fn new(runner_version: &str, artifact: &ColdRebuildArtifactV1) -> Result<Self, ArtifactError> {
-        ensure_supported_execution_target()?;
-        if runner_version.is_empty() {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "runner version is empty",
-            });
-        }
-        Ok(Self {
-            schema: COLD_REBUILD_PROVENANCE_SCHEMA.to_owned(),
-            runner_version: runner_version.to_owned(),
-            target_os: std::env::consts::OS.to_owned(),
-            target_arch: std::env::consts::ARCH.to_owned(),
-            cold_rebuild_blake2s256: artifact.digest()?,
-        })
+        new_os_attested_provenance(
+            runner_version,
+            artifact.digest(),
+            "typed-worker cold-rebuild publication requires Linux x86_64 execution",
+            |runner_version, target_os, target_arch, cold_rebuild_blake2s256| Self {
+                schema: COLD_REBUILD_PROVENANCE_SCHEMA.to_owned(),
+                runner_version,
+                target_os,
+                target_arch,
+                cold_rebuild_blake2s256,
+            },
+        )
     }
 
     fn validate(&self, artifact: &ColdRebuildArtifactV1) -> Result<(), ArtifactError> {
-        if self.schema != COLD_REBUILD_PROVENANCE_SCHEMA
-            || self.runner_version.is_empty()
-            || !is_supported_execution_target(&self.target_os, &self.target_arch)
-        {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker cold-rebuild provenance is invalid",
-            });
-        }
-        if self.cold_rebuild_blake2s256 != artifact.digest()? {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker cold-rebuild digest mismatch",
-            });
-        }
-        Ok(())
+        validate_os_attested_provenance(
+            self.schema == COLD_REBUILD_PROVENANCE_SCHEMA,
+            &self.runner_version,
+            &self.target_os,
+            &self.target_arch,
+            "typed-worker cold-rebuild provenance is invalid",
+            &self.cold_rebuild_blake2s256,
+            &artifact.digest()?,
+            "typed-worker cold-rebuild digest mismatch",
+        )
     }
 }
 
@@ -208,90 +191,44 @@ pub(super) fn publish_cold_rebuild(
     source_snapshot: &PreverifiedSourceSnapshotV1,
     runner_version: &str,
 ) -> Result<(), ArtifactError> {
-    validate_derived_source_lineage(capture, sizing)?;
-    let artifact = ColdRebuildArtifactV1::new(
-        cold_rebuild,
-        capture.measurement(),
-        sizing.qualification(),
-        capture.measurement_blake2s256(),
-        sizing.qualification_blake2s256(),
-        declared_rebuild_budget,
-        source_snapshot,
-    )?;
-    let provenance = ColdRebuildProvenanceV1::new(runner_version, &artifact)?;
-    provenance.validate(&artifact)?;
-
-    let files = [
-        ArtifactFile::new(
-            COLD_REBUILD_JSON,
-            serde_json::to_vec_pretty(&artifact).map_err(ArtifactError::Json)?,
-        ),
-        ArtifactFile::new(COLD_REBUILD_TEXT, cold_rebuild.to_string().into_bytes()),
-        ArtifactFile::new(
-            PROVENANCE_JSON,
-            serde_json::to_vec_pretty(&provenance).map_err(ArtifactError::Json)?,
-        ),
-    ];
-
-    publish_verified_derived_artifact(output_dir, capture, sizing, &files, |stage| {
-        validate_staged_cold_rebuild(
-            stage,
-            capture,
-            sizing,
-            declared_rebuild_budget,
-            source_snapshot,
-            &artifact,
-            &provenance,
-        )
-    })
-}
-
-fn validate_staged_cold_rebuild(
-    stage: &ArtifactDirectory,
-    capture: &ValidatedCapture,
-    sizing: &ValidatedSizing,
-    declared_rebuild_budget: Duration,
-    source_snapshot: &PreverifiedSourceSnapshotV1,
-    expected_artifact: &ColdRebuildArtifactV1,
-    expected_provenance: &ColdRebuildProvenanceV1,
-) -> Result<(), ArtifactError> {
-    let cold_rebuild_json =
-        read_artifact_file(stage, COLD_REBUILD_JSON, MAX_COLD_REBUILD_JSON_BYTES)?;
-    let cold_rebuild_text =
-        read_artifact_file(stage, COLD_REBUILD_TEXT, MAX_COLD_REBUILD_TEXT_BYTES)?;
-    let provenance_json = read_artifact_file(stage, PROVENANCE_JSON, MAX_PROVENANCE_JSON_BYTES)?;
-
-    let artifact: ColdRebuildArtifactV1 =
-        serde_json::from_slice(&cold_rebuild_json).map_err(ArtifactError::Json)?;
-    validate_derived_source_lineage(capture, sizing)?;
-    artifact.validate(
-        capture.measurement(),
-        sizing.qualification(),
-        capture.measurement_blake2s256(),
-        sizing.qualification_blake2s256(),
-        declared_rebuild_budget,
-        source_snapshot,
-    )?;
-    let provenance: ColdRebuildProvenanceV1 =
-        serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
-    provenance.validate(&artifact)?;
-    if cold_rebuild_text != artifact.cold_rebuild.to_string().as_bytes() {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker cold-rebuild text does not match the typed report",
-        });
-    }
-    if artifact != *expected_artifact {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker cold-rebuild read-back differs from the computed report",
-        });
-    }
-    if provenance != *expected_provenance {
-        return Err(ArtifactError::InvalidArtifact {
-            reason:
-                "typed-worker cold-rebuild provenance read-back differs from expected provenance",
-        });
-    }
-    Ok(())
+    publish_derived_evidence(
+        output_dir,
+        capture,
+        sizing,
+        || {
+            ColdRebuildArtifactV1::new(
+                cold_rebuild,
+                capture.measurement(),
+                sizing.qualification(),
+                capture.measurement_blake2s256(),
+                sizing.qualification_blake2s256(),
+                declared_rebuild_budget,
+                source_snapshot,
+            )
+        },
+        |artifact| ColdRebuildProvenanceV1::new(runner_version, artifact),
+        COLD_REBUILD_JSON,
+        MAX_COLD_REBUILD_JSON_BYTES,
+        COLD_REBUILD_TEXT,
+        MAX_COLD_REBUILD_TEXT_BYTES,
+        PROVENANCE_JSON,
+        MAX_PROVENANCE_JSON_BYTES,
+        |artifact| artifact.cold_rebuild.to_string().into_bytes(),
+        |artifact| {
+            artifact.validate(
+                capture.measurement(),
+                sizing.qualification(),
+                capture.measurement_blake2s256(),
+                sizing.qualification_blake2s256(),
+                declared_rebuild_budget,
+                source_snapshot,
+            )
+        },
+        |provenance, artifact| provenance.validate(artifact),
+        "typed-worker cold-rebuild text does not match the typed report",
+        "typed-worker cold-rebuild read-back differs from the computed report",
+        "typed-worker cold-rebuild provenance read-back differs from expected provenance",
+    )
 }
 
 #[cfg(test)]

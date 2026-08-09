@@ -8,9 +8,9 @@ use zaino_oram::{
 };
 
 use crate::corpus_artifact::{
-    artifact_blake2s256_hex, publish_verified_derived_artifact, read_artifact_file,
-    validate_derived_source_lineage, ArtifactDirectory, ArtifactError, ArtifactFile,
-    PreverifiedSourceSnapshotV1, ValidatedCapture, ValidatedSizing,
+    artifact_blake2s256_hex, ensure_matching_digest, ensure_runner_version_present,
+    publish_derived_evidence, ArtifactError, PreverifiedSourceSnapshotV1, ValidatedCapture,
+    ValidatedSizing,
 };
 
 const INSERTION_BOUND_SCHEMA: &str = "zaino-oram-source-bound-insertion-budget-v1";
@@ -115,11 +115,7 @@ impl InsertionBoundProvenanceV1 {
         runner_version: &str,
         artifact: &InsertionBoundArtifactV1,
     ) -> Result<Self, ArtifactError> {
-        if runner_version.is_empty() {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "runner version is empty",
-            });
-        }
+        ensure_runner_version_present(runner_version)?;
         Ok(Self {
             schema: INSERTION_BOUND_PROVENANCE_SCHEMA.to_owned(),
             runner_version: runner_version.to_owned(),
@@ -133,12 +129,11 @@ impl InsertionBoundProvenanceV1 {
                 reason: "insertion-bound provenance is invalid",
             });
         }
-        if self.insertion_bound_blake2s256 != artifact.digest()? {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "insertion-bound digest mismatch",
-            });
-        }
-        Ok(())
+        ensure_matching_digest(
+            &self.insertion_bound_blake2s256,
+            &artifact.digest()?,
+            "insertion-bound digest mismatch",
+        )
     }
 }
 
@@ -173,92 +168,44 @@ pub(super) fn publish_insertion_bound(
     source_snapshot: &PreverifiedSourceSnapshotV1,
     runner_version: &str,
 ) -> Result<(), ArtifactError> {
-    validate_derived_source_lineage(capture, sizing)?;
-    let artifact = InsertionBoundArtifactV1::new(
-        insertion_bound,
-        capture.measurement(),
-        sizing.qualification(),
-        capture.measurement_blake2s256(),
-        sizing.qualification_blake2s256(),
-        failure_budget_bps,
-        source_snapshot,
-    )?;
-    let provenance = InsertionBoundProvenanceV1::new(runner_version, &artifact)?;
-    provenance.validate(&artifact)?;
-
-    let files = [
-        ArtifactFile::new(
-            INSERTION_BOUND_JSON,
-            serde_json::to_vec_pretty(&artifact).map_err(ArtifactError::Json)?,
-        ),
-        ArtifactFile::new(
-            INSERTION_BOUND_TEXT,
-            insertion_bound.to_string().into_bytes(),
-        ),
-        ArtifactFile::new(
-            PROVENANCE_JSON,
-            serde_json::to_vec_pretty(&provenance).map_err(ArtifactError::Json)?,
-        ),
-    ];
-
-    publish_verified_derived_artifact(output_dir, capture, sizing, &files, |stage| {
-        validate_staged_insertion_bound(
-            stage,
-            capture,
-            sizing,
-            failure_budget_bps,
-            source_snapshot,
-            &artifact,
-            &provenance,
-        )
-    })
-}
-
-fn validate_staged_insertion_bound(
-    stage: &ArtifactDirectory,
-    capture: &ValidatedCapture,
-    sizing: &ValidatedSizing,
-    failure_budget_bps: u64,
-    source_snapshot: &PreverifiedSourceSnapshotV1,
-    expected_artifact: &InsertionBoundArtifactV1,
-    expected_provenance: &InsertionBoundProvenanceV1,
-) -> Result<(), ArtifactError> {
-    let insertion_bound_json =
-        read_artifact_file(stage, INSERTION_BOUND_JSON, MAX_INSERTION_BOUND_JSON_BYTES)?;
-    let insertion_bound_text =
-        read_artifact_file(stage, INSERTION_BOUND_TEXT, MAX_INSERTION_BOUND_TEXT_BYTES)?;
-    let provenance_json = read_artifact_file(stage, PROVENANCE_JSON, MAX_PROVENANCE_JSON_BYTES)?;
-
-    let artifact: InsertionBoundArtifactV1 =
-        serde_json::from_slice(&insertion_bound_json).map_err(ArtifactError::Json)?;
-    validate_derived_source_lineage(capture, sizing)?;
-    artifact.validate(
-        capture.measurement(),
-        sizing.qualification(),
-        capture.measurement_blake2s256(),
-        sizing.qualification_blake2s256(),
-        failure_budget_bps,
-        source_snapshot,
-    )?;
-    let provenance: InsertionBoundProvenanceV1 =
-        serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
-    provenance.validate(&artifact)?;
-    if insertion_bound_text != artifact.insertion_bound.to_string().as_bytes() {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "insertion-bound text does not match the typed report",
-        });
-    }
-    if artifact != *expected_artifact {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "insertion-bound read-back differs from the computed report",
-        });
-    }
-    if provenance != *expected_provenance {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "insertion-bound provenance read-back differs from expected provenance",
-        });
-    }
-    Ok(())
+    publish_derived_evidence(
+        output_dir,
+        capture,
+        sizing,
+        || {
+            InsertionBoundArtifactV1::new(
+                insertion_bound,
+                capture.measurement(),
+                sizing.qualification(),
+                capture.measurement_blake2s256(),
+                sizing.qualification_blake2s256(),
+                failure_budget_bps,
+                source_snapshot,
+            )
+        },
+        |artifact| InsertionBoundProvenanceV1::new(runner_version, artifact),
+        INSERTION_BOUND_JSON,
+        MAX_INSERTION_BOUND_JSON_BYTES,
+        INSERTION_BOUND_TEXT,
+        MAX_INSERTION_BOUND_TEXT_BYTES,
+        PROVENANCE_JSON,
+        MAX_PROVENANCE_JSON_BYTES,
+        |artifact| artifact.insertion_bound.to_string().into_bytes(),
+        |artifact| {
+            artifact.validate(
+                capture.measurement(),
+                sizing.qualification(),
+                capture.measurement_blake2s256(),
+                sizing.qualification_blake2s256(),
+                failure_budget_bps,
+                source_snapshot,
+            )
+        },
+        |provenance, artifact| provenance.validate(artifact),
+        "insertion-bound text does not match the typed report",
+        "insertion-bound read-back differs from the computed report",
+        "insertion-bound provenance read-back differs from expected provenance",
+    )
 }
 
 #[cfg(test)]

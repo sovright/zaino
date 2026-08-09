@@ -16,55 +16,21 @@
 # The two `tools/` groups that the lint also found were fixed rather than
 # exempted: `encoded_byte_len` and `is_gnu_prefix` now live in
 # `tools/workbench/src/lib.rs`.
-
-[[ignore]]
-fingerprint = "aa6bebf382d901e2"
-reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/publish/validate family, which has real N-way duplication worth extracting into one shared artifact helper. Deferred out of the upstream-sync merge so the refactor is reviewable on its own."
-members = [
-    "TargetLoadProvenanceV1::new (method) at packages/zainod-oram/src/target_load_artifact.rs:109-123",
-    "QualificationProvenanceV1::new (method) at packages/zainod-oram/src/qualification_artifact.rs:77-94",
-    "FullMapSaturationProvenanceV1::new (method) at packages/zainod-oram/src/full_map_saturation_artifact.rs:83-100",
-    "ColdRebuildProvenanceV1::new (method) at packages/zainod-oram/src/cold_rebuild_artifact.rs:131-145",
-    "StressQualificationProvenanceV1::new (method) at packages/zainod-oram/src/stress_qualification_artifact.rs:81-98",
-]
-
-[[ignore]]
-fingerprint = "021b77ad223286fb"
-reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/publish/validate family, which has real N-way duplication worth extracting into one shared artifact helper. Deferred out of the upstream-sync merge so the refactor is reviewable on its own."
-members = [
-    "StressWorkerTrace::try_from_snapshot (method) at packages/zaino-oram/src/stress_qualification.rs:167-188",
-    "TargetLoadWorkerTrace::try_from_snapshot (method) at packages/zaino-oram/src/target_load.rs:333-354",
-    "SaturationWorkerTrace::try_from_snapshot (method) at packages/zaino-oram/src/full_map_saturation.rs:268-289",
-    "QualificationWorkerTrace::try_from_snapshot (method) at packages/zaino-oram/src/qualification.rs:319-340",
-]
-
-[[ignore]]
-fingerprint = "f83b4348f227cb6c"
-reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/publish/validate family, which has real N-way duplication worth extracting into one shared artifact helper. Deferred out of the upstream-sync merge so the refactor is reviewable on its own."
-members = [
-    "TargetLoadProvenanceV1::validate (method) at packages/zainod-oram/src/target_load_artifact.rs:125-140",
-    "FullMapSaturationProvenanceV1::validate (method) at packages/zainod-oram/src/full_map_saturation_artifact.rs:102-117",
-    "ColdRebuildProvenanceV1::validate (method) at packages/zainod-oram/src/cold_rebuild_artifact.rs:147-162",
-    "StressQualificationProvenanceV1::validate (method) at packages/zainod-oram/src/stress_qualification_artifact.rs:100-115",
-]
-
-[[ignore]]
-fingerprint = "45ddd2e9c5663d24"
-reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/publish/validate family, which has real N-way duplication worth extracting into one shared artifact helper. Deferred out of the upstream-sync merge so the refactor is reviewable on its own."
-members = [
-    "validate_staged_qualification (function) at packages/zainod-oram/src/qualification_artifact.rs:152-185",
-    "validate_staged_full_map_saturation (function) at packages/zainod-oram/src/full_map_saturation_artifact.rs:160-199",
-    "validate_staged_qualification (function) at packages/zainod-oram/src/stress_qualification_artifact.rs:158-197",
-]
-
-[[ignore]]
-fingerprint = "5846a85b93258caf"
-reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/publish/validate family, which has real N-way duplication worth extracting into one shared artifact helper. Deferred out of the upstream-sync merge so the refactor is reviewable on its own."
-members = [
-    "publish_qualification (function) at packages/zainod-oram/src/qualification_artifact.rs:126-150",
-    "publish_full_map_saturation (function) at packages/zainod-oram/src/full_map_saturation_artifact.rs:131-158",
-    "publish_stress_qualification (function) at packages/zainod-oram/src/stress_qualification_artifact.rs:129-156",
-]
+#
+# The zainod-oram artifact provenance/publish/validate family (issue #108) was
+# deduplicated: the shared envelope/digest/read-back logic for every
+# `*ProvenanceV1::new`, `*ProvenanceV1::validate`, `publish_*`, and
+# `validate_staged_*` now lives in `packages/zainod-oram/src/corpus_artifact.rs`
+# (`new_os_attested_provenance`, `validate_os_attested_provenance`,
+# `publish_unwrapped_evidence`, `publish_derived_evidence`,
+# `validate_staged_evidence`), and the four `*WorkerTrace::try_from_snapshot`
+# copies collapsed into one `WorkerTrace` type in
+# `packages/zaino-oram/src/trace.rs`. Two PERMANENT residues remain below
+# (773f5a66e163886b, dcb8dbafaaa5787d): the per-report `publish_*` entry
+# points, once reduced to a single call into the shared helper, are
+# irreducibly identical in shape across types — the only further step would
+# be a macro, which CLAUDE.md's DRY section explicitly asks us to avoid in
+# favor of a (here, already-adopted) more verbose `fn`-based design.
 
 [[ignore]]
 fingerprint = "0e00f31646f6966c"
@@ -72,14 +38,6 @@ reason = "TRACKED. Tracked debt. Type-distinct pair differing only in table kind
 members = [
     "FixedProbeLayout::backend_directory_insert (method) at packages/zaino-oram/src/layout.rs:1563-1578",
     "FixedProbeLayout::backend_event_insert (method) at packages/zaino-oram/src/layout.rs:1580-1595",
-]
-
-[[ignore]]
-fingerprint = "26cd7d44c793e143"
-reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/publish/validate family, which has real N-way duplication worth extracting into one shared artifact helper. Deferred out of the upstream-sync merge so the refactor is reviewable on its own."
-members = [
-    "HybridSizingProvenanceV1::validate (method) at packages/zainod-oram/src/hybrid_sizing_artifact.rs:145-157",
-    "InsertionBoundProvenanceV1::validate (method) at packages/zainod-oram/src/insertion_bound_artifact.rs:130-142",
 ]
 
 [[ignore]]
@@ -99,19 +57,12 @@ members = [
 ]
 
 [[ignore]]
-fingerprint = "76a5b6349abbaf30"
-reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/publish/validate family, which has real N-way duplication worth extracting into one shared artifact helper. Deferred out of the upstream-sync merge so the refactor is reviewable on its own."
+fingerprint = "773f5a66e163886b"
+reason = "PERMANENT. Residue of the artifact-family dedup (issue #108). Each publish_* is a single call into the shared corpus_artifact::publish_unwrapped_evidence helper (artifact/provenance construction, file names/limits, and three small validation closures); the three call sites are structurally identical because the family's shape is identical, not because logic is copy-pasted. Collapsing the wrapper functions themselves would require either a macro (CLAUDE.md prefers a verbose fn over a macro) or merging distinct report types, which would change each artifact's JSON schema and its recorded evidence digests."
 members = [
-    "validate_staged_insertion_bound (function) at packages/zainod-oram/src/insertion_bound_artifact.rs:217-262",
-    "validate_staged_cold_rebuild (function) at packages/zainod-oram/src/cold_rebuild_artifact.rs:249-295",
-]
-
-[[ignore]]
-fingerprint = "815575206bacdc8e"
-reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/publish/validate family, which has real N-way duplication worth extracting into one shared artifact helper. Deferred out of the upstream-sync merge so the refactor is reviewable on its own."
-members = [
-    "publish_insertion_bound (function) at packages/zainod-oram/src/insertion_bound_artifact.rs:167-215",
-    "publish_cold_rebuild (function) at packages/zainod-oram/src/cold_rebuild_artifact.rs:202-247",
+    "publish_qualification (function) at packages/zainod-oram/src/qualification_artifact.rs:110-132",
+    "publish_full_map_saturation (function) at packages/zainod-oram/src/full_map_saturation_artifact.rs:114-136",
+    "publish_stress_qualification (function) at packages/zainod-oram/src/stress_qualification_artifact.rs:112-134",
 ]
 
 [[ignore]]
@@ -120,6 +71,14 @@ reason = "TRACKED. Tracked debt. Part of the zainod-oram artifact provenance/pub
 members = [
     "rebuild_fixed_snapshot (function) at packages/zainod-oram/src/main.rs:1176-1218",
     "analyze_insertion_bound_fixed_snapshot (function) at packages/zainod-oram/src/main.rs:1220-1265",
+]
+
+[[ignore]]
+fingerprint = "dcb8dbafaaa5787d"
+reason = "PERMANENT. Residue of the artifact-family dedup (issue #108). Each publish_* is a single call into the shared corpus_artifact::publish_derived_evidence helper (artifact/provenance construction, file names/limits, source-lineage revalidation, and three small validation closures); the two call sites are structurally identical because the family's shape is identical, not because logic is copy-pasted. Collapsing the wrapper functions themselves would require either a macro (CLAUDE.md prefers a verbose fn over a macro) or merging distinct report types, which would change each artifact's JSON schema and its recorded evidence digests."
+members = [
+    "publish_insertion_bound (function) at packages/zainod-oram/src/insertion_bound_artifact.rs:162-209",
+    "publish_cold_rebuild (function) at packages/zainod-oram/src/cold_rebuild_artifact.rs:185-232",
 ]
 
 [[ignore]]
