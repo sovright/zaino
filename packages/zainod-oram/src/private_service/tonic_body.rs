@@ -222,8 +222,15 @@ where
 /// `BootstrapRequest` is empty on the wire, so the only work here is building
 /// the response; the cap on the request itself is enforced by the codec's
 /// `max_decoding_message_size` before this service is ever called.
+///
+/// `envelope_bytes` is carried separately from `session_bootstrap` rather
+/// than as one of its fields: `SessionBootstrap` deliberately does not carry
+/// the envelope width, so there is exactly one source of that number -- the
+/// adapter's own const generic `N` -- and no second copy that could disagree
+/// with it.
 struct RespondBootstrap<'a> {
     session_bootstrap: &'a SessionBootstrap,
+    envelope_bytes: usize,
 }
 
 impl UnaryService<private_proto::BootstrapRequest> for RespondBootstrap<'_> {
@@ -233,6 +240,7 @@ impl UnaryService<private_proto::BootstrapRequest> for RespondBootstrap<'_> {
     fn call(&mut self, _request: Request<private_proto::BootstrapRequest>) -> Self::Future {
         ready(Ok(Response::new(session_bootstrap_to_wire(
             self.session_bootstrap,
+            self.envelope_bytes,
         ))))
     }
 }
@@ -240,14 +248,19 @@ impl UnaryService<private_proto::BootstrapRequest> for RespondBootstrap<'_> {
 /// Encodes bootstrap material as the wire response, named rather than a
 /// `From`/`TryFrom` impl per this crate's boundary-conversion convention.
 /// `SessionBootstrap` is foreign to this crate, so this is a plain function
-/// rather than an inherent method.
-fn session_bootstrap_to_wire(bootstrap: &SessionBootstrap) -> private_proto::BootstrapResponse {
+/// rather than an inherent method. `envelope_bytes` is supplied by the
+/// caller (derived from the adapter's `N`) rather than read off `bootstrap`,
+/// since `SessionBootstrap` does not carry it.
+fn session_bootstrap_to_wire(
+    bootstrap: &SessionBootstrap,
+    envelope_bytes: usize,
+) -> private_proto::BootstrapResponse {
     private_proto::BootstrapResponse {
         key_epoch: bootstrap.key_epoch,
         request_key: bootstrap.keys.request_key.to_vec(),
         response_key: bootstrap.keys.response_key.to_vec(),
         profile_id: bootstrap.profile_id.to_owned(),
-        envelope_bytes: u32::try_from(bootstrap.envelope_bytes).unwrap_or(u32::MAX),
+        envelope_bytes: u32::try_from(envelope_bytes).unwrap_or(u32::MAX),
         // Reserved for a future TDX quote; present and empty in this release.
         attestation: Vec::new(),
     }
@@ -290,18 +303,12 @@ where
     /// runtime's process lifetime, and this is also the one live epoch the
     /// query-page route checks every request's envelope against.
     ///
-    /// `session_bootstrap.envelope_bytes` is plain data threaded in by the
-    /// caller, not derived from `N`, so nothing in the type system stops it
-    /// from disagreeing with the adapter's actual fixed envelope width. A
-    /// mismatch would advertise one padding width over bootstrap and then
-    /// reject every request at that width through the uniform refusal, with
-    /// no diagnostic at all -- so this constructor checks it rather than
-    /// trusting the caller's convention.
-    pub(super) fn new(handler: H, session_bootstrap: SessionBootstrap) -> Self {
-        debug_assert_eq!(
-            session_bootstrap.envelope_bytes, N,
-            "session_bootstrap.envelope_bytes must equal this adapter's fixed envelope width N"
-        );
+    /// `SessionBootstrap` does not carry the envelope width -- see its own
+    /// doc comment -- so there is no second copy of `N` here that could
+    /// disagree with it; every place this adapter reports an envelope width
+    /// (the bootstrap response, both decode caps) derives it from `N`
+    /// directly.
+    pub(super) const fn new(handler: H, session_bootstrap: SessionBootstrap) -> Self {
         Self {
             adapter: PrivateServiceAdapter::new(handler),
             session_bootstrap,
@@ -349,6 +356,7 @@ where
         .max_decoding_message_size(fixed_envelope_wire_size(BOOTSTRAP_REQUEST_BYTES));
         let service = RespondBootstrap {
             session_bootstrap: &self.session_bootstrap,
+            envelope_bytes: N,
         };
         capped_unary_call(grpc, service, request).await
     }
@@ -645,7 +653,6 @@ mod tests {
                 response_key: [0x22; PRIVATE_RUNTIME_KEY_BYTES],
             },
             profile_id: "test-profile",
-            envelope_bytes: ENVELOPE_BYTES,
         }
     }
 

@@ -282,7 +282,6 @@ mod tests {
                 response_key: [0x22; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
             },
             profile_id: "test-profile",
-            envelope_bytes: ENVELOPE_BYTES,
         }
     }
 

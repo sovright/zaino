@@ -348,9 +348,15 @@ impl std::fmt::Debug for ReleasableSessionKeys {
 
 /// Everything a wallet needs to seal a query, and nothing else.
 ///
-/// A named struct rather than a tuple: four positional fields, two of them
-/// integers, is exactly where a caller could silently swap `key_epoch` and
-/// `envelope_bytes`.
+/// A named struct rather than a tuple: `key_epoch` and `keys` are unambiguous
+/// by name where two positional fields would invite a silent swap.
+///
+/// Deliberately does *not* carry the envelope width. That number is already
+/// determined by the runtime's fixed-envelope const generic (`N` in
+/// `FixedEnvelopeRuntime<N>`); carrying a second copy here would let the two
+/// disagree; a caller wiring a bootstrap response derives it from `N`
+/// directly instead, so there is only one source of that number and no pair
+/// to fall out of sync.
 pub struct SessionBootstrap {
     /// Identifies the key generation `keys` belongs to.
     pub key_epoch: u64,
@@ -358,8 +364,6 @@ pub struct SessionBootstrap {
     pub keys: ReleasableSessionKeys,
     /// The compiled privacy profile these keys are valid under.
     pub profile_id: &'static str,
-    /// Exact application-envelope width every request and response must carry.
-    pub envelope_bytes: usize,
 }
 
 impl std::fmt::Debug for SessionBootstrap {
@@ -638,7 +642,6 @@ where
                 response_key: self.response_key,
             },
             profile_id: self.profile_id,
-            envelope_bytes: PRIVATE_MAINNET_ENVELOPE_BYTES,
         }
     }
 
@@ -809,7 +812,6 @@ mod tests {
         assert_eq!(bootstrap.key_epoch, 42);
         assert_eq!(bootstrap.keys.request_key, releasable_request_key);
         assert_eq!(bootstrap.keys.response_key, releasable_response_key);
-        assert_eq!(bootstrap.envelope_bytes, PRIVATE_MAINNET_ENVELOPE_BYTES);
         assert!(!bootstrap.profile_id.is_empty());
         assert_eq!(
             format!("{bootstrap:?}"),
