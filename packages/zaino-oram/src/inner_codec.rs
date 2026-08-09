@@ -840,6 +840,7 @@ fn validate_response_shape<const N: usize>(
                 return Err(InnerCodecError::InvalidResponseShape);
             }
         }
+        _ => return Err(InnerCodecError::InvalidResponseShape),
     }
     Ok(())
 }
@@ -866,6 +867,7 @@ const fn outcome_tag(outcome: QueryOutcome) -> u8 {
         QueryOutcome::StoreFailure => 3,
         QueryOutcome::ProjectionNotReady => 4,
         QueryOutcome::InvalidContinuation => 5,
+        _ => panic!("query outcome is always one of the six defined tags"),
     }
 }
 

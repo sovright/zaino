@@ -94,6 +94,33 @@ impl TransparentUtxo {
         }
     }
 
+    /// Selects `replacement` when `mask` is all ones, otherwise keeps `self`.
+    ///
+    /// Callers must pass either `0` or `usize::MAX`. This arithmetic form is
+    /// intended to avoid source-level secret-dependent control flow; Rust and
+    /// LLVM do not guarantee that the emitted machine code remains branchless.
+    pub(super) fn conditional_select(self, replacement: Self, mask: usize) -> Self {
+        let byte_mask = mask as u8;
+        let word_mask = mask as u32;
+        let wide_mask = mask as u64;
+        let mut txid = self.txid;
+        for (selected, replacement) in txid.iter_mut().zip(replacement.txid) {
+            *selected = (*selected & !byte_mask) | (replacement & byte_mask);
+        }
+        let mut script = self.script;
+        for (selected, replacement) in script.iter_mut().zip(replacement.script) {
+            *selected = (*selected & !byte_mask) | (replacement & byte_mask);
+        }
+        Self {
+            txid,
+            output_index: (self.output_index & !word_mask) | (replacement.output_index & word_mask),
+            value_zat: (self.value_zat & !wide_mask) | (replacement.value_zat & wide_mask),
+            height: (self.height & !word_mask) | (replacement.height & word_mask),
+            script_len: (self.script_len & !byte_mask) | (replacement.script_len & byte_mask),
+            script,
+        }
+    }
+
     /// Validates and builds a fixed transparent UTXO.
     pub(super) fn new(
         txid: [u8; TXID_BYTES],
@@ -2477,19 +2504,28 @@ impl fmt::Debug for UtxoQuery {
 
 /// Protected outcome encoded inside a fixed response envelope.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum QueryOutcome {
+pub(super) struct QueryOutcome(u8);
+
+#[allow(non_upper_case_globals)]
+impl QueryOutcome {
     /// All matching records fit in the configured result budget.
-    Complete,
+    pub(super) const Complete: Self = Self(0);
     /// More matching records existed than the profile permits returning.
-    ResultBudgetExceeded,
+    pub(super) const ResultBudgetExceeded: Self = Self(1);
     /// The protected request did not contain a valid address-key domain value.
-    InvalidDomain,
+    pub(super) const InvalidDomain: Self = Self(2);
     /// The store could not complete at least one logical read.
-    StoreFailure,
+    pub(super) const StoreFailure: Self = Self(3);
     /// The protected projection has no ready checkpoint for this query round.
-    ProjectionNotReady,
+    pub(super) const ProjectionNotReady: Self = Self(4);
     /// The opaque continuation was invalid, expired, mismatched, or replayed.
-    InvalidContinuation,
+    pub(super) const InvalidContinuation: Self = Self(5);
+
+    /// Selects `replacement` when `mask` is all ones, otherwise keeps `self`.
+    pub(super) const fn conditional_select(self, replacement: Self, mask: usize) -> Self {
+        let byte_mask = mask as u8;
+        Self((self.0 & !byte_mask) | (replacement.0 & byte_mask))
+    }
 }
 
 impl fmt::Debug for QueryOutcome {
@@ -2558,6 +2594,26 @@ impl<const N: usize> UtxoResultPage<N> {
 
     pub(super) fn set_slot(&mut self, index: usize, utxo: TransparentUtxo) {
         self.slots[index] = UtxoResultSlot::real(utxo);
+    }
+
+    /// Conditionally replaces one publicly indexed slot with a real record.
+    pub(super) fn conditional_set_slot(
+        &mut self,
+        index: usize,
+        utxo: TransparentUtxo,
+        mask: usize,
+    ) {
+        let slot = &mut self.slots[index];
+        slot.occupied = ((slot.occupied as usize & !mask) | (mask & 1)) != 0;
+        slot.utxo = slot.utxo.conditional_select(utxo, mask);
+    }
+
+    /// Conditionally clears every response slot using a fixed sweep.
+    pub(super) fn conditional_clear(&mut self, mask: usize) {
+        for slot in &mut self.slots {
+            slot.occupied = (slot.occupied as usize & !mask) != 0;
+            slot.utxo = slot.utxo.conditional_select(TransparentUtxo::dummy(), mask);
+        }
     }
 
     /// Returns the protected query outcome.
