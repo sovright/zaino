@@ -156,10 +156,35 @@ const fn classify_request_epoch(
 /// it must re-bootstrap.
 const STALE_KEY_EPOCH_GRPC_MESSAGE: &str = "stale-key-epoch";
 
+/// gRPC status code for the stale-key-epoch refusal (`Code::FailedPrecondition`).
+const STALE_KEY_EPOCH_GRPC_STATUS: &str = "9";
+
+/// Marks a `Status` as the stale-key-epoch outcome, carried through its error
+/// source rather than through its code or message text.
+///
+/// [`coarsen_initial_status`] keys its one exemption off this type rather
+/// than off re-parsing the serialized `grpc-status`/`grpc-message` headers.
+/// The marker never reaches the wire -- `Status::source` is not part of
+/// `to_header_map` -- so any future `Status::failed_precondition` with this
+/// same code and message, from this file or a dependency, would not also
+/// carry this marker and would still be coarsened uniformly.
+#[derive(Debug)]
+struct StaleKeyEpochMarker;
+
+impl std::fmt::Display for StaleKeyEpochMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stale key epoch")
+    }
+}
+
+impl std::error::Error for StaleKeyEpochMarker {}
+
 fn status_for_query_outcome(outcome: PrivateQueryOutcome) -> Status {
     match outcome {
         PrivateQueryOutcome::StaleKeyEpoch => {
-            Status::failed_precondition(STALE_KEY_EPOCH_GRPC_MESSAGE)
+            let mut status = Status::failed_precondition(STALE_KEY_EPOCH_GRPC_MESSAGE);
+            status.set_source(std::sync::Arc::new(StaleKeyEpochMarker));
+            status
         }
     }
 }
@@ -264,7 +289,19 @@ where
     /// re-derived per request: the epoch, keys, and profile are fixed for a
     /// runtime's process lifetime, and this is also the one live epoch the
     /// query-page route checks every request's envelope against.
-    pub(super) const fn new(handler: H, session_bootstrap: SessionBootstrap) -> Self {
+    ///
+    /// `session_bootstrap.envelope_bytes` is plain data threaded in by the
+    /// caller, not derived from `N`, so nothing in the type system stops it
+    /// from disagreeing with the adapter's actual fixed envelope width. A
+    /// mismatch would advertise one padding width over bootstrap and then
+    /// reject every request at that width through the uniform refusal, with
+    /// no diagnostic at all -- so this constructor checks it rather than
+    /// trusting the caller's convention.
+    pub(super) fn new(handler: H, session_bootstrap: SessionBootstrap) -> Self {
+        debug_assert_eq!(
+            session_bootstrap.envelope_bytes, N,
+            "session_bootstrap.envelope_bytes must equal this adapter's fixed envelope width N"
+        );
         Self {
             adapter: PrivateServiceAdapter::new(handler),
             session_bootstrap,
@@ -407,30 +444,61 @@ fn status_is_failure(headers: &http::HeaderMap) -> bool {
         .is_some_and(|status| status.as_bytes() != b"0")
 }
 
+/// Rewrites every failure's headers to one of exactly two fixed sets, then
+/// clears extensions on both paths.
+///
+/// The stale-key-epoch outcome is the one response this file deliberately
+/// does *not* coarsen to the uniform refusal -- which is exactly why it gets
+/// scrubbed the same as everything else: its own fixed minimal header set,
+/// and no leftover extensions (including the marker read below) riding out
+/// to the caller. Every other failure -- transport errors, handler refusals,
+/// cap violations -- still collapses to the one uniform response.
 fn coarsen_initial_status(response: &mut http::Response<TonicBody>) {
-    if status_is_failure(response.headers()) && !status_is_stale_key_epoch(response.headers()) {
-        *response.headers_mut() = uniform_initial_status_headers();
-        response.extensions_mut().clear();
+    if status_is_failure(response.headers()) {
+        *response.headers_mut() = if extensions_carry_stale_key_epoch(response.extensions()) {
+            stale_key_epoch_initial_headers()
+        } else {
+            uniform_initial_status_headers()
+        };
     }
+    response.extensions_mut().clear();
 }
 
-/// Recognizes this file's own stale-key-epoch status by its exact code and
-/// message, so it alone survives [`coarsen_initial_status`]'s rewrite.
-/// Everything else -- transport errors, handler refusals -- is still coarsened
-/// uniformly; only this one outcome is deliberately distinguishable, and only
-/// because the epoch it reports is public.
-fn status_is_stale_key_epoch(headers: &http::HeaderMap) -> bool {
-    let failed_precondition = i32::from(tonic::Code::FailedPrecondition).to_string();
-    headers
-        .get(Status::GRPC_STATUS)
-        .is_some_and(|status| status.as_bytes() == failed_precondition.as_bytes())
-        && headers
-            .get(Status::GRPC_MESSAGE)
-            .is_some_and(|message| message.as_bytes() == STALE_KEY_EPOCH_GRPC_MESSAGE.as_bytes())
+/// Recognizes the stale-key-epoch outcome structurally: by the
+/// [`StaleKeyEpochMarker`] attached to the `Status` tonic inserted into
+/// `response.extensions()`, not by re-deriving the decision from serialized
+/// header bytes.
+fn extensions_carry_stale_key_epoch(extensions: &http::Extensions) -> bool {
+    extensions
+        .get::<Status>()
+        .and_then(|status| std::error::Error::source(status))
+        .is_some_and(|source| source.is::<StaleKeyEpochMarker>())
 }
 
 fn uniform_initial_status_headers() -> http::HeaderMap {
-    let mut headers = uniform_status_headers();
+    fixed_initial_status_headers("14", UNIFORM_GRPC_MESSAGE)
+}
+
+/// The stale-key-epoch outcome's own fixed minimal header set -- parallel to
+/// [`uniform_initial_status_headers`], not a preserved copy of whatever
+/// `Status::into_http` happened to produce.
+fn stale_key_epoch_initial_headers() -> http::HeaderMap {
+    fixed_initial_status_headers(STALE_KEY_EPOCH_GRPC_STATUS, STALE_KEY_EPOCH_GRPC_MESSAGE)
+}
+
+fn fixed_initial_status_headers(
+    grpc_status: &'static str,
+    grpc_message: &'static str,
+) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        Status::GRPC_STATUS,
+        http::HeaderValue::from_static(grpc_status),
+    );
+    headers.insert(
+        Status::GRPC_MESSAGE,
+        http::HeaderValue::from_static(grpc_message),
+    );
     headers.insert(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/grpc"),
@@ -640,6 +708,20 @@ mod tests {
         assert!(!headers.contains_key(Status::GRPC_STATUS_DETAILS));
     }
 
+    fn assert_stale_key_epoch_status(headers: &http::HeaderMap) {
+        assert_eq!(
+            headers.get(Status::GRPC_STATUS),
+            Some(&http::HeaderValue::from_static(STALE_KEY_EPOCH_GRPC_STATUS))
+        );
+        assert_eq!(
+            headers.get(Status::GRPC_MESSAGE),
+            Some(&http::HeaderValue::from_static(
+                STALE_KEY_EPOCH_GRPC_MESSAGE
+            ))
+        );
+        assert!(!headers.contains_key(Status::GRPC_STATUS_DETAILS));
+    }
+
     fn detailed_status() -> Status {
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert(
@@ -760,8 +842,16 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_body_is_rejected_with_the_uniform_refusal() {
+        // Sized past `fixed_envelope_request_wire_size(ENVELOPE_BYTES)` (17
+        // bytes: 6 for the envelope field plus the 11-byte key_epoch
+        // allowance), so this still exercises the transport-level cap
+        // rejection rather than `try_from_wire`'s length check -- a body
+        // merely one byte over `ENVELOPE_BYTES` now fits comfortably inside
+        // the wider cap and reaches the handler's own length validation
+        // instead (see `boundary_failure_is_uniform_before_body_creation`).
         let (mut adapter, state) = fixture();
-        let response = adapter.query_page(request(&[1, 2, 3, 4, 5])).await;
+        let oversized = vec![0u8; ENVELOPE_BYTES + 20];
+        let response = adapter.query_page(request(&oversized)).await;
 
         assert_uniform_status(response.headers());
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
@@ -861,17 +951,15 @@ mod tests {
             .query_page(request_with_epoch(&[1, 2, 3, 4], FIXTURE_KEY_EPOCH + 1))
             .await;
 
-        assert!(status_is_failure(response.headers()));
-        assert_ne!(
-            response.headers().get(Status::GRPC_STATUS),
-            Some(&http::HeaderValue::from_static("14")),
-            "a stale key epoch must not collapse into the uniform refusal code"
-        );
+        assert_stale_key_epoch_status(response.headers());
         assert_eq!(
             state.calls.load(Ordering::SeqCst),
             0,
             "the handler must not be invoked before the epoch check"
         );
+        // The marker that distinguishes this response must not ride out as a
+        // caller-visible extension once the coarsener has read it.
+        assert!(response.extensions().is_empty());
         assert!(response.into_body().is_end_stream());
     }
 
@@ -885,6 +973,29 @@ mod tests {
 
         assert!(!status_is_failure(response.headers()));
         assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The 10-byte-varint case is the entire reason
+    /// `KEY_EPOCH_FIELD_WIRE_BYTES` exists: if the cap under-counted it, this
+    /// request would be rejected by the transport before ever reaching the
+    /// epoch check, and would surface as the uniform refusal instead of the
+    /// distinguishable stale-epoch one. Reaching that distinguishable status
+    /// is exactly the evidence that decoding succeeded within the cap.
+    #[tokio::test]
+    async fn a_request_epoch_of_u64_max_fits_the_decode_cap() {
+        let (mut adapter, state) = fixture();
+
+        let response = adapter
+            .query_page(request_with_epoch(&[1, 2, 3, 4], u64::MAX))
+            .await;
+
+        assert_stale_key_epoch_status(response.headers());
+        assert_eq!(
+            state.calls.load(Ordering::SeqCst),
+            0,
+            "a u64::MAX epoch mismatches the fixture and must not reach the handler"
+        );
+        assert!(response.into_body().is_end_stream());
     }
 
     #[tokio::test]
