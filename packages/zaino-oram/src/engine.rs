@@ -10,6 +10,8 @@ use crate::{
 pub(super) struct QueryExecution<const RESPONSE_SLOTS: usize> {
     page: UtxoResultPage<RESPONSE_SLOTS>,
     next_cursor: Option<usize>,
+    #[cfg(test)]
+    conditional_slot_writes: usize,
 }
 
 impl<const RESPONSE_SLOTS: usize> QueryExecution<RESPONSE_SLOTS> {
@@ -21,6 +23,11 @@ impl<const RESPONSE_SLOTS: usize> QueryExecution<RESPONSE_SLOTS> {
         self.next_cursor
     }
 
+    #[cfg(test)]
+    const fn conditional_slot_writes(&self) -> usize {
+        self.conditional_slot_writes
+    }
+
     pub(super) fn into_parts(self) -> (UtxoResultPage<RESPONSE_SLOTS>, Option<usize>) {
         (self.page, self.next_cursor)
     }
@@ -28,9 +35,13 @@ impl<const RESPONSE_SLOTS: usize> QueryExecution<RESPONSE_SLOTS> {
 
 /// A synchronous transparent-UTXO logical-schedule model.
 ///
-/// This foundation guarantees only an exact logical store-call sequence and
-/// fixed Rust data shapes. It does not claim data-independent instructions,
-/// memory accesses, allocations, or timing.
+/// In addition to an exact logical store-call sequence and fixed Rust data
+/// shapes, candidate selection uses fixed response-slot sweeps and
+/// source-level non-short-circuiting/masked operations so its control flow and
+/// coarse memory accesses do not depend on query matches or result count.
+/// This does not guarantee constant-time machine code: Rust and LLVM may
+/// transform these operations, and allocations, the ORAM backend, and the
+/// whole binary remain outside this source-level claim.
 pub(super) struct PrivateQueryEngine<S, const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize> {
     store: S,
     shape: CompiledQueryShape<RESPONSE_SLOTS, ENVELOPE_BYTES>,
@@ -85,8 +96,7 @@ where
         trace: &mut TraceRecorder,
     ) -> Result<QueryExecution<RESPONSE_SLOTS>, TraceError> {
         let mut page = UtxoResultPage::empty();
-        let mut real_slots = 0;
-        let mut next_cursor = None;
+        let mut selection = CandidateSelectionState::new();
         let mut store_failed = false;
         let mut recent_snapshot_valid = recent_snapshot_is_semantically_valid(recent_snapshot);
         let store_reads = self.profile().store_reads();
@@ -103,25 +113,17 @@ where
             let candidate: TransparentUtxo = *store_slot.record();
             let (survives_recent_snapshot, finalized_relation_valid) =
                 finalized_snapshot_relation(query.address_key(), &candidate, recent_snapshot);
-            if store_slot.is_occupied() {
-                recent_snapshot_valid &= finalized_relation_valid;
-            }
+            recent_snapshot_valid &= !store_slot.is_occupied() | finalized_relation_valid;
             let matches = store_slot.is_occupied()
-                && query.domain_valid()
-                && candidate.height() >= query.minimum_height()
-                && survives_recent_snapshot;
-            consider_candidate(
-                &mut page,
-                &mut real_slots,
-                &mut next_cursor,
-                cursor,
-                slot,
-                candidate,
-                matches,
-            );
+                & query.domain_valid()
+                & (candidate.height() >= query.minimum_height())
+                & survives_recent_snapshot;
+            consider_candidate(&mut page, &mut selection, cursor, slot, candidate, matches);
         }
 
         for (recent_ordinal, recent_slot) in recent_snapshot.iter().enumerate() {
+            // Slot presence is public snapshot shape/data shared by every query
+            // in the generation, so this branch is not query-dependent.
             let Some(change) = recent_slot.change() else {
                 continue;
             };
@@ -133,14 +135,13 @@ where
                     })?;
             let candidate = *change.utxo();
             let matches = query.domain_valid()
-                && change.kind() == RecentUtxoChangeKind::Created
-                && change.address_key() == query.address_key()
-                && candidate.height() >= query.minimum_height()
-                && recent_creation_is_live(recent_ordinal, change, recent_snapshot);
+                & (change.kind() == RecentUtxoChangeKind::Created)
+                & same_address(change.address_key(), query.address_key())
+                & (candidate.height() >= query.minimum_height())
+                & recent_creation_is_live(recent_ordinal, change, recent_snapshot);
             consider_candidate(
                 &mut page,
-                &mut real_slots,
-                &mut next_cursor,
+                &mut selection,
                 cursor,
                 combined_ordinal,
                 candidate,
@@ -148,44 +149,83 @@ where
             );
         }
 
-        let outcome = if store_failed {
-            page = UtxoResultPage::empty();
-            next_cursor = None;
-            QueryOutcome::StoreFailure
-        } else if !recent_snapshot_valid {
-            page = UtxoResultPage::empty();
-            next_cursor = None;
-            QueryOutcome::ProjectionNotReady
-        } else if !query.domain_valid() {
-            QueryOutcome::InvalidDomain
-        } else if next_cursor.is_some() {
-            QueryOutcome::ResultBudgetExceeded
-        } else {
-            QueryOutcome::Complete
-        };
+        let projection_not_ready = !store_failed & !recent_snapshot_valid;
+        let invalid_domain = !store_failed & recent_snapshot_valid & !query.domain_valid();
+        let budget_exceeded = !store_failed
+            & recent_snapshot_valid
+            & query.domain_valid()
+            & selection.next_cursor_found;
+        let clear_results = store_failed | projection_not_ready;
+        page.conditional_clear(ct::mask(clear_results));
+        selection.next_cursor_found &= !clear_results;
+        let next_cursor = selection
+            .next_cursor_found
+            .then_some(selection.next_cursor_value);
+        let mut outcome = QueryOutcome::Complete;
+        outcome = outcome.conditional_select(
+            QueryOutcome::ResultBudgetExceeded,
+            ct::mask(budget_exceeded),
+        );
+        outcome = outcome.conditional_select(QueryOutcome::InvalidDomain, ct::mask(invalid_domain));
+        outcome = outcome.conditional_select(
+            QueryOutcome::ProjectionNotReady,
+            ct::mask(projection_not_ready),
+        );
+        outcome = outcome.conditional_select(QueryOutcome::StoreFailure, ct::mask(store_failed));
         page.set_outcome(outcome);
-        Ok(QueryExecution { page, next_cursor })
+        Ok(QueryExecution {
+            page,
+            next_cursor,
+            #[cfg(test)]
+            conditional_slot_writes: selection.conditional_slot_writes,
+        })
+    }
+}
+
+struct CandidateSelectionState {
+    real_slots: usize,
+    next_cursor_value: usize,
+    next_cursor_found: bool,
+    #[cfg(test)]
+    conditional_slot_writes: usize,
+}
+
+impl CandidateSelectionState {
+    const fn new() -> Self {
+        Self {
+            real_slots: 0,
+            next_cursor_value: 0,
+            next_cursor_found: false,
+            #[cfg(test)]
+            conditional_slot_writes: 0,
+        }
     }
 }
 
 fn consider_candidate<const RESPONSE_SLOTS: usize>(
     page: &mut UtxoResultPage<RESPONSE_SLOTS>,
-    real_slots: &mut usize,
-    next_cursor: &mut Option<usize>,
+    state: &mut CandidateSelectionState,
     cursor: usize,
     ordinal: usize,
     candidate: TransparentUtxo,
     matches: bool,
 ) {
-    if !matches || ordinal < cursor {
-        return;
+    let eligible = matches & (ordinal >= cursor);
+    let has_capacity = state.real_slots < RESPONSE_SLOTS;
+    let insert = eligible & has_capacity;
+    for slot_index in 0..RESPONSE_SLOTS {
+        let select = insert & (slot_index == state.real_slots);
+        page.conditional_set_slot(slot_index, candidate, ct::mask(select));
+        #[cfg(test)]
+        {
+            state.conditional_slot_writes += 1;
+        }
     }
-    if *real_slots < RESPONSE_SLOTS {
-        page.set_slot(*real_slots, candidate);
-        *real_slots += 1;
-    } else if next_cursor.is_none() {
-        *next_cursor = Some(ordinal);
-    }
+    state.real_slots = ct::select_usize(state.real_slots, state.real_slots + 1, insert);
+
+    let set_cursor = eligible & !has_capacity & !state.next_cursor_found;
+    state.next_cursor_value = ct::select_usize(state.next_cursor_value, ordinal, set_cursor);
+    state.next_cursor_found = ct::select_bool(state.next_cursor_found, true, set_cursor);
 }
 
 fn finalized_snapshot_relation<const RECENT_SNAPSHOT_SLOTS: usize>(
@@ -196,15 +236,16 @@ fn finalized_snapshot_relation<const RECENT_SNAPSHOT_SLOTS: usize>(
     let mut survives = true;
     let mut valid = true;
     for slot in recent_snapshot {
+        // Slot presence is public snapshot data shared by every query in the
+        // generation, so this branch is not query-dependent.
         let Some(change) = slot.change() else {
             continue;
         };
-        if same_outpoint(change.utxo(), candidate) {
-            let is_valid_spend =
-                change.address_key() == address_key && change.kind() == RecentUtxoChangeKind::Spent;
-            valid &= is_valid_spend;
-            survives &= !is_valid_spend;
-        }
+        let same = same_outpoint(change.utxo(), candidate);
+        let is_valid_spend = same_address(change.address_key(), address_key)
+            & (change.kind() == RecentUtxoChangeKind::Spent);
+        valid &= !same | is_valid_spend;
+        survives &= !(same & is_valid_spend);
     }
     (survives, valid)
 }
@@ -236,20 +277,48 @@ fn recent_creation_is_live<const RECENT_SNAPSHOT_SLOTS: usize>(
     candidate: &RecentUtxoChange,
     recent_snapshot: &[RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
 ) -> bool {
-    !recent_snapshot
-        .iter()
-        .enumerate()
-        .any(|(later_ordinal, slot)| {
-            later_ordinal > ordinal
-                && slot.change().is_some_and(|later| {
-                    later.address_key() == candidate.address_key()
-                        && same_outpoint(later.utxo(), candidate.utxo())
-                })
-        })
+    let mut spent_later = false;
+    for (later_ordinal, slot) in recent_snapshot.iter().enumerate() {
+        let Some(later) = slot.change() else {
+            continue;
+        };
+        spent_later |= (later_ordinal > ordinal)
+            & same_address(later.address_key(), candidate.address_key())
+            & same_outpoint(later.utxo(), candidate.utxo());
+    }
+    !spent_later
 }
 
 fn same_outpoint(left: &TransparentUtxo, right: &TransparentUtxo) -> bool {
-    left.txid() == right.txid() && left.output_index() == right.output_index()
+    ct::eq_bytes(left.txid(), right.txid()) & (left.output_index() == right.output_index())
+}
+
+fn same_address(left: &crate::records::AddressKey, right: &crate::records::AddressKey) -> bool {
+    ct::eq_bytes(left.as_bytes(), right.as_bytes())
+}
+
+/// Minimal source-level masked operations used by candidate selection.
+mod ct {
+    pub(super) const fn mask(choice: bool) -> usize {
+        0usize.wrapping_sub(choice as usize)
+    }
+
+    pub(super) const fn select_usize(current: usize, replacement: usize, choice: bool) -> usize {
+        let mask = mask(choice);
+        (current & !mask) | (replacement & mask)
+    }
+
+    pub(super) const fn select_bool(current: bool, replacement: bool, choice: bool) -> bool {
+        select_usize(current as usize, replacement as usize, choice) != 0
+    }
+
+    pub(super) fn eq_bytes<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
+        let mut difference = 0;
+        for index in 0..N {
+            difference |= left[index] ^ right[index];
+        }
+        difference == 0
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +445,14 @@ mod tests {
         let mut miss = engine_with(&[])?;
         let miss_execution = execute(&mut miss, &UtxoQuery::new(address(9), 0), 0)?;
         assert_fixed_logical_schedule(&miss_execution, QueryOutcome::Complete, 0, None);
+        assert_eq!(
+            hit_execution.conditional_slot_writes(),
+            miss_execution.conditional_slot_writes()
+        );
+        assert_eq!(
+            hit_execution.conditional_slot_writes(),
+            expected_schedule_slots().len() * RESPONSE_SLOTS
+        );
 
         let mut filtered = engine_with(&[(0, utxo(1, 10))])?;
         let filtered_execution = execute(&mut filtered, &UtxoQuery::new(key, 11), 0)?;
@@ -411,6 +488,57 @@ mod tests {
 
     fn expected_schedule_slots() -> [usize; 4] {
         [0, 1, 2, 3]
+    }
+
+    #[test]
+    fn branchless_candidate_selection_matches_previous_semantics() {
+        let cases = [
+            ([false, false, false, false], 0),
+            ([true, false, false, false], 0),
+            ([true, true, false, false], 0),
+            ([true, true, true, true], 0),
+            ([true, true, true, true], 2),
+        ];
+
+        for (matches, cursor) in cases {
+            let candidate_count = matches.len();
+            let mut actual_page: UtxoResultPage<RESPONSE_SLOTS> = UtxoResultPage::empty();
+            let mut actual = CandidateSelectionState::new();
+            let mut expected_page: UtxoResultPage<RESPONSE_SLOTS> = UtxoResultPage::empty();
+            let mut expected_count = 0;
+            let mut expected_next_cursor = None;
+
+            for (ordinal, matches) in matches.into_iter().enumerate() {
+                let candidate = utxo(ordinal as u8 + 1, ordinal as u32 + 10);
+                consider_candidate(
+                    &mut actual_page,
+                    &mut actual,
+                    cursor,
+                    ordinal,
+                    candidate,
+                    matches,
+                );
+                if matches && ordinal >= cursor {
+                    if expected_count < RESPONSE_SLOTS {
+                        expected_page.set_slot(expected_count, candidate);
+                        expected_count += 1;
+                    } else if expected_next_cursor.is_none() {
+                        expected_next_cursor = Some(ordinal);
+                    }
+                }
+            }
+
+            assert_eq!(actual_page, expected_page);
+            assert_eq!(actual.real_slots, expected_count);
+            assert_eq!(
+                actual.next_cursor_found.then_some(actual.next_cursor_value),
+                expected_next_cursor
+            );
+            assert_eq!(
+                actual.conditional_slot_writes,
+                candidate_count * RESPONSE_SLOTS
+            );
+        }
     }
 
     #[test]
