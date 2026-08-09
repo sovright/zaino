@@ -212,10 +212,11 @@ impl PrivacyProfile {
 
     /// Returns the human-readable, non-authoritative profile label.
     ///
-    /// Surfaced on the wire as a bootstrap response's `profile_id` string --
-    /// the compiled profile these keys are valid under -- but it stays
-    /// diagnostic rather than authoritative; [`Self::profile_id`] is the value
-    /// bound into protected request state.
+    /// Surfaced on the wire as a bootstrap response's `profile_label` string.
+    /// It is named `profile_label` rather than `profile_id` precisely so a
+    /// wallet author does not pin on it as an identifier: it stays diagnostic,
+    /// and [`Self::profile_id`] is the digest actually bound into protected
+    /// request state.
     pub(super) const fn label(&self) -> &'static str {
         self.label
     }

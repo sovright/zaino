@@ -15,12 +15,12 @@ query today because there is no way to obtain client key material at all.
 
 `mainnet_private_query_runtime` takes one `PrivateRuntimeKeys` per runtime:
 four symmetric keys — `request_key`, `response_key`, `token_key`,
-`replay_journal_key`. Its only constructor is `PrivateRuntimeKeys::ephemeral()`,
-which draws them from the OS generator and keeps them for the process lifetime.
+`replay_journal_key`. They were drawn from the OS generator and kept for the
+process lifetime.
 
-Nothing distributes them. A wallet therefore cannot seal a request, and the
-surface cannot be used by anyone. That is the functional blocker; the security
-questions below follow from how it is resolved.
+Nothing distributed them. A wallet therefore could not seal a request, and the
+surface could not be used by anyone. That was the functional blocker; the
+security questions below follow from how it is resolved.
 
 ## Decisions
 
