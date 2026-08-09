@@ -33,7 +33,13 @@ pub(crate) struct OfflineProjectionOwner<P = NoopProjectionCheckpointPublisher> 
 }
 
 impl OfflineProjectionOwner<NoopProjectionCheckpointPublisher> {
-    fn new<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
+    /// Build an owner on the typed ORAM backend.
+    ///
+    /// This is the constructor a privacy-claiming deployment uses. It fails
+    /// closed when the backend is unavailable — wrong platform, or the
+    /// `rostl-experimental` feature not selected — rather than falling back to
+    /// a table that offers no obliviousness.
+    pub(crate) fn new<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>(
         projection: ProjectionConfig,
         layout: FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>,
         queue_capacity: usize,
