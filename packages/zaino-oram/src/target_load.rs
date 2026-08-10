@@ -15,14 +15,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     layout::{
-        spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
-        AtomicQualificationSnapshot, AtomicQueueCapacity, AtomicWorker, AtomicWorkerBuildError,
-        DirectoryTableConfiguration, EventTableConfiguration, FixedProbeLayout, LayoutIdentity,
-        LayoutNetwork, StandardAddress, StandardScriptKind,
+        spawn_typed_rostl_worker, AtomicQualificationAppendDisposition, AtomicQueueCapacity,
+        AtomicWorker, AtomicWorkerBuildError, DirectoryTableConfiguration, EventTableConfiguration,
+        FixedProbeLayout, LayoutIdentity, LayoutNetwork, StandardAddress, StandardScriptKind,
     },
     process_memory::{sample_process_memory, ProcessMemorySample},
     records::{UtxoEvent, UtxoScriptClass},
     stress_qualification::digest_hex,
+    trace::WorkerTrace,
     zaino_corpus::MainnetSizingQualification,
 };
 
@@ -312,62 +312,22 @@ impl TargetLoadRssReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TargetLoadWorkerTrace {
-    queue_capacity: u64,
-    queued_at_shutdown: u64,
-    in_flight_at_shutdown: u64,
-    queue_high_water: u64,
-    accepted: u64,
-    completed: u64,
-    failed: u64,
-    full_rejected: u64,
-    not_running_rejected: u64,
-    reply_delivery_failed: u64,
-    stopped: bool,
-    faulted: bool,
-}
-
-impl TargetLoadWorkerTrace {
-    fn try_from_snapshot(
-        snapshot: AtomicQualificationSnapshot,
-    ) -> Result<Self, TypedWorkerTargetLoadError> {
-        Ok(Self {
-            queue_capacity: u64::try_from(snapshot.queue_capacity)
-                .map_err(|_| TypedWorkerTargetLoadError::InvalidReport)?,
-            queued_at_shutdown: u64::try_from(snapshot.queued)
-                .map_err(|_| TypedWorkerTargetLoadError::InvalidReport)?,
-            in_flight_at_shutdown: u64::try_from(snapshot.in_flight)
-                .map_err(|_| TypedWorkerTargetLoadError::InvalidReport)?,
-            queue_high_water: u64::try_from(snapshot.queue_high_water)
-                .map_err(|_| TypedWorkerTargetLoadError::InvalidReport)?,
-            accepted: snapshot.accepted,
-            completed: snapshot.completed,
-            failed: snapshot.failed,
-            full_rejected: snapshot.full_rejected,
-            not_running_rejected: snapshot.not_running_rejected,
-            reply_delivery_failed: snapshot.reply_delivery_failed,
-            stopped: snapshot.stopped,
-            faulted: snapshot.faulted,
-        })
-    }
-
-    const fn expected(total_commands: u64) -> Self {
-        Self {
-            queue_capacity: QUEUE_CAPACITY,
-            queued_at_shutdown: 0,
-            in_flight_at_shutdown: 0,
-            queue_high_water: 1,
-            accepted: total_commands,
-            completed: total_commands,
-            failed: 0,
-            full_rejected: 0,
-            not_running_rejected: 0,
-            reply_delivery_failed: 0,
-            stopped: true,
-            faulted: false,
-        }
+/// The one worker trace a fully successful, uncontended target-load run of
+/// `total_commands` commands can produce.
+const fn expected_target_load_trace(total_commands: u64) -> WorkerTrace {
+    WorkerTrace {
+        queue_capacity: QUEUE_CAPACITY,
+        queued_at_shutdown: 0,
+        in_flight_at_shutdown: 0,
+        queue_high_water: 1,
+        accepted: total_commands,
+        completed: total_commands,
+        failed: 0,
+        full_rejected: 0,
+        not_running_rejected: 0,
+        reply_delivery_failed: 0,
+        stopped: true,
+        faulted: false,
     }
 }
 
@@ -466,7 +426,7 @@ pub struct TypedWorkerTargetLoadReport {
     final_state_blake2s256: String,
     timing: TargetLoadTimingReport,
     rss: TargetLoadRssReport,
-    worker_trace: TargetLoadWorkerTrace,
+    worker_trace: WorkerTrace,
     unavailable: TargetLoadUnavailableMarkers,
     evidence_scope: TargetLoadEvidenceScope,
 }
@@ -493,7 +453,7 @@ impl TypedWorkerTargetLoadReport {
             || self.final_state_blake2s256 != plan.final_state_blake2s256
             || !self.timing.validate()
             || !self.rss.validate()
-            || self.worker_trace != TargetLoadWorkerTrace::expected(plan.summary.total_commands)
+            || self.worker_trace != expected_target_load_trace(plan.summary.total_commands)
             || self.unavailable != UNAVAILABLE_MARKERS
             || self.evidence_scope != EVIDENCE_SCOPE
         {
@@ -1519,8 +1479,9 @@ where
         }
     };
     let snapshot = shutdown.map_err(|_| TypedWorkerTargetLoadError::ShutdownFailed)?;
-    let worker_trace = TargetLoadWorkerTrace::try_from_snapshot(snapshot)?;
-    if worker_trace != TargetLoadWorkerTrace::expected(plan.summary.total_commands) {
+    let worker_trace = WorkerTrace::try_from_snapshot(snapshot)
+        .map_err(|_| TypedWorkerTargetLoadError::InvalidReport)?;
+    if worker_trace != expected_target_load_trace(plan.summary.total_commands) {
         return Err(TypedWorkerTargetLoadError::ShutdownFailed);
     }
     if evidence.final_state_blake2s256 != plan.final_state_blake2s256 {

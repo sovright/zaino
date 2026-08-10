@@ -13,12 +13,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     layout::{
         spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
-        AtomicQualificationCommandError, AtomicQualificationSnapshot, AtomicQueueCapacity,
-        AtomicWorker, AtomicWorkerBuildError, DirectoryTableConfiguration, EventTableConfiguration,
-        FixedProbeLayout, LayoutIdentity, LayoutNetwork,
+        AtomicQualificationCommandError, AtomicQueueCapacity, AtomicWorker, AtomicWorkerBuildError,
+        DirectoryTableConfiguration, EventTableConfiguration, FixedProbeLayout, LayoutIdentity,
+        LayoutNetwork,
     },
     records::UtxoEvent,
     stress_qualification::{absent_address, digest_hex, modeled_address, modeled_event},
+    trace::WorkerTrace,
 };
 
 const SCENARIO: &str = "typed-worker-full-map-saturation-v1";
@@ -247,62 +248,21 @@ impl BoundaryCondition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SaturationWorkerTrace {
-    queue_capacity: u64,
-    queued_at_shutdown: u64,
-    in_flight_at_shutdown: u64,
-    queue_high_water: u64,
-    accepted: u64,
-    completed: u64,
-    failed: u64,
-    full_rejected: u64,
-    not_running_rejected: u64,
-    reply_delivery_failed: u64,
-    stopped: bool,
-    faulted: bool,
-}
-
-impl SaturationWorkerTrace {
-    fn try_from_snapshot(
-        snapshot: AtomicQualificationSnapshot,
-    ) -> Result<Self, TypedWorkerFullMapSaturationError> {
-        Ok(Self {
-            queue_capacity: u64::try_from(snapshot.queue_capacity)
-                .map_err(|_| TypedWorkerFullMapSaturationError::InvalidReport)?,
-            queued_at_shutdown: u64::try_from(snapshot.queued)
-                .map_err(|_| TypedWorkerFullMapSaturationError::InvalidReport)?,
-            in_flight_at_shutdown: u64::try_from(snapshot.in_flight)
-                .map_err(|_| TypedWorkerFullMapSaturationError::InvalidReport)?,
-            queue_high_water: u64::try_from(snapshot.queue_high_water)
-                .map_err(|_| TypedWorkerFullMapSaturationError::InvalidReport)?,
-            accepted: snapshot.accepted,
-            completed: snapshot.completed,
-            failed: snapshot.failed,
-            full_rejected: snapshot.full_rejected,
-            not_running_rejected: snapshot.not_running_rejected,
-            reply_delivery_failed: snapshot.reply_delivery_failed,
-            stopped: snapshot.stopped,
-            faulted: snapshot.faulted,
-        })
-    }
-
-    const fn expected(spec: CaseSpec) -> Self {
-        Self {
-            queue_capacity: WORKER_SHAPE.queue_capacity,
-            queued_at_shutdown: 0,
-            in_flight_at_shutdown: 0,
-            queue_high_water: 1,
-            accepted: spec.expected_accepted(),
-            completed: spec.expected_completed(),
-            failed: 2,
-            full_rejected: 0,
-            not_running_rejected: 2,
-            reply_delivery_failed: 0,
-            stopped: true,
-            faulted: true,
-        }
+/// The one worker trace a faulting saturation case for `spec` can produce.
+const fn expected_saturation_trace(spec: CaseSpec) -> WorkerTrace {
+    WorkerTrace {
+        queue_capacity: WORKER_SHAPE.queue_capacity,
+        queued_at_shutdown: 0,
+        in_flight_at_shutdown: 0,
+        queue_high_water: 1,
+        accepted: spec.expected_accepted(),
+        completed: spec.expected_completed(),
+        failed: 2,
+        full_rejected: 0,
+        not_running_rejected: 2,
+        reply_delivery_failed: 0,
+        stopped: true,
+        faulted: true,
     }
 }
 
@@ -316,7 +276,7 @@ struct SaturationCaseReport {
     schedule_blake2s256: String,
     final_state_blake2s256: String,
     boundary_condition: BoundaryCondition,
-    worker_trace: SaturationWorkerTrace,
+    worker_trace: WorkerTrace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,8 +349,8 @@ impl TypedWorkerFullMapSaturationReport {
     /// Revalidates both fixed cases, counters, digests, and negative evidence flags.
     pub fn validate(&self) -> Result<(), TypedWorkerFullMapSaturationError> {
         let expected = build_report(
-            SaturationWorkerTrace::expected(DIRECTORY_CASE),
-            SaturationWorkerTrace::expected(EVENT_CASE),
+            expected_saturation_trace(DIRECTORY_CASE),
+            expected_saturation_trace(EVENT_CASE),
         );
         if *self != expected
             || !self
@@ -514,12 +474,12 @@ fn run_full_map_saturation_v1(
 ) -> Result<TypedWorkerFullMapSaturationReport, TypedWorkerFullMapSaturationError> {
     let directory_trace =
         run_boundary_case(spawn_saturation_worker(DIRECTORY_CASE)?, DIRECTORY_CASE)?;
-    if directory_trace != SaturationWorkerTrace::expected(DIRECTORY_CASE) {
+    if directory_trace != expected_saturation_trace(DIRECTORY_CASE) {
         return Err(TypedWorkerFullMapSaturationError::ShutdownFailed);
     }
 
     let event_trace = run_boundary_case(spawn_saturation_worker(EVENT_CASE)?, EVENT_CASE)?;
-    if event_trace != SaturationWorkerTrace::expected(EVENT_CASE) {
+    if event_trace != expected_saturation_trace(EVENT_CASE) {
         return Err(TypedWorkerFullMapSaturationError::ShutdownFailed);
     }
 
@@ -529,8 +489,8 @@ fn run_full_map_saturation_v1(
 }
 
 fn build_report(
-    directory_trace: SaturationWorkerTrace,
-    event_trace: SaturationWorkerTrace,
+    directory_trace: WorkerTrace,
+    event_trace: WorkerTrace,
 ) -> TypedWorkerFullMapSaturationReport {
     TypedWorkerFullMapSaturationReport {
         scenario: SCENARIO.to_owned(),
@@ -542,7 +502,7 @@ fn build_report(
     }
 }
 
-fn build_case_report(spec: CaseSpec, worker_trace: SaturationWorkerTrace) -> SaturationCaseReport {
+fn build_case_report(spec: CaseSpec, worker_trace: WorkerTrace) -> SaturationCaseReport {
     SaturationCaseReport {
         boundary: spec.boundary,
         worker_shape: WORKER_SHAPE,
@@ -596,7 +556,7 @@ fn build_saturation_layout(
 fn run_boundary_case(
     worker: AtomicWorker,
     spec: CaseSpec,
-) -> Result<SaturationWorkerTrace, TypedWorkerFullMapSaturationError> {
+) -> Result<WorkerTrace, TypedWorkerFullMapSaturationError> {
     for address in 0..spec.modeled_addresses {
         for ordinal in 0..spec.events_per_address {
             let event = modeled_event(address, ordinal);
@@ -679,7 +639,8 @@ fn run_boundary_case(
     let snapshot = worker
         .qualification_shutdown()
         .map_err(|_| TypedWorkerFullMapSaturationError::ShutdownFailed)?;
-    SaturationWorkerTrace::try_from_snapshot(snapshot)
+    WorkerTrace::try_from_snapshot(snapshot)
+        .map_err(|_| TypedWorkerFullMapSaturationError::InvalidReport)
 }
 
 fn expected_history(address: u8, event_count: u8) -> Vec<Option<UtxoEvent>> {
@@ -808,25 +769,22 @@ mod tests {
 
     fn expected_report() -> TypedWorkerFullMapSaturationReport {
         build_report(
-            SaturationWorkerTrace::expected(DIRECTORY_CASE),
-            SaturationWorkerTrace::expected(EVENT_CASE),
+            expected_saturation_trace(DIRECTORY_CASE),
+            expected_saturation_trace(EVENT_CASE),
         )
     }
 
     #[test]
     fn exact_profile_exercises_directory_logical_boundary() -> TestResult {
         let directory_trace = run_boundary_case(fake_worker(DIRECTORY_CASE)?, DIRECTORY_CASE)?;
-        assert_eq!(
-            directory_trace,
-            SaturationWorkerTrace::expected(DIRECTORY_CASE)
-        );
+        assert_eq!(directory_trace, expected_saturation_trace(DIRECTORY_CASE));
         Ok(())
     }
 
     #[test]
     fn exact_profile_exercises_event_logical_boundary() -> TestResult {
         let event_trace = run_boundary_case(fake_worker(EVENT_CASE)?, EVENT_CASE)?;
-        assert_eq!(event_trace, SaturationWorkerTrace::expected(EVENT_CASE));
+        assert_eq!(event_trace, expected_saturation_trace(EVENT_CASE));
         Ok(())
     }
 

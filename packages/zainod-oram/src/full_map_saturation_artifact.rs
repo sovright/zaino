@@ -5,9 +5,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use zaino_oram::TypedWorkerFullMapSaturationReport;
 
+#[cfg(test)]
+use crate::corpus_artifact::is_supported_execution_target;
 use crate::corpus_artifact::{
-    artifact_blake2s256_hex, publish_verified_artifact, read_artifact_file, ArtifactDirectory,
-    ArtifactError, ArtifactFile,
+    artifact_blake2s256_hex, new_os_attested_provenance, publish_unwrapped_evidence,
+    validate_os_attested_provenance, ArtifactError,
 };
 
 const FULL_MAP_SATURATION_SCHEMA: &str = "zaino-oram-full-map-saturation-v1";
@@ -18,20 +20,6 @@ const PROVENANCE_JSON: &str = "provenance.json";
 const MAX_FULL_MAP_SATURATION_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FULL_MAP_SATURATION_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVENANCE_JSON_BYTES: usize = 64 * 1024;
-
-fn ensure_supported_execution_target() -> Result<(), ArtifactError> {
-    if is_supported_execution_target(std::env::consts::OS, std::env::consts::ARCH) {
-        Ok(())
-    } else {
-        Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker full-map saturation publication requires Linux x86_64 execution",
-        })
-    }
-}
-
-fn is_supported_execution_target(target_os: &str, target_arch: &str) -> bool {
-    target_os == "linux" && target_arch == "x86_64"
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,36 +72,31 @@ impl FullMapSaturationProvenanceV1 {
         runner_version: &str,
         artifact: &FullMapSaturationArtifactV1,
     ) -> Result<Self, ArtifactError> {
-        ensure_supported_execution_target()?;
-        if runner_version.is_empty() {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "runner version is empty",
-            });
-        }
-        Ok(Self {
-            schema: FULL_MAP_SATURATION_PROVENANCE_SCHEMA.to_owned(),
-            runner_version: runner_version.to_owned(),
-            target_os: std::env::consts::OS.to_owned(),
-            target_arch: std::env::consts::ARCH.to_owned(),
-            full_map_saturation_blake2s256: artifact.digest()?,
-        })
+        new_os_attested_provenance(
+            runner_version,
+            artifact.digest(),
+            "typed-worker full-map saturation publication requires Linux x86_64 execution",
+            |runner_version, target_os, target_arch, full_map_saturation_blake2s256| Self {
+                schema: FULL_MAP_SATURATION_PROVENANCE_SCHEMA.to_owned(),
+                runner_version,
+                target_os,
+                target_arch,
+                full_map_saturation_blake2s256,
+            },
+        )
     }
 
     fn validate(&self, artifact: &FullMapSaturationArtifactV1) -> Result<(), ArtifactError> {
-        if self.schema != FULL_MAP_SATURATION_PROVENANCE_SCHEMA
-            || self.runner_version.is_empty()
-            || !is_supported_execution_target(&self.target_os, &self.target_arch)
-        {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker full-map saturation provenance is invalid",
-            });
-        }
-        if self.full_map_saturation_blake2s256 != artifact.digest()? {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker full-map saturation digest mismatch",
-            });
-        }
-        Ok(())
+        validate_os_attested_provenance(
+            self.schema == FULL_MAP_SATURATION_PROVENANCE_SCHEMA,
+            &self.runner_version,
+            &self.target_os,
+            &self.target_arch,
+            "typed-worker full-map saturation provenance is invalid",
+            &self.full_map_saturation_blake2s256,
+            &artifact.digest()?,
+            "typed-worker full-map saturation digest mismatch",
+        )
     }
 }
 
@@ -133,69 +116,23 @@ pub(super) fn publish_full_map_saturation(
     full_map_saturation: &TypedWorkerFullMapSaturationReport,
     runner_version: &str,
 ) -> Result<(), ArtifactError> {
-    let artifact = FullMapSaturationArtifactV1::new(full_map_saturation)?;
-    let provenance = FullMapSaturationProvenanceV1::new(runner_version, &artifact)?;
-    provenance.validate(&artifact)?;
-
-    let files = [
-        ArtifactFile::new(
-            FULL_MAP_SATURATION_JSON,
-            serde_json::to_vec_pretty(&artifact).map_err(ArtifactError::Json)?,
-        ),
-        ArtifactFile::new(
-            FULL_MAP_SATURATION_TEXT,
-            full_map_saturation.to_string().into_bytes(),
-        ),
-        ArtifactFile::new(
-            PROVENANCE_JSON,
-            serde_json::to_vec_pretty(&provenance).map_err(ArtifactError::Json)?,
-        ),
-    ];
-
-    publish_verified_artifact(output_dir, &files, |stage| {
-        validate_staged_full_map_saturation(stage, &artifact, &provenance)
-    })
-}
-
-fn validate_staged_full_map_saturation(
-    stage: &ArtifactDirectory,
-    expected_artifact: &FullMapSaturationArtifactV1,
-    expected_provenance: &FullMapSaturationProvenanceV1,
-) -> Result<(), ArtifactError> {
-    let full_map_saturation_json = read_artifact_file(
-        stage,
+    publish_unwrapped_evidence(
+        output_dir,
+        || FullMapSaturationArtifactV1::new(full_map_saturation),
+        |artifact| FullMapSaturationProvenanceV1::new(runner_version, artifact),
         FULL_MAP_SATURATION_JSON,
         MAX_FULL_MAP_SATURATION_JSON_BYTES,
-    )?;
-    let full_map_saturation_text = read_artifact_file(
-        stage,
         FULL_MAP_SATURATION_TEXT,
         MAX_FULL_MAP_SATURATION_TEXT_BYTES,
-    )?;
-    let provenance_json = read_artifact_file(stage, PROVENANCE_JSON, MAX_PROVENANCE_JSON_BYTES)?;
-
-    let artifact: FullMapSaturationArtifactV1 =
-        serde_json::from_slice(&full_map_saturation_json).map_err(ArtifactError::Json)?;
-    artifact.validate()?;
-    let provenance: FullMapSaturationProvenanceV1 =
-        serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
-    provenance.validate(&artifact)?;
-    if full_map_saturation_text != artifact.full_map_saturation.to_string().as_bytes() {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker full-map saturation text does not match the typed report",
-        });
-    }
-    if artifact != *expected_artifact {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker full-map saturation read-back differs from the computed report",
-        });
-    }
-    if provenance != *expected_provenance {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker full-map saturation provenance read-back differs from the expected provenance",
-        });
-    }
-    Ok(())
+        PROVENANCE_JSON,
+        MAX_PROVENANCE_JSON_BYTES,
+        |artifact| artifact.full_map_saturation.to_string().into_bytes(),
+        |artifact| artifact.validate(),
+        |provenance, artifact| provenance.validate(artifact),
+        "typed-worker full-map saturation text does not match the typed report",
+        "typed-worker full-map saturation read-back differs from the computed report",
+        "typed-worker full-map saturation provenance read-back differs from the expected provenance",
+    )
 }
 
 #[cfg(test)]

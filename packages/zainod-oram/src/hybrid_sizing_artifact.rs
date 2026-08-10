@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use zaino_oram::{MainnetCorpusMeasurement, SourceBoundHybridSizingReport};
 
 use crate::corpus_artifact::{
-    artifact_blake2s256_hex, publish_verified_derived_artifact, read_artifact_file,
-    validate_derived_source_lineage, ArtifactDirectory, ArtifactError, ArtifactFile,
-    PreverifiedSourceSnapshotV1, ValidatedCapture, ValidatedSizing,
+    artifact_blake2s256_hex, ensure_matching_digest, ensure_runner_version_present,
+    publish_verified_derived_artifact, read_artifact_file, validate_derived_source_lineage,
+    ArtifactDirectory, ArtifactError, ArtifactFile, PreverifiedSourceSnapshotV1, ValidatedCapture,
+    ValidatedSizing,
 };
 #[cfg(feature = "typed-qualification")]
 use crate::corpus_artifact::{open_artifact_directory, validate_artifact_file_set};
@@ -130,11 +131,7 @@ struct HybridSizingProvenanceV1 {
 
 impl HybridSizingProvenanceV1 {
     fn new(runner_version: &str, artifact: &HybridSizingArtifactV1) -> Result<Self, ArtifactError> {
-        if runner_version.is_empty() {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "runner version is empty",
-            });
-        }
+        ensure_runner_version_present(runner_version)?;
         Ok(Self {
             schema: HYBRID_SIZING_PROVENANCE_SCHEMA.to_owned(),
             runner_version: runner_version.to_owned(),
@@ -148,12 +145,11 @@ impl HybridSizingProvenanceV1 {
                 reason: "hybrid-sizing provenance is invalid",
             });
         }
-        if self.hybrid_sizing_blake2s256 != artifact.digest()? {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "hybrid-sizing digest mismatch",
-            });
-        }
-        Ok(())
+        ensure_matching_digest(
+            &self.hybrid_sizing_blake2s256,
+            &artifact.digest()?,
+            "hybrid-sizing digest mismatch",
+        )
     }
 }
 

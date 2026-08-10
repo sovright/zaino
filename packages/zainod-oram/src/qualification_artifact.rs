@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use zaino_oram::TypedWorkerQualificationReport;
 
 use crate::corpus_artifact::{
-    artifact_blake2s256_hex, publish_verified_artifact, read_artifact_file, ArtifactDirectory,
-    ArtifactError, ArtifactFile,
+    artifact_blake2s256_hex, new_os_attested_provenance, publish_unwrapped_evidence,
+    validate_os_attested_provenance, ArtifactError,
 };
 
 const QUALIFICATION_SCHEMA: &str = "zaino-oram-typed-worker-qualification-v1";
@@ -18,16 +18,6 @@ const PROVENANCE_JSON: &str = "provenance.json";
 const MAX_QUALIFICATION_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_QUALIFICATION_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVENANCE_JSON_BYTES: usize = 64 * 1024;
-
-fn ensure_supported_execution_target() -> Result<(), ArtifactError> {
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Ok(())
-    } else {
-        Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker qualification publication requires Linux x86_64 execution",
-        })
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,37 +68,31 @@ impl QualificationProvenanceV1 {
         runner_version: &str,
         artifact: &QualificationArtifactV1,
     ) -> Result<Self, ArtifactError> {
-        ensure_supported_execution_target()?;
-        if runner_version.is_empty() {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "runner version is empty",
-            });
-        }
-        Ok(Self {
-            schema: QUALIFICATION_PROVENANCE_SCHEMA.to_owned(),
-            runner_version: runner_version.to_owned(),
-            target_os: std::env::consts::OS.to_owned(),
-            target_arch: std::env::consts::ARCH.to_owned(),
-            qualification_blake2s256: artifact.digest()?,
-        })
+        new_os_attested_provenance(
+            runner_version,
+            artifact.digest(),
+            "typed-worker qualification publication requires Linux x86_64 execution",
+            |runner_version, target_os, target_arch, qualification_blake2s256| Self {
+                schema: QUALIFICATION_PROVENANCE_SCHEMA.to_owned(),
+                runner_version,
+                target_os,
+                target_arch,
+                qualification_blake2s256,
+            },
+        )
     }
 
     fn validate(&self, artifact: &QualificationArtifactV1) -> Result<(), ArtifactError> {
-        if self.schema != QUALIFICATION_PROVENANCE_SCHEMA
-            || self.runner_version.is_empty()
-            || self.target_os != "linux"
-            || self.target_arch != "x86_64"
-        {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker qualification provenance is invalid",
-            });
-        }
-        if self.qualification_blake2s256 != artifact.digest()? {
-            return Err(ArtifactError::InvalidArtifact {
-                reason: "typed-worker qualification digest mismatch",
-            });
-        }
-        Ok(())
+        validate_os_attested_provenance(
+            self.schema == QUALIFICATION_PROVENANCE_SCHEMA,
+            &self.runner_version,
+            &self.target_os,
+            &self.target_arch,
+            "typed-worker qualification provenance is invalid",
+            &self.qualification_blake2s256,
+            &artifact.digest()?,
+            "typed-worker qualification digest mismatch",
+        )
     }
 }
 
@@ -128,60 +112,23 @@ pub(super) fn publish_qualification(
     qualification: &TypedWorkerQualificationReport,
     runner_version: &str,
 ) -> Result<(), ArtifactError> {
-    let artifact = QualificationArtifactV1::new(qualification)?;
-    let provenance = QualificationProvenanceV1::new(runner_version, &artifact)?;
-    provenance.validate(&artifact)?;
-
-    let files = [
-        ArtifactFile::new(
-            QUALIFICATION_JSON,
-            serde_json::to_vec_pretty(&artifact).map_err(ArtifactError::Json)?,
-        ),
-        ArtifactFile::new(QUALIFICATION_TEXT, qualification.to_string().into_bytes()),
-        ArtifactFile::new(
-            PROVENANCE_JSON,
-            serde_json::to_vec_pretty(&provenance).map_err(ArtifactError::Json)?,
-        ),
-    ];
-
-    publish_verified_artifact(output_dir, &files, |stage| {
-        validate_staged_qualification(stage, &artifact, &provenance)
-    })
-}
-
-fn validate_staged_qualification(
-    stage: &ArtifactDirectory,
-    expected_artifact: &QualificationArtifactV1,
-    expected_provenance: &QualificationProvenanceV1,
-) -> Result<(), ArtifactError> {
-    let qualification_json =
-        read_artifact_file(stage, QUALIFICATION_JSON, MAX_QUALIFICATION_JSON_BYTES)?;
-    let qualification_text =
-        read_artifact_file(stage, QUALIFICATION_TEXT, MAX_QUALIFICATION_TEXT_BYTES)?;
-    let provenance_json = read_artifact_file(stage, PROVENANCE_JSON, MAX_PROVENANCE_JSON_BYTES)?;
-
-    let artifact: QualificationArtifactV1 =
-        serde_json::from_slice(&qualification_json).map_err(ArtifactError::Json)?;
-    artifact.validate()?;
-    let provenance: QualificationProvenanceV1 =
-        serde_json::from_slice(&provenance_json).map_err(ArtifactError::Json)?;
-    provenance.validate(&artifact)?;
-    if qualification_text != artifact.qualification.to_string().as_bytes() {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker qualification text does not match the typed report",
-        });
-    }
-    if artifact != *expected_artifact {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker qualification read-back differs from the computed report",
-        });
-    }
-    if provenance != *expected_provenance {
-        return Err(ArtifactError::InvalidArtifact {
-            reason: "typed-worker provenance read-back differs from the expected provenance",
-        });
-    }
-    Ok(())
+    publish_unwrapped_evidence(
+        output_dir,
+        || QualificationArtifactV1::new(qualification),
+        |artifact| QualificationProvenanceV1::new(runner_version, artifact),
+        QUALIFICATION_JSON,
+        MAX_QUALIFICATION_JSON_BYTES,
+        QUALIFICATION_TEXT,
+        MAX_QUALIFICATION_TEXT_BYTES,
+        PROVENANCE_JSON,
+        MAX_PROVENANCE_JSON_BYTES,
+        |artifact| artifact.qualification.to_string().into_bytes(),
+        |artifact| artifact.validate(),
+        |provenance, artifact| provenance.validate(artifact),
+        "typed-worker qualification text does not match the typed report",
+        "typed-worker qualification read-back differs from the computed report",
+        "typed-worker provenance read-back differs from the expected provenance",
+    )
 }
 
 #[cfg(test)]

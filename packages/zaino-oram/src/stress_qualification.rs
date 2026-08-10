@@ -13,11 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     layout::{
         spawn_typed_rostl_worker, AtomicQualificationAppendDisposition,
-        AtomicQualificationCommandError, AtomicQualificationSnapshot, AtomicQueueCapacity,
-        AtomicWorker, AtomicWorkerBuildError, DirectoryTableConfiguration, EventTableConfiguration,
-        FixedProbeLayout, LayoutIdentity, LayoutNetwork, StandardAddress, StandardScriptKind,
+        AtomicQualificationCommandError, AtomicQueueCapacity, AtomicWorker, AtomicWorkerBuildError,
+        DirectoryTableConfiguration, EventTableConfiguration, FixedProbeLayout, LayoutIdentity,
+        LayoutNetwork, StandardAddress, StandardScriptKind,
     },
     records::{UtxoEvent, UtxoScriptClass},
+    trace::WorkerTrace,
 };
 
 const SCENARIO: &str = "typed-worker-stress-smoke-v1";
@@ -148,48 +149,6 @@ impl StressWorkloadSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StressWorkerTrace {
-    queue_capacity: u64,
-    queued_at_shutdown: u64,
-    in_flight_at_shutdown: u64,
-    queue_high_water: u64,
-    accepted: u64,
-    completed: u64,
-    failed: u64,
-    full_rejected: u64,
-    not_running_rejected: u64,
-    reply_delivery_failed: u64,
-    stopped: bool,
-    faulted: bool,
-}
-
-impl StressWorkerTrace {
-    fn try_from_snapshot(
-        snapshot: AtomicQualificationSnapshot,
-    ) -> Result<Self, TypedWorkerStressQualificationError> {
-        Ok(Self {
-            queue_capacity: u64::try_from(snapshot.queue_capacity)
-                .map_err(|_| TypedWorkerStressQualificationError::InvalidReport)?,
-            queued_at_shutdown: u64::try_from(snapshot.queued)
-                .map_err(|_| TypedWorkerStressQualificationError::InvalidReport)?,
-            in_flight_at_shutdown: u64::try_from(snapshot.in_flight)
-                .map_err(|_| TypedWorkerStressQualificationError::InvalidReport)?,
-            queue_high_water: u64::try_from(snapshot.queue_high_water)
-                .map_err(|_| TypedWorkerStressQualificationError::InvalidReport)?,
-            accepted: snapshot.accepted,
-            completed: snapshot.completed,
-            failed: snapshot.failed,
-            full_rejected: snapshot.full_rejected,
-            not_running_rejected: snapshot.not_running_rejected,
-            reply_delivery_failed: snapshot.reply_delivery_failed,
-            stopped: snapshot.stopped,
-            faulted: snapshot.faulted,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NonterminalRejectionSummary {
     attempts: u64,
     command_rejected: u64,
@@ -213,7 +172,7 @@ struct TerminalFaultSummary {
     post_fault_read_failed_closed: bool,
     post_fault_append_failed_closed: bool,
     post_fault_commands_rejected_at_admission: u64,
-    worker_trace: StressWorkerTrace,
+    worker_trace: WorkerTrace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,7 +236,7 @@ pub struct TypedWorkerStressQualificationReport {
     workload_summary: StressWorkloadSummary,
     schedule_blake2s256: String,
     final_state_blake2s256: String,
-    healthy_worker_trace: StressWorkerTrace,
+    healthy_worker_trace: WorkerTrace,
     nonterminal_rejection: NonterminalRejectionSummary,
     terminal_fault: TerminalFaultSummary,
     evidence_scope: StressEvidenceScope,
@@ -766,8 +725,8 @@ pub(super) fn digest_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn expected_healthy_trace(plan: &HealthyPlan) -> StressWorkerTrace {
-    StressWorkerTrace {
+fn expected_healthy_trace(plan: &HealthyPlan) -> WorkerTrace {
+    WorkerTrace {
         queue_capacity: 1,
         queued_at_shutdown: 0,
         in_flight_at_shutdown: 0,
@@ -783,8 +742,8 @@ fn expected_healthy_trace(plan: &HealthyPlan) -> StressWorkerTrace {
     }
 }
 
-const fn expected_fault_trace() -> StressWorkerTrace {
-    StressWorkerTrace {
+const fn expected_fault_trace() -> WorkerTrace {
+    WorkerTrace {
         queue_capacity: 1,
         queued_at_shutdown: 0,
         in_flight_at_shutdown: 0,
@@ -800,7 +759,7 @@ const fn expected_fault_trace() -> StressWorkerTrace {
     }
 }
 
-const fn expected_terminal_fault(worker_trace: StressWorkerTrace) -> TerminalFaultSummary {
+const fn expected_terminal_fault(worker_trace: WorkerTrace) -> TerminalFaultSummary {
     TerminalFaultSummary {
         worker_shape: FAULT_WORKER_SHAPE,
         inserted_before_fault: 1,
@@ -814,8 +773,8 @@ const fn expected_terminal_fault(worker_trace: StressWorkerTrace) -> TerminalFau
 
 fn build_report(
     plan: &HealthyPlan,
-    healthy_worker_trace: StressWorkerTrace,
-    fault_worker_trace: StressWorkerTrace,
+    healthy_worker_trace: WorkerTrace,
+    fault_worker_trace: WorkerTrace,
 ) -> TypedWorkerStressQualificationReport {
     TypedWorkerStressQualificationReport {
         scenario: SCENARIO.to_owned(),
@@ -858,7 +817,8 @@ fn run_smoke_v1(
     let healthy_snapshot = healthy_worker
         .qualification_shutdown()
         .map_err(|_| TypedWorkerStressQualificationError::ShutdownFailed)?;
-    let healthy_trace = StressWorkerTrace::try_from_snapshot(healthy_snapshot)?;
+    let healthy_trace = WorkerTrace::try_from_snapshot(healthy_snapshot)
+        .map_err(|_| TypedWorkerStressQualificationError::InvalidReport)?;
     if healthy_trace != expected_healthy_trace(&plan) {
         return Err(TypedWorkerStressQualificationError::ShutdownFailed);
     }
@@ -991,7 +951,7 @@ fn run_healthy_commands(
 
 fn run_terminal_fault(
     worker: AtomicWorker,
-) -> Result<StressWorkerTrace, TypedWorkerStressQualificationError> {
+) -> Result<WorkerTrace, TypedWorkerStressQualificationError> {
     let address_a = modeled_address(0);
     let event_a0 = modeled_event(0, 0);
     let first = worker
@@ -1018,7 +978,8 @@ fn run_terminal_fault(
     let snapshot = worker
         .qualification_shutdown()
         .map_err(|_| TypedWorkerStressQualificationError::ShutdownFailed)?;
-    StressWorkerTrace::try_from_snapshot(snapshot)
+    WorkerTrace::try_from_snapshot(snapshot)
+        .map_err(|_| TypedWorkerStressQualificationError::InvalidReport)
 }
 
 fn verify_history(
@@ -1127,7 +1088,7 @@ mod tests {
             .qualification_shutdown()
             .map_err(|_| TypedWorkerStressQualificationError::ShutdownFailed)?;
         assert_eq!(
-            StressWorkerTrace::try_from_snapshot(snapshot)?,
+            WorkerTrace::try_from_snapshot(snapshot)?,
             expected_healthy_trace(&plan)
         );
 
