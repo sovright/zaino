@@ -216,7 +216,9 @@ impl PrivacyProfile {
     /// It is named `profile_label` rather than `profile_id` precisely so a
     /// wallet author does not pin on it as an identifier: it stays diagnostic,
     /// and [`Self::profile_id`] is the digest actually bound into protected
-    /// request state.
+    /// request state, published beside it as the separate `profile_id` field.
+    /// The label is excluded from the digest, so neither value is derivable
+    /// from the other.
     pub(super) const fn label(&self) -> &'static str {
         self.label
     }
