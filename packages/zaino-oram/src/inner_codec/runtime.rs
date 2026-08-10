@@ -776,9 +776,14 @@ where
             recent_snapshot_failed = true;
         }
 
+        // The engine reads the published generation's precomputed scan rather
+        // than the array just materialized: the two are byte-identical whenever
+        // the digest check above passed, and when it did not `recent_snapshot_failed`
+        // already forces `ProjectionNotReady` with an emptied page.
+        let published_scan = *epoch.recent_snapshot.scan();
         let execution = epoch
             .engine
-            .execute_from(request.query(), cursor, &recent_snapshot, &mut trace)
+            .execute_from(request.query(), cursor, &published_scan, &mut trace)
             .map_err(|_| self.latch_failure())?;
         trace
             .record_runtime_phase(RuntimePhase::ResultNormalization)

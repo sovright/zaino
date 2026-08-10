@@ -235,6 +235,140 @@ impl fmt::Debug for RecentSnapshotSlot {
     }
 }
 
+/// A published slot array together with the facts no query can influence.
+///
+/// Both carried facts are functions of the slot array alone. Semantic validity
+/// asks whether every repeated outpoint in the snapshot is one address's
+/// create-then-spend pair; per-ordinal liveness asks whether a later slot
+/// supersedes that ordinal's change. Neither reads a query. Computing them once
+/// here, when a generation is published, replaces two `N^2` per-query sweeps in
+/// the engine with `O(1)` reads.
+///
+/// This costs nothing in leakage: the results are public generation-wide shape,
+/// identical for every query against the generation, exactly like slot
+/// occupancy which the engine already branches on. The engine still sweeps
+/// every slot on every query; only the per-slot work shrinks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct RecentSnapshotScan<const N: usize> {
+    slots: [RecentSnapshotSlot; N],
+    live: [bool; N],
+    semantically_valid: bool,
+}
+
+impl<const N: usize> RecentSnapshotScan<N> {
+    /// Precomputes the query-independent snapshot facts once, at publication.
+    pub(super) fn from_slots(slots: [RecentSnapshotSlot; N]) -> Self {
+        let semantically_valid = snapshot_is_semantically_valid(&slots);
+        let live = creation_liveness(&slots);
+        Self {
+            slots,
+            live,
+            semantically_valid,
+        }
+    }
+
+    /// Injects independently derived facts so a test can compare derivations.
+    #[cfg(test)]
+    pub(crate) const fn from_parts_for_tests(
+        slots: [RecentSnapshotSlot; N],
+        live: [bool; N],
+        semantically_valid: bool,
+    ) -> Self {
+        Self {
+            slots,
+            live,
+            semantically_valid,
+        }
+    }
+
+    pub(super) const fn slots(&self) -> &[RecentSnapshotSlot; N] {
+        &self.slots
+    }
+
+    /// Returns whether every repeated outpoint is a single address's
+    /// create-then-spend pair in ordinal order.
+    pub(super) const fn semantically_valid(&self) -> bool {
+        self.semantically_valid
+    }
+
+    /// Returns, per ordinal, whether no later slot supersedes that change.
+    pub(super) const fn liveness(&self) -> &[bool; N] {
+        &self.live
+    }
+
+    /// Simulates post-publication slot corruption without touching the facts
+    /// derived from the uncorrupted array, which is what corruption means.
+    #[cfg(test)]
+    pub(crate) fn replace_slot(&mut self, ordinal: usize, slot: RecentSnapshotSlot) {
+        if let Some(destination) = self.slots.get_mut(ordinal) {
+            *destination = slot;
+        }
+    }
+}
+
+impl<const N: usize> fmt::Debug for RecentSnapshotScan<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecentSnapshotScan { ..REDACTED.. }")
+    }
+}
+
+/// Returns whether repeated outpoints are all one address's create-then-spend
+/// pair, in ordinal order.
+///
+/// Publication-time only: it takes the snapshot and nothing else, runs once per
+/// generation, and never observes a query, so ordinary control flow carries no
+/// per-query signal.
+fn snapshot_is_semantically_valid<const N: usize>(slots: &[RecentSnapshotSlot; N]) -> bool {
+    let mut valid = true;
+    for (later_ordinal, later_slot) in slots.iter().enumerate() {
+        for earlier_slot in slots.iter().take(later_ordinal) {
+            let (Some(later), Some(earlier)) = (later_slot.change(), earlier_slot.change()) else {
+                continue;
+            };
+            if same_outpoint(earlier.utxo(), later.utxo()) {
+                valid &= earlier.address_key() == later.address_key()
+                    && earlier.kind() == RecentUtxoChangeKind::Created
+                    && later.kind() == RecentUtxoChangeKind::Spent;
+            }
+        }
+    }
+    valid
+}
+
+/// Returns, per ordinal, whether no later slot restates that ordinal's
+/// outpoint for the same address.
+///
+/// Publication-time only, for the same reason as
+/// [`snapshot_is_semantically_valid`]. Unoccupied ordinals keep the vacuous
+/// `true`; the engine never consults them.
+fn creation_liveness<const N: usize>(slots: &[RecentSnapshotSlot; N]) -> [bool; N] {
+    let mut live = [true; N];
+    for (ordinal, slot) in slots.iter().enumerate() {
+        let (Some(candidate), Some(destination)) = (slot.change(), live.get_mut(ordinal)) else {
+            continue;
+        };
+        *destination = !slots
+            .iter()
+            .skip(ordinal.saturating_add(1))
+            .any(|later_slot| {
+                later_slot.change().is_some_and(|later| {
+                    later.address_key() == candidate.address_key()
+                        && same_outpoint(later.utxo(), candidate.utxo())
+                })
+            });
+    }
+    live
+}
+
+/// Compares the outpoint half of two transparent records.
+///
+/// Deliberately separate from the engine's masked equality: this runs once per
+/// published generation with no query in scope, so it does not owe the
+/// engine's source-level data-independence contract.
+fn same_outpoint(left: &TransparentUtxo, right: &TransparentUtxo) -> bool {
+    left.txid() == right.txid() && left.output_index() == right.output_index()
+}
+
 /// Commits every fixed snapshot slot in public ordinal order.
 pub(super) fn content_digest<const N: usize>(slots: &[RecentSnapshotSlot; N]) -> [u8; 32] {
     let mut hasher = Blake2s256::new();

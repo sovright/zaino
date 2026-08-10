@@ -1,6 +1,6 @@
 use crate::{
     profile::{CompiledQueryShape, PrivacyProfile, PrivacyProfileError},
-    recent_snapshot::{RecentSnapshotSlot, RecentUtxoChange, RecentUtxoChangeKind},
+    recent_snapshot::{RecentSnapshotScan, RecentSnapshotSlot, RecentUtxoChangeKind},
     records::{QueryOutcome, TransparentUtxo, UtxoQuery, UtxoResultPage},
     store::{ObliviousStore, StoreSlot},
     trace::{TraceDimension, TraceError, TraceRecorder},
@@ -92,13 +92,16 @@ where
         &mut self,
         query: &UtxoQuery,
         cursor: usize,
-        recent_snapshot: &[RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
+        recent_snapshot: &RecentSnapshotScan<RECENT_SNAPSHOT_SLOTS>,
         trace: &mut TraceRecorder,
     ) -> Result<QueryExecution<RESPONSE_SLOTS>, TraceError> {
         let mut page = UtxoResultPage::empty();
         let mut selection = CandidateSelectionState::new();
         let mut store_failed = false;
-        let mut recent_snapshot_valid = recent_snapshot_is_semantically_valid(recent_snapshot);
+        // Both snapshot-only facts were computed once when this generation was
+        // published; see `RecentSnapshotScan`. They are read here, never
+        // recomputed, and they never shorten the sweeps below.
+        let mut recent_snapshot_valid = recent_snapshot.semantically_valid();
         let store_reads = self.profile().store_reads();
 
         for slot in 0..store_reads {
@@ -111,8 +114,11 @@ where
                 }
             };
             let candidate: TransparentUtxo = *store_slot.record();
-            let (survives_recent_snapshot, finalized_relation_valid) =
-                finalized_snapshot_relation(query.address_key(), &candidate, recent_snapshot);
+            let (survives_recent_snapshot, finalized_relation_valid) = finalized_snapshot_relation(
+                query.address_key(),
+                &candidate,
+                recent_snapshot.slots(),
+            );
             recent_snapshot_valid &= !store_slot.is_occupied() | finalized_relation_valid;
             let matches = store_slot.is_occupied()
                 & query.domain_valid()
@@ -121,7 +127,15 @@ where
             consider_candidate(&mut page, &mut selection, cursor, slot, candidate, matches);
         }
 
-        for (recent_ordinal, recent_slot) in recent_snapshot.iter().enumerate() {
+        // The sweep still visits every snapshot ordinal. The precomputed
+        // liveness bit only replaces the inner `O(N)` rescan each visit used to
+        // perform; it never selects which ordinals are visited.
+        for (recent_ordinal, (recent_slot, live)) in recent_snapshot
+            .slots()
+            .iter()
+            .zip(recent_snapshot.liveness().iter())
+            .enumerate()
+        {
             // Slot presence is public snapshot shape/data shared by every query
             // in the generation, so this branch is not query-dependent.
             let Some(change) = recent_slot.change() else {
@@ -138,7 +152,7 @@ where
                 & (change.kind() == RecentUtxoChangeKind::Created)
                 & same_address(change.address_key(), query.address_key())
                 & (candidate.height() >= query.minimum_height())
-                & recent_creation_is_live(recent_ordinal, change, recent_snapshot);
+                & *live;
             consider_candidate(
                 &mut page,
                 &mut selection,
@@ -250,45 +264,6 @@ fn finalized_snapshot_relation<const RECENT_SNAPSHOT_SLOTS: usize>(
     (survives, valid)
 }
 
-fn recent_snapshot_is_semantically_valid<const RECENT_SNAPSHOT_SLOTS: usize>(
-    recent_snapshot: &[RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
-) -> bool {
-    let mut valid = true;
-    for (later_ordinal, later_slot) in recent_snapshot.iter().enumerate() {
-        for (earlier_ordinal, earlier_slot) in recent_snapshot.iter().enumerate() {
-            let Some(later) = later_slot.change() else {
-                continue;
-            };
-            let Some(earlier) = earlier_slot.change() else {
-                continue;
-            };
-            if earlier_ordinal < later_ordinal && same_outpoint(earlier.utxo(), later.utxo()) {
-                valid &= earlier.address_key() == later.address_key()
-                    && earlier.kind() == RecentUtxoChangeKind::Created
-                    && later.kind() == RecentUtxoChangeKind::Spent;
-            }
-        }
-    }
-    valid
-}
-
-fn recent_creation_is_live<const RECENT_SNAPSHOT_SLOTS: usize>(
-    ordinal: usize,
-    candidate: &RecentUtxoChange,
-    recent_snapshot: &[RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
-) -> bool {
-    let mut spent_later = false;
-    for (later_ordinal, slot) in recent_snapshot.iter().enumerate() {
-        let Some(later) = slot.change() else {
-            continue;
-        };
-        spent_later |= (later_ordinal > ordinal)
-            & same_address(later.address_key(), candidate.address_key())
-            & same_outpoint(later.utxo(), candidate.utxo());
-    }
-    !spent_later
-}
-
 fn same_outpoint(left: &TransparentUtxo, right: &TransparentUtxo) -> bool {
     ct::eq_bytes(left.txid(), right.txid()) & (left.output_index() == right.output_index())
 }
@@ -326,6 +301,7 @@ mod tests {
     use super::*;
     use crate::{
         profile::test_profile_without_recent_snapshot,
+        recent_snapshot::RecentUtxoChange,
         records::{AddressKey, ADDRESS_KEY_BYTES, TXID_BYTES},
         store::{PlaintextMockStore, PlaintextMockStoreError},
         trace::RuntimePhase,
@@ -416,7 +392,12 @@ mod tests {
             trace.record_recent_snapshot_read(ordinal)?;
         }
         trace.complete_recent_snapshot_scan(RECENT_SNAPSHOT_SLOTS)?;
-        engine.execute_from(query, cursor, recent_snapshot, &mut trace)
+        engine.execute_from(
+            query,
+            cursor,
+            &RecentSnapshotScan::from_slots(*recent_snapshot),
+            &mut trace,
+        )
     }
 
     fn open_engine_execution(trace: &mut TraceRecorder) -> Result<(), TraceError> {
@@ -777,6 +758,223 @@ mod tests {
             .filter(|slot| slot.is_occupied())
             .map(|slot| *slot.padded_utxo().txid())
             .collect()
+    }
+
+    /// The pre-hoist `recent_snapshot_is_semantically_valid`, verbatim.
+    ///
+    /// Kept as an oracle so the publication-time precomputation is proved
+    /// against the predicate it replaced rather than against itself.
+    fn legacy_semantically_valid<const N: usize>(
+        recent_snapshot: &[RecentSnapshotSlot; N],
+    ) -> bool {
+        let mut valid = true;
+        for (later_ordinal, later_slot) in recent_snapshot.iter().enumerate() {
+            for (earlier_ordinal, earlier_slot) in recent_snapshot.iter().enumerate() {
+                let Some(later) = later_slot.change() else {
+                    continue;
+                };
+                let Some(earlier) = earlier_slot.change() else {
+                    continue;
+                };
+                if earlier_ordinal < later_ordinal && same_outpoint(earlier.utxo(), later.utxo()) {
+                    valid &= earlier.address_key() == later.address_key()
+                        && earlier.kind() == RecentUtxoChangeKind::Created
+                        && later.kind() == RecentUtxoChangeKind::Spent;
+                }
+            }
+        }
+        valid
+    }
+
+    /// The pre-hoist `recent_creation_is_live`, verbatim.
+    fn legacy_creation_is_live<const N: usize>(
+        ordinal: usize,
+        candidate: &RecentUtxoChange,
+        recent_snapshot: &[RecentSnapshotSlot; N],
+    ) -> bool {
+        let mut spent_later = false;
+        for (later_ordinal, slot) in recent_snapshot.iter().enumerate() {
+            let Some(later) = slot.change() else {
+                continue;
+            };
+            spent_later |= (later_ordinal > ordinal)
+                & same_address(later.address_key(), candidate.address_key())
+                & same_outpoint(later.utxo(), candidate.utxo());
+        }
+        !spent_later
+    }
+
+    /// Builds the scan the way the engine used to, one predicate per query.
+    fn legacy_scan<const N: usize>(slots: [RecentSnapshotSlot; N]) -> RecentSnapshotScan<N> {
+        let mut live = [true; N];
+        for (ordinal, slot) in slots.iter().enumerate() {
+            let (Some(change), Some(destination)) = (slot.change(), live.get_mut(ordinal)) else {
+                continue;
+            };
+            *destination = legacy_creation_is_live(ordinal, change, &slots);
+        }
+        RecentSnapshotScan::from_parts_for_tests(slots, live, legacy_semantically_valid(&slots))
+    }
+
+    /// One equivalence fixture: label, store entries, snapshot, floor, cursor.
+    type HoistCase = (
+        &'static str,
+        Vec<(usize, TransparentUtxo)>,
+        [RecentSnapshotSlot; 4],
+        u32,
+        usize,
+    );
+
+    /// Every case the hoist could have changed, run both ways.
+    fn hoist_equivalence_cases() -> Vec<HoistCase> {
+        let key = address(1);
+        let first = utxo(1, 10);
+        let second = utxo(2, 11);
+        let third = utxo(3, 12);
+        let recent_created = utxo(4, 13);
+        let also_created = utxo(5, 14);
+        vec![
+            ("empty", vec![], [RecentSnapshotSlot::dummy(); 4], 0, 0),
+            (
+                "no-match",
+                vec![(0, first)],
+                [
+                    RecentSnapshotSlot::created(address(9), recent_created),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                99,
+                0,
+            ),
+            (
+                "single-match",
+                vec![(0, first)],
+                [
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                0,
+            ),
+            (
+                "pagination-first-page",
+                vec![(0, first), (1, second), (2, third)],
+                [
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::created(key, also_created),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                0,
+            ),
+            (
+                "pagination-continued",
+                vec![(0, first), (1, second), (2, third)],
+                [
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::created(key, also_created),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                2,
+            ),
+            (
+                "spent-later",
+                vec![(0, first)],
+                [
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::spent(key, recent_created),
+                    RecentSnapshotSlot::created(key, also_created),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                0,
+            ),
+            (
+                "recent-spend-of-finalized",
+                vec![(0, first), (1, second)],
+                [
+                    RecentSnapshotSlot::spent(key, first),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                0,
+            ),
+            (
+                "duplicate-outpoint",
+                vec![],
+                [
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                0,
+            ),
+        ]
+    }
+
+    /// The precomputed facts equal the predicates they replaced, case by case.
+    #[test]
+    fn hoisted_snapshot_facts_match_the_per_query_predicates() {
+        for (label, _, recent, _, _) in hoist_equivalence_cases() {
+            assert_eq!(
+                RecentSnapshotScan::from_slots(recent),
+                legacy_scan(recent),
+                "{label}"
+            );
+        }
+    }
+
+    /// Identical pages and cursors whichever derivation the engine is handed.
+    #[test]
+    fn hoisted_and_per_query_derivations_produce_identical_results(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        for (label, entries, recent, minimum_height, cursor) in hoist_equivalence_cases() {
+            let query = UtxoQuery::new(key, minimum_height);
+            let mut hoisted_engine = engine_with(&entries)?;
+            let hoisted = run_with_scan(
+                &mut hoisted_engine,
+                &query,
+                cursor,
+                &RecentSnapshotScan::from_slots(recent),
+            )?;
+            let mut legacy_engine = engine_with(&entries)?;
+            let legacy = run_with_scan(&mut legacy_engine, &query, cursor, &legacy_scan(recent))?;
+
+            assert_eq!(hoisted.page(), legacy.page(), "{label}");
+            assert_eq!(hoisted.next_cursor(), legacy.next_cursor(), "{label}");
+            assert_eq!(
+                hoisted_engine.store.read_slots(),
+                legacy_engine.store.read_slots(),
+                "{label}"
+            );
+        }
+        Ok(())
+    }
+
+    fn run_with_scan<const N: usize>(
+        engine: &mut TestEngine,
+        query: &UtxoQuery,
+        cursor: usize,
+        scan: &RecentSnapshotScan<N>,
+    ) -> Result<QueryExecution<RESPONSE_SLOTS>, TraceError> {
+        let mut trace = TraceRecorder::new();
+        open_engine_execution(&mut trace)?;
+        for ordinal in 0..N {
+            trace.record_recent_snapshot_read(ordinal)?;
+        }
+        trace.complete_recent_snapshot_scan(N)?;
+        engine.execute_from(query, cursor, scan, &mut trace)
     }
 
     #[test]

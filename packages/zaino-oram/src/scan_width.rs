@@ -31,15 +31,20 @@
 //!
 //! Per query the engine performs, over a snapshot of `slots` entries:
 //!
-//! - `slots * slots` slot pairings in `recent_snapshot_is_semantically_valid`,
 //! - `store_reads * slots` pairings in `finalized_snapshot_relation`, once per
 //!   finalized slot read,
-//! - `slots * slots` pairings in `recent_creation_is_live`, once per recent
-//!   slot.
+//! - `slots` pairings in the recent-slot sweep, one address comparison each.
 //!
-//! so the cost is `2 * slots^2 + store_reads * slots` — quadratic, and paid in
-//! full by every request including misses. A width is serviceable only when
+//! so the cost is `(store_reads + 1) * slots` — linear in the width, and paid
+//! in full by every request including misses. A width is serviceable only when
 //! that polynomial fits a stated per-query comparison budget.
+//!
+//! Two further `slots^2` terms used to sit in this polynomial:
+//! `recent_snapshot_is_semantically_valid` and `recent_creation_is_live`. Both
+//! read the snapshot and nothing else, so both were hoisted to snapshot
+//! publication (see `recent_snapshot::RecentSnapshotScan`) where they are paid
+//! once per generation rather than once per query. The engine still sweeps
+//! every slot; it just reads their results in `O(1)` per slot.
 //!
 //! All arithmetic here is integer and checked. No floating point and no
 //! hash-map iteration influences a selected width, so a width is reproducible
@@ -47,19 +52,33 @@
 
 use std::fmt;
 
-use crate::profile::{MAINNET_QUERY_SLOTS, MAINNET_STORE_READS};
+#[cfg(test)]
+use crate::profile::MAINNET_QUERY_SLOTS;
+use crate::profile::MAINNET_STORE_READS;
 
 /// Denominator for basis-point margins.
 const BASIS_POINTS_DENOMINATOR: u64 = 10_000;
 
 /// Headroom the accepted design point is allowed to grow into.
 ///
-/// The mainnet profile already charges `2 * 256^2 + 1028 * 256` slot pairings
-/// per request. This policy accepts up to four times that, which is a stated
-/// operational choice rather than a measurement: it bounds how much fixed work
-/// a width may add relative to a design point that has already been reviewed.
-/// Raising it is a profile change and needs its own justification.
+/// This policy accepts up to four times the reviewed design point's per-query
+/// cost, which is a stated operational choice rather than a measurement: it
+/// bounds how much fixed work a width may add relative to a design point that
+/// has already been reviewed. Raising it is a profile change and needs its own
+/// justification.
 const ACCEPTED_COMPARISON_HEADROOM: u64 = 4;
+
+/// Per-query slot pairings the reviewed 256-slot design point cost.
+///
+/// `2 * 256^2 + 1028 * 256`, the pre-hoist engine's charge for
+/// `MAINNET_QUERY_SLOTS` against `MAINNET_STORE_READS`. Hoisting the two
+/// query-independent quadratic terms to publication removed work from the
+/// query; it did not change how much per-query work an operator is willing to
+/// fund. The budget therefore stays anchored to this reviewed figure, and what
+/// rises is the width it admits — which is the entire point of the hoist.
+/// `the_reviewed_budget_is_the_pre_hoist_design_point_cost` keeps the
+/// arithmetic checkable now that the polynomial no longer reproduces it.
+const REVIEWED_DESIGN_POINT_COMPARISONS: u64 = 394_240;
 
 /// Growth margin applied to measured demand before it becomes a width.
 ///
@@ -249,19 +268,14 @@ fn apply_growth_margin(
 
 /// Returns the per-query slot pairings a scan of `slots` entries costs.
 ///
-/// `2 * slots^2 + store_reads * slots`, mirroring the three engine loops that
-/// touch the recent snapshot. The quadratic terms dominate for any width past a
-/// few thousand slots.
+/// `(store_reads + 1) * slots`, mirroring the two engine loops that still touch
+/// the recent snapshot per query: `finalized_snapshot_relation` once per
+/// finalized slot read, and one address comparison per recent slot. The two
+/// former `slots^2` terms are now paid once per published generation instead.
 fn query_slot_comparisons(slots: u64, store_reads: u64) -> Result<u64, ScanWidthError> {
-    let quadratic = slots
-        .checked_mul(slots)
-        .and_then(|square| square.checked_mul(2))
-        .ok_or(ScanWidthError::ArithmeticOverflow)?;
-    let linear = store_reads
-        .checked_mul(slots)
-        .ok_or(ScanWidthError::ArithmeticOverflow)?;
-    quadratic
-        .checked_add(linear)
+    store_reads
+        .checked_add(1)
+        .and_then(|per_slot| per_slot.checked_mul(slots))
         .ok_or(ScanWidthError::ArithmeticOverflow)
 }
 
@@ -274,8 +288,9 @@ fn serviceable_slot_ceiling(policy: ScanWidthPolicy) -> Result<u64, ScanWidthErr
         return Err(ScanWidthError::BudgetBelowMinimumWidth);
     }
     let mut low = 1_u64;
-    // `2 * slots^2 <= budget` bounds any admissible width, so the budget itself
-    // is always a strict upper bound and the search cannot overflow.
+    // `store_reads >= 1` makes the per-slot charge at least two, so an
+    // admissible width never exceeds half the budget; the budget itself is
+    // always an upper bound and the search cannot overflow.
     let mut high = policy.comparison_budget;
     while low < high {
         let midpoint = low
@@ -412,9 +427,7 @@ pub(super) const MAINNET_CAPTURE_INTERVAL_BLOCKS: u32 = 288;
 pub(super) fn mainnet_scan_width_policy() -> Result<ScanWidthPolicy, ScanWidthError> {
     let store_reads =
         u64::try_from(MAINNET_STORE_READS).map_err(|_| ScanWidthError::PolicyInput)?;
-    let accepted_slots =
-        u64::try_from(MAINNET_QUERY_SLOTS).map_err(|_| ScanWidthError::PolicyInput)?;
-    let comparison_budget = query_slot_comparisons(accepted_slots, store_reads)?
+    let comparison_budget = REVIEWED_DESIGN_POINT_COMPARISONS
         .checked_mul(ACCEPTED_COMPARISON_HEADROOM)
         .ok_or(ScanWidthError::ArithmeticOverflow)?;
     ScanWidthPolicy::new(
@@ -503,27 +516,40 @@ mod tests {
     }
 
     #[test]
-    fn cost_polynomial_mirrors_the_three_engine_loops() {
-        // 2 * 8^2 + 4 * 8.
+    fn cost_polynomial_mirrors_the_two_remaining_per_query_engine_loops() {
+        // (4 + 1) * 8, linear in the width now that the two snapshot-only
+        // quadratic terms are paid at publication.
         assert_eq!(
             query_slot_comparisons(8, 4).expect("small width does not overflow"),
-            160
+            40
         );
+    }
+
+    /// The hoisted terms are gone from the per-query polynomial, not renamed.
+    #[test]
+    fn the_polynomial_is_linear_in_the_scan_width() {
+        let single = query_slot_comparisons(1, 1_028).expect("no overflow");
+        for width in [2_u64, 16, 1_024, 1_000_000] {
+            assert_eq!(
+                query_slot_comparisons(width, 1_028).expect("no overflow"),
+                single * width
+            );
+        }
     }
 
     #[test]
     fn ceiling_is_the_largest_width_inside_the_budget() {
-        let policy = policy(4, 160);
+        let policy = policy(4, 40);
         let ceiling = serviceable_slot_ceiling(policy).expect("budget funds at least one slot");
         assert_eq!(ceiling, 8);
-        assert!(query_slot_comparisons(ceiling, 4).expect("no overflow") <= 160);
-        assert!(query_slot_comparisons(ceiling + 1, 4).expect("no overflow") > 160);
+        assert!(query_slot_comparisons(ceiling, 4).expect("no overflow") <= 40);
+        assert!(query_slot_comparisons(ceiling + 1, 4).expect("no overflow") > 40);
     }
 
     #[test]
     fn ceiling_rejects_a_budget_below_one_slot() {
         assert_eq!(
-            serviceable_slot_ceiling(policy(4, 5)),
+            serviceable_slot_ceiling(policy(4, 4)),
             Err(ScanWidthError::BudgetBelowMinimumWidth)
         );
     }
@@ -539,14 +565,14 @@ mod tests {
     fn a_demand_inside_the_budget_is_serviceable() {
         let decision = recent_snapshot_scan_width(
             RecentSnapshotDemand::new(288, 8),
-            ScanWidthPolicy::new(4, 160, 0).expect("valid policy"),
+            ScanWidthPolicy::new(4, 40, 0).expect("valid policy"),
         )
         .expect("sizing succeeds");
         let ScanWidthDecision::Serviceable(width) = decision else {
             panic!("a demand of 8 slots fits a budget that funds 8 slots");
         };
         assert_eq!(width.slots(), 8);
-        assert_eq!(width.query_comparisons(), 160);
+        assert_eq!(width.query_comparisons(), 40);
         assert_eq!(width.serviceable_ceiling(), 8);
     }
 
@@ -573,7 +599,7 @@ mod tests {
     /// The other half of the same regression: evidence can also refuse a width.
     #[test]
     fn a_generation_past_the_ceiling_is_refused_rather_than_truncated() {
-        let policy = ScanWidthPolicy::new(4, 160, 0).expect("valid policy");
+        let policy = ScanWidthPolicy::new(4, 40, 0).expect("valid policy");
         let decision = recent_snapshot_scan_width(RecentSnapshotDemand::new(288, 9), policy)
             .expect("sizing succeeds");
         let ScanWidthDecision::Unserviceable(refusal) = decision else {
@@ -627,12 +653,14 @@ mod tests {
         };
         // 1,386,025 grown by 25%.
         assert_eq!(refusal.required_slots(), 1_732_532);
-        // The budget funds roughly two thousand slots, not roughly two million.
-        assert!(refusal.serviceable_ceiling() < 2_048);
-        assert!(refusal.serviceable_ceiling() > 512);
-        // Six orders of magnitude over budget, not a tuning gap.
-        assert!(refusal.budget_overrun_factor() > 1_000_000);
-        assert_eq!(refusal.required_query_comparisons(), 6_005_115_304_944);
+        // The budget funds roughly fifteen hundred slots, not roughly two
+        // million. Hoisting the two snapshot-only quadratic terms raised this
+        // from 667; it did not close a gap three orders of magnitude wide.
+        assert_eq!(refusal.serviceable_ceiling(), 1_532);
+        // 1,732,532 * 1029.
+        assert_eq!(refusal.required_query_comparisons(), 1_782_775_428);
+        // Three orders of magnitude over budget, not a tuning gap.
+        assert_eq!(refusal.budget_overrun_factor(), 1_130);
     }
 
     /// The width the profile actually ships is inside the budget it declares.
@@ -641,10 +669,26 @@ mod tests {
         let policy = mainnet_scan_width_policy().expect("mainnet policy is well formed");
         let accepted = u64::try_from(MAINNET_QUERY_SLOTS).expect("accepted width fits u64");
         let ceiling = serviceable_slot_ceiling(policy).expect("budget funds at least one slot");
-        // Four times the 394,240 pairings the accepted design point costs.
+        // Four times the 394,240 pairings the reviewed design point cost.
         assert_eq!(policy.comparison_budget(), 1_576_960);
-        assert_eq!(ceiling, 667);
+        // 1,576,960 / 1029, up from 667 before the hoist.
+        assert_eq!(ceiling, 1_532);
         assert!(accepted <= ceiling);
+    }
+
+    /// The frozen budget is still the reviewed design point's own cost.
+    ///
+    /// The per-query polynomial no longer reproduces this figure, so the
+    /// arithmetic that justifies the constant is asserted here instead of
+    /// being recomputed in production.
+    #[test]
+    fn the_reviewed_budget_is_the_pre_hoist_design_point_cost() {
+        let slots = u64::try_from(MAINNET_QUERY_SLOTS).expect("accepted width fits u64");
+        let store_reads = u64::try_from(MAINNET_STORE_READS).expect("store reads fit u64");
+        assert_eq!(
+            2 * slots * slots + store_reads * slots,
+            REVIEWED_DESIGN_POINT_COMPARISONS
+        );
     }
 
     #[test]
