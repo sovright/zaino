@@ -15,11 +15,14 @@ claimed a rescan would ground it. That claim was wrong twice over.
    **1,386,025** at the selected 288-block interval. Nine times larger. The
    per-address histogram PR #96 added cannot size this dimension at any
    resolution, because it is a marginal over the wrong axis.
-2. **No width covers that demand, because the scan is quadratic.** Covering
-   1,386,025 events (plus margin, 1,732,532 slots) costs roughly
-   **6.0 x 10^12 slot pairings per request** — every request, including misses.
-   The current 256-slot design point costs 394,240. That is a factor of about
-   1.5 x 10^7, not a tuning gap.
+2. **No width covers that demand.** Covering 1,386,025 events (plus margin,
+   1,732,532 slots) costs **1,782,775,428 slot pairings per request** — every
+   request, including misses — against a stated budget of 1,576,960. That is a
+   factor of about 1,130, not a tuning gap.
+
+   This was `6.0 x 10^12` pairings and a factor of `3.8 x 10^6` before
+   recommendation B below landed; the hoist removed the quadratic, and the
+   demand still does not fit.
 
 So: **no serviceable width exists under the current recent-state structure.**
 Setting 1,732,532 would be honest about the demand and unusable; leaving 256 is
@@ -62,28 +65,38 @@ Per query, over a snapshot of `N` slots (`packages/zaino-oram/src/engine.rs`):
 
 | Loop | Pairings |
 | --- | --- |
-| `recent_snapshot_is_semantically_valid` | `N * N` |
 | `finalized_snapshot_relation`, once per finalized slot read | `store_reads * N` |
-| `recent_creation_is_live`, once per recent slot | `N * N` |
+| the recent-slot sweep, one address comparison each | `N` |
 
-Total `2N^2 + store_reads * N`, with `store_reads = 1028` for the mainnet
-profile.
+Total `(store_reads + 1) * N` = `1029N`, with `store_reads = 1028` for the
+mainnet profile.
+
+Two `N * N` terms — `recent_snapshot_is_semantically_valid` and
+`recent_creation_is_live` — used to sit in this table. Recommendation B below
+moved them to snapshot publication, where they are paid once per generation.
+The engine still sweeps every slot on every query; it now reads their results
+in `O(1)` per slot from `recent_snapshot::RecentSnapshotScan`.
 
 ### Budget and verdict
 
 `scan_width::mainnet_scan_width_policy` sets the per-query budget at 4x what the
-already-reviewed 256-slot design point costs — a stated operational choice, not
-a measurement:
+already-reviewed 256-slot design point cost — a stated operational choice, not
+a measurement. The hoist removed work from the query; it did not change how much
+per-query work an operator is willing to fund, so the budget stays anchored to
+the reviewed figure (`scan_width::REVIEWED_DESIGN_POINT_COMPARISONS`) and what
+rises is the width it admits:
 
-- design point: `2*256^2 + 1028*256` = **394,240** pairings
+- reviewed design point: `2*256^2 + 1028*256` = **394,240** pairings
 - budget: **1,576,960** pairings
-- widest width the budget admits: **667 slots**
+- widest width the budget admits: **1,532 slots** (was 667 before the hoist)
 - demand with the 25% growth margin: **1,732,532 slots**
-- cost of that width: **~6.0 x 10^12** pairings
-- overrun: **~3.8 x 10^6 x** the budget
+- cost of that width: **1,782,775,428** pairings
+- overrun: **1,130x** the budget
 
-At an optimistic 10^9 pairings/second/core that is about **100 minutes per
-query**, against a 250 ms timeout bucket.
+At an optimistic 10^9 pairings/second/core that is about **1.8 seconds per
+query**, against a 250 ms timeout bucket — still ~7x over on wall clock, and
+1,130x over the stated pairing budget. Better than the pre-hoist 100 minutes,
+and still not servable.
 
 ## Statistic and risk policy, stated plainly
 
@@ -110,29 +123,31 @@ computed and asserted in a test rather than discovered on mainnet.
 
 ### A. Shorten the public rebuild interval — insufficient alone
 
-To reach 667 slots from 1,386,025 needs a ~2,000x reduction. The worst window
+To reach 1,532 slots from 1,386,025 needs a ~900x reduction. The worst window
 already averages 4,813 delta events *per block*, so even a **1-block** rebuild
-interval leaves demand ~7x over the ceiling — and per-block republication of the
-finalized projection is not operationally plausible. Shortening the interval
-helps linearly and the wall is quadratic. Not a fix on its own.
+interval leaves demand ~3x over the ceiling — and per-block republication of the
+finalized projection is not operationally plausible. Not a fix on its own.
 
-### B. Hoist the two query-independent loops to publication time — real, partial
+### B. Hoist the two query-independent loops to publication time — landed
 
-`recent_snapshot_is_semantically_valid` and `recent_creation_is_live` depend
+`recent_snapshot_is_semantically_valid` and `recent_creation_is_live` depended
 **only on the snapshot**, not on the query. Both are properties of the
-published generation. Computing them once at `FrozenRecentSnapshot`
-construction and storing a per-slot `live` bit removes both `N^2` terms and
-costs nothing in leakage: the result is public snapshot shape shared by every
-query in the generation, which the engine's own comments already assert.
+published generation. They are now computed once at `FrozenRecentSnapshot`
+construction, into a `recent_snapshot::RecentSnapshotScan` carrying a
+snapshot-wide `semantically_valid` flag and a per-ordinal `live` bit. Both
+`N^2` terms are gone from the per-query cost, and this costs nothing in
+leakage: the results are public snapshot shape shared by every query in the
+generation, which the engine's own comments already asserted about slot
+occupancy. The engine's sweep over every slot is unchanged; no branch on a
+precomputed flag skips or shortens any loop.
 
-Per-query cost becomes `(store_reads + 1) * N` = `1029N`. The ceiling rises from
-667 to **1,532 slots** — a 2.3x width improvement, and more importantly it
-removes the quadratic. This is a contained change and should be made regardless
-of what else happens.
+Per-query cost is now `(store_reads + 1) * N` = `1029N`. The ceiling rose from
+667 to **1,532 slots** — a 2.3x width improvement, and more importantly the
+quadratic is gone. It is not, on its own, enough to serve mainnet.
 
 ### C. Make the finalized/recent join linear — the actual unlock
 
-After B, the wall is `store_reads * N`: `finalized_snapshot_relation` re-scans
+With B landed, the wall is `store_reads * N`: `finalized_snapshot_relation` re-scans
 the whole snapshot once per finalized slot read to find recent spends that
 cancel a finalized candidate. That is a nested-loop join. Replacing it with an
 oblivious sorted merge or a fixed-size oblivious hash makes the recent-side cost
@@ -162,8 +177,8 @@ exception rather than an expected condition.
 
 1. Keep `MAINNET_QUERY_SLOTS = 256` and keep the fail-closed conversion. Do not
    raise it to a number nobody can execute.
-2. Land B (hoist the query-independent loops). Contained, no leakage cost,
-   removes the quadratic.
+2. ~~Land B (hoist the query-independent loops).~~ **Done.** Contained, no
+   leakage cost, removed the quadratic; the ceiling is now 1,532 slots.
 3. Treat C as the blocking design item for a mainnet recent-state scan. Until it
    exists, the private service cannot serve mainnet, and no `EvidenceScope`
    mainnet-readiness flag should be set. (None currently is.)

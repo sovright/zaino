@@ -17,7 +17,7 @@ use arc_swap::ArcSwapOption;
 use super::zaino::ConvertedRecentSnapshot;
 use super::{
     content_digest, lineage_binding_digest, RecentSnapshotIdentity, RecentSnapshotReadError,
-    RecentSnapshotSlot,
+    RecentSnapshotScan, RecentSnapshotSlot,
 };
 use crate::{
     records::AddressKey,
@@ -135,7 +135,7 @@ impl std::error::Error for RecentSnapshotLineageError {}
 /// Fixed, oldest-to-newest snapshot owned by one private runtime lifecycle.
 pub(crate) struct FrozenRecentSnapshot<const N: usize> {
     lineage: RecentSnapshotLineage,
-    slots: [RecentSnapshotSlot; N],
+    scan: RecentSnapshotScan<N>,
     content_digest: [u8; 32],
     binding_digest: [u8; 32],
     #[cfg(test)]
@@ -148,7 +148,7 @@ impl<const N: usize> Clone for FrozenRecentSnapshot<N> {
     fn clone(&self) -> Self {
         Self {
             lineage: self.lineage,
-            slots: self.slots,
+            scan: self.scan,
             content_digest: self.content_digest,
             binding_digest: self.binding_digest,
             #[cfg(test)]
@@ -161,12 +161,13 @@ impl<const N: usize> Clone for FrozenRecentSnapshot<N> {
 }
 
 impl<const N: usize> FrozenRecentSnapshot<N> {
+    /// Publishes one generation, precomputing its query-independent facts once.
     fn new(lineage: RecentSnapshotLineage, slots: [RecentSnapshotSlot; N]) -> Self {
         let content_digest = content_digest(&slots);
         let binding_digest = lineage_binding_digest(lineage, content_digest);
         Self {
             lineage,
-            slots,
+            scan: RecentSnapshotScan::from_slots(slots),
             content_digest,
             binding_digest,
             #[cfg(test)]
@@ -194,7 +195,7 @@ impl<const N: usize> FrozenRecentSnapshot<N> {
         let binding_digest = lineage_binding_digest(lineage, content_digest);
         Self {
             lineage,
-            slots,
+            scan: RecentSnapshotScan::from_slots(slots),
             content_digest,
             binding_digest,
             failing_ordinal: Some(failing_ordinal),
@@ -239,10 +240,16 @@ impl<const N: usize> FrozenRecentSnapshot<N> {
                 return Err(RecentSnapshotReadError);
             }
         }
-        self.slots
+        self.scan
+            .slots()
             .get(ordinal)
             .copied()
             .ok_or(RecentSnapshotReadError)
+    }
+
+    /// Returns the published slots beside the facts precomputed with them.
+    pub(crate) const fn scan(&self) -> &RecentSnapshotScan<N> {
+        &self.scan
     }
 
     #[cfg(test)]
@@ -253,9 +260,7 @@ impl<const N: usize> FrozenRecentSnapshot<N> {
     /// Simulates post-construction corruption without changing the bound digest.
     #[cfg(test)]
     pub(crate) fn replace_slot(&mut self, ordinal: usize, slot: RecentSnapshotSlot) {
-        if let Some(destination) = self.slots.get_mut(ordinal) {
-            *destination = slot;
-        }
+        self.scan.replace_slot(ordinal, slot);
     }
 
     /// Simulates post-construction checkpoint-identity corruption.
