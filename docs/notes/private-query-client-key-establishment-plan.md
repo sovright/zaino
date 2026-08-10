@@ -429,9 +429,9 @@ certificate and the key.
 **What was built:**
 
 - `packages/zainod-oram/src/private_service/tls.rs` — `PrivateTlsIdentity`.
-  `generate(key_epoch)` mints a self-signed ECDSA P-256 identity in-process.
-  The private key is held only inside the value: no accessor, absent from
-  `Debug`, never written to disk.
+  `load_or_generate(deployment_dir)` mints a self-signed ECDSA P-256 identity
+  in-process on first start and reuses it thereafter. The private key is
+  reachable only from inside the value: no accessor, absent from `Debug`.
 - `PrivateQueryListener::serve` now takes `&PrivateTlsIdentity` and calls
   `Server::builder().tls_config(...)`, after
   `zaino_common::crypto::ensure_default_crypto_provider()` — the same
@@ -442,33 +442,72 @@ certificate and the key.
   semaphore whose permit rides with the connection, `concurrency_limit_per_connection(1)`,
   the per-route decode caps, and the uniform refusal. TLS wraps the transport
   and sits above the same accepted-connection stream.
-- `run_private_serve` mints the identity from the same key epoch the envelope
-  keys were drawn under, *before* binding and long before chain replay, writes
-  the fingerprint record to stdout, and publishes it to
-  `<replay_journal_dir>/private-tls-fingerprint.txt`.
+- `run_private_serve` loads or mints the identity *before* binding and long
+  before chain replay, so a damaged one fails immediately rather than after a
+  full replay is paid for. It writes the fingerprint record to stdout and
+  publishes it to `<replay_journal_dir>/private-tls-fingerprint.txt`, checking
+  rather than overwriting a record a previous start left.
 
-**Where the key epoch went, and why: a SAN, not the subject.** The certificate
-carries two dNSName SANs — `private-query.zaino.invalid` (the name a wallet
-verifies against; `.invalid` per RFC 6761 because this identity is pinned or
-attested, never resolved) and `key-epoch-<n>.private-query.zaino.invalid`. A
-SAN is the field TLS stacks parse and expose, so a wallet reads the epoch off
-the presented certificate through its own TLS library with no X.509 subject
-parsing. Modern name verification (RFC 6125) ignores the subject common name
-entirely, so an epoch placed there would be invisible to exactly the code that
-needs it. A second SAN also composes: it sits beside the verified name rather
-than replacing it.
+**The certificate persists across restarts.** An earlier revision of this task
+minted a fresh certificate on every start, tied to the key epoch for
+consistency with "restart is rotation". That was wrong and was reversed. The
+symmetric keys can rotate safely because the recovery path runs *above* TLS: a
+wallet with stale keys gets `StaleKeyEpoch` in cleartext and re-bootstraps. A
+rotating certificate breaks a wallet's pin *below* TLS — an opaque handshake
+failure, no route to `BootstrapSession` to find out why, and no way to
+distinguish rotation from substitution. That is the same anti-pattern the
+cleartext `key_epoch` removed, reintroduced one layer down. Certificate
+lifetime and key lifetime are separate concerns.
 
-**The pinning reality, stated as the code and the operator warning state it.**
-The certificate regenerates on every start, bound to that start's key epoch.
-That is deliberate and consistent — the symmetric keys are already ephemeral
-and restart is rotation, so a persistent certificate would be the one durable
-secret in a design that has none, and would have to live somewhere an
-honest-but-curious operator can read it. The cost: pinning this fingerprint is
-**trust-on-first-use for the lifetime of one process**. It attests nothing
-about which binary is running, and after a restart the fingerprint changes and
-a wallet cannot distinguish rotation from substitution. `run_private_serve`
-prints that in full on stderr next to the fingerprint. Attestation is what
-closes the gap; ADR 0010 defers it.
+So `PrivateTlsIdentity::load_or_generate(deployment_dir)` mints on first start
+and reuses thereafter, persisting `private-tls-cert.pem` and
+`private-tls-key.pem` beside the fingerprint. Rotation is an explicit operator
+action — delete both files — never a side effect of a restart.
+
+**It fails closed, never regenerates.** A damaged, unreadable, half-present, or
+over-permissive identity is a typed `PrivateTlsError` naming the file and what
+was wrong (`Unreadable`, `Malformed { reason }`, `Incomplete { present,
+missing }`, `InsecureKeyPermissions { mode }`, `FingerprintMismatch`). Silent
+regeneration is the dangerous path: it breaks every wallet's pin with no
+signal, which is precisely what persisting the identity is for. Validation is
+a PEM decode plus a complete-DER-SEQUENCE check — enough to catch truncation,
+concatenation, and editor damage without an ASN.1 crate; anything that slips
+past still fails closed one layer later when the acceptor is built.
+
+**A private key is now at rest on disk.** Created owner-only (0600), and the
+loader refuses one that is not. Acceptable *specifically* under ADR 0010, where
+the operator is honest-but-curious and outside the threat model — the
+adversaries in scope are network observers and other clients, and neither gains
+from a key the operator could always have read out of process memory. Flagged
+in the module header as something that **must be revisited as the posture
+tightens toward ADR 0007**, where the answer is a TEE-sealed or attested
+ephemeral key.
+
+**Nothing per-generation is in the certificate.** One SAN, the verified name
+`private-query.zaino.invalid` (`.invalid` per RFC 6761: pinned or attested,
+never resolved). The key-epoch SAN the first revision carried was removed — the
+certificate now outlives many epochs, so a baked-in one is stale from the next
+restart onward and would actively mislead a wallet reading it. Nothing replaced
+it: the service namespace id tracks the capture, which can be upgraded under a
+stable deployment directory, and `profile_label` is documented in the proto as
+diagnostic and explicitly not for pinning. A name that can go stale is worse
+than no name.
+
+**The pinning story, stated without overclaiming.** The fingerprint is stable
+across restarts, so a wallet pins once and keeps it, and a broken pin now means
+something actually changed rather than "the process bounced". A pin still only
+establishes that the wallet is talking to the *same* surface as last time — not
+*what* that surface is, which binary is running, or whether the workload is the
+measured one. Only attestation answers that, and it supersedes pinning when it
+lands. `run_private_serve` prints all of this on stderr beside the fingerprint.
+
+**Handshake timeout.** `ServerTlsConfig::timeout(10s)`. The 32-connection
+semaphore takes its permit at accept, before the handshake, so an unbounded
+handshake lets a peer that connects and never speaks hold one of the 32
+forever. Ten seconds is roughly two orders of magnitude above a legitimate TLS
+1.3 handshake even on a bad mobile link — deliberately generous, because
+refusing a slow but honest wallet costs more than tolerating a slow attacker
+who is already capped at 32 connections.
 
 **Tests** (all green):
 
@@ -477,12 +516,21 @@ closes the gap; ADR 0010 defers it.
   `QueryPage` through it.
 - `the_reported_fingerprint_is_the_certificate_that_is_served` — the published
   fingerprint is SHA-256 over the DER the handshake presented.
-- `a_certificate_from_another_start_is_refused` — a pin from a different start
-  fails the handshake, which is both the restart-rotation behaviour and the
-  proof the client above trusted *only* the served certificate.
-- `two_starts_mint_different_identities` — two separately started runtimes
-  produce different certificates under the same epoch, so the difference comes
-  from a fresh key draw.
+- `a_certificate_from_another_deployment_is_refused` — a pin from a different
+  deployment fails the handshake, which is the proof the client above trusted
+  *only* the served certificate.
+- `a_second_start_reuses_the_persisted_identity` — a second start over the same
+  directory reports the identical fingerprint, certificate, and key, while a
+  different directory does not, so the equality is reuse rather than a constant
+  certificate.
+- `a_damaged_identity_fails_closed_rather_than_regenerating` — non-base64 PEM,
+  a truncated DER body, and a half-present pair each produce a named error, and
+  the operator's files are left untouched.
+- `a_world_readable_key_is_refused`, `the_persisted_key_is_owner_only` — the
+  0600 contract in both directions.
+- `publishing_is_idempotent_and_catches_a_disagreeing_record` — a restart
+  republishes silently; a record that disagrees with the certificate on disk is
+  an error.
 - The pre-existing connection-cap and decode-cap tests still pass; the five
   serving tests now run over TLS through one shared `ServedSurface` helper
   (bind port 0, mint, spawn, stop off the served task — no fixed sleeps).

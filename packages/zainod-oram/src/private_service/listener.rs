@@ -382,12 +382,15 @@ mod tests {
         /// What a wallet pins. The private half stayed in the served task.
         certificate_pem: String,
         fingerprint: String,
+        /// The persisted identity lives here; held so it outlives the serve
+        /// loop rather than being reaped mid-test.
+        _deployment: tempfile::TempDir,
         stop: tokio::sync::oneshot::Sender<()>,
         served: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     }
 
     impl ServedSurface {
-        /// Binds port 0, mints an identity for the bootstrap's key epoch, and
+        /// Binds port 0, loads or mints this deployment's identity, and
         /// spawns the serve loop.
         async fn start<H, const N: usize>(
             handler: H,
@@ -399,7 +402,8 @@ mod tests {
         {
             let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
             let address = listener.local_addr();
-            let tls = PrivateTlsIdentity::generate(session_bootstrap.key_epoch)?;
+            let deployment = tempfile::TempDir::new()?;
+            let tls = PrivateTlsIdentity::load_or_generate(deployment.path())?;
             let certificate_pem = tls.certificate_pem().to_owned();
             let fingerprint = tls.fingerprint().to_owned();
             let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -414,6 +418,7 @@ mod tests {
                 address,
                 certificate_pem,
                 fingerprint,
+                _deployment: deployment,
                 stop,
                 served,
             })
@@ -602,7 +607,7 @@ mod tests {
         surface.shutdown().await
     }
 
-    /// A client that pins a *different* generation's certificate must fail
+    /// A client that pins a *different* deployment's certificate must fail
     /// the handshake. Without this, "the client trusts only this
     /// certificate" above would be unproven -- a client that in fact trusted
     /// anything would pass it just as well.
@@ -611,22 +616,20 @@ mod tests {
     /// on separate tasks and the client blocks on a handshake the server
     /// must answer.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_certificate_from_another_start_is_refused() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn a_certificate_from_another_deployment_is_refused(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let surface = ServedSurface::start::<_, ENVELOPE_BYTES>(
             handler(),
             session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
         )
         .await?;
-        let other_start = PrivateTlsIdentity::generate(FIXTURE_KEY_EPOCH)?;
+        let elsewhere = tempfile::TempDir::new()?;
+        let other_deployment = PrivateTlsIdentity::load_or_generate(elsewhere.path())?;
 
-        // Restart is rotation, and this is what that costs a wallet: the
-        // fingerprint moved, so a pin from the previous process no longer
-        // matches. Trust-on-first-use is per process.
-        assert_ne!(other_start.fingerprint(), surface.fingerprint);
+        assert_ne!(other_deployment.fingerprint(), surface.fingerprint);
         let refused = query_page_over_the_wire(
             surface.address,
-            other_start.certificate_pem(),
+            other_deployment.certificate_pem(),
             vec![1, 2, 3, 4],
             FIXTURE_KEY_EPOCH,
         )

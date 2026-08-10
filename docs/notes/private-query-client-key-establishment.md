@@ -70,39 +70,82 @@ so adding verification later is not a breaking wire change. Until then the
 wallet trusts the operator's deployment rather than verifying it, and the
 documentation must say exactly that.
 
-For TLS the workload generates its identity internally at startup, and this is
-now built (`packages/zainod-oram/src/private_service/tls.rs`). At start the
+For TLS the workload generates its identity internally on first start, and
+this is now built (`packages/zainod-oram/src/private_service/tls.rs`). The
 process mints a self-signed ECDSA P-256 certificate with `rcgen` over
 aws-lc-rs; the private key is drawn in-process, is held only inside
-`PrivateTlsIdentity`, and is never written to disk or exposed by any accessor
-or `Debug` rendering. `PrivateQueryListener::serve` terminates on it, and takes
-it as a required argument rather than an `Option`, so a cleartext private
-surface is unrepresentable.
+`PrivateTlsIdentity`, and is exposed by no accessor and no `Debug` rendering.
+`PrivateQueryListener::serve` terminates on it and takes it as a required
+argument rather than an `Option`, so a cleartext private surface is
+unrepresentable.
 
-The certificate is bound to the key epoch through a second dNSName SAN,
-`key-epoch-<n>.private-query.zaino.invalid`, beside the name a wallet verifies
-against, `private-query.zaino.invalid`. A SAN rather than the subject: RFC 6125
-verification ignores the subject common name, so an epoch placed there would be
-invisible to the code that needs it, whereas a SAN is exposed by every TLS
-stack. The `.invalid` TLD (RFC 6761) is deliberate — this identity is pinned or
-attested, never resolved.
+The certificate and its key are **persisted** in the deployment directory and
+reused on every subsequent start. This is the one thing here that deliberately
+does not follow "restart is rotation", and the reason is the section below it:
+a wallet whose *keys* went stale is told so — the cleartext `key_epoch` earns
+it `StaleKeyEpoch` and it re-bootstraps — but that recovery path runs *above*
+TLS. A wallet whose *pin* broke gets an opaque handshake failure, cannot reach
+`BootstrapSession` to discover why, and cannot tell rotation from
+substitution. Rotating the certificate would reintroduce, one layer lower,
+exactly the opaque failure the cleartext epoch exists to prevent. Certificate
+lifetime and key lifetime look like they should match; they are separate
+concerns, and only the layer that can explain itself should be allowed to
+change.
+
+Rotation is therefore an explicit operator action — delete the certificate and
+key — never an implicit consequence of a restart. A damaged, unreadable, or
+half-present identity **fails closed** with a typed error naming the file:
+silently regenerating would break every wallet's pin with no signal at all,
+which is the failure mode this whole arrangement exists to avoid.
+
+The cost is a private key at rest on disk, readable by the operator. That is
+acceptable *specifically* under ADR 0010's interim posture, where the operator
+is honest-but-curious and out of the threat model; the adversaries in scope are
+network observers and other clients, and neither gains from a key the operator
+could always have read out of process memory. The file is created owner-only
+(0600) and the loader refuses one that is not. **This must be revisited as the
+posture tightens toward ADR 0007**: against an operator in scope, a key at rest
+is a key the operator holds, and the answer there is a TEE-sealed or attested
+ephemeral key, not this.
+
+Nothing per-generation is encoded into the certificate. It carries one SAN, the
+name a wallet verifies against (`private-query.zaino.invalid`; `.invalid` per
+RFC 6761 because this identity is pinned or attested, never resolved). An
+earlier revision carried the key epoch in a second SAN; that is now wrong, and
+was removed — the certificate outlives many epochs, so a baked-in one would be
+stale from the next restart onward and would actively mislead a wallet reading
+it. The same objection retires the other candidates: the service namespace id
+tracks the capture, which can be upgraded under a stable deployment directory,
+and `profile_label` is documented in the proto as diagnostic and explicitly not
+for pinning.
 
 The process writes the fingerprint (SHA-256 over the served DER, hex) to stdout
 and to `<replay_journal_dir>/private-tls-fingerprint.txt`, so an operator has
-something concrete to publish and a wallet has something concrete to pin.
+something concrete to publish and a wallet has something concrete to pin. On a
+later start the published record is checked rather than overwritten: a
+disagreement with the certificate on disk means the pair is not what operators
+told wallets to expect, and that too fails closed.
 
-**Say exactly what that pin is worth.** Because the certificate is minted fresh
-on every start — restart is rotation for the TLS identity just as it is for the
-symmetric keys, and a persistent certificate would be the one durable secret in
-a design that has none — pinning it is trust-on-first-use **for the lifetime of
-one process**. A wallet that pins learns only that it is still talking to the
-process it first talked to. It learns nothing about which binary that process
-is running, and after a restart the fingerprint changes, which the wallet
-cannot distinguish from being handed a different server. The runner prints that
-caveat on stderr beside the fingerprint. Attestation replaces pinning later;
-until it lands this is exactly as strong as trusting the operator's deployment.
+**What a pin is worth, without overclaiming.** It is stable across restarts, so
+a wallet pins once and keeps it, and a broken pin now means something actually
+changed rather than "the process bounced". But a pin still only establishes
+that the wallet is talking to the *same* thing it talked to last time. It says
+nothing about *what* that thing is — which binary is running, whether the
+workload is the measured one. Only attestation answers that; ADR 0010 defers
+it, and when it lands it supersedes pinning entirely.
+
+The listener also bounds one TLS handshake at ten seconds
+(`ServerTlsConfig::timeout`). The 32-connection semaphore takes its permit at
+accept, before the handshake, so without a bound a peer that connects and never
+speaks would hold one of the 32 indefinitely. Ten seconds is roughly two orders
+of magnitude above a legitimate handshake even on a poor mobile link, so it is
+deliberately generous: refusing a slow but honest wallet costs more than
+tolerating a slow attacker, who is already capped at 32 connections.
 
 ### Restart is rotation
+
+This is about the four symmetric keys, and only them. The TLS identity above is
+the deliberate exception and persists; the section above says why.
 
 Keys stay ephemeral. A restart mints fresh ones, so wallets re-bootstrap,
 outstanding continuation tokens become invalid, and the replay journal starts

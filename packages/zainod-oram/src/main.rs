@@ -1409,12 +1409,13 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         EphemeralKeyGeneration::draw().map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
     let shape = private_projection_shape(&capture, &sizing, key_generation.key_epoch)?;
 
-    // Minted from the same key epoch as the envelope keys, and minted here --
-    // before the bind and long before the chain replay -- so a workload that
-    // cannot produce an identity fails immediately rather than after paying
-    // for a full replay. Restart is rotation for this identity exactly as it
-    // is for the keys: the fingerprint below moves every start.
-    let tls = PrivateTlsIdentity::generate(key_generation.key_epoch)?;
+    // Loaded here -- before the bind and long before the chain replay -- so a
+    // deployment whose identity is missing, damaged, or half-present fails
+    // immediately rather than after paying for a full replay. Unlike the
+    // symmetric keys drawn above, this identity is *not* rotated by a restart:
+    // a broken pin is an opaque handshake failure a wallet cannot recover
+    // from, where stale keys earn it a StaleKeyEpoch and a re-bootstrap.
+    let tls = PrivateTlsIdentity::load_or_generate(&args.replay_journal_dir)?;
     let fingerprint_path = tls.publish_fingerprint(&args.replay_journal_dir)?;
     print!("{}", tls.fingerprint_record());
     println!(
@@ -1422,11 +1423,14 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         fingerprint_path.display()
     );
     eprintln!(
-        "NOTE: this certificate is generated fresh on every start, so pinning its \
-         fingerprint is trust-on-first-use for the lifetime of THIS process only. It \
-         attests to nothing about which binary is running; after a restart the \
-         fingerprint changes and a wallet cannot distinguish rotation from \
-         substitution. Attestation replaces pinning (docs/adr/0010)."
+        "NOTE: this certificate persists across restarts, so a wallet's pin stays \
+         valid until an operator rotates it deliberately by deleting the certificate \
+         and key in the deployment directory -- which invalidates every pin. Its \
+         private key is therefore at rest on disk, owner-only; that is acceptable \
+         only because docs/adr/0010 places the operator outside the threat model, and \
+         must be revisited as the posture tightens toward docs/adr/0007. A pin proves \
+         only that a wallet is talking to the same surface as before; it attests \
+         nothing about which binary is running. Attestation supersedes pinning."
     );
 
     let listener = PrivateQueryListener::bind(args.listen_address).await?;
