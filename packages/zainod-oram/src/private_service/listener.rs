@@ -43,7 +43,10 @@ use tonic::{
 
 use zaino_oram::{FixedEnvelopeRuntime, SessionBootstrap};
 
-use super::tonic_body::{PrivateSessionBootstrap, PrivateTonicBodyAdapter};
+use super::{
+    tls::PrivateTlsIdentity,
+    tonic_body::{PrivateSessionBootstrap, PrivateTonicBodyAdapter},
+};
 use crate::private_proto;
 
 /// The private method, answered under the single-admission mutex.
@@ -82,10 +85,17 @@ impl PrivateQueryListener {
     /// `session_bootstrap` is captured once here rather than re-derived per
     /// request: it is fixed for `handler`'s process lifetime, and it is also
     /// the one live epoch the query-page route checks every request against.
+    ///
+    /// `tls` is not optional. The envelope keys this surface releases are
+    /// runtime-wide, so without TLS there is no isolation between clients at
+    /// all -- see [`PrivateTlsIdentity`]. Taking the identity by value rather
+    /// than as an `Option` makes serving this surface in cleartext
+    /// unrepresentable rather than merely discouraged.
     pub(crate) async fn serve<H, const N: usize>(
         self,
         handler: H,
         session_bootstrap: SessionBootstrap,
+        tls: &PrivateTlsIdentity,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
     where
@@ -93,7 +103,15 @@ impl PrivateQueryListener {
         H::PendingResponse: Send + 'static,
     {
         let service = PrivateQueryService::<H, N>::new(handler, session_bootstrap);
+        // Building the TLS acceptor requires a process-level rustls
+        // CryptoProvider (zingolabs/zaino#1360), exactly as the public gRPC
+        // server needs one.
+        zaino_common::crypto::ensure_default_crypto_provider();
+        // TLS wraps the transport and nothing else: the connection semaphore
+        // below, the per-connection request limit, and the uniform refusal all
+        // sit where they did, on the same accepted-connection stream.
         Server::builder()
+            .tls_config(tls.server_tls_config())?
             .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
             .add_service(service)
             .serve_with_incoming_shutdown(
@@ -283,12 +301,13 @@ mod tests {
     };
 
     use futures::StreamExt;
+    use sha2::Digest as _;
     use zaino_oram::{
         MainnetPrivateQueryRuntime, PendingFixedEnvelope, PrivateQueryUnavailable,
         ReleasableSessionKeys,
     };
 
-    use super::*;
+    use super::{super::tls::PRIVATE_SURFACE_DNS_NAME, *};
 
     const ENVELOPE_BYTES: usize = 4;
     const RESPONSE: [u8; ENVELOPE_BYTES] = [9, 8, 7, 6];
@@ -352,6 +371,62 @@ mod tests {
         }
     }
 
+    /// One private surface bound to an ephemeral port and served on a task,
+    /// with the public half of its identity kept back for the client.
+    ///
+    /// Every serving test in this file needs the identical
+    /// bind-mint-spawn-then-stop sequence and differs only in handler and
+    /// bootstrap material, so it lives here once rather than five times.
+    struct ServedSurface {
+        address: SocketAddr,
+        /// What a wallet pins. The private half stayed in the served task.
+        certificate_pem: String,
+        fingerprint: String,
+        stop: tokio::sync::oneshot::Sender<()>,
+        served: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    impl ServedSurface {
+        /// Binds port 0, mints an identity for the bootstrap's key epoch, and
+        /// spawns the serve loop.
+        async fn start<H, const N: usize>(
+            handler: H,
+            session_bootstrap: SessionBootstrap,
+        ) -> Result<Self, Box<dyn std::error::Error>>
+        where
+            H: FixedEnvelopeRuntime<N> + Send + 'static,
+            H::PendingResponse: Send + 'static,
+        {
+            let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+            let address = listener.local_addr();
+            let tls = PrivateTlsIdentity::generate(session_bootstrap.key_epoch)?;
+            let certificate_pem = tls.certificate_pem().to_owned();
+            let fingerprint = tls.fingerprint().to_owned();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let served = tokio::spawn(async move {
+                listener
+                    .serve::<_, N>(handler, session_bootstrap, &tls, async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            });
+            Ok(Self {
+                address,
+                certificate_pem,
+                fingerprint,
+                stop,
+                served,
+            })
+        }
+
+        /// Asks the serve loop to stop and propagates whatever it returned.
+        async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
+            let _ = self.stop.send(());
+            self.served.await??;
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn accepted_connections_waits_for_a_connection_permit(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -378,16 +453,29 @@ mod tests {
         Ok(())
     }
 
-    /// Connects and readies one real gRPC client against the bound address.
+    /// Connects and readies one real gRPC client against the bound address,
+    /// over a real TLS handshake against the served identity.
     ///
     /// Factored out of `query_page_over_the_wire` and `bootstrap_client`:
     /// both routes need the identical connect-then-ready sequence, and only
     /// the codec and route path differ between them.
+    ///
+    /// This is the wallet's side of the pinning story: the certificate is
+    /// trusted because it is *this* certificate, not because a CA vouched for
+    /// it, and the name it is verified under is the fixed unresolvable
+    /// [`PRIVATE_SURFACE_DNS_NAME`], never the address dialled.
     async fn connected_private_client(
         address: SocketAddr,
+        certificate_pem: &str,
     ) -> Result<tonic::client::Grpc<tonic::transport::Channel>, tonic::Status> {
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        zaino_common::crypto::ensure_default_crypto_provider();
+        let client_tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(certificate_pem))
+            .domain_name(PRIVATE_SURFACE_DNS_NAME);
+        let channel = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
             .map_err(|_| tonic::Status::internal("endpoint"))?
+            .tls_config(client_tls)
+            .map_err(|_| tonic::Status::internal("client tls"))?
             .connect()
             .await
             .map_err(|_| tonic::Status::internal("connect"))?;
@@ -406,10 +494,11 @@ mod tests {
     /// to ship a client.
     async fn query_page_over_the_wire(
         address: SocketAddr,
+        certificate_pem: &str,
         envelope: Vec<u8>,
         key_epoch: u64,
     ) -> Result<private_proto::FixedEnvelope, tonic::Status> {
-        let mut client = connected_private_client(address).await?;
+        let mut client = connected_private_client(address, certificate_pem).await?;
         let codec = tonic_prost::ProstCodec::<
             private_proto::FixedEnvelope,
             private_proto::FixedEnvelope,
@@ -435,8 +524,9 @@ mod tests {
     /// prior bootstrap test called the adapter's `bootstrap` method directly.
     async fn bootstrap_client(
         address: SocketAddr,
+        certificate_pem: &str,
     ) -> Result<private_proto::BootstrapResponse, tonic::Status> {
-        let mut client = connected_private_client(address).await?;
+        let mut client = connected_private_client(address, certificate_pem).await?;
         let codec = tonic_prost::ProstCodec::<
             private_proto::BootstrapRequest,
             private_proto::BootstrapResponse,
@@ -455,31 +545,106 @@ mod tests {
     /// separate tasks and the client blocks on a response the server must send.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bound_listener_answers_one_exact_query() -> Result<(), Box<dyn std::error::Error>> {
-        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
-        let address = listener.local_addr();
-        assert_ne!(address.port(), 0);
+        let surface = ServedSurface::start::<_, ENVELOPE_BYTES>(
+            handler(),
+            session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+        )
+        .await?;
+        assert_ne!(surface.address.port(), 0);
 
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let served = tokio::spawn(async move {
-            listener
-                .serve::<_, ENVELOPE_BYTES>(
-                    handler(),
-                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
-                    async {
-                        let _ = stopped.await;
-                    },
-                )
-                .await
-        });
-
-        let response =
-            query_page_over_the_wire(address, vec![1, 2, 3, 4], FIXTURE_KEY_EPOCH).await?;
+        let response = query_page_over_the_wire(
+            surface.address,
+            &surface.certificate_pem,
+            vec![1, 2, 3, 4],
+            FIXTURE_KEY_EPOCH,
+        )
+        .await?;
 
         assert_eq!(response.envelope, RESPONSE);
 
-        let _ = stop.send(());
-        served.await??;
-        Ok(())
+        surface.shutdown().await
+    }
+
+    /// The fingerprint an operator publishes must be the one a wallet
+    /// computes from the certificate the handshake actually presented. A
+    /// value derived from anything but the served DER -- a stale copy, a
+    /// re-encode -- would be a pin that silently never matches.
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently
+    /// on separate tasks and the client blocks on the handshake the server
+    /// must complete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reported_fingerprint_is_the_certificate_that_is_served(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let surface = ServedSurface::start::<_, ENVELOPE_BYTES>(
+            handler(),
+            session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+        )
+        .await?;
+
+        // Pinning path: the client trusts only this certificate, so a
+        // successful call is proof the handshake presented it.
+        let response = query_page_over_the_wire(
+            surface.address,
+            &surface.certificate_pem,
+            vec![1, 2, 3, 4],
+            FIXTURE_KEY_EPOCH,
+        )
+        .await?;
+        assert_eq!(response.envelope, RESPONSE);
+
+        let served_der = pem_certificate_der(&surface.certificate_pem)?;
+        assert_eq!(
+            surface.fingerprint,
+            hex::encode(sha2::Sha256::digest(&served_der))
+        );
+
+        surface.shutdown().await
+    }
+
+    /// A client that pins a *different* generation's certificate must fail
+    /// the handshake. Without this, "the client trusts only this
+    /// certificate" above would be unproven -- a client that in fact trusted
+    /// anything would pass it just as well.
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently
+    /// on separate tasks and the client blocks on a handshake the server
+    /// must answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_certificate_from_another_start_is_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let surface = ServedSurface::start::<_, ENVELOPE_BYTES>(
+            handler(),
+            session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+        )
+        .await?;
+        let other_start = PrivateTlsIdentity::generate(FIXTURE_KEY_EPOCH)?;
+
+        // Restart is rotation, and this is what that costs a wallet: the
+        // fingerprint moved, so a pin from the previous process no longer
+        // matches. Trust-on-first-use is per process.
+        assert_ne!(other_start.fingerprint(), surface.fingerprint);
+        let refused = query_page_over_the_wire(
+            surface.address,
+            other_start.certificate_pem(),
+            vec![1, 2, 3, 4],
+            FIXTURE_KEY_EPOCH,
+        )
+        .await
+        .expect_err("a certificate this surface does not hold cannot be pinned to it");
+        assert_eq!(refused.message(), "connect");
+
+        surface.shutdown().await
+    }
+
+    /// Extracts the DER a PEM certificate block carries.
+    fn pem_certificate_der(pem: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        use base64::Engine as _;
+        let body: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        Ok(base64::engine::general_purpose::STANDARD.decode(body)?)
     }
 
     /// The real composed runtime -- real XChaCha20 lease, real replay journal
@@ -526,23 +691,15 @@ mod tests {
         let session_bootstrap = runtime.session_bootstrap();
         let key_epoch = session_bootstrap.key_epoch;
 
-        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
-        let address = listener.local_addr();
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let served = tokio::spawn(async move {
-            listener
-                .serve::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(
-                    runtime,
-                    session_bootstrap,
-                    async {
-                        let _ = stopped.await;
-                    },
-                )
-                .await
-        });
+        let surface = ServedSurface::start::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(
+            runtime,
+            session_bootstrap,
+        )
+        .await?;
 
         let status = query_page_over_the_wire(
-            address,
+            surface.address,
+            &surface.certificate_pem,
             vec![0; zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES],
             key_epoch,
         )
@@ -551,40 +708,31 @@ mod tests {
 
         assert_eq!(status.message(), "private query unavailable");
 
-        let _ = stop.send(());
-        served.await??;
-        Ok(())
+        surface.shutdown().await
     }
 
     /// A wrong-length envelope must be refused by the adapter, not by Tonic's
     /// decoder, and must reach the client as the surface's one failure.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_wrong_length_envelope_is_refused() -> Result<(), Box<dyn std::error::Error>> {
-        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
-        let address = listener.local_addr();
+        let surface = ServedSurface::start::<_, ENVELOPE_BYTES>(
+            handler(),
+            session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+        )
+        .await?;
 
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let served = tokio::spawn(async move {
-            listener
-                .serve::<_, ENVELOPE_BYTES>(
-                    handler(),
-                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
-                    async {
-                        let _ = stopped.await;
-                    },
-                )
-                .await
-        });
-
-        let status = query_page_over_the_wire(address, vec![1, 2, 3], FIXTURE_KEY_EPOCH)
-            .await
-            .expect_err("a short envelope is refused");
+        let status = query_page_over_the_wire(
+            surface.address,
+            &surface.certificate_pem,
+            vec![1, 2, 3],
+            FIXTURE_KEY_EPOCH,
+        )
+        .await
+        .expect_err("a short envelope is refused");
 
         assert_eq!(status.message(), "private query unavailable");
 
-        let _ = stop.send(());
-        served.await??;
-        Ok(())
+        surface.shutdown().await
     }
 
     /// Test-only symmetric transform standing in for the crate-private AEAD a
@@ -734,9 +882,6 @@ mod tests {
     /// send.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_wallet_bootstraps_then_queries() -> Result<(), Box<dyn std::error::Error>> {
-        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
-        let address = listener.local_addr();
-
         // Position-varying, not a uniform fill: a reversed, rotated, or
         // partially garbled key must be detectable. A uniform `[0x33; 32]`
         // fill would make byte position unobservable and let such an error
@@ -759,16 +904,9 @@ mod tests {
             profile_label: "test-profile",
         };
 
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let served = tokio::spawn(async move {
-            listener
-                .serve::<_, ENVELOPE_BYTES>(handler, session_bootstrap, async {
-                    let _ = stopped.await;
-                })
-                .await
-        });
+        let surface = ServedSurface::start::<_, ENVELOPE_BYTES>(handler, session_bootstrap).await?;
 
-        let bootstrap = bootstrap_client(address).await?;
+        let bootstrap = bootstrap_client(surface.address, &surface.certificate_pem).await?;
         assert_eq!(bootstrap.key_epoch, FIXTURE_KEY_EPOCH);
         let released = releasable_keys_from_wire(&bootstrap)?;
 
@@ -785,8 +923,13 @@ mod tests {
         assert_eq!(released.response_key, response_key);
 
         let sealed = seal_request(&released.request_key, sample_query());
-        let response =
-            query_page_over_the_wire(address, sealed.to_vec(), bootstrap.key_epoch).await?;
+        let response = query_page_over_the_wire(
+            surface.address,
+            &surface.certificate_pem,
+            sealed.to_vec(),
+            bootstrap.key_epoch,
+        )
+        .await?;
         let sealed_response: [u8; ENVELOPE_BYTES] = response
             .envelope
             .try_into()
@@ -795,9 +938,7 @@ mod tests {
 
         assert_eq!(opened, expected_page_for(sample_query()));
 
-        let _ = stop.send(());
-        served.await??;
-        Ok(())
+        surface.shutdown().await
     }
 
     /// A wallet that keeps querying under a retired key must learn to
@@ -812,31 +953,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_retired_epoch_is_actionable_rather_than_opaque(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
-        let address = listener.local_addr();
+        let surface = ServedSurface::start::<_, ENVELOPE_BYTES>(
+            handler(),
+            session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+        )
+        .await?;
 
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let served = tokio::spawn(async move {
-            listener
-                .serve::<_, ENVELOPE_BYTES>(
-                    handler(),
-                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
-                    async {
-                        let _ = stopped.await;
-                    },
-                )
-                .await
-        });
-
-        let status = query_page_over_the_wire(address, vec![1, 2, 3, 4], FIXTURE_KEY_EPOCH + 1)
-            .await
-            .expect_err("a stale key epoch must be refused");
+        let status = query_page_over_the_wire(
+            surface.address,
+            &surface.certificate_pem,
+            vec![1, 2, 3, 4],
+            FIXTURE_KEY_EPOCH + 1,
+        )
+        .await
+        .expect_err("a stale key epoch must be refused");
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(status.message(), "stale-key-epoch");
 
-        let _ = stop.send(());
-        served.await??;
-        Ok(())
+        surface.shutdown().await
     }
 }

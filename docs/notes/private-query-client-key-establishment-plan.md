@@ -28,7 +28,8 @@ so restart is rotation.
   factor rather than copy-paste.
 - Test attributes escalate only as the body justifies: `#[test]`, then
   `#[tokio::test]`, then `multi_thread` only when genuinely required.
-- **No new dependency without explicit approval.** Task 5 is gated on this.
+- **No new dependency without explicit approval.** Task 5's decision is
+  recorded there: `rcgen` with the `aws_lc_rs` feature, approved.
 - Wire conversions use named methods, never `impl From`/`TryFrom` on `proto::`
   types. CI lints this.
 - Every task ends green: `cargo test -p zaino-oram -p zainod-oram`,
@@ -386,30 +387,105 @@ git commit -m "Serve the current key epoch and releasable keys over bootstrap"
 
 ---
 
-### Task 5: TLS — GATED ON A DEPENDENCY DECISION
+### Task 5: TLS on the private listener — DONE
 
-**Do not start this task until the dependency question is answered.**
+The dependency question this task was gated on has been answered: **add
+`rcgen`**, built against **aws-lc-rs**, not ring. The workspace standardised on
+aws-lc-rs in ADR 0006 and already carries `aws-lc-rs 1.17.1`, so the ring
+alternative would have contradicted the ADR *and* added a second crypto
+backend. The operator-supplied-PEM alternative was rejected: it puts the TLS
+private key in the operator's hands, which is precisely the custody question
+ADR 0010 avoids and ADR 0007's "generates its TLS identity internally" rules
+out.
 
-The spec says the workload generates its TLS identity internally at startup.
-`rustls` 0.23 and tonic's TLS features are already in the tree via
-`zaino-serve`, but **no certificate-generation crate is present** — `rcgen` is
-absent from `Cargo.lock`. This repo requires explicit approval for new
-dependency edges.
+**Manifest** (`packages/zainod-oram/Cargo.toml`, added with `cargo add`):
 
-Two ways forward, to be decided before implementing:
+```toml
+rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs"], optional = true }
+base64 = { workspace = true, optional = true }
+```
 
-- **Add `rcgen`.** Matches the spec and ADR 0007's "generates its TLS identity
-  internally". Adds a new crate and its transitive graph.
-- **Operator-supplied PEM cert and key.** No new dependency for generation, and
-  defensible under ADR 0010 specifically because the operator is not the
-  adversary — but it departs from ADR 0007's wording, and the operator then
-  holds the TLS private key. Note this still likely needs `rustls-pemfile`,
-  which is also absent, so confirm before assuming it is dependency-free.
+with `dep:rcgen`, `dep:base64` and `tonic/tls-aws-lc` folded into the
+`private-service` feature.
 
-Whichever is chosen, the remainder is the same: terminate TLS on the private
-listener, write the certificate fingerprint to stdout and to a file in the
-deployment directory, and document the pinning story. Tasks 1-4 and 6 do not
-depend on this and can land first.
+Crates **actually compiled** that were not compiled before: `rcgen` and
+`yasna`. `base64` was already a workspace dependency and is only newly
+*referenced* here. `Cargo.lock` additionally gained nine entries it never
+builds — `x509-parser` and its tree (`asn1-rs`, `asn1-rs-derive`,
+`asn1-rs-impl`, `der-parser`, `oid-registry`, `rusticata-macros`, `bit-vec`,
+`data-encoding`, `untrusted 0.7.1`). That is a lock artifact, not a build edge:
+rcgen's `aws_lc_rs` feature *names* `x509-parser?/verify-aws`, and Cargo's
+resolver records every dependency an enabled feature names even when the weak
+`?` means feature resolution never activates it. `cargo tree -p zainod-oram
+--features private-service` shows none of them. No feature selection avoids
+this while keeping aws-lc-rs.
+
+`pem` was deliberately **not** enabled. rcgen's `pem` feature would pull the
+`pem` crate purely to base64-wrap DER; `pem_block` in
+`packages/zainod-oram/src/private_service/tls.rs` does that in one shared
+function over the `base64` encoder the workspace already has, used for both the
+certificate and the key.
+
+**What was built:**
+
+- `packages/zainod-oram/src/private_service/tls.rs` — `PrivateTlsIdentity`.
+  `generate(key_epoch)` mints a self-signed ECDSA P-256 identity in-process.
+  The private key is held only inside the value: no accessor, absent from
+  `Debug`, never written to disk.
+- `PrivateQueryListener::serve` now takes `&PrivateTlsIdentity` and calls
+  `Server::builder().tls_config(...)`, after
+  `zaino_common::crypto::ensure_default_crypto_provider()` — the same
+  process-level rustls provider install the public gRPC server needs
+  (zingolabs/zaino#1360). The identity is a required argument, not an
+  `Option`, so serving this surface in cleartext is unrepresentable.
+- Everything the listener already did is untouched: the 32-permit connection
+  semaphore whose permit rides with the connection, `concurrency_limit_per_connection(1)`,
+  the per-route decode caps, and the uniform refusal. TLS wraps the transport
+  and sits above the same accepted-connection stream.
+- `run_private_serve` mints the identity from the same key epoch the envelope
+  keys were drawn under, *before* binding and long before chain replay, writes
+  the fingerprint record to stdout, and publishes it to
+  `<replay_journal_dir>/private-tls-fingerprint.txt`.
+
+**Where the key epoch went, and why: a SAN, not the subject.** The certificate
+carries two dNSName SANs — `private-query.zaino.invalid` (the name a wallet
+verifies against; `.invalid` per RFC 6761 because this identity is pinned or
+attested, never resolved) and `key-epoch-<n>.private-query.zaino.invalid`. A
+SAN is the field TLS stacks parse and expose, so a wallet reads the epoch off
+the presented certificate through its own TLS library with no X.509 subject
+parsing. Modern name verification (RFC 6125) ignores the subject common name
+entirely, so an epoch placed there would be invisible to exactly the code that
+needs it. A second SAN also composes: it sits beside the verified name rather
+than replacing it.
+
+**The pinning reality, stated as the code and the operator warning state it.**
+The certificate regenerates on every start, bound to that start's key epoch.
+That is deliberate and consistent — the symmetric keys are already ephemeral
+and restart is rotation, so a persistent certificate would be the one durable
+secret in a design that has none, and would have to live somewhere an
+honest-but-curious operator can read it. The cost: pinning this fingerprint is
+**trust-on-first-use for the lifetime of one process**. It attests nothing
+about which binary is running, and after a restart the fingerprint changes and
+a wallet cannot distinguish rotation from substitution. `run_private_serve`
+prints that in full on stderr next to the fingerprint. Attestation is what
+closes the gap; ADR 0010 defers it.
+
+**Tests** (all green):
+
+- `a_bound_listener_answers_one_exact_query`, `a_wallet_bootstraps_then_queries` —
+  a real client completes a real TLS handshake and calls `BootstrapSession` and
+  `QueryPage` through it.
+- `the_reported_fingerprint_is_the_certificate_that_is_served` — the published
+  fingerprint is SHA-256 over the DER the handshake presented.
+- `a_certificate_from_another_start_is_refused` — a pin from a different start
+  fails the handshake, which is both the restart-rotation behaviour and the
+  proof the client above trusted *only* the served certificate.
+- `two_starts_mint_different_identities` — two separately started runtimes
+  produce different certificates under the same epoch, so the difference comes
+  from a fresh key draw.
+- The pre-existing connection-cap and decode-cap tests still pass; the five
+  serving tests now run over TLS through one shared `ServedSurface` helper
+  (bind port 0, mint, spawn, stop off the served task — no fixed sleeps).
 
 ---
 

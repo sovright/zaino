@@ -107,7 +107,7 @@ mod private_proto;
 #[cfg(feature = "private-service")]
 mod private_service;
 #[cfg(feature = "private-service")]
-use crate::private_service::PrivateQueryListener;
+use crate::private_service::{PrivateQueryListener, PrivateTlsIdentity};
 #[cfg(feature = "typed-qualification")]
 mod qualification_artifact;
 #[cfg(feature = "typed-qualification")]
@@ -1409,6 +1409,26 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         EphemeralKeyGeneration::draw().map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
     let shape = private_projection_shape(&capture, &sizing, key_generation.key_epoch)?;
 
+    // Minted from the same key epoch as the envelope keys, and minted here --
+    // before the bind and long before the chain replay -- so a workload that
+    // cannot produce an identity fails immediately rather than after paying
+    // for a full replay. Restart is rotation for this identity exactly as it
+    // is for the keys: the fingerprint below moves every start.
+    let tls = PrivateTlsIdentity::generate(key_generation.key_epoch)?;
+    let fingerprint_path = tls.publish_fingerprint(&args.replay_journal_dir)?;
+    print!("{}", tls.fingerprint_record());
+    println!(
+        "private_tls_fingerprint_file={}",
+        fingerprint_path.display()
+    );
+    eprintln!(
+        "NOTE: this certificate is generated fresh on every start, so pinning its \
+         fingerprint is trust-on-first-use for the lifetime of THIS process only. It \
+         attests to nothing about which binary is running; after a restart the \
+         fingerprint changes and a wallet cannot distinguish rotation from \
+         substitution. Attestation replaces pinning (docs/adr/0010)."
+    );
+
     let listener = PrivateQueryListener::bind(args.listen_address).await?;
     let listening_on = listener.local_addr();
 
@@ -1424,6 +1444,7 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         shape,
         key_generation.keys,
         &args.replay_journal_dir,
+        &tls,
     )
     .await;
     service.close();
@@ -1505,6 +1526,7 @@ async fn serve_private_surface(
     shape: PrivateProjectionShape,
     keys: PrivateRuntimeKeys,
     replay_journal_dir: &Path,
+    tls: &PrivateTlsIdentity,
 ) -> RunnerResult<()> {
     let (projection, _source_snapshot) = replay_preverified_snapshot(
         service,
@@ -1556,7 +1578,7 @@ async fn serve_private_surface(
         "private_surface_listening={listening_on},committed_height:{committed_height},envelope_bytes:{PRIVATE_MAINNET_ENVELOPE_BYTES}"
     );
     listener
-        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(runtime, session_bootstrap, async {
+        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(runtime, session_bootstrap, tls, async {
             // A failed signal registration must stop the server rather than
             // leave it serving with no way to be asked to stop.
             if let Err(error) = tokio::signal::ctrl_c().await {

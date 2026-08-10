@@ -70,10 +70,37 @@ so adding verification later is not a breaking wire change. Until then the
 wallet trusts the operator's deployment rather than verifying it, and the
 documentation must say exactly that.
 
-For TLS the workload generates its identity internally at startup. It writes
-the certificate fingerprint to stdout and to a file in the deployment
-directory, so an operator has something concrete to publish and a wallet has
-something concrete to pin. Attestation replaces pinning later.
+For TLS the workload generates its identity internally at startup, and this is
+now built (`packages/zainod-oram/src/private_service/tls.rs`). At start the
+process mints a self-signed ECDSA P-256 certificate with `rcgen` over
+aws-lc-rs; the private key is drawn in-process, is held only inside
+`PrivateTlsIdentity`, and is never written to disk or exposed by any accessor
+or `Debug` rendering. `PrivateQueryListener::serve` terminates on it, and takes
+it as a required argument rather than an `Option`, so a cleartext private
+surface is unrepresentable.
+
+The certificate is bound to the key epoch through a second dNSName SAN,
+`key-epoch-<n>.private-query.zaino.invalid`, beside the name a wallet verifies
+against, `private-query.zaino.invalid`. A SAN rather than the subject: RFC 6125
+verification ignores the subject common name, so an epoch placed there would be
+invisible to the code that needs it, whereas a SAN is exposed by every TLS
+stack. The `.invalid` TLD (RFC 6761) is deliberate — this identity is pinned or
+attested, never resolved.
+
+The process writes the fingerprint (SHA-256 over the served DER, hex) to stdout
+and to `<replay_journal_dir>/private-tls-fingerprint.txt`, so an operator has
+something concrete to publish and a wallet has something concrete to pin.
+
+**Say exactly what that pin is worth.** Because the certificate is minted fresh
+on every start — restart is rotation for the TLS identity just as it is for the
+symmetric keys, and a persistent certificate would be the one durable secret in
+a design that has none — pinning it is trust-on-first-use **for the lifetime of
+one process**. A wallet that pins learns only that it is still talking to the
+process it first talked to. It learns nothing about which binary that process
+is running, and after a restart the fingerprint changes, which the wallet
+cannot distinguish from being handed a different server. The runner prints that
+caveat on stderr beside the fingerprint. Attestation replaces pinning later;
+until it lands this is exactly as strong as trusting the operator's deployment.
 
 ### Restart is rotation
 
