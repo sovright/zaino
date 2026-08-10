@@ -555,7 +555,7 @@ const MAINNET_EVENT_PROBES: usize = 4;
 
 /// Logical store calls per query: one directory probe set plus one probe set
 /// per scanned slot.
-const MAINNET_STORE_READS: usize =
+pub(super) const MAINNET_STORE_READS: usize =
     MAINNET_DIRECTORY_PROBES + MAINNET_EVENT_PROBES * MAINNET_QUERY_SLOTS;
 
 /// Fixed protected envelope width.
@@ -585,16 +585,23 @@ pub(super) fn mainnet_utxo_history_profile() -> Result<PrivacyProfile, PrivacyPr
         label: "zaino.private.mainnet.utxo-history.v1",
         store_reads: MAINNET_STORE_READS,
         padded_input_slots: 1,
-        // UNMEASURED. Set to match the finalized width by symmetry, not from
-        // evidence. The Gate 1 capture records only `max_per_address_delta_events`
-        // per rebuild interval (153,037 at 288 blocks), which is the same outlier
-        // address the finalized width deliberately ignores. `hybrid_sizing` now
-        // retains the per-address delta distribution alongside those maxima, so
-        // grounding this needs only a rescan against a node at the capture
-        // height to populate `per_address_delta_event_histogram`; the committed
-        // capture predates the field and carries it empty. Until that rescan
-        // this is the one dimension of the identifier below not backed by a
-        // measurement.
+        // KNOWN INSUFFICIENT FOR MAINNET, not merely unmeasured, and a rescan
+        // will not ground it. The recent snapshot is one flat all-address
+        // array, so the capacity it must cover is the widest generation's
+        // *total* delta events — 1,386,025 for the selected 288-block interval
+        // in the Gate 1 capture — and not the 153,037 per-address maximum,
+        // which is the wrong marginal for a shared array. Populating
+        // `per_address_delta_event_histogram` therefore cannot size this
+        // dimension; that distribution sizes `response_slots` instead.
+        // `scan_width::mainnet_recent_snapshot_scan_width` computes this width
+        // from the capture and returns `Unserviceable`: the engine's
+        // recent-snapshot scan is quadratic in the width, so covering that
+        // demand costs roughly 6.0e12 slot pairings per request against a
+        // budget of 1.6e6. No constant fixes this. Until the recent-state
+        // structure changes, this width serves only chains whose generations
+        // stay under it and fails closed on mainnet, which is consistent with
+        // `hybrid_sizing::EvidenceScope` asserting no mainnet readiness.
+        // See docs/notes/recent-snapshot-scan-width.md.
         recent_snapshot_scan_slots: MAINNET_QUERY_SLOTS,
         response_slots: MAINNET_QUERY_SLOTS,
         envelope_bytes: MAINNET_ENVELOPE_BYTES,
