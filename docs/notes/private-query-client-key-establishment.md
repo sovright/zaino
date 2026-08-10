@@ -79,8 +79,8 @@ aws-lc-rs; the private key is drawn in-process, is held only inside
 argument rather than an `Option`, so a cleartext private surface is
 unrepresentable.
 
-The certificate and its key are **persisted** in the deployment directory and
-reused on every subsequent start. This is the one thing here that deliberately
+The certificate and its key are **persisted** in a dedicated TLS identity
+directory and reused on every subsequent start. This is the one thing here that deliberately
 does not follow "restart is rotation", and the reason is the section below it:
 a wallet whose *keys* went stale is told so — the cleartext `key_epoch` earns
 it `StaleKeyEpoch` and it re-bootstraps — but that recovery path runs *above*
@@ -97,6 +97,31 @@ key — never an implicit consequence of a restart. A damaged, unreadable, or
 half-present identity **fails closed** with a typed error naming the file:
 silently regenerating would break every wallet's pin with no signal at all,
 which is the failure mode this whole arrangement exists to avoid.
+
+### The identity directory is a sibling of the replay journal, never inside it
+
+`--tls-identity-dir` selects it, defaulting to `<replay-journal-dir>-tls-identity`
+— a sibling, deliberately not a subdirectory. Wiping the replay journal to
+reset replay state is a routine, legitimate operator action; if the identity
+lived under the journal, `rm -rf <journal-dir>` would silently destroy every
+wallet's trust anchor, with no warning and no obvious causal link between "I
+reset replay state" and "every client can no longer connect". That is worse
+than the rotating certificate this design replaced, which at least broke pins
+predictably. A subdirectory would not help — it is exactly what a recursive
+delete of the parent takes with it — so the default is a sibling, and an
+explicit `--tls-identity-dir` inside the journal is refused with an error
+saying why.
+
+The default is derived from the journal directory's own name rather than being
+a fixed name beside it, so two deployments sharing a parent cannot collide on
+one identity and unknowingly serve each other's certificate.
+
+Earlier builds co-located the identity with the journal. Upgrading in place
+does **not** silently mint a new certificate over that: if the new location is
+empty while the old one holds an identity, the runner fails closed and names
+both directories. Migration is a move of three files —
+`private-tls-cert.pem`, `private-tls-key.pem`, `private-tls-fingerprint.txt` —
+and every existing pin survives it.
 
 The cost is a private key at rest on disk, readable by the operator. That is
 acceptable *specifically* under ADR 0010's interim posture, where the operator
@@ -120,7 +145,7 @@ and `profile_label` is documented in the proto as diagnostic and explicitly not
 for pinning.
 
 The process writes the fingerprint (SHA-256 over the served DER, hex) to stdout
-and to `<replay_journal_dir>/private-tls-fingerprint.txt`, so an operator has
+and to `private-tls-fingerprint.txt` in the identity directory, so an operator has
 something concrete to publish and a wallet has something concrete to pin. On a
 later start the published record is checked rather than overwritten: a
 disagreement with the certificate on disk means the pair is not what operators

@@ -24,10 +24,18 @@
 //! lifetime looks consistent and is not: they are separate concerns, and the
 //! layer that can explain itself is the one that should be allowed to change.
 //!
-//! So the certificate and its key are written to the deployment directory on
-//! first start and reused on every start after. Rotation is an explicit
-//! operator action -- delete the files -- never an implicit consequence of a
-//! restart.
+//! So the certificate and its key are written to this deployment's TLS
+//! identity directory on first start and reused on every start after. Rotation
+//! is an explicit operator action -- delete the files -- never an implicit
+//! consequence of a restart.
+//!
+//! That directory is deliberately *not* the replay journal's, and the runner
+//! refuses one nested inside it. Wiping the journal to reset replay state is a
+//! routine operator action; if it also deleted the identity it would break
+//! every wallet's pin with no warning and no obvious causal link -- worse than
+//! the rotating certificate this replaced, which at least broke pins
+//! predictably. See `require_no_stranded_identity` for the in-place upgrade
+//! path from the earlier co-located layout.
 //!
 //! # What that costs: a private key at rest
 //!
@@ -79,7 +87,7 @@ use tonic::transport::{Identity, ServerTlsConfig};
 /// wallet to trust DNS for something DNS cannot establish here.
 pub(crate) const PRIVATE_SURFACE_DNS_NAME: &str = "private-query.zaino.invalid";
 
-/// Basename of the fingerprint file published into the deployment directory.
+/// Basename of the fingerprint file published into the identity directory.
 pub(crate) const FINGERPRINT_FILE_NAME: &str = "private-tls-fingerprint.txt";
 /// Basename of the persisted certificate. Public; safe to read or copy.
 const CERTIFICATE_FILE_NAME: &str = "private-tls-cert.pem";
@@ -121,12 +129,12 @@ impl PrivateTlsIdentity {
     /// it would break every wallet's pin with no signal, which is the exact
     /// failure the persisted identity exists to prevent. Rotation is deleting
     /// both files, on purpose, by hand.
-    pub(crate) fn load_or_generate(deployment_dir: &Path) -> Result<Self, PrivateTlsError> {
-        std::fs::create_dir_all(deployment_dir).map_err(|_| PrivateTlsError::Unwritable {
-            path: deployment_dir.to_path_buf(),
+    pub(crate) fn load_or_generate(identity_dir: &Path) -> Result<Self, PrivateTlsError> {
+        std::fs::create_dir_all(identity_dir).map_err(|_| PrivateTlsError::Unwritable {
+            path: identity_dir.to_path_buf(),
         })?;
-        let certificate_path = deployment_dir.join(CERTIFICATE_FILE_NAME);
-        let key_path = deployment_dir.join(PRIVATE_KEY_FILE_NAME);
+        let certificate_path = identity_dir.join(CERTIFICATE_FILE_NAME);
+        let key_path = identity_dir.join(PRIVATE_KEY_FILE_NAME);
         match (certificate_path.exists(), key_path.exists()) {
             (true, true) => Self::load(&certificate_path, &key_path),
             (false, false) => Self::generate_into(&certificate_path, &key_path),
@@ -224,7 +232,7 @@ impl PrivateTlsIdentity {
     /// The public half, PEM encoded.
     ///
     /// Safe to publish -- it is exactly what any handshake presents, and it
-    /// sits in the deployment directory unrestricted -- but nothing in
+    /// sits in the identity directory unrestricted -- but nothing in
     /// production hands it out: a wallet obtains it from the handshake and
     /// checks it against the published fingerprint. `cfg(test)` so it stays
     /// that way; this is the wallet's side of the pinning path in the
@@ -244,7 +252,7 @@ impl PrivateTlsIdentity {
             .timeout(HANDSHAKE_TIMEOUT)
     }
 
-    /// Publishes the fingerprint into `deployment_dir` and reports the path.
+    /// Publishes the fingerprint into `identity_dir` and reports the path.
     ///
     /// If a record is already there it is checked, not overwritten: a
     /// disagreement between the published fingerprint and the loaded
@@ -254,12 +262,12 @@ impl PrivateTlsIdentity {
     /// key are written once, by [`Self::load_or_generate`].
     pub(crate) fn publish_fingerprint(
         &self,
-        deployment_dir: &Path,
+        identity_dir: &Path,
     ) -> Result<PathBuf, PrivateTlsError> {
-        std::fs::create_dir_all(deployment_dir).map_err(|_| PrivateTlsError::Unwritable {
-            path: deployment_dir.to_path_buf(),
+        std::fs::create_dir_all(identity_dir).map_err(|_| PrivateTlsError::Unwritable {
+            path: identity_dir.to_path_buf(),
         })?;
-        let path = deployment_dir.join(FINGERPRINT_FILE_NAME);
+        let path = identity_dir.join(FINGERPRINT_FILE_NAME);
         let record = self.fingerprint_record();
         if path.exists() {
             let published = read_to_string(&path)?;
@@ -293,6 +301,38 @@ impl fmt::Debug for PrivateTlsIdentity {
             .field("fingerprint", &self.fingerprint)
             .finish_non_exhaustive()
     }
+}
+
+/// Refuses to mint a fresh identity while one sits at a superseded location.
+///
+/// The identity used to live in the replay-journal directory, and moved out of
+/// it so that wiping the journal could not take every wallet's trust anchor
+/// with it. That move leaves one dangerous window: a deployment upgraded
+/// in place would find the new location empty, mint a new certificate, and
+/// silently break every pin -- with the old, correct identity sitting
+/// untouched a directory away. This closes it.
+///
+/// Only fires when the new location has *no* identity: once one is there it is
+/// authoritative, and an operator who migrated by copying rather than moving
+/// is not blocked forever.
+pub(crate) fn require_no_stranded_identity(
+    identity_dir: &Path,
+    superseded_dir: &Path,
+) -> Result<(), PrivateTlsError> {
+    if identity_dir.join(CERTIFICATE_FILE_NAME).exists()
+        || identity_dir.join(PRIVATE_KEY_FILE_NAME).exists()
+    {
+        return Ok(());
+    }
+    if superseded_dir.join(CERTIFICATE_FILE_NAME).exists()
+        || superseded_dir.join(PRIVATE_KEY_FILE_NAME).exists()
+    {
+        return Err(PrivateTlsError::Stranded {
+            superseded: superseded_dir.to_path_buf(),
+            expected: identity_dir.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// Validates one certificate name at the X.509 boundary.
@@ -510,6 +550,13 @@ pub(crate) enum PrivateTlsError {
         /// The published record that disagrees.
         path: PathBuf,
     },
+    /// An identity is still at the superseded co-located location.
+    Stranded {
+        /// Where the identity actually is.
+        superseded: PathBuf,
+        /// Where this build looks for it.
+        expected: PathBuf,
+    },
 }
 
 impl fmt::Display for PrivateTlsError {
@@ -546,6 +593,13 @@ impl fmt::Display for PrivateTlsError {
                 f,
                 "published fingerprint in {} does not match the certificate on disk; one of them is not what operators told wallets to expect",
                 path.display()
+            ),
+            Self::Stranded { superseded, expected } => write!(
+                f,
+                "a TLS identity is still in {}, where earlier builds co-located it with the replay journal, while {} has none. Refusing to mint a new one: that would break every wallet's pin while the correct identity sat untouched. Move {CERTIFICATE_FILE_NAME}, {PRIVATE_KEY_FILE_NAME} and {FINGERPRINT_FILE_NAME} into {} to keep every pin, or delete them to rotate deliberately",
+                superseded.display(),
+                expected.display(),
+                expected.display()
             ),
         }
     }
@@ -720,6 +774,47 @@ mod tests {
         // The certificate outlives many key epochs, so a baked-in one would
         // be wrong from the next restart onward.
         assert!(!contains_subslice(&der, b"key-epoch"));
+        Ok(())
+    }
+
+    /// Upgrading in place must not mint over a pin that is still good one
+    /// directory away.
+    #[test]
+    fn an_identity_stranded_at_the_superseded_location_is_refused(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let superseded = tempfile::TempDir::new()?;
+        let identity_dir = tempfile::TempDir::new()?;
+        let stranded = persisted(superseded.path())?;
+
+        let error = require_no_stranded_identity(identity_dir.path(), superseded.path())
+            .expect_err("an identity left at the old location must not be minted over");
+        let rendered = error.to_string();
+        assert!(rendered.contains(&superseded.path().display().to_string()));
+        assert!(rendered.contains(&identity_dir.path().display().to_string()));
+        assert!(rendered.contains(CERTIFICATE_FILE_NAME));
+
+        // Migrating is a move of the named files, and then it is quiet again
+        // -- and the pin the wallet holds is unchanged.
+        for name in [
+            CERTIFICATE_FILE_NAME,
+            PRIVATE_KEY_FILE_NAME,
+            FINGERPRINT_FILE_NAME,
+        ] {
+            let from = superseded.path().join(name);
+            if from.exists() {
+                std::fs::rename(from, identity_dir.path().join(name))?;
+            }
+        }
+        require_no_stranded_identity(identity_dir.path(), superseded.path())?;
+        assert_eq!(
+            persisted(identity_dir.path())?.fingerprint(),
+            stranded.fingerprint()
+        );
+
+        // A genuinely fresh deployment is not blocked by either directory
+        // being empty.
+        let fresh = tempfile::TempDir::new()?;
+        require_no_stranded_identity(fresh.path(), superseded.path())?;
         Ok(())
     }
 

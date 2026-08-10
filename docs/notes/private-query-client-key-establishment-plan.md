@@ -442,11 +442,12 @@ certificate and the key.
   semaphore whose permit rides with the connection, `concurrency_limit_per_connection(1)`,
   the per-route decode caps, and the uniform refusal. TLS wraps the transport
   and sits above the same accepted-connection stream.
-- `run_private_serve` loads or mints the identity *before* binding and long
-  before chain replay, so a damaged one fails immediately rather than after a
-  full replay is paid for. It writes the fingerprint record to stdout and
-  publishes it to `<replay_journal_dir>/private-tls-fingerprint.txt`, checking
-  rather than overwriting a record a previous start left.
+- `run_private_serve` resolves the identity directory, refuses one inside the
+  journal, refuses to mint over a stranded one, then loads or mints — all
+  *before* binding and long before chain replay, so any of those fails
+  immediately rather than after a full replay is paid for. It writes the
+  fingerprint record to stdout and publishes it into the identity directory,
+  checking rather than overwriting a record a previous start left.
 
 **The certificate persists across restarts.** An earlier revision of this task
 minted a fresh certificate on every start, tied to the key epoch for
@@ -459,10 +460,35 @@ distinguish rotation from substitution. That is the same anti-pattern the
 cleartext `key_epoch` removed, reintroduced one layer down. Certificate
 lifetime and key lifetime are separate concerns.
 
-So `PrivateTlsIdentity::load_or_generate(deployment_dir)` mints on first start
+So `PrivateTlsIdentity::load_or_generate(identity_dir)` mints on first start
 and reuses thereafter, persisting `private-tls-cert.pem` and
-`private-tls-key.pem` beside the fingerprint. Rotation is an explicit operator
-action — delete both files — never a side effect of a restart.
+`private-tls-key.pem` beside the published fingerprint. Rotation is an explicit
+operator action — delete both files — never a side effect of a restart.
+
+**The identity directory is a sibling of the replay journal, never inside it.**
+`--tls-identity-dir` selects it and defaults to
+`<replay-journal-dir>-tls-identity`. Co-locating it with the journal would have
+undone the whole rework: wiping the journal to reset replay state is a routine
+operator action, and `rm -rf <journal-dir>` would have taken every wallet's
+trust anchor with it — no warning, no obvious causal link, and strictly worse
+than the rotating certificate this replaced, which at least broke pins
+predictably. A *subdirectory* of the journal is no better, since that is
+exactly what a recursive delete of the parent removes, so the default is a
+sibling and an explicit `--tls-identity-dir` inside the journal is refused with
+`PrivateTlsIdentityDirInsideJournal`. The default is derived from the journal
+directory's own name, not a fixed name beside it, so two deployments sharing a
+parent cannot collide on one identity and unknowingly serve each other's
+certificate.
+
+**Migration from the co-located layout is cheap, and is not silent.** If the
+identity directory is empty while the journal directory still holds a
+certificate or key, `require_no_stranded_identity` fails closed and names both
+directories: minting there would break every pin while the correct identity sat
+untouched a directory away. Migrating is `mv` of three files —
+`private-tls-cert.pem`, `private-tls-key.pem`, `private-tls-fingerprint.txt` —
+after which every existing pin still validates. (In practice this is
+pre-release and there is nothing deployed to migrate; the guard exists so that
+statement never has to be trusted.)
 
 **It fails closed, never regenerates.** A damaged, unreadable, half-present, or
 over-permissive identity is a typed `PrivateTlsError` naming the file and what
@@ -531,6 +557,16 @@ who is already capped at 32 connections.
 - `publishing_is_idempotent_and_catches_a_disagreeing_record` — a restart
   republishes silently; a record that disagrees with the certificate on disk is
   an error.
+- `the_default_tls_identity_directory_is_a_sibling_of_the_journal` — the
+  default is outside the journal, shares its parent, and is distinct per
+  journal directory.
+- `a_tls_identity_directory_inside_the_journal_is_refused` — both the
+  subdirectory and the identical-path cases.
+- `an_identity_stranded_at_the_superseded_location_is_refused` — an in-place
+  upgrade fails closed, the three-file move fixes it, and the fingerprint after
+  migrating is the one wallets already pinned.
+- `the_private_serve_cli_defaults_the_tls_identity_directory` — the common path
+  needs no new flag.
 - The pre-existing connection-cap and decode-cap tests still pass; the five
   serving tests now run over TLS through one shared `ServedSurface` helper
   (bind port 0, mint, spawn, stop off the served task — no fixed sleeps).

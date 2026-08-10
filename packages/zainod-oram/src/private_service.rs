@@ -12,7 +12,7 @@ mod tls;
 mod tonic_body;
 
 pub(crate) use listener::PrivateQueryListener;
-pub(crate) use tls::PrivateTlsIdentity;
+pub(crate) use tls::{require_no_stranded_identity, PrivateTlsIdentity};
 
 /// Exact application envelope after validation at the private wire boundary.
 struct ValidatedFixedEnvelope<const N: usize> {
