@@ -2589,8 +2589,8 @@ mod tests {
     use crate::{
         canonical_chain::CanonicalNetwork,
         scan_width::{
-            per_address_pagination_coverage, recent_snapshot_scan_width, ScanWidthDecision,
-            ScanWidthError, ScanWidthPolicy,
+            per_address_pagination_coverage, recent_snapshot_scan_width, JoinStrategy,
+            ScanWidthDecision, ScanWidthError, ScanWidthPolicy,
         },
         zaino_corpus::MainnetCorpusScanner,
         zaino_fixtures::{indexed_block, output, transaction},
@@ -3316,7 +3316,8 @@ mod tests {
         let measured = report.selected_recent_snapshot_demand()?;
         let policy = ScanWidthPolicy::new(4, 1_000_000, 0)?;
 
-        let narrow = recent_snapshot_scan_width(measured, policy)?;
+        let narrow =
+            recent_snapshot_scan_width(measured, policy, JoinStrategy::NestedLoopRelation)?;
         let doubled = recent_snapshot_scan_width(
             RecentSnapshotDemand::new(
                 measured.interval_blocks(),
@@ -3326,6 +3327,7 @@ mod tests {
                     .ok_or("doubled fixture demand overflowed")?,
             ),
             policy,
+            JoinStrategy::NestedLoopRelation,
         )?;
 
         let (ScanWidthDecision::Serviceable(narrow), ScanWidthDecision::Serviceable(doubled)) =

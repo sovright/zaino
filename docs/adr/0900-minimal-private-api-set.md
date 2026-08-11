@@ -40,8 +40,11 @@ We decide:
 1. **The minimal private set is three operations**, not one:
 
    - **address → UTXOs.** Implemented as `QueryPage`.
-   - **address → txids.** Not implemented. UTXOs are unspent-only, so history
-     and spend detection cannot be derived from them.
+   - **address → txids.** Not implemented, but not new storage: the served
+     UTXO result is unspent-only, so history and spend detection cannot be
+     derived from *it* — yet the stored event history it is folded from retains
+     both `Created` and `Spent` events, each carrying its txid. This operation
+     is a second fold over that same history. See the consequences below.
    - **txid → transaction.** Not implemented. Without it, the previous
      operation returns identifiers a wallet cannot use without leaking which
      one it cared about.
@@ -70,18 +73,43 @@ We decide:
 
 ## Consequences
 
-- **The privacy machinery covers one third of the minimal set.** Everything
-  built so far — the fixed envelope, the data-independent engine, the release
-  schedule, the replay journal, key establishment — serves one operation.
-- **The remaining two are not free, and the second is keyed differently.**
-  address → txids is another address-keyed projection with its own width and
-  sizing problem. txid → transaction cannot use the current projection at all:
-  it is address-keyed and cannot answer a txid-keyed question, so it needs a
-  separate index with its own capacity, publication and qualification story.
-- **Mainnet sizing was scoped to one projection.** The unservable-width finding
-  in `docs/notes/recent-snapshot-scan-width.md` concerns the address→UTXO
-  projection alone. A usable wallet needs at least two, so the cost question is
-  larger than that note currently frames it.
+- **The privacy machinery serves one operation of three, but its storage
+  reaches two.** Everything built so far — the fixed envelope, the
+  data-independent engine, the release schedule, the replay journal, key
+  establishment — is wired to one operation. The stored projection underneath
+  it already holds what a second one needs, per the next point.
+- **Only one of the remaining two needs new storage.** address → txids is *not*
+  a second projection. The store already retains what it needs: `UtxoEvent`
+  carries `txid` and a `UtxoEventKind` of `Created` or `Spent`, and the stored
+  per-address history retains events of both kinds. `finalized_live_utxo_at`
+  folds exactly that history down to live UTXOs at read time, discarding the
+  spends on the way out. address → txids is a different fold over the same
+  stored history — same projection, same `store_reads`, same scan width — and
+  needs no new key, no new capacity and no new publication path.
+
+  txid → transaction is the genuinely new one. It cannot use the current
+  projection at all: the projection is address-keyed and cannot answer a
+  txid-keyed question, so it needs a separate index with its own capacity,
+  publication and qualification story.
+- **Mainnet sizing is not scoped more narrowly than the wallet needs.** The
+  unservable-width finding in `docs/notes/recent-snapshot-scan-width.md` is
+  stated for the address-keyed projection, and by the point above that
+  projection serves two of the three operations, not one. Fixing the width
+  fixes it for both. An earlier revision of this ADR claimed the cost question
+  was larger than that note frames it; that claim was wrong and is withdrawn.
+
+  One real marginal remains, and it is a pagination cost rather than a width
+  cost: the txid fold returns more rows per address than the UTXO fold, because
+  it keeps spends and because an output created and spent inside the window
+  contributes two txids where it contributes no live UTXO. That sizes
+  `response_slots`, which the per-address delta-event histogram already
+  measures via `scan_width::per_address_pagination_coverage`. Because
+  `store_reads = directory_probes + event_probes * response_slots`, a deeper
+  page does raise per-query cost — but through a dimension that has measured
+  evidence behind it, not through the unmeasured one.
+- **The third operation is the one with no sizing story at all.** txid →
+  transaction has no evidence, no capacity model and no qualification path in
+  the tree today.
 - **The current surface cannot support a wallet even if the unpublished
   protocol values were published tomorrow.** A client with UTXOs but no
   transaction history and no way to fetch a transaction can display a balance
