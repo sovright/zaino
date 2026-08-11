@@ -159,7 +159,7 @@ mod tests {
     const BODY_BYTES: usize = 24;
     const PLAINTEXT: [u8; BODY_BYTES] = [0x5c; BODY_BYTES];
     const KINDS: [ReplayJournalRecordKind; 2] = [
-        ReplayJournalRecordKind::CurrentStateV3,
+        ReplayJournalRecordKind::CurrentStateV4,
         ReplayJournalRecordKind::ImmutableEntryV2,
     ];
 
@@ -234,12 +234,12 @@ mod tests {
         let protected = seal(
             &protector,
             &sealing_context,
-            ReplayJournalRecordKind::CurrentStateV3,
+            ReplayJournalRecordKind::CurrentStateV4,
         );
         let other_context = context(0x9b);
 
         for (context, kind) in [
-            (&other_context, ReplayJournalRecordKind::CurrentStateV3),
+            (&other_context, ReplayJournalRecordKind::CurrentStateV4),
             (&sealing_context, ReplayJournalRecordKind::ImmutableEntryV2),
         ] {
             let mut recovered = [0xff; BODY_BYTES];
@@ -256,7 +256,7 @@ mod tests {
     fn every_protected_byte_is_authenticated_without_exposing_plaintext() {
         let protector = protector();
         let context = context(0x9a);
-        let kind = ReplayJournalRecordKind::CurrentStateV3;
+        let kind = ReplayJournalRecordKind::CurrentStateV4;
         let protected = seal(&protector, &context, kind);
 
         for index in 0..protected.len() {
@@ -276,7 +276,7 @@ mod tests {
     fn each_seal_draws_a_fresh_nonce() {
         let protector = protector();
         let context = context(0x9a);
-        let kind = ReplayJournalRecordKind::CurrentStateV3;
+        let kind = ReplayJournalRecordKind::CurrentStateV4;
 
         let first = seal(&protector, &context, kind);
         let second = seal(&protector, &context, kind);
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(
             protector.seal(
                 &context(0x9a),
-                ReplayJournalRecordKind::CurrentStateV3,
+                ReplayJournalRecordKind::CurrentStateV4,
                 &PLAINTEXT,
                 &mut protected,
             ),
@@ -308,7 +308,7 @@ mod tests {
     fn mismatched_buffer_lengths_are_rejected_before_any_key_use() {
         let protector = protector();
         let context = context(0x9a);
-        let kind = ReplayJournalRecordKind::CurrentStateV3;
+        let kind = ReplayJournalRecordKind::CurrentStateV4;
         let mut short = [0; BODY_BYTES + PROTECTION_OVERHEAD_BYTES - 1];
 
         assert_eq!(
@@ -371,8 +371,9 @@ mod properties {
 
     fn kind() -> impl Strategy<Value = ReplayJournalRecordKind> {
         prop_oneof![
-            Just(ReplayJournalRecordKind::CurrentStateV3),
+            Just(ReplayJournalRecordKind::CurrentStateV4),
             Just(ReplayJournalRecordKind::ImmutableEntryV2),
+            Just(ReplayJournalRecordKind::CheckpointV1),
         ]
     }
 
@@ -441,11 +442,14 @@ mod properties {
             )?;
 
             let other_kind = match kind {
-                ReplayJournalRecordKind::CurrentStateV3 => {
+                ReplayJournalRecordKind::CurrentStateV4 => {
                     ReplayJournalRecordKind::ImmutableEntryV2
                 }
                 ReplayJournalRecordKind::ImmutableEntryV2 => {
-                    ReplayJournalRecordKind::CurrentStateV3
+                    ReplayJournalRecordKind::CheckpointV1
+                }
+                ReplayJournalRecordKind::CheckpointV1 => {
+                    ReplayJournalRecordKind::CurrentStateV4
                 }
             };
             let foreign = [

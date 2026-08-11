@@ -10,17 +10,25 @@
 //! writer for a recovery
 //! directory; no process lock or multi-writer linearizability is provided.
 //!
-//! The v6 journal is append-only and capacity counts total committed
-//! transactions, not live claims. Request claims have no expiry. A continuation
-//! claim keeps its opaque key and profile-derived expiry bucket ordinal
-//! inseparable in entry v2. Current-state v3 can persist a monotonic inclusive
-//! expiry-bucket watermark through a dedicated typed transition, but this
-//! module supplies no trusted authority or non-test caller for that transition.
-//! There is still no claim deletion, count reduction, compaction, or capacity
-//! reclamation.
+//! The v7 journal reclaims. Current-state v4 names an authenticated checkpoint
+//! that carries the exact surviving claim sets across a reclaimed prefix, so
+//! capacity counts live claims and the unreclaimed suffix instead of lifetime
+//! appends, and recovery replays only that suffix.
+//!
+//! Retention is deliberately asymmetric because the two lanes carry different
+//! evidence. A request claim is `H(namespace, authenticated_nonce)` with no
+//! expiry field and no age check anywhere on the accept path, so within one
+//! namespace it stays replayable forever: the checkpoint carries every request
+//! claim forward verbatim and retires none. A continuation claim commits its
+//! exact token expiry and, in entry v2, the profile-derived one-based ceiling
+//! expiry-bucket ordinal beside it. Continuation claims at or below the
+//! durable, monotonic maintenance watermark are retired -- and the same
+//! watermark becomes a commit-path floor that refuses every continuation claim
+//! in a retired bucket outright, so retirement never depends on the accept
+//! path's clock and never widens what the journal accepts.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     fs::{self, File},
     io::{self, Read, Write},
@@ -62,8 +70,9 @@ mod xchacha20;
 
 pub(super) use xchacha20::{record_protector, OsJournalRecordNonces};
 
-const CURRENT_FORMAT_VERSION: u16 = 3;
+const CURRENT_FORMAT_VERSION: u16 = 4;
 const ENTRY_FORMAT_VERSION: u16 = 2;
+const CHECKPOINT_FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
 const U64_BYTES: usize = 8;
 const DIGEST_BYTES: usize = 32;
@@ -72,9 +81,11 @@ const PROTECTION_OVERHEAD_BYTES: usize = 40;
 const CURRENT_RESERVED_BYTES: usize = 40;
 const ENTRY_RESERVED_BYTES: usize = 15;
 
-const CURRENT_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJCUR3";
+const CURRENT_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJCUR4";
 const ENTRY_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJENT2";
+const CHECKPOINT_MAGIC: [u8; RECORD_MAGIC_BYTES] = *b"ZORJCHK1";
 const CURRENT_STATE_FILE: &str = "current.bin";
+const CHECKPOINT_FILE: &str = "checkpoint.bin";
 const ENTRIES_DIRECTORY: &str = "entries";
 const STAGING_DIRECTORY: &str = "staging";
 const ENTRY_FILE_SUFFIX: &str = ".bin";
@@ -82,6 +93,7 @@ const ENTRY_FILE_SUFFIX: &str = ".bin";
 const ENTRY_PAYLOAD_DOMAIN: &[u8] = b"zaino-oram/replay-journal/entry-payload";
 const ENTRY_CHAIN_DOMAIN: &[u8] = b"zaino-oram/replay-journal/entry-chain";
 const COMPONENT_STATE_DOMAIN: &[u8] = b"zaino-oram/replay-journal/component-state";
+const CHECKPOINT_RECORD_DOMAIN: &[u8] = b"zaino-oram/replay-journal/checkpoint-record";
 
 const CURRENT_LIMIT_TRANSACTIONS_START: usize = 0;
 const CURRENT_PROFILE_ID_START: usize = CURRENT_LIMIT_TRANSACTIONS_START + U64_BYTES;
@@ -90,7 +102,9 @@ const CURRENT_REQUEST_COUNT_START: usize = CURRENT_SEQUENCE_START + U64_BYTES;
 const CURRENT_CONTINUATION_COUNT_START: usize = CURRENT_REQUEST_COUNT_START + U64_BYTES;
 const CURRENT_CHAIN_DIGEST_START: usize = CURRENT_CONTINUATION_COUNT_START + U64_BYTES;
 const CURRENT_MAINTENANCE_WATERMARK_START: usize = CURRENT_CHAIN_DIGEST_START + DIGEST_BYTES;
-const CURRENT_RESERVED_START: usize = CURRENT_MAINTENANCE_WATERMARK_START + U64_BYTES;
+const CURRENT_CHECKPOINT_BASE_START: usize = CURRENT_MAINTENANCE_WATERMARK_START + U64_BYTES;
+const CURRENT_CHECKPOINT_DIGEST_START: usize = CURRENT_CHECKPOINT_BASE_START + U64_BYTES;
+const CURRENT_RESERVED_START: usize = CURRENT_CHECKPOINT_DIGEST_START + DIGEST_BYTES;
 const CURRENT_BODY_BYTES: usize = CURRENT_RESERVED_START + CURRENT_RESERVED_BYTES;
 const CURRENT_PROTECTED_BYTES: usize = CURRENT_BODY_BYTES + PROTECTION_OVERHEAD_BYTES;
 const CURRENT_PROTECTED_START: usize = RECORD_MAGIC_BYTES + U16_BYTES;
@@ -108,13 +122,45 @@ const ENTRY_PROTECTED_BYTES: usize = ENTRY_BODY_BYTES + PROTECTION_OVERHEAD_BYTE
 const ENTRY_PROTECTED_START: usize = RECORD_MAGIC_BYTES + U16_BYTES;
 const ENTRY_RECORD_BYTES: usize = ENTRY_PROTECTED_START + ENTRY_PROTECTED_BYTES;
 
+const CHECKPOINT_RESERVED_BYTES: usize = 24;
+const CHECKPOINT_BASE_SEQUENCE_START: usize = 0;
+const CHECKPOINT_PROFILE_ID_START: usize = CHECKPOINT_BASE_SEQUENCE_START + U64_BYTES;
+const CHECKPOINT_LIMIT_TRANSACTIONS_START: usize = CHECKPOINT_PROFILE_ID_START + PROFILE_ID_BYTES;
+const CHECKPOINT_REQUEST_COUNT_START: usize = CHECKPOINT_LIMIT_TRANSACTIONS_START + U64_BYTES;
+const CHECKPOINT_CONTINUATION_COUNT_START: usize = CHECKPOINT_REQUEST_COUNT_START + U64_BYTES;
+const CHECKPOINT_CHAIN_DIGEST_START: usize = CHECKPOINT_CONTINUATION_COUNT_START + U64_BYTES;
+const CHECKPOINT_MAINTENANCE_WATERMARK_START: usize = CHECKPOINT_CHAIN_DIGEST_START + DIGEST_BYTES;
+const CHECKPOINT_SLOT_COUNT_START: usize = CHECKPOINT_MAINTENANCE_WATERMARK_START + U64_BYTES;
+const CHECKPOINT_RESERVED_START: usize = CHECKPOINT_SLOT_COUNT_START + U64_BYTES;
+const CHECKPOINT_HEADER_BYTES: usize = CHECKPOINT_RESERVED_START + CHECKPOINT_RESERVED_BYTES;
+
+const CHECKPOINT_SLOT_TAG_START: usize = 0;
+const CHECKPOINT_SLOT_KEY_START: usize = CHECKPOINT_SLOT_TAG_START + 1;
+const CHECKPOINT_SLOT_BUCKET_START: usize = CHECKPOINT_SLOT_KEY_START + REPLAY_RECORD_KEY_BYTES;
+const CHECKPOINT_SLOT_BYTES: usize = CHECKPOINT_SLOT_BUCKET_START + U64_BYTES;
+
+/// Slot granularity the sealed checkpoint body is padded up to.
+///
+/// The checkpoint file's length is the one thing reclamation cannot hide: a
+/// record that carries the surviving claims is inherently proportional to how
+/// many survive. Padding to a fixed block of slots coarsens that to a block
+/// count, matching the committed-entry count the entries directory already
+/// exposes, and every padding slot is zeroed inside the sealed body.
+const CHECKPOINT_SLOT_GRANULARITY: u64 = 64;
+
+const CHECKPOINT_PADDING_TAG: u8 = 0;
+const CHECKPOINT_REQUEST_TAG: u8 = 1;
+const CHECKPOINT_CONTINUATION_TAG: u8 = 2;
+
 const CONTINUATION_COVER_TAG: u8 = 0;
 const CONTINUATION_CLAIM_TAG: u8 = 1;
 
-const _: [(); 128] = [(); CURRENT_BODY_BYTES];
-const _: [(); 178] = [(); CURRENT_RECORD_BYTES];
+const _: [(); 168] = [(); CURRENT_BODY_BYTES];
+const _: [(); 218] = [(); CURRENT_RECORD_BYTES];
 const _: [(); 96] = [(); ENTRY_BODY_BYTES];
 const _: [(); 146] = [(); ENTRY_RECORD_BYTES];
+const _: [(); 120] = [(); CHECKPOINT_HEADER_BYTES];
+const _: [(); 41] = [(); CHECKPOINT_SLOT_BYTES];
 
 /// Protects one fixed-size local replay-journal record body.
 ///
@@ -168,22 +214,25 @@ impl fmt::Debug for ReplayJournalProtectionContext {
 // format tag, already written in the clear as part of every record header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReplayJournalRecordKind {
-    CurrentStateV3,
+    CurrentStateV4,
     ImmutableEntryV2,
+    CheckpointV1,
 }
 
 impl ReplayJournalRecordKind {
     const fn tag(self) -> u8 {
         match self {
-            Self::CurrentStateV3 => 0,
+            Self::CurrentStateV4 => 0,
             Self::ImmutableEntryV2 => 1,
+            Self::CheckpointV1 => 2,
         }
     }
 
     const fn format_version(self) -> u16 {
         match self {
-            Self::CurrentStateV3 => CURRENT_FORMAT_VERSION,
+            Self::CurrentStateV4 => CURRENT_FORMAT_VERSION,
             Self::ImmutableEntryV2 => ENTRY_FORMAT_VERSION,
+            Self::CheckpointV1 => CHECKPOINT_FORMAT_VERSION,
         }
     }
 }
@@ -325,11 +374,13 @@ impl fmt::Debug for ReplayJournalComponentStateDigest {
     }
 }
 
-/// Monotonic v6 replay head reconstructed from every committed entry plus the
-/// independently persisted maintenance watermark.
+/// Monotonic v7 replay head reconstructed from the named checkpoint plus every
+/// committed entry after it.
 ///
-/// Both claim counts only increase. This state has no deletion base, live-count
-/// distinction, or authority to retire claims or capacity.
+/// Both claim counts are lifetime totals and only increase; they are audit
+/// history, not the live claim sets. The live sets are the checkpoint's
+/// surviving claims plus the suffix's, minus every continuation claim at or
+/// below `maintenance_expiry_bucket_watermark`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReplayJournalState {
     limits: ReplayJournalLimits,
@@ -339,6 +390,12 @@ struct ReplayJournalState {
     claimed_continuation_count: u64,
     entry_chain_digest: [u8; DIGEST_BYTES],
     maintenance_expiry_bucket_watermark: ReplayMaintenanceWatermark,
+    /// Highest sequence covered by the named checkpoint; entries at or below it
+    /// are reclaimable and are never replayed again.
+    checkpoint_base_sequence: u64,
+    /// Record digest of the checkpoint that covers that prefix, so the pair is
+    /// only ever accepted together.
+    checkpoint_digest: [u8; DIGEST_BYTES],
 }
 
 impl ReplayJournalState {
@@ -351,14 +408,23 @@ impl ReplayJournalState {
             claimed_continuation_count: 0,
             entry_chain_digest: [0; DIGEST_BYTES],
             maintenance_expiry_bucket_watermark: ReplayMaintenanceWatermark::NONE,
+            checkpoint_base_sequence: 0,
+            checkpoint_digest: [0; DIGEST_BYTES],
         }
+    }
+
+    /// Number of committed entries that recovery must still replay.
+    const fn unreclaimed_suffix_length(&self) -> u64 {
+        self.committed_sequence
+            .saturating_sub(self.checkpoint_base_sequence)
     }
 
     fn validate(&self) -> Result<(), ReplayJournalValueError> {
         if all_zero(&self.profile_id) {
             return Err(ReplayJournalValueError::ProfileIdIsEmpty);
         }
-        if self.committed_sequence > self.limits.max_transactions
+        if self.checkpoint_base_sequence > self.committed_sequence
+            || self.unreclaimed_suffix_length() > self.limits.max_transactions
             || self.claimed_request_count > self.committed_sequence
             || self.claimed_continuation_count > self.claimed_request_count
         {
@@ -370,6 +436,17 @@ impl ReplayJournalState {
                 || self.entry_chain_digest != [0; DIGEST_BYTES])
         {
             return Err(ReplayJournalValueError::InvalidState);
+        }
+        Ok(())
+    }
+
+    /// A current-state record must name a checkpoint and its digest together.
+    ///
+    /// Only the current record carries the pairing; a checkpoint's own embedded
+    /// state describes the prefix it closes and cannot reference itself.
+    fn validate_checkpoint_reference(&self) -> Result<(), ReplayJournalValueError> {
+        if (self.checkpoint_base_sequence == 0) != (self.checkpoint_digest == [0; DIGEST_BYTES]) {
+            return Err(ReplayJournalValueError::InvalidCheckpointReference);
         }
         Ok(())
     }
@@ -387,19 +464,23 @@ impl ReplayJournalState {
             .copy_from_slice(&self.claimed_continuation_count.to_be_bytes());
         body[CURRENT_CHAIN_DIGEST_START..CURRENT_MAINTENANCE_WATERMARK_START]
             .copy_from_slice(&self.entry_chain_digest);
-        body[CURRENT_MAINTENANCE_WATERMARK_START..CURRENT_RESERVED_START].copy_from_slice(
+        body[CURRENT_MAINTENANCE_WATERMARK_START..CURRENT_CHECKPOINT_BASE_START].copy_from_slice(
             &self
                 .maintenance_expiry_bucket_watermark
                 .inclusive_expiry_bucket_ordinal()
                 .to_be_bytes(),
         );
+        body[CURRENT_CHECKPOINT_BASE_START..CURRENT_CHECKPOINT_DIGEST_START]
+            .copy_from_slice(&self.checkpoint_base_sequence.to_be_bytes());
+        body[CURRENT_CHECKPOINT_DIGEST_START..CURRENT_RESERVED_START]
+            .copy_from_slice(&self.checkpoint_digest);
         body
     }
 
     fn preview_entry(
         &self,
         request_claims: &HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
-        continuation_claims: &HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
+        continuation_claims: &LiveContinuationClaims,
         entry: &ReplayJournalEntry,
     ) -> Result<(Self, ReplayJournalDelta, ReplayDuplicateDecision), ReplayJournalTransitionError>
     {
@@ -410,19 +491,22 @@ impl ReplayJournalState {
         if entry.sequence != expected_sequence {
             return Err(ReplayJournalTransitionError::InvalidSequence);
         }
-        if entry.sequence > self.limits.max_transactions {
-            return Err(ReplayJournalTransitionError::TransactionCapacityExceeded);
-        }
 
         let request_is_fresh = !request_claims.contains(&entry.request_key);
         let (insert_continuation, decision) = if request_is_fresh {
             match entry.continuation_lane {
                 ReplayJournalContinuationLane::Cover => (None, ReplayDuplicateDecision::Fresh),
-                ReplayJournalContinuationLane::Claim { key, .. } => {
+                ReplayJournalContinuationLane::Claim {
+                    key,
+                    expiry_bucket_ordinal,
+                } => {
                     if continuation_claims.contains(&key) {
                         return Err(ReplayJournalTransitionError::InvalidDuplicateContinuationLane);
                     }
-                    (Some(key), ReplayDuplicateDecision::Fresh)
+                    (
+                        Some((key, expiry_bucket_ordinal)),
+                        ReplayDuplicateDecision::Fresh,
+                    )
                 }
             }
         } else {
@@ -455,6 +539,8 @@ impl ReplayJournalState {
             claimed_continuation_count,
             entry_chain_digest,
             maintenance_expiry_bucket_watermark: self.maintenance_expiry_bucket_watermark,
+            checkpoint_base_sequence: self.checkpoint_base_sequence,
+            checkpoint_digest: self.checkpoint_digest,
         };
         Ok((
             next,
@@ -469,7 +555,7 @@ impl ReplayJournalState {
     fn apply_entry(
         &self,
         request_claims: &mut HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
-        continuation_claims: &mut HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
+        continuation_claims: &mut LiveContinuationClaims,
         entry: &ReplayJournalEntry,
     ) -> Result<(Self, ReplayDuplicateDecision), ReplayJournalTransitionError> {
         let (next, delta, decision) =
@@ -479,8 +565,8 @@ impl ReplayJournalState {
                 return Err(ReplayJournalTransitionError::InconsistentClaimSet);
             }
         }
-        if let Some(key) = delta.insert_continuation {
-            if !continuation_claims.insert(key) {
+        if let Some((key, expiry_bucket_ordinal)) = delta.insert_continuation {
+            if !continuation_claims.insert(key, expiry_bucket_ordinal) {
                 return Err(ReplayJournalTransitionError::InconsistentClaimSet);
             }
         }
@@ -512,7 +598,9 @@ impl ReplayJournalState {
     }
 
     const fn has_persisted_transition(&self) -> bool {
-        self.committed_sequence != 0 || self.maintenance_expiry_bucket_watermark.0 != 0
+        self.committed_sequence != 0
+            || self.maintenance_expiry_bucket_watermark.0 != 0
+            || self.checkpoint_base_sequence != 0
     }
 }
 
@@ -525,7 +613,57 @@ impl fmt::Debug for ReplayJournalState {
 #[derive(Clone, Copy)]
 struct ReplayJournalDelta {
     insert_request: Option<[u8; REPLAY_RECORD_KEY_BYTES]>,
-    insert_continuation: Option<[u8; REPLAY_RECORD_KEY_BYTES]>,
+    insert_continuation: Option<([u8; REPLAY_RECORD_KEY_BYTES], NonZeroU64)>,
+}
+
+/// Live continuation claims, each kept beside the expiry bucket that decides
+/// whether it may ever be retired.
+///
+/// The bucket has to survive in memory as well as on disk: it is what lets a
+/// later watermark advance retire exactly the right claims, and what the next
+/// checkpoint writes back out.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct LiveContinuationClaims {
+    by_key: HashMap<[u8; REPLAY_RECORD_KEY_BYTES], NonZeroU64>,
+}
+
+impl LiveContinuationClaims {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn contains(&self, key: &[u8; REPLAY_RECORD_KEY_BYTES]) -> bool {
+        self.by_key.contains_key(key)
+    }
+
+    /// Inserts one claim, reporting whether the key was previously absent.
+    fn insert(&mut self, key: [u8; REPLAY_RECORD_KEY_BYTES], bucket: NonZeroU64) -> bool {
+        self.by_key.insert(key, bucket).is_none()
+    }
+
+    fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    /// Drops every claim the watermark has retired.
+    ///
+    /// Safe only because [`ReplayJournalStore::prepare_commit`] refuses any
+    /// continuation claim in a retired bucket by rule, without consulting this
+    /// map. Dropping the membership therefore cannot widen what is accepted.
+    fn retire_through(&mut self, watermark: ReplayMaintenanceWatermark) {
+        self.by_key
+            .retain(|_, bucket| bucket.get() > watermark.inclusive_expiry_bucket_ordinal());
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&[u8; REPLAY_RECORD_KEY_BYTES], &NonZeroU64)> {
+        self.by_key.iter()
+    }
+}
+
+impl fmt::Debug for LiveContinuationClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LiveContinuationClaims { ..REDACTED.. }")
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -538,6 +676,12 @@ enum ReplayJournalValueError {
     NonZeroCoverKey,
     NonZeroCoverExpiryBucketOrdinal,
     ZeroClaimExpiryBucketOrdinal,
+    InvalidCheckpointReference,
+    InvalidCheckpointSlotTag,
+    ZeroCheckpointSlotBucketOrdinal,
+    NonZeroRequestSlotBucketOrdinal,
+    CheckpointSlotCountMismatch,
+    DuplicateCheckpointSlot,
 }
 
 impl fmt::Debug for ReplayJournalValueError {
@@ -559,7 +703,11 @@ enum ReplayJournalTransitionError {
     InvalidSequence,
     InvalidDuplicateRequestLane,
     InvalidDuplicateContinuationLane,
-    TransactionCapacityExceeded,
+    // No `TransactionCapacityExceeded`: capacity stopped being a lifetime
+    // append count the transition layer could exceed once reclamation re-based
+    // it on unreclaimed suffix length and live claim count. The store boundary
+    // is the only place that knows both, so the check lives there and
+    // `ReplayJournalStoreError` keeps its own variant.
     SequenceOverflow,
     InconsistentClaimSet,
 }
@@ -570,9 +718,9 @@ impl fmt::Debug for ReplayJournalTransitionError {
     }
 }
 
-struct PersistentReplayJournalCurrentStateV3([u8; CURRENT_RECORD_BYTES]);
+struct PersistentReplayJournalCurrentStateV4([u8; CURRENT_RECORD_BYTES]);
 
-impl PersistentReplayJournalCurrentStateV3 {
+impl PersistentReplayJournalCurrentStateV4 {
     fn from_business<P>(
         state: &ReplayJournalState,
         context: &ReplayJournalProtectionContext,
@@ -583,6 +731,9 @@ impl PersistentReplayJournalCurrentStateV3 {
     {
         state
             .validate()
+            .map_err(ReplayJournalRecordError::InvalidValue)?;
+        state
+            .validate_checkpoint_reference()
             .map_err(ReplayJournalRecordError::InvalidValue)?;
         if !state.has_persisted_transition() {
             return Err(ReplayJournalRecordError::InvalidValue(
@@ -599,7 +750,7 @@ impl PersistentReplayJournalCurrentStateV3 {
         protector
             .seal(
                 context,
-                ReplayJournalRecordKind::CurrentStateV3,
+                ReplayJournalRecordKind::CurrentStateV4,
                 &body,
                 &mut bytes[CURRENT_PROTECTED_START..],
             )
@@ -620,7 +771,7 @@ impl PersistentReplayJournalCurrentStateV3 {
         match protector
             .open(
                 context,
-                ReplayJournalRecordKind::CurrentStateV3,
+                ReplayJournalRecordKind::CurrentStateV4,
                 &self.0[CURRENT_PROTECTED_START..],
                 &mut body,
             )
@@ -649,9 +800,14 @@ impl PersistentReplayJournalCurrentStateV3 {
                 &body,
                 CURRENT_MAINTENANCE_WATERMARK_START,
             )),
+            checkpoint_base_sequence: read_u64(&body, CURRENT_CHECKPOINT_BASE_START),
+            checkpoint_digest: read_array(&body, CURRENT_CHECKPOINT_DIGEST_START),
         };
         state
             .validate()
+            .map_err(ReplayJournalRecordError::InvalidValue)?;
+        state
+            .validate_checkpoint_reference()
             .map_err(ReplayJournalRecordError::InvalidValue)?;
         if !state.has_persisted_transition() {
             return Err(ReplayJournalRecordError::InvalidValue(
@@ -666,9 +822,9 @@ impl PersistentReplayJournalCurrentStateV3 {
     }
 }
 
-impl fmt::Debug for PersistentReplayJournalCurrentStateV3 {
+impl fmt::Debug for PersistentReplayJournalCurrentStateV4 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("PersistentReplayJournalCurrentStateV3([REDACTED])")
+        f.write_str("PersistentReplayJournalCurrentStateV4([REDACTED])")
     }
 }
 
@@ -790,6 +946,361 @@ impl fmt::Debug for PersistentReplayJournalEntry {
     }
 }
 
+/// Business-layer content of one authenticated checkpoint.
+///
+/// `state` is the exact replay head as of `state.committed_sequence`, which is
+/// also the reclaimable prefix's last sequence. The two claim collections are
+/// the complete surviving live sets at that point: every request claim ever
+/// committed, and every continuation claim above the watermark.
+struct ReplayJournalCheckpoint {
+    state: ReplayJournalState,
+    request_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
+    continuation_claims: LiveContinuationClaims,
+}
+
+impl ReplayJournalCheckpoint {
+    fn slot_count(&self) -> Result<u64, ReplayJournalValueError> {
+        let requests = u64::try_from(self.request_claims.len())
+            .map_err(|_| ReplayJournalValueError::CheckpointSlotCountMismatch)?;
+        let continuations = u64::try_from(self.continuation_claims.len())
+            .map_err(|_| ReplayJournalValueError::CheckpointSlotCountMismatch)?;
+        requests
+            .checked_add(continuations)
+            .ok_or(ReplayJournalValueError::CheckpointSlotCountMismatch)
+    }
+}
+
+impl fmt::Debug for ReplayJournalCheckpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplayJournalCheckpoint { ..REDACTED.. }")
+    }
+}
+
+/// One sealed checkpoint record.
+///
+/// The body is variable length only in whole slot blocks, and it is sealed
+/// under the journal's own protection context with its own record kind, so a
+/// checkpoint minted for another deployment, owner generation, key epoch, or
+/// profile fails to authenticate rather than being reinterpreted, and a
+/// current-state record can never be opened as a checkpoint or the reverse.
+struct PersistentReplayJournalCheckpointV1(Vec<u8>);
+
+impl PersistentReplayJournalCheckpointV1 {
+    fn from_business<P>(
+        checkpoint: &ReplayJournalCheckpoint,
+        context: &ReplayJournalProtectionContext,
+        protector: &P,
+    ) -> Result<Self, ReplayJournalRecordError>
+    where
+        P: ReplayJournalRecordProtector,
+    {
+        checkpoint
+            .state
+            .validate()
+            .map_err(ReplayJournalRecordError::InvalidValue)?;
+        let slot_count = checkpoint
+            .slot_count()
+            .map_err(ReplayJournalRecordError::InvalidValue)?;
+        let padded_slots =
+            padded_slot_count(slot_count).map_err(ReplayJournalRecordError::InvalidValue)?;
+        let body_bytes = checkpoint_body_bytes(padded_slots)?;
+
+        let mut body = vec![0; body_bytes];
+        body[CHECKPOINT_BASE_SEQUENCE_START..CHECKPOINT_PROFILE_ID_START]
+            .copy_from_slice(&checkpoint.state.committed_sequence.to_be_bytes());
+        body[CHECKPOINT_PROFILE_ID_START..CHECKPOINT_LIMIT_TRANSACTIONS_START]
+            .copy_from_slice(&checkpoint.state.profile_id);
+        body[CHECKPOINT_LIMIT_TRANSACTIONS_START..CHECKPOINT_REQUEST_COUNT_START]
+            .copy_from_slice(&checkpoint.state.limits.max_transactions.to_be_bytes());
+        body[CHECKPOINT_REQUEST_COUNT_START..CHECKPOINT_CONTINUATION_COUNT_START]
+            .copy_from_slice(&checkpoint.state.claimed_request_count.to_be_bytes());
+        body[CHECKPOINT_CONTINUATION_COUNT_START..CHECKPOINT_CHAIN_DIGEST_START]
+            .copy_from_slice(&checkpoint.state.claimed_continuation_count.to_be_bytes());
+        body[CHECKPOINT_CHAIN_DIGEST_START..CHECKPOINT_MAINTENANCE_WATERMARK_START]
+            .copy_from_slice(&checkpoint.state.entry_chain_digest);
+        body[CHECKPOINT_MAINTENANCE_WATERMARK_START..CHECKPOINT_SLOT_COUNT_START].copy_from_slice(
+            &checkpoint
+                .state
+                .maintenance_expiry_bucket_watermark
+                .inclusive_expiry_bucket_ordinal()
+                .to_be_bytes(),
+        );
+        body[CHECKPOINT_SLOT_COUNT_START..CHECKPOINT_RESERVED_START]
+            .copy_from_slice(&slot_count.to_be_bytes());
+
+        let mut cursor = CHECKPOINT_HEADER_BYTES;
+        for key in &checkpoint.request_claims {
+            write_checkpoint_slot(&mut body[cursor..], CHECKPOINT_REQUEST_TAG, key, 0);
+            cursor += CHECKPOINT_SLOT_BYTES;
+        }
+        for (key, bucket) in checkpoint.continuation_claims.iter() {
+            write_checkpoint_slot(
+                &mut body[cursor..],
+                CHECKPOINT_CONTINUATION_TAG,
+                key,
+                bucket.get(),
+            );
+            cursor += CHECKPOINT_SLOT_BYTES;
+        }
+
+        let mut bytes =
+            vec![0; CHECKPOINT_PROTECTED_START + body_bytes + PROTECTION_OVERHEAD_BYTES];
+        bytes[..RECORD_MAGIC_BYTES].copy_from_slice(&CHECKPOINT_MAGIC);
+        bytes[RECORD_MAGIC_BYTES..CHECKPOINT_PROTECTED_START]
+            .copy_from_slice(&CHECKPOINT_FORMAT_VERSION.to_be_bytes());
+        protector
+            .seal(
+                context,
+                ReplayJournalRecordKind::CheckpointV1,
+                &body,
+                &mut bytes[CHECKPOINT_PROTECTED_START..],
+            )
+            .map_err(|_| ReplayJournalRecordError::ProtectionUnavailable)?;
+        Ok(Self(bytes))
+    }
+
+    fn into_business<P>(
+        self,
+        limits: ReplayJournalLimits,
+        expected_profile_id: [u8; PROFILE_ID_BYTES],
+        context: &ReplayJournalProtectionContext,
+        protector: &P,
+    ) -> Result<ReplayJournalCheckpoint, ReplayJournalRecordError>
+    where
+        P: ReplayJournalRecordProtector,
+    {
+        if self.0.len() < CHECKPOINT_PROTECTED_START + CHECKPOINT_HEADER_BYTES {
+            return Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::InvalidState,
+            ));
+        }
+        if self.0[..RECORD_MAGIC_BYTES] != CHECKPOINT_MAGIC {
+            return Err(ReplayJournalRecordError::InvalidMagic);
+        }
+        if read_u16(&self.0, RECORD_MAGIC_BYTES) != CHECKPOINT_FORMAT_VERSION {
+            return Err(ReplayJournalRecordError::UnsupportedVersion);
+        }
+        let protected = &self.0[CHECKPOINT_PROTECTED_START..];
+        let body_bytes = protected
+            .len()
+            .checked_sub(PROTECTION_OVERHEAD_BYTES)
+            .ok_or(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::InvalidState,
+            ))?;
+        if body_bytes < CHECKPOINT_HEADER_BYTES
+            || !(body_bytes - CHECKPOINT_HEADER_BYTES).is_multiple_of(CHECKPOINT_SLOT_BYTES)
+        {
+            return Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::CheckpointSlotCountMismatch,
+            ));
+        }
+        let mut body = vec![0; body_bytes];
+        match protector
+            .open(
+                context,
+                ReplayJournalRecordKind::CheckpointV1,
+                protected,
+                &mut body,
+            )
+            .map_err(|_| ReplayJournalRecordError::ProtectionUnavailable)?
+        {
+            AuthenticationDecision::Accepted => {}
+            AuthenticationDecision::Rejected => {
+                return Err(ReplayJournalRecordError::AuthenticationFailed);
+            }
+        }
+        if !all_zero(&body[CHECKPOINT_RESERVED_START..CHECKPOINT_HEADER_BYTES]) {
+            return Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::NonZeroReservedBytes,
+            ));
+        }
+        let recorded_limits =
+            ReplayJournalLimits::new(read_u64(&body, CHECKPOINT_LIMIT_TRANSACTIONS_START))
+                .map_err(ReplayJournalRecordError::InvalidValue)?;
+        let profile_id = read_array(&body, CHECKPOINT_PROFILE_ID_START);
+        if recorded_limits != limits || profile_id != expected_profile_id {
+            return Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::InvalidState,
+            ));
+        }
+        let base_sequence = read_u64(&body, CHECKPOINT_BASE_SEQUENCE_START);
+        let state = ReplayJournalState {
+            limits,
+            profile_id,
+            committed_sequence: base_sequence,
+            claimed_request_count: read_u64(&body, CHECKPOINT_REQUEST_COUNT_START),
+            claimed_continuation_count: read_u64(&body, CHECKPOINT_CONTINUATION_COUNT_START),
+            entry_chain_digest: read_array(&body, CHECKPOINT_CHAIN_DIGEST_START),
+            maintenance_expiry_bucket_watermark: ReplayMaintenanceWatermark::new(read_u64(
+                &body,
+                CHECKPOINT_MAINTENANCE_WATERMARK_START,
+            )),
+            checkpoint_base_sequence: base_sequence,
+            checkpoint_digest: [0; DIGEST_BYTES],
+        };
+        if base_sequence == 0 {
+            return Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::InvalidCheckpointReference,
+            ));
+        }
+
+        let declared_slots = read_u64(&body, CHECKPOINT_SLOT_COUNT_START);
+        let available_slots = u64::try_from(
+            (body_bytes - CHECKPOINT_HEADER_BYTES) / CHECKPOINT_SLOT_BYTES,
+        )
+        .map_err(|_| {
+            ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::CheckpointSlotCountMismatch,
+            )
+        })?;
+        if declared_slots > available_slots
+            || padded_slot_count(declared_slots).map_err(ReplayJournalRecordError::InvalidValue)?
+                != available_slots
+        {
+            return Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::CheckpointSlotCountMismatch,
+            ));
+        }
+
+        let mut request_claims = HashSet::new();
+        let mut continuation_claims = LiveContinuationClaims::new();
+        for index in 0..available_slots {
+            let start = CHECKPOINT_HEADER_BYTES
+                + usize::try_from(index).map_err(|_| {
+                    ReplayJournalRecordError::InvalidValue(
+                        ReplayJournalValueError::CheckpointSlotCountMismatch,
+                    )
+                })? * CHECKPOINT_SLOT_BYTES;
+            let slot = &body[start..start + CHECKPOINT_SLOT_BYTES];
+            let key = read_array::<REPLAY_RECORD_KEY_BYTES>(slot, CHECKPOINT_SLOT_KEY_START);
+            let bucket = read_u64(slot, CHECKPOINT_SLOT_BUCKET_START);
+            let used = index < declared_slots;
+            match slot[CHECKPOINT_SLOT_TAG_START] {
+                CHECKPOINT_PADDING_TAG if !used => {
+                    if key != [0; REPLAY_RECORD_KEY_BYTES] || bucket != 0 {
+                        return Err(ReplayJournalRecordError::InvalidValue(
+                            ReplayJournalValueError::NonZeroReservedBytes,
+                        ));
+                    }
+                }
+                CHECKPOINT_REQUEST_TAG if used => {
+                    if bucket != 0 {
+                        return Err(ReplayJournalRecordError::InvalidValue(
+                            ReplayJournalValueError::NonZeroRequestSlotBucketOrdinal,
+                        ));
+                    }
+                    if !request_claims.insert(key) {
+                        return Err(ReplayJournalRecordError::InvalidValue(
+                            ReplayJournalValueError::DuplicateCheckpointSlot,
+                        ));
+                    }
+                }
+                CHECKPOINT_CONTINUATION_TAG if used => {
+                    let bucket =
+                        NonZeroU64::new(bucket).ok_or(ReplayJournalRecordError::InvalidValue(
+                            ReplayJournalValueError::ZeroCheckpointSlotBucketOrdinal,
+                        ))?;
+                    if !continuation_claims.insert(key, bucket) {
+                        return Err(ReplayJournalRecordError::InvalidValue(
+                            ReplayJournalValueError::DuplicateCheckpointSlot,
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ReplayJournalRecordError::InvalidValue(
+                        ReplayJournalValueError::InvalidCheckpointSlotTag,
+                    ));
+                }
+            }
+        }
+
+        let checkpoint = ReplayJournalCheckpoint {
+            state,
+            request_claims,
+            continuation_claims,
+        };
+        // The surviving sets can never exceed the lifetime totals they were
+        // drawn from, and every surviving continuation claim must sit above the
+        // watermark the checkpoint itself recorded.
+        if u64::try_from(checkpoint.request_claims.len()).unwrap_or(u64::MAX)
+            != state.claimed_request_count
+            || u64::try_from(checkpoint.continuation_claims.len()).unwrap_or(u64::MAX)
+                > state.claimed_continuation_count
+        {
+            return Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::InvalidState,
+            ));
+        }
+        if checkpoint.continuation_claims.iter().any(|(_, bucket)| {
+            bucket.get()
+                <= state
+                    .maintenance_expiry_bucket_watermark
+                    .inclusive_expiry_bucket_ordinal()
+        }) {
+            return Err(ReplayJournalRecordError::InvalidValue(
+                ReplayJournalValueError::InvalidState,
+            ));
+        }
+        state
+            .validate()
+            .map_err(ReplayJournalRecordError::InvalidValue)?;
+        Ok(checkpoint)
+    }
+
+    fn record_digest(&self) -> [u8; DIGEST_BYTES] {
+        versioned_digest(
+            CHECKPOINT_RECORD_DOMAIN,
+            CHECKPOINT_FORMAT_VERSION,
+            &[&self.0],
+        )
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PersistentReplayJournalCheckpointV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PersistentReplayJournalCheckpointV1([REDACTED])")
+    }
+}
+
+const CHECKPOINT_PROTECTED_START: usize = RECORD_MAGIC_BYTES + U16_BYTES;
+
+fn write_checkpoint_slot(
+    slot: &mut [u8],
+    tag: u8,
+    key: &[u8; REPLAY_RECORD_KEY_BYTES],
+    bucket: u64,
+) {
+    slot[CHECKPOINT_SLOT_TAG_START] = tag;
+    slot[CHECKPOINT_SLOT_KEY_START..CHECKPOINT_SLOT_BUCKET_START].copy_from_slice(key);
+    slot[CHECKPOINT_SLOT_BUCKET_START..CHECKPOINT_SLOT_BYTES]
+        .copy_from_slice(&bucket.to_be_bytes());
+}
+
+/// Rounds a used-slot count up to the next whole padding block.
+fn padded_slot_count(slot_count: u64) -> Result<u64, ReplayJournalValueError> {
+    let blocks = slot_count
+        .checked_add(CHECKPOINT_SLOT_GRANULARITY - 1)
+        .ok_or(ReplayJournalValueError::CheckpointSlotCountMismatch)?
+        / CHECKPOINT_SLOT_GRANULARITY;
+    blocks
+        .checked_mul(CHECKPOINT_SLOT_GRANULARITY)
+        .ok_or(ReplayJournalValueError::CheckpointSlotCountMismatch)
+}
+
+fn checkpoint_body_bytes(padded_slots: u64) -> Result<usize, ReplayJournalRecordError> {
+    usize::try_from(padded_slots)
+        .ok()
+        .and_then(|slots| slots.checked_mul(CHECKPOINT_SLOT_BYTES))
+        .and_then(|slot_bytes| slot_bytes.checked_add(CHECKPOINT_HEADER_BYTES))
+        .ok_or(ReplayJournalRecordError::InvalidValue(
+            ReplayJournalValueError::CheckpointSlotCountMismatch,
+        ))
+}
+
 #[derive(Debug)]
 enum ReplayJournalRecordError {
     InvalidMagic,
@@ -830,6 +1341,35 @@ enum ReplayMaintenancePreparation {
 struct PreparedReplayMaintenanceAdvance {
     previous_digest: ReplayJournalComponentStateDigest,
     next_state: ReplayJournalState,
+}
+
+enum ReplayJournalCheckpointPreparation {
+    NoAdvance,
+    Advance(PreparedReplayJournalCheckpoint),
+}
+
+/// One checkpoint sealed and ready for its durable ordering.
+struct PreparedReplayJournalCheckpoint {
+    previous_digest: ReplayJournalComponentStateDigest,
+    next_state: ReplayJournalState,
+    /// Highest sequence the committed checkpoint makes reclaimable.
+    reclaim_through: u64,
+    /// Lowest sequence still present, so the sweep skips what an earlier
+    /// checkpoint already removed.
+    previous_base: u64,
+    persistent: PersistentReplayJournalCheckpointV1,
+}
+
+impl fmt::Debug for ReplayJournalCheckpointPreparation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplayJournalCheckpointPreparation { ..REDACTED.. }")
+    }
+}
+
+impl fmt::Debug for PreparedReplayJournalCheckpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedReplayJournalCheckpoint { ..REDACTED.. }")
+    }
 }
 
 impl fmt::Debug for ReplayMaintenancePreparation {
@@ -1023,6 +1563,52 @@ mod committed_advance {
             let replaced_current = self.replace_current_state(staged_current)?;
             self.confirm_current_state_durable(replaced_current)?;
             self.state = prepared.next_state;
+            self.continuation_claims
+                .retire_through(self.state.maintenance_expiry_bucket_watermark);
+            Ok(ReplayJournalMaintenanceAdvanceReceipt {
+                evidence: ReplayJournalAdvanceEvidence::new(
+                    self.instance_identity.clone(),
+                    prepared.previous_digest,
+                    self.state.component_state_digest(),
+                ),
+            })
+        }
+
+        /// Commits one prepared checkpoint and then reclaims what it covers.
+        ///
+        /// The ordering is checkpoint file, then current state, then entry
+        /// removal, and it is not reversible. The checkpoint has to be durable
+        /// before anything names it, and nothing may be deleted before the
+        /// current state names the checkpoint that replaced it: a crash between
+        /// any two of these steps leaves recovery reading the older base over
+        /// entries that are all still present, so the journal comes back with
+        /// exactly the claim set it had and refuses exactly the replays it
+        /// refused. Deleting first would instead leave a base whose entries are
+        /// gone -- a journal that can no longer prove what it already accepted.
+        /// A checkpoint left unreferenced by a crash is inert: recovery reads
+        /// `checkpoint.bin` only when the current state names its digest.
+        pub(super) fn commit_prepared_checkpoint_and_capture(
+            &mut self,
+            prepared: PreparedReplayJournalCheckpoint,
+        ) -> Result<ReplayJournalMaintenanceAdvanceReceipt, ReplayJournalStoreError> {
+            if self.health == ReplayJournalStoreHealth::Indeterminate {
+                return Err(ReplayJournalStoreError::LatchedIndeterminate);
+            }
+            if self.state.component_state_digest() != prepared.previous_digest {
+                return Err(ReplayJournalStoreError::CurrentStateMismatch);
+            }
+            self.ensure_directories()?;
+            let staged_checkpoint = self.stage_checkpoint(&prepared.persistent)?;
+            let replaced_checkpoint = self.replace_checkpoint_file(staged_checkpoint)?;
+            self.confirm_checkpoint_durable(replaced_checkpoint)?;
+            let staged_current = match self.stage_current_state(&prepared.next_state) {
+                Ok(staged_current) => staged_current,
+                Err(error) => return Err(self.latch(error)),
+            };
+            let replaced_current = self.replace_current_state(staged_current)?;
+            self.confirm_current_state_durable(replaced_current)?;
+            self.state = prepared.next_state;
+            self.remove_entry_range(prepared.previous_base + 1, prepared.reclaim_through);
             Ok(ReplayJournalMaintenanceAdvanceReceipt {
                 evidence: ReplayJournalAdvanceEvidence::new(
                     self.instance_identity.clone(),
@@ -1074,6 +1660,14 @@ struct StagedReplayJournalEntry {
 }
 
 struct ReplacedReplayJournalEntry {
+    path: PathBuf,
+}
+
+struct StagedReplayJournalCheckpoint {
+    file: NamedTempFile,
+}
+
+struct ReplacedReplayJournalCheckpoint {
     path: PathBuf,
 }
 
@@ -1150,7 +1744,7 @@ pub(super) struct ReplayJournalStore<P> {
     // non-goal of this module (see the module docs). Revisit if the duplicate
     // verdict ever stops being visible in the response.
     request_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
-    continuation_claims: HashSet<[u8; REPLAY_RECORD_KEY_BYTES]>,
+    continuation_claims: LiveContinuationClaims,
     health: ReplayJournalStoreHealth,
 }
 
@@ -1225,7 +1819,7 @@ where
                     instance_identity,
                     state: ReplayJournalState::empty(limits, expected_profile_id),
                     request_claims: HashSet::new(),
-                    continuation_claims: HashSet::new(),
+                    continuation_claims: LiveContinuationClaims::new(),
                     health: ReplayJournalStoreHealth::Ready,
                 });
             }
@@ -1236,7 +1830,7 @@ where
                 return Err(ReplayJournalStoreError::CurrentStateUnreadable);
             }
         };
-        let persisted_state = PersistentReplayJournalCurrentStateV3(current_bytes)
+        let persisted_state = PersistentReplayJournalCurrentStateV4(current_bytes)
             .into_business(&protection_context, &protector);
         let persisted_state = match persisted_state {
             Ok(state) => state,
@@ -1254,13 +1848,35 @@ where
 
         let entries_directory = recovery_directory.join(ENTRIES_DIRECTORY);
         validate_committed_entries_directory(&entries_directory)?;
-        let mut state = ReplayJournalState::empty(limits, expected_profile_id);
-        let mut request_claims = HashSet::new();
-        let mut continuation_claims = HashSet::new();
-        // Recovery rebuilds both exact claim sets from the complete authoritative
-        // prefix. Deleting a committed entry is therefore unsafe until a new
-        // authenticated base/checkpoint format replaces this invariant.
-        for expected_sequence in 1..=persisted_state.committed_sequence {
+        // Recovery starts from the checkpoint the current state names, or from
+        // the empty state when it names none, and then replays only the
+        // committed entries after it. Entries at or below the base are never
+        // read again, which is exactly what makes deleting them safe.
+        let (mut state, mut request_claims, mut continuation_claims) =
+            if persisted_state.checkpoint_base_sequence == 0 {
+                (
+                    ReplayJournalState::empty(limits, expected_profile_id),
+                    HashSet::new(),
+                    LiveContinuationClaims::new(),
+                )
+            } else {
+                let checkpoint = load_authoritative_checkpoint(
+                    &recovery_directory,
+                    &persisted_state,
+                    limits,
+                    expected_profile_id,
+                    &protection_context,
+                    &protector,
+                )?;
+                (
+                    checkpoint.state,
+                    checkpoint.request_claims,
+                    checkpoint.continuation_claims,
+                )
+            };
+        for expected_sequence in
+            persisted_state.checkpoint_base_sequence + 1..=persisted_state.committed_sequence
+        {
             let entry = load_authoritative_entry(
                 &entries_directory,
                 expected_sequence,
@@ -1274,10 +1890,16 @@ where
         }
         state.maintenance_expiry_bucket_watermark =
             persisted_state.maintenance_expiry_bucket_watermark;
+        state.checkpoint_base_sequence = persisted_state.checkpoint_base_sequence;
+        state.checkpoint_digest = persisted_state.checkpoint_digest;
         if state != persisted_state {
             return Err(ReplayJournalStoreError::CurrentStateMismatch);
         }
-        Ok(Self {
+        // The live set is the same function of the durable state either way:
+        // recovery over an unreclaimed journal replays retired claims and drops
+        // them here; recovery over a reclaimed one never sees them.
+        continuation_claims.retire_through(state.maintenance_expiry_bucket_watermark);
+        let store = Self {
             recovery_directory,
             protection_context,
             protector,
@@ -1286,7 +1908,13 @@ where
             request_claims,
             continuation_claims,
             health: ReplayJournalStoreHealth::Ready,
-        })
+        };
+        // Finishes a reclamation that a crash interrupted after the current
+        // state named the checkpoint but before every covered entry was gone.
+        // Recovery already ignores those entries, so failing to remove one
+        // costs space, never correctness.
+        store.remove_reclaimed_entries();
+        Ok(store)
     }
 
     fn entries_directory(&self) -> PathBuf {
@@ -1318,9 +1946,6 @@ where
             .committed_sequence
             .checked_add(1)
             .ok_or(ReplayJournalStoreError::SequenceOverflow)?;
-        if sequence > self.state.limits.max_transactions {
-            return Err(ReplayJournalStoreError::TransactionCapacityExceeded);
-        }
         let request_key = *request_key.as_bytes();
         let (continuation_lane, decision) = if self.request_claims.contains(&request_key) {
             (
@@ -1335,7 +1960,13 @@ where
                 ),
                 ContinuationReplayPlan::ClaimOrCover(claim) => {
                     let key = *claim.replay_key_bytes();
-                    if self.continuation_claims.contains(&key) {
+                    // The retired-bucket floor is checked before membership on
+                    // purpose. A claim the checkpoint dropped must be refused by
+                    // rule, not by a lookup that would now miss -- that identity
+                    // is exactly what reclamation stopped storing.
+                    if self.is_retired_bucket(claim.expiry_bucket_ordinal())
+                        || self.continuation_claims.contains(&key)
+                    {
                         (
                             ReplayJournalContinuationLane::Cover,
                             ReplayDuplicateDecision::ContinuationDuplicate,
@@ -1361,12 +1992,98 @@ where
             .state
             .preview_entry(&self.request_claims, &self.continuation_claims, &entry)
             .map_err(map_prepare_transition_error)?;
+        self.check_capacity(&next_state, &delta)?;
         Ok(PreparedReplayJournalCommit {
             entry,
             next_state,
             delta,
             decision,
         })
+    }
+
+    /// Reports whether the watermark has already retired this expiry bucket.
+    fn is_retired_bucket(&self, expiry_bucket_ordinal: NonZeroU64) -> bool {
+        expiry_bucket_ordinal.get()
+            <= self
+                .state
+                .maintenance_expiry_bucket_watermark
+                .inclusive_expiry_bucket_ordinal()
+    }
+
+    /// Number of claims the journal must still be able to reproduce.
+    ///
+    /// This -- not the lifetime append count -- is what a replay-refusing
+    /// journal actually has to keep, so it is what capacity bounds. A duplicate
+    /// request or a cover continuation adds nothing to it, and a retired
+    /// continuation claim leaves it.
+    fn live_claim_count(&self) -> u64 {
+        let requests = u64::try_from(self.request_claims.len()).unwrap_or(u64::MAX);
+        let continuations = u64::try_from(self.continuation_claims.len()).unwrap_or(u64::MAX);
+        requests.saturating_add(continuations)
+    }
+
+    /// Refuses a commit that would outgrow either reclaimable budget.
+    ///
+    /// Both quantities shrink again: the suffix at the next checkpoint, the
+    /// live claim count as continuation buckets retire.
+    fn check_capacity(
+        &self,
+        next_state: &ReplayJournalState,
+        delta: &ReplayJournalDelta,
+    ) -> Result<(), ReplayJournalStoreError> {
+        if next_state.unreclaimed_suffix_length() > self.state.limits.max_transactions {
+            return Err(ReplayJournalStoreError::TransactionCapacityExceeded);
+        }
+        let admitted = u64::from(delta.insert_request.is_some())
+            .saturating_add(u64::from(delta.insert_continuation.is_some()));
+        if self.live_claim_count().saturating_add(admitted) > self.state.limits.max_transactions {
+            return Err(ReplayJournalStoreError::TransactionCapacityExceeded);
+        }
+        Ok(())
+    }
+
+    /// Builds the checkpoint that would retire everything retirable right now.
+    ///
+    /// The surviving sets are copied from the live sets, which recovery already
+    /// reproduces exactly, so the checkpoint preserves membership by
+    /// construction rather than by re-deriving it.
+    fn prepare_checkpoint(
+        &self,
+    ) -> Result<ReplayJournalCheckpointPreparation, ReplayJournalStoreError> {
+        if self.health == ReplayJournalStoreHealth::Indeterminate {
+            return Err(ReplayJournalStoreError::LatchedIndeterminate);
+        }
+        if self.state.committed_sequence == 0
+            || self.state.committed_sequence == self.state.checkpoint_base_sequence
+        {
+            return Ok(ReplayJournalCheckpointPreparation::NoAdvance);
+        }
+        let mut base_state = self.state;
+        base_state.checkpoint_base_sequence = self.state.committed_sequence;
+        base_state.checkpoint_digest = [0; DIGEST_BYTES];
+        let checkpoint = ReplayJournalCheckpoint {
+            state: base_state,
+            request_claims: self.request_claims.clone(),
+            continuation_claims: self.continuation_claims.clone(),
+        };
+        let persistent = PersistentReplayJournalCheckpointV1::from_business(
+            &checkpoint,
+            &self.protection_context,
+            &self.protector,
+        )
+        .map_err(map_checkpoint_record_for_commit)?;
+        let mut next_state = self.state;
+        next_state.checkpoint_base_sequence = self.state.committed_sequence;
+        next_state.checkpoint_digest = persistent.record_digest();
+        Ok(ReplayJournalCheckpointPreparation::Advance(
+            PreparedReplayJournalCheckpoint {
+                previous_digest: self.state.component_state_digest(),
+                next_state,
+                reclaim_through: self.state.committed_sequence,
+                previous_base: self.state.checkpoint_base_sequence,
+                persistent,
+            },
+        ))
     }
 
     fn prepare_maintenance_watermark(
@@ -1451,11 +2168,98 @@ where
         Ok(())
     }
 
+    fn checkpoint_path(&self) -> PathBuf {
+        self.recovery_directory.join(CHECKPOINT_FILE)
+    }
+
+    fn stage_checkpoint(
+        &self,
+        persistent: &PersistentReplayJournalCheckpointV1,
+    ) -> Result<StagedReplayJournalCheckpoint, ReplayJournalStoreError> {
+        let mut file = create_unique_file(&self.staging_directory(), "replay-checkpoint")
+            .map_err(|_| ReplayJournalStoreError::LocalStageUnavailable)?;
+        file.write_all(persistent.as_bytes())
+            .and_then(|()| file.as_file().sync_all())
+            .map_err(|_| ReplayJournalStoreError::LocalStageUnavailable)?;
+        Ok(StagedReplayJournalCheckpoint { file })
+    }
+
+    fn replace_checkpoint_file(
+        &mut self,
+        staged: StagedReplayJournalCheckpoint,
+    ) -> Result<ReplacedReplayJournalCheckpoint, ReplayJournalStoreError> {
+        let final_path = self.checkpoint_path();
+        if fs::rename(staged.file.path(), &final_path).is_err() {
+            // The current state still names the previous base, so a failed
+            // rename leaves a journal that recovers from it unchanged.
+            return Err(ReplayJournalStoreError::CheckpointStateIndeterminate);
+        }
+        drop(staged);
+        Ok(ReplacedReplayJournalCheckpoint { path: final_path })
+    }
+
+    fn confirm_checkpoint_durable(
+        &mut self,
+        replaced: ReplacedReplayJournalCheckpoint,
+    ) -> Result<(), ReplayJournalStoreError> {
+        if File::open(replaced.path)
+            .and_then(|file| file.sync_all())
+            .and_then(|()| sync_directory(&self.recovery_directory))
+            .and_then(|()| sync_directory(&self.staging_directory()))
+            .is_err()
+        {
+            return Err(ReplayJournalStoreError::CheckpointStateIndeterminate);
+        }
+        Ok(())
+    }
+
+    /// Removes entry files the committed checkpoint has made unreachable.
+    ///
+    /// Best effort by design: recovery never reads this range again, so a file
+    /// that survives costs space and nothing else.
+    fn remove_entry_range(&self, from_sequence: u64, through_sequence: u64) {
+        for sequence in from_sequence..=through_sequence {
+            drop(fs::remove_file(self.entry_path(sequence)));
+        }
+        drop(sync_directory(&self.entries_directory()));
+    }
+
+    /// Sweeps any entry an earlier, interrupted reclamation left behind.
+    ///
+    /// Driven by what the directory still holds rather than by the base
+    /// sequence, so the cost is the number of leftover files, not the length of
+    /// the reclaimed history.
+    fn remove_reclaimed_entries(&self) {
+        let base = self.state.checkpoint_base_sequence;
+        if base == 0 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(self.entries_directory()) else {
+            return;
+        };
+        let mut removed_any = false;
+        for entry in entries.flatten() {
+            let Some(sequence) = entry
+                .file_name()
+                .to_str()
+                .and_then(parse_entry_filename_sequence)
+            else {
+                continue;
+            };
+            if sequence <= base {
+                removed_any |= fs::remove_file(entry.path()).is_ok();
+            }
+        }
+        if removed_any {
+            drop(sync_directory(&self.entries_directory()));
+        }
+    }
+
     fn stage_current_state(
         &self,
         next_state: &ReplayJournalState,
     ) -> Result<StagedReplayJournalCurrentState, ReplayJournalStoreError> {
-        let persistent = PersistentReplayJournalCurrentStateV3::from_business(
+        let persistent = PersistentReplayJournalCurrentStateV4::from_business(
             next_state,
             &self.protection_context,
             &self.protector,
@@ -1500,8 +2304,8 @@ where
         if let Some(key) = prepared.delta.insert_request {
             self.request_claims.insert(key);
         }
-        if let Some(key) = prepared.delta.insert_continuation {
-            self.continuation_claims.insert(key);
+        if let Some((key, expiry_bucket_ordinal)) = prepared.delta.insert_continuation {
+            self.continuation_claims.insert(key, expiry_bucket_ordinal);
         }
         self.state = prepared.next_state;
         ReplayCommitResult::new(
@@ -1729,14 +2533,65 @@ where
         let ReplayMaintenancePreparation::Advance(prepared) = prepared else {
             return Ok(ReplaySnapshotCoordinatorMaintenanceOutcome::NoAdvance);
         };
+        self.commit_prepared_maintenance_class_transition(|journal| {
+            journal.commit_prepared_maintenance_and_capture(prepared)
+        })
+    }
 
+    /// Checkpoints the journal and reclaims the prefix the checkpoint covers.
+    ///
+    /// A checkpoint mutates replay-current exactly the way a watermark advance
+    /// does, so it carries the same maintenance-class receipt and the same
+    /// outer-snapshot binding. That receipt still proves only a durable
+    /// replay-current transition: it grants no trusted-time authority, and the
+    /// retirement it performs is the one the already-committed watermark
+    /// authorized.
+    fn commit_checkpoint(
+        &mut self,
+    ) -> Result<
+        ReplaySnapshotCoordinatorMaintenanceOutcome,
+        ReplaySnapshotCoordinatorMaintenanceError,
+    > {
+        if self.health == ReplaySnapshotCoordinatorHealth::Indeterminate {
+            return Err(ReplaySnapshotCoordinatorMaintenanceError::LatchedIndeterminate);
+        }
+
+        let prepared = self
+            .replay_journal
+            .prepare_checkpoint()
+            .map_err(ReplaySnapshotCoordinatorMaintenanceError::ReplayJournal)?;
+        let ReplayJournalCheckpointPreparation::Advance(prepared) = prepared else {
+            return Ok(ReplaySnapshotCoordinatorMaintenanceOutcome::NoAdvance);
+        };
+        self.commit_prepared_maintenance_class_transition(|journal| {
+            journal.commit_prepared_checkpoint_and_capture(prepared)
+        })
+    }
+
+    /// Runs the shared durable-then-bind sequence for one maintenance-class
+    /// replay-current transition.
+    ///
+    /// Both callers owe the outer snapshot the same protocol: refuse an
+    /// exhausted outer sequence before anything becomes durable, latch when the
+    /// journal itself becomes indeterminate, and latch when the outer advance
+    /// cannot be resolved after the replay side already committed.
+    fn commit_prepared_maintenance_class_transition<F>(
+        &mut self,
+        commit: F,
+    ) -> Result<
+        ReplaySnapshotCoordinatorMaintenanceOutcome,
+        ReplaySnapshotCoordinatorMaintenanceError,
+    >
+    where
+        F: FnOnce(
+            &mut ReplayJournalStore<P>,
+        )
+            -> Result<ReplayJournalMaintenanceAdvanceReceipt, ReplayJournalStoreError>,
+    {
         preflight_successor(&self.current_snapshot)
             .map_err(ReplaySnapshotCoordinatorMaintenanceError::OuterAdvancePreflight)?;
 
-        let receipt = match self
-            .replay_journal
-            .commit_prepared_maintenance_and_capture(prepared)
-        {
+        let receipt = match commit(&mut self.replay_journal) {
             Ok(receipt) => receipt,
             Err(error) => {
                 if self.replay_journal.health == ReplayJournalStoreHealth::Indeterminate {
@@ -1971,6 +2826,13 @@ pub(super) enum ReplayJournalStoreError {
     CommittedEntryCorrupt,
     CommittedEntryAuthenticationFailed,
     CommittedEntryProtectionUnavailable,
+    CheckpointMissing,
+    CheckpointUnreadable,
+    CheckpointCorrupt,
+    CheckpointAuthenticationFailed,
+    CheckpointProtectionUnavailable,
+    CheckpointMismatch,
+    CheckpointStateIndeterminate,
     CurrentStateMismatch,
     TransactionCapacityExceeded,
     SequenceOverflow,
@@ -2086,8 +2948,96 @@ where
     Ok(entry)
 }
 
+/// Loads the one checkpoint the current state names, or fails closed.
+///
+/// Three independent checks have to agree before a checkpoint may seed
+/// recovery: it authenticates under this deployment's protection context and
+/// the checkpoint record kind, its record digest is the exact digest the
+/// current state committed, and its base sequence is the one the current state
+/// named. A checkpoint minted for another namespace, owner generation, key
+/// epoch, or profile fails the first; any other checkpoint of this deployment,
+/// including an earlier one of this same journal, fails the second.
+fn load_authoritative_checkpoint<P>(
+    recovery_directory: &Path,
+    persisted_state: &ReplayJournalState,
+    limits: ReplayJournalLimits,
+    expected_profile_id: [u8; PROFILE_ID_BYTES],
+    context: &ReplayJournalProtectionContext,
+    protector: &P,
+) -> Result<ReplayJournalCheckpoint, ReplayJournalStoreError>
+where
+    P: ReplayJournalRecordProtector,
+{
+    let path = recovery_directory.join(CHECKPOINT_FILE);
+    let bytes = read_variable_record(&path).map_err(|error| match error {
+        ExactRecordReadError::Missing => ReplayJournalStoreError::CheckpointMissing,
+        ExactRecordReadError::Unreadable => ReplayJournalStoreError::CheckpointUnreadable,
+        ExactRecordReadError::UnsafePath | ExactRecordReadError::WrongLength => {
+            ReplayJournalStoreError::CheckpointCorrupt
+        }
+    })?;
+    let persistent = PersistentReplayJournalCheckpointV1(bytes);
+    if persistent.record_digest() != persisted_state.checkpoint_digest {
+        return Err(ReplayJournalStoreError::CheckpointMismatch);
+    }
+    let checkpoint = match persistent.into_business(limits, expected_profile_id, context, protector)
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(ReplayJournalRecordError::AuthenticationFailed) => {
+            return Err(ReplayJournalStoreError::CheckpointAuthenticationFailed);
+        }
+        Err(ReplayJournalRecordError::ProtectionUnavailable) => {
+            return Err(ReplayJournalStoreError::CheckpointProtectionUnavailable);
+        }
+        Err(_) => return Err(ReplayJournalStoreError::CheckpointCorrupt),
+    };
+    if checkpoint.state.committed_sequence != persisted_state.checkpoint_base_sequence
+        || checkpoint.state.claimed_request_count > persisted_state.claimed_request_count
+        || checkpoint.state.claimed_continuation_count > persisted_state.claimed_continuation_count
+        || checkpoint.state.maintenance_expiry_bucket_watermark
+            > persisted_state.maintenance_expiry_bucket_watermark
+    {
+        return Err(ReplayJournalStoreError::CheckpointMismatch);
+    }
+    Ok(checkpoint)
+}
+
 fn entry_filename(sequence: u64) -> String {
     format!("{sequence:020}{ENTRY_FILE_SUFFIX}")
+}
+
+/// Recovers the sequence from a committed entry's filename, or nothing.
+fn parse_entry_filename_sequence(filename: &str) -> Option<u64> {
+    let digits = filename.strip_suffix(ENTRY_FILE_SUFFIX)?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Reads one whole variable-length record, refusing anything but a real file.
+fn read_variable_record(path: &Path) -> Result<Vec<u8>, ExactRecordReadError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ExactRecordReadError::Missing);
+        }
+        Err(_) => return Err(ExactRecordReadError::Unreadable),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(ExactRecordReadError::UnsafePath);
+    }
+    let mut file = File::open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            ExactRecordReadError::Missing
+        } else {
+            ExactRecordReadError::Unreadable
+        }
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| ExactRecordReadError::Unreadable)?;
+    Ok(bytes)
 }
 
 fn read_exact_record<const N: usize>(path: &Path) -> Result<[u8; N], ExactRecordReadError> {
@@ -2133,9 +3083,6 @@ fn map_directory_error(error: RealDirectoryError) -> ReplayJournalStoreError {
 
 fn map_prepare_transition_error(error: ReplayJournalTransitionError) -> ReplayJournalStoreError {
     match error {
-        ReplayJournalTransitionError::TransactionCapacityExceeded => {
-            ReplayJournalStoreError::TransactionCapacityExceeded
-        }
         ReplayJournalTransitionError::SequenceOverflow => ReplayJournalStoreError::SequenceOverflow,
         ReplayJournalTransitionError::InvalidSequence
         | ReplayJournalTransitionError::InvalidDuplicateRequestLane
@@ -2161,6 +3108,15 @@ fn map_entry_record_for_commit(error: ReplayJournalRecordError) -> ReplayJournal
             ReplayJournalStoreError::CommittedEntryProtectionUnavailable
         }
         _ => ReplayJournalStoreError::CommittedEntryCorrupt,
+    }
+}
+
+fn map_checkpoint_record_for_commit(error: ReplayJournalRecordError) -> ReplayJournalStoreError {
+    match error {
+        ReplayJournalRecordError::ProtectionUnavailable => {
+            ReplayJournalStoreError::CheckpointProtectionUnavailable
+        }
+        _ => ReplayJournalStoreError::CheckpointCorrupt,
     }
 }
 
@@ -2686,7 +3642,7 @@ mod tests {
         replay_entry: &ReplayJournalEntry,
     ) -> ReplayJournalState {
         let mut requests = HashSet::new();
-        let mut continuations = HashSet::new();
+        let mut continuations = LiveContinuationClaims::new();
         ReplayJournalState::empty(limits, test_profile_id())
             .apply_entry(&mut requests, &mut continuations, replay_entry)
             .expect("fixture entry is valid")
@@ -2699,7 +3655,7 @@ mod tests {
         protector: &DeterministicTestProtector,
     ) -> TestResult {
         fs::create_dir_all(root)?;
-        let persistent = PersistentReplayJournalCurrentStateV3::from_business(
+        let persistent = PersistentReplayJournalCurrentStateV4::from_business(
             state,
             &protection_context(),
             protector,
@@ -2762,7 +3718,7 @@ mod tests {
         let persistent_entry =
             PersistentReplayJournalEntry::from_business(&replay_entry, &context, &protector)?;
         let persistent_current =
-            PersistentReplayJournalCurrentStateV3::from_business(&state, &context, &protector)?;
+            PersistentReplayJournalCurrentStateV4::from_business(&state, &context, &protector)?;
 
         assert_eq!(persistent_entry.as_bytes().len(), ENTRY_RECORD_BYTES);
         assert_eq!(persistent_current.as_bytes().len(), CURRENT_RECORD_BYTES);
@@ -2800,7 +3756,7 @@ mod tests {
             replay_entry
         );
         assert_eq!(
-            PersistentReplayJournalCurrentStateV3(*persistent_current.as_bytes())
+            PersistentReplayJournalCurrentStateV4(*persistent_current.as_bytes())
                 .into_business(&context, &protector)?,
             state
         );
@@ -2808,10 +3764,12 @@ mod tests {
     }
 
     #[test]
-    fn current_v3_body_layout_is_canonical() {
+    fn current_v4_body_layout_is_canonical() {
         let replay_entry = entry(1, 0x51, claim_lane(0x61, 7));
         let mut state = one_entry_state(limits(), &replay_entry);
         state.maintenance_expiry_bucket_watermark = ReplayMaintenanceWatermark::new(9);
+        state.checkpoint_base_sequence = 11;
+        state.checkpoint_digest = [0x73; DIGEST_BYTES];
         let body = state.canonical_current_body();
 
         assert_eq!(
@@ -2839,28 +3797,36 @@ mod tests {
             &state.entry_chain_digest
         );
         assert_eq!(
-            &body[CURRENT_MAINTENANCE_WATERMARK_START..CURRENT_RESERVED_START],
+            &body[CURRENT_MAINTENANCE_WATERMARK_START..CURRENT_CHECKPOINT_BASE_START],
             &9_u64.to_be_bytes()
         );
+        assert_eq!(
+            &body[CURRENT_CHECKPOINT_BASE_START..CURRENT_CHECKPOINT_DIGEST_START],
+            &11_u64.to_be_bytes()
+        );
+        assert_eq!(
+            &body[CURRENT_CHECKPOINT_DIGEST_START..CURRENT_RESERVED_START],
+            &[0x73; DIGEST_BYTES]
+        );
         assert!(all_zero(&body[CURRENT_RESERVED_START..]));
-        assert_eq!(CURRENT_MAGIC, *b"ZORJCUR3");
-        assert_eq!(CURRENT_FORMAT_VERSION, 3);
-        assert_eq!(body.len(), 128);
-        assert_eq!(CURRENT_RECORD_BYTES, 178);
+        assert_eq!(CURRENT_MAGIC, *b"ZORJCUR4");
+        assert_eq!(CURRENT_FORMAT_VERSION, 4);
+        assert_eq!(body.len(), 168);
+        assert_eq!(CURRENT_RECORD_BYTES, 218);
     }
 
     #[test]
-    fn current_v3_round_trips_watermark_without_entries() -> TestResult {
+    fn current_v4_round_trips_watermark_without_entries() -> TestResult {
         let protector = DeterministicTestProtector::available();
         let context = protection_context();
         let state = ReplayJournalState::empty(limits(), test_profile_id())
             .preview_maintenance_watermark(ReplayMaintenanceWatermark::new(7))?
             .expect("greater fixture watermark prepares an advance");
         let persistent =
-            PersistentReplayJournalCurrentStateV3::from_business(&state, &context, &protector)?;
+            PersistentReplayJournalCurrentStateV4::from_business(&state, &context, &protector)?;
 
         assert_eq!(
-            PersistentReplayJournalCurrentStateV3(*persistent.as_bytes())
+            PersistentReplayJournalCurrentStateV4(*persistent.as_bytes())
                 .into_business(&context, &protector)?,
             state
         );
@@ -2914,7 +3880,7 @@ mod tests {
         let replay_entry = entry(1, 0x51, ReplayJournalContinuationLane::Cover);
         let persistent =
             PersistentReplayJournalEntry::from_business(&replay_entry, &context, &protector)?;
-        let current = PersistentReplayJournalCurrentStateV3::from_business(
+        let current = PersistentReplayJournalCurrentStateV4::from_business(
             &one_entry_state(limits(), &replay_entry),
             &context,
             &protector,
@@ -2937,7 +3903,7 @@ mod tests {
         let mut wrong_current_magic = *current.as_bytes();
         wrong_current_magic[0] ^= 1;
         assert!(matches!(
-            PersistentReplayJournalCurrentStateV3(wrong_current_magic)
+            PersistentReplayJournalCurrentStateV4(wrong_current_magic)
                 .into_business(&context, &protector),
             Err(ReplayJournalRecordError::InvalidMagic)
         ));
@@ -2945,7 +3911,7 @@ mod tests {
         let mut wrong_current_version = *current.as_bytes();
         wrong_current_version[RECORD_MAGIC_BYTES + 1] ^= 1;
         assert!(matches!(
-            PersistentReplayJournalCurrentStateV3(wrong_current_version)
+            PersistentReplayJournalCurrentStateV4(wrong_current_version)
                 .into_business(&context, &protector),
             Err(ReplayJournalRecordError::UnsupportedVersion)
         ));
@@ -2954,7 +3920,7 @@ mod tests {
             let mut tampered = *current.as_bytes();
             tampered[index] ^= 1;
             assert!(matches!(
-                PersistentReplayJournalCurrentStateV3(tampered).into_business(&context, &protector),
+                PersistentReplayJournalCurrentStateV4(tampered).into_business(&context, &protector),
                 Err(ReplayJournalRecordError::AuthenticationFailed)
             ));
         }
@@ -3184,7 +4150,7 @@ mod tests {
         let swapped_first = entry(1, 0x52, ReplayJournalContinuationLane::Cover);
         let swapped_second = entry(2, 0x51, ReplayJournalContinuationLane::Cover);
         let mut requests = HashSet::new();
-        let mut continuations = HashSet::new();
+        let mut continuations = LiveContinuationClaims::new();
         let (first_state, _) = ReplayJournalState::empty(limits(), test_profile_id())
             .apply_entry(&mut requests, &mut continuations, &first)
             .expect("first fixture entry is valid");
@@ -3193,7 +4159,7 @@ mod tests {
             .expect("second fixture entry is valid");
 
         let mut swapped_requests = HashSet::new();
-        let mut swapped_continuations = HashSet::new();
+        let mut swapped_continuations = LiveContinuationClaims::new();
         let (swapped_first_state, _) = ReplayJournalState::empty(limits(), test_profile_id())
             .apply_entry(
                 &mut swapped_requests,
@@ -3240,7 +4206,7 @@ mod tests {
         );
 
         let mut bucket_seven_requests = HashSet::new();
-        let mut bucket_seven_continuations = HashSet::new();
+        let mut bucket_seven_continuations = LiveContinuationClaims::new();
         let (bucket_seven, _) = ReplayJournalState::empty(limits(), test_profile_id())
             .apply_entry(
                 &mut bucket_seven_requests,
@@ -3249,7 +4215,7 @@ mod tests {
             )
             .expect("bucket-seven fixture entry is valid");
         let mut bucket_eight_requests = HashSet::new();
-        let mut bucket_eight_continuations = HashSet::new();
+        let mut bucket_eight_continuations = LiveContinuationClaims::new();
         let (bucket_eight, _) = ReplayJournalState::empty(limits(), test_profile_id())
             .apply_entry(
                 &mut bucket_eight_requests,
@@ -4380,9 +5346,9 @@ mod tests {
         assert_eq!(
             initial.component_state_digest(),
             [
-                0x30, 0x64, 0x43, 0xa4, 0x74, 0x04, 0xd8, 0xbc, 0xbd, 0x86, 0xfc, 0x37, 0xfb, 0xa2,
-                0xc2, 0x3c, 0x70, 0x22, 0x26, 0x4a, 0x65, 0x80, 0x0c, 0x2b, 0xce, 0x2b, 0x00, 0x5a,
-                0x0e, 0x8d, 0xb5, 0xf9,
+                0x2e, 0xf0, 0x5d, 0x21, 0x38, 0xd1, 0xe5, 0x03, 0x3e, 0xeb, 0x2d, 0x3d, 0x79, 0xd5,
+                0xcc, 0xb5, 0xe3, 0x69, 0xad, 0xa9, 0xca, 0x91, 0x01, 0x24, 0x7e, 0x55, 0xb6, 0x9f,
+                0xfb, 0x1e, 0x61, 0x5c,
             ]
         );
         verify_current(&initial, &store)?;
@@ -4761,6 +5727,8 @@ mod tests {
             claimed_continuation_count: 1,
             entry_chain_digest: [0x71; DIGEST_BYTES],
             maintenance_expiry_bucket_watermark: ReplayMaintenanceWatermark::NONE,
+            checkpoint_base_sequence: 0,
+            checkpoint_digest: [0; DIGEST_BYTES],
         };
         write_current(&root, &noncanonical_state, &protector)?;
 
@@ -4804,13 +5772,13 @@ mod tests {
     }
 
     #[test]
-    fn expiry_bucket_metadata_does_not_reclaim_transaction_capacity() -> TestResult {
+    fn retiring_a_continuation_bucket_returns_its_capacity_and_still_refuses_it() -> TestResult {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("journal");
-        let one_transaction = ReplayJournalLimits::new(1)?;
+        let two_claims = ReplayJournalLimits::new(2)?;
         let mut store = ReplayJournalStore::open_with_limits(
-            root.clone(),
-            one_transaction,
+            root,
+            two_claims,
             test_profile_id(),
             protection_context(),
             DeterministicTestProtector::available(),
@@ -4822,26 +5790,31 @@ mod tests {
             &request_key(1),
             &ContinuationReplayPlan::ClaimOrCover(claim),
         )?;
-        drop(store);
 
-        let reopened = ReplayJournalStore::open_with_limits(
-            root,
-            one_transaction,
-            test_profile_id(),
-            protection_context(),
-            DeterministicTestProtector::available(),
-        )?;
-        assert_eq!(reopened.state.committed_sequence, 1);
-        assert_eq!(reopened.state.claimed_request_count, 1);
-        assert_eq!(reopened.state.claimed_continuation_count, 1);
-        assert!(reopened
-            .continuation_claims
-            .contains(claim.replay_key_bytes()));
+        // One request claim plus one continuation claim fills the budget.
+        assert_eq!(store.live_claim_count(), 2);
         assert_eq!(
-            reopened
+            store
                 .prepare_commit(&request_key(2), &ContinuationReplayPlan::Cover)
-                .expect_err("expiry bucket metadata does not authorize capacity reclamation"),
+                .expect_err("a full live claim set admits no further claim"),
             ReplayJournalStoreError::TransactionCapacityExceeded
+        );
+
+        advance_maintenance_watermark(&mut store, ReplayMaintenanceWatermark::new(1))?
+            .expect("greater fixture watermark advances");
+
+        assert_eq!(store.live_claim_count(), 1);
+        assert!(!store.continuation_claims.contains(claim.replay_key_bytes()));
+        store.prepare_commit(&request_key(2), &ContinuationReplayPlan::Cover)?;
+        assert_eq!(
+            store
+                .prepare_commit(
+                    &request_key(3),
+                    &ContinuationReplayPlan::ClaimOrCover(claim)
+                )?
+                .decision,
+            ReplayDuplicateDecision::ContinuationDuplicate,
+            "a retired continuation claim is refused by the bucket floor, not by membership"
         );
         Ok(())
     }
@@ -5363,6 +6336,515 @@ mod tests {
 
         assert_eq!(fs::read(target)?, target_bytes);
         assert!(fs::symlink_metadata(candidate)?.file_type().is_file());
+        Ok(())
+    }
+    // ---- authenticated checkpoint and reclamation ----
+
+    fn checkpoint_store(
+        store: &mut ReplayJournalStore<DeterministicTestProtector>,
+    ) -> Result<Option<ReplayJournalMaintenanceAdvanceReceipt>, ReplayJournalStoreError> {
+        match store.prepare_checkpoint()? {
+            ReplayJournalCheckpointPreparation::NoAdvance => Ok(None),
+            ReplayJournalCheckpointPreparation::Advance(prepared) => store
+                .commit_prepared_checkpoint_and_capture(prepared)
+                .map(Some),
+        }
+    }
+
+    /// Commits a checkpoint's durable steps by hand up to `stop_after`, so a
+    /// test can leave the journal exactly where a crash would.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CheckpointCrashPoint {
+        BeforeCheckpointDurable,
+        AfterCheckpointBeforeCurrent,
+        AfterCurrentBeforeEntryRemoval,
+    }
+
+    fn commit_checkpoint_up_to(
+        store: &mut ReplayJournalStore<DeterministicTestProtector>,
+        stop_after: CheckpointCrashPoint,
+    ) -> TestResult {
+        let ReplayJournalCheckpointPreparation::Advance(prepared) = store.prepare_checkpoint()?
+        else {
+            return Err("fixture journal has a checkpointable prefix".into());
+        };
+        store.ensure_directories()?;
+        if stop_after == CheckpointCrashPoint::BeforeCheckpointDurable {
+            // The sealed record never reaches its final name.
+            drop(store.stage_checkpoint(&prepared.persistent)?);
+            return Ok(());
+        }
+        let staged = store.stage_checkpoint(&prepared.persistent)?;
+        let replaced = store.replace_checkpoint_file(staged)?;
+        store.confirm_checkpoint_durable(replaced)?;
+        if stop_after == CheckpointCrashPoint::AfterCheckpointBeforeCurrent {
+            return Ok(());
+        }
+        let staged_current = store.stage_current_state(&prepared.next_state)?;
+        let replaced_current = store.replace_current_state(staged_current)?;
+        store.confirm_current_state_durable(replaced_current)?;
+        store.state = prepared.next_state;
+        Ok(())
+    }
+
+    fn committed_entry_count(root: &Path) -> Result<usize, Box<dyn Error>> {
+        let entries = root.join(ENTRIES_DIRECTORY);
+        if !entries.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        for entry in fs::read_dir(entries)? {
+            if entry?
+                .file_name()
+                .to_str()
+                .and_then(parse_entry_filename_sequence)
+                .is_some()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn open_store_at(
+        root: &Path,
+    ) -> Result<ReplayJournalStore<DeterministicTestProtector>, ReplayJournalStoreError> {
+        ReplayJournalStore::open_with_limits(
+            root.to_path_buf(),
+            limits(),
+            test_profile_id(),
+            protection_context(),
+            DeterministicTestProtector::available(),
+        )
+    }
+
+    /// Commits the fixture history every checkpoint test reasons about.
+    ///
+    /// Sequence 1 claims a live continuation in bucket 9, sequence 2 claims one
+    /// in bucket 2, and sequence 3 is a duplicate of sequence 1's request. The
+    /// watermark then retires bucket 2 only, so the journal holds exactly one
+    /// retired continuation claim and one live one.
+    fn commit_reclaimable_history(
+        store: &mut ReplayJournalStore<DeterministicTestProtector>,
+    ) -> TestResult {
+        let (_, round) = security_round();
+        store.commit_transaction(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::ClaimOrCover(continuation_claim(continuation_key(1), 9)),
+        )?;
+        store.commit_transaction(
+            &round,
+            &request_key(2),
+            &ContinuationReplayPlan::ClaimOrCover(continuation_claim(continuation_key(2), 2)),
+        )?;
+        store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        advance_maintenance_watermark(store, ReplayMaintenanceWatermark::new(2))?
+            .expect("greater fixture watermark advances");
+        Ok(())
+    }
+
+    /// Every replay decision the fixture history must keep refusing.
+    fn assert_refuses_the_fixture_replays(
+        store: &ReplayJournalStore<DeterministicTestProtector>,
+    ) -> TestResult {
+        let live = continuation_claim(continuation_key(1), 9);
+        let retired = continuation_claim(continuation_key(2), 2);
+
+        assert_eq!(
+            store
+                .prepare_commit(&request_key(1), &ContinuationReplayPlan::Cover)?
+                .decision,
+            ReplayDuplicateDecision::RequestDuplicate,
+            "a committed request nonce is never retirable"
+        );
+        assert_eq!(
+            store
+                .prepare_commit(&request_key(2), &ContinuationReplayPlan::Cover)?
+                .decision,
+            ReplayDuplicateDecision::RequestDuplicate
+        );
+        assert_eq!(
+            store
+                .prepare_commit(&request_key(9), &ContinuationReplayPlan::ClaimOrCover(live))?
+                .decision,
+            ReplayDuplicateDecision::ContinuationDuplicate,
+            "a live continuation claim must survive every reclamation"
+        );
+        assert_eq!(
+            store
+                .prepare_commit(
+                    &request_key(9),
+                    &ContinuationReplayPlan::ClaimOrCover(retired)
+                )?
+                .decision,
+            ReplayDuplicateDecision::ContinuationDuplicate,
+            "a retired continuation claim stays refused by the bucket floor"
+        );
+        assert_eq!(
+            store
+                .prepare_commit(&request_key(9), &ContinuationReplayPlan::Cover)?
+                .decision,
+            ReplayDuplicateDecision::Fresh,
+            "an unseen request must still be admitted"
+        );
+        Ok(())
+    }
+
+    /// The load-bearing property: reclamation may not reopen a replay.
+    #[test]
+    fn live_claims_survive_a_checkpoint_and_are_still_refused() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        let mut store = open_store_at(&root)?;
+        commit_reclaimable_history(&mut store)?;
+        assert_refuses_the_fixture_replays(&store)?;
+
+        checkpoint_store(&mut store)?.expect("a committed prefix is checkpointable");
+
+        assert_eq!(store.state.checkpoint_base_sequence, 3);
+        assert_ne!(store.state.checkpoint_digest, [0; DIGEST_BYTES]);
+        assert_eq!(committed_entry_count(&root)?, 0, "the prefix is reclaimed");
+        assert_eq!(
+            store.request_claims.len(),
+            2,
+            "both request claims are carried forward"
+        );
+        assert_eq!(
+            store.continuation_claims.len(),
+            1,
+            "only the retired continuation bucket is dropped"
+        );
+        assert_eq!(
+            store.state.claimed_continuation_count, 2,
+            "the lifetime totals stay whole"
+        );
+        assert_refuses_the_fixture_replays(&store)?;
+        drop(store);
+
+        assert_refuses_the_fixture_replays(&open_store_at(&root)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_after_reclamation_matches_recovery_over_the_full_journal() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let unreclaimed_root = directory.path().join("unreclaimed");
+        let reclaimed_root = directory.path().join("reclaimed");
+        for root in [&unreclaimed_root, &reclaimed_root] {
+            let mut store = open_store_at(root)?;
+            commit_reclaimable_history(&mut store)?;
+            if root == &reclaimed_root {
+                checkpoint_store(&mut store)?.expect("a committed prefix is checkpointable");
+            }
+        }
+        assert_eq!(committed_entry_count(&unreclaimed_root)?, 3);
+        assert_eq!(committed_entry_count(&reclaimed_root)?, 0);
+
+        let unreclaimed = open_store_at(&unreclaimed_root)?;
+        let reclaimed = open_store_at(&reclaimed_root)?;
+
+        assert_eq!(unreclaimed.request_claims, reclaimed.request_claims);
+        assert_eq!(
+            unreclaimed.continuation_claims,
+            reclaimed.continuation_claims
+        );
+        assert_eq!(
+            unreclaimed.state.claimed_request_count,
+            reclaimed.state.claimed_request_count
+        );
+        assert_eq!(
+            unreclaimed.state.claimed_continuation_count,
+            reclaimed.state.claimed_continuation_count
+        );
+        assert_eq!(
+            unreclaimed.state.entry_chain_digest,
+            reclaimed.state.entry_chain_digest
+        );
+        assert_eq!(
+            unreclaimed.state.committed_sequence,
+            reclaimed.state.committed_sequence
+        );
+        assert_refuses_the_fixture_replays(&unreclaimed)?;
+        assert_refuses_the_fixture_replays(&reclaimed)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_crash_at_every_checkpoint_ordering_boundary_recovers_and_refuses_the_same_replays(
+    ) -> TestResult {
+        let boundaries = [
+            CheckpointCrashPoint::BeforeCheckpointDurable,
+            CheckpointCrashPoint::AfterCheckpointBeforeCurrent,
+            CheckpointCrashPoint::AfterCurrentBeforeEntryRemoval,
+        ];
+        for boundary in boundaries {
+            let directory = tempfile::tempdir()?;
+            let root = directory.path().join("journal");
+            let mut store = open_store_at(&root)?;
+            commit_reclaimable_history(&mut store)?;
+            commit_checkpoint_up_to(&mut store, boundary)?;
+            // Every entry is still on disk at each boundary: nothing is removed
+            // before the current state names the checkpoint that replaced it.
+            assert_eq!(committed_entry_count(&root)?, 3);
+            drop(store);
+
+            let reopened = open_store_at(&root)?;
+            assert_eq!(reopened.state.committed_sequence, 3);
+            assert_refuses_the_fixture_replays(&reopened)?;
+            match boundary {
+                CheckpointCrashPoint::AfterCurrentBeforeEntryRemoval => {
+                    assert_eq!(reopened.state.checkpoint_base_sequence, 3);
+                    assert_eq!(
+                        committed_entry_count(&root)?,
+                        0,
+                        "reopening finishes the interrupted reclamation"
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        reopened.state.checkpoint_base_sequence, 0,
+                        "an unreferenced checkpoint is inert"
+                    );
+                    assert_eq!(committed_entry_count(&root)?, 3);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_checkpoint_from_another_deployment_epoch_or_namespace_is_rejected() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        let foreign_root = directory.path().join("foreign");
+        let mut store = open_store_at(&root)?;
+        commit_reclaimable_history(&mut store)?;
+        checkpoint_store(&mut store)?.expect("a committed prefix is checkpointable");
+        drop(store);
+        let checkpoint_bytes = fs::read(root.join(CHECKPOINT_FILE))?;
+
+        // A different protection context is exactly how the composition layer
+        // separates deployments, owner generations, key epochs, and profiles.
+        let foreign_context = ReplayJournalProtectionContext::new([0x93; DIGEST_BYTES]);
+        let mut foreign = ReplayJournalStore::open_with_limits(
+            foreign_root.clone(),
+            limits(),
+            test_profile_id(),
+            foreign_context,
+            DeterministicTestProtector::available(),
+        )?;
+        commit_reclaimable_history(&mut foreign)?;
+        checkpoint_store(&mut foreign)?.expect("a committed prefix is checkpointable");
+        drop(foreign);
+
+        // Swapping the foreign deployment's checkpoint in keeps the digest the
+        // current state committed unreachable, and even a caller that forced
+        // the digest through could not authenticate the record.
+        fs::write(
+            root.join(CHECKPOINT_FILE),
+            fs::read(foreign_root.join(CHECKPOINT_FILE))?,
+        )?;
+        assert_eq!(
+            open_store_at(&root).expect_err("a foreign checkpoint must not seed recovery"),
+            ReplayJournalStoreError::CheckpointMismatch
+        );
+        let foreign_bytes = fs::read(foreign_root.join(CHECKPOINT_FILE))?;
+        assert_eq!(
+            PersistentReplayJournalCheckpointV1(foreign_bytes)
+                .into_business(
+                    limits(),
+                    test_profile_id(),
+                    &protection_context(),
+                    &DeterministicTestProtector::available()
+                )
+                .expect_err("a foreign checkpoint must not authenticate")
+                .to_string(),
+            ReplayJournalRecordError::AuthenticationFailed.to_string()
+        );
+
+        // The journal's own checkpoint still opens, so the rejection above is
+        // the binding and not an artefact of the fixture.
+        fs::write(root.join(CHECKPOINT_FILE), &checkpoint_bytes)?;
+        assert_eq!(open_store_at(&root)?.state.checkpoint_base_sequence, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_tampered_or_truncated_checkpoint_fails_closed() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        let mut store = open_store_at(&root)?;
+        commit_reclaimable_history(&mut store)?;
+        checkpoint_store(&mut store)?.expect("a committed prefix is checkpointable");
+        drop(store);
+        let checkpoint_path = root.join(CHECKPOINT_FILE);
+        let original = fs::read(&checkpoint_path)?;
+
+        let mut tampered = original.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        fs::write(&checkpoint_path, &tampered)?;
+        assert_eq!(
+            open_store_at(&root).expect_err("a tampered checkpoint must not seed recovery"),
+            ReplayJournalStoreError::CheckpointMismatch
+        );
+
+        fs::write(&checkpoint_path, &original[..original.len() - 1])?;
+        assert_eq!(
+            open_store_at(&root).expect_err("a truncated checkpoint must not seed recovery"),
+            ReplayJournalStoreError::CheckpointMismatch
+        );
+
+        fs::remove_file(&checkpoint_path)?;
+        assert_eq!(
+            open_store_at(&root).expect_err("a missing checkpoint must not be treated as empty"),
+            ReplayJournalStoreError::CheckpointMissing
+        );
+
+        fs::write(&checkpoint_path, &original)?;
+        assert_eq!(open_store_at(&root)?.state.checkpoint_base_sequence, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_checkpoint_reclaims_the_suffix_capacity_a_duplicate_burned() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        let two_transactions = ReplayJournalLimits::new(2)?;
+        let mut store = ReplayJournalStore::open_with_limits(
+            root,
+            two_transactions,
+            test_profile_id(),
+            protection_context(),
+            DeterministicTestProtector::available(),
+        )?;
+        let (_, round) = security_round();
+        store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+        store.commit_transaction(&round, &request_key(1), &ContinuationReplayPlan::Cover)?;
+
+        assert_eq!(store.state.committed_sequence, 2);
+        assert_eq!(store.live_claim_count(), 1, "a duplicate claims nothing");
+        assert_eq!(
+            store
+                .prepare_commit(&request_key(2), &ContinuationReplayPlan::Cover)
+                .expect_err("the unreclaimed suffix is full"),
+            ReplayJournalStoreError::TransactionCapacityExceeded
+        );
+
+        checkpoint_store(&mut store)?.expect("a committed prefix is checkpointable");
+
+        store.commit_transaction(&round, &request_key(2), &ContinuationReplayPlan::Cover)?;
+        assert_eq!(store.state.committed_sequence, 3);
+        assert_eq!(
+            store
+                .prepare_commit(&request_key(1), &ContinuationReplayPlan::Cover)?
+                .decision,
+            ReplayDuplicateDecision::RequestDuplicate,
+            "reclaimed capacity must not cost a claim"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpointing_an_unchanged_prefix_is_a_no_op() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("journal");
+        let mut store = open_store_at(&root)?;
+
+        assert!(
+            checkpoint_store(&mut store)?.is_none(),
+            "nothing to reclaim"
+        );
+        commit_reclaimable_history(&mut store)?;
+        checkpoint_store(&mut store)?.expect("a committed prefix is checkpointable");
+        let after_first = store.state;
+
+        assert!(
+            checkpoint_store(&mut store)?.is_none(),
+            "a second checkpoint over the same prefix cannot advance the state"
+        );
+        assert_eq!(store.state, after_first);
+        Ok(())
+    }
+
+    #[test]
+    fn the_coordinator_binds_a_checkpoint_to_the_outer_snapshot() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let replay_root = directory.path().join("journal");
+        let security_state_root = directory.path().join("security");
+        let protector = DeterministicTestProtector::available();
+        let witness = CoordinatorWitness::empty();
+        let mut coordinator = provision_coordinator(
+            &replay_root,
+            &security_state_root,
+            protector.clone(),
+            witness.clone(),
+        )?;
+        let (_, round) = security_round();
+        coordinator.commit_request_and_snapshot(
+            &round,
+            &request_key(1),
+            &ContinuationReplayPlan::Cover,
+        )?;
+        let before = coordinator.current_snapshot;
+
+        assert_eq!(
+            coordinator.commit_checkpoint()?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::Advanced
+        );
+        assert_ne!(
+            coordinator.current_snapshot.component_state_digest(),
+            before.component_state_digest()
+        );
+        verify_current(&coordinator.current_snapshot, &coordinator.replay_journal)?;
+        assert_eq!(
+            coordinator.commit_checkpoint()?,
+            ReplaySnapshotCoordinatorMaintenanceOutcome::NoAdvance
+        );
+        drop(coordinator);
+
+        let reopened = open_coordinator(
+            &replay_root,
+            &security_state_root,
+            protector,
+            witness.clone(),
+        )?;
+        assert_eq!(reopened.replay_journal.state.checkpoint_base_sequence, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_slot_padding_hides_the_live_claim_count_within_a_block() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut lengths = Vec::new();
+        for claims in 1_u8..=3 {
+            let root = directory.path().join(format!("journal-{claims}"));
+            let mut store = open_store_at(&root)?;
+            let (_, round) = security_round();
+            for index in 1..=claims {
+                store.commit_transaction(
+                    &round,
+                    &request_key(index),
+                    &ContinuationReplayPlan::Cover,
+                )?;
+            }
+            checkpoint_store(&mut store)?.expect("a committed prefix is checkpointable");
+            lengths.push(fs::metadata(root.join(CHECKPOINT_FILE))?.len());
+        }
+
+        assert_eq!(
+            lengths.iter().collect::<HashSet<_>>().len(),
+            1,
+            "claim counts inside one padding block must not change the record length"
+        );
+        assert_eq!(
+            lengths[0],
+            (CHECKPOINT_PROTECTED_START
+                + CHECKPOINT_HEADER_BYTES
+                + usize::try_from(CHECKPOINT_SLOT_GRANULARITY)? * CHECKPOINT_SLOT_BYTES
+                + PROTECTION_OVERHEAD_BYTES) as u64
+        );
         Ok(())
     }
 }
