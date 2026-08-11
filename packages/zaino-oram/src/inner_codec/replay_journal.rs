@@ -703,7 +703,11 @@ enum ReplayJournalTransitionError {
     InvalidSequence,
     InvalidDuplicateRequestLane,
     InvalidDuplicateContinuationLane,
-    TransactionCapacityExceeded,
+    // No `TransactionCapacityExceeded`: capacity stopped being a lifetime
+    // append count the transition layer could exceed once reclamation re-based
+    // it on unreclaimed suffix length and live claim count. The store boundary
+    // is the only place that knows both, so the check lives there and
+    // `ReplayJournalStoreError` keeps its own variant.
     SequenceOverflow,
     InconsistentClaimSet,
 }
@@ -3079,9 +3083,6 @@ fn map_directory_error(error: RealDirectoryError) -> ReplayJournalStoreError {
 
 fn map_prepare_transition_error(error: ReplayJournalTransitionError) -> ReplayJournalStoreError {
     match error {
-        ReplayJournalTransitionError::TransactionCapacityExceeded => {
-            ReplayJournalStoreError::TransactionCapacityExceeded
-        }
         ReplayJournalTransitionError::SequenceOverflow => ReplayJournalStoreError::SequenceOverflow,
         ReplayJournalTransitionError::InvalidSequence
         | ReplayJournalTransitionError::InvalidDuplicateRequestLane
