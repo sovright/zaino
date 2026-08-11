@@ -47,6 +47,12 @@ mod xchacha20;
 #[cfg(feature = "corpus-zaino")]
 pub(super) mod private_service;
 
+// Test-support only. Same reason for living here as `private_service`: it
+// composes a runtime, which means naming the protector, lease, and journal
+// types this module keeps private.
+#[cfg(feature = "wallet-parity-harness")]
+pub(super) mod wallet_parity_harness;
+
 const FORMAT_VERSION: u16 = 1;
 const U16_BYTES: usize = 2;
 const U32_BYTES: usize = 4;
@@ -219,6 +225,24 @@ impl<const RESPONSE_SLOTS: usize> PrivateQueryResponse<RESPONSE_SLOTS> {
     }
 }
 
+#[cfg(feature = "wallet-parity-harness")]
+impl<const RESPONSE_SLOTS: usize> PrivateQueryResponse<RESPONSE_SLOTS> {
+    /// Decomposes a decoded response for a wallet-side reader.
+    ///
+    /// The checkpoint is deliberately dropped: a wallet already knows which
+    /// checkpoint it sealed under, and re-reading the one the server echoed
+    /// back would invite a caller to trust it.
+    pub(super) fn into_wallet_parts(
+        self,
+    ) -> (
+        UtxoResultPage<RESPONSE_SLOTS>,
+        bool,
+        Option<ContinuationToken>,
+    ) {
+        (self.page, self.has_more, self.continuation)
+    }
+}
+
 impl<const RESPONSE_SLOTS: usize> fmt::Debug for PrivateQueryResponse<RESPONSE_SLOTS> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrivateQueryResponse")
@@ -257,7 +281,7 @@ trait EnvelopeProtector {
 fn xchacha20_envelope_protector(
     request_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
     response_key: zeroize::Zeroizing<[u8; crate::xchacha20::KEY_BYTES]>,
-) -> impl EnvelopeProtector {
+) -> xchacha20::XChaCha20EnvelopeProtector {
     xchacha20::envelope_protector(request_key, response_key)
 }
 

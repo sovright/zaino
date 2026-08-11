@@ -21,7 +21,7 @@ use crate::canonical_chain::CanonicalNetwork;
 use crate::records::{AddressKey, TransparentUtxo, ADDRESS_KEY_BYTES, TXID_BYTES};
 
 mod publication;
-#[cfg(test)]
+#[cfg(any(test, feature = "wallet-parity-harness"))]
 pub(crate) use publication::serving_epoch_for_tests;
 #[cfg(feature = "corpus-zaino")]
 pub(super) use publication::FinalizedServingStore;
@@ -35,7 +35,7 @@ pub(super) use publication::{FrozenRecentSnapshot, RecentSnapshotLineage};
 pub(super) use publication::{
     ServingEpochBoundary, ServingEpochCurrentness, ServingEpochLease, ServingEpochStore,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "wallet-parity-harness"))]
 pub(crate) use publication::{ServingEpochObservation, ServingEpochUnavailable};
 #[cfg(feature = "corpus-zaino")]
 mod zaino;

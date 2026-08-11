@@ -70,7 +70,7 @@ impl RecentSnapshotLineage {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "wallet-parity-harness"))]
     pub(crate) fn from_parts_for_tests(
         generation: u64,
         finalized: RecentSnapshotIdentity,
@@ -177,7 +177,7 @@ impl<const N: usize> FrozenRecentSnapshot<N> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "wallet-parity-harness"))]
     pub(crate) fn from_parts_for_tests(
         lineage: RecentSnapshotLineage,
         slots: [RecentSnapshotSlot; N],
@@ -832,7 +832,7 @@ impl<const N: usize, B, S, C> fmt::Debug for ServingEpochInvalidator<N, B, S, C>
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "wallet-parity-harness"))]
 pub(crate) fn serving_epoch_for_tests<const N: usize, B, S, C>(
     snapshot: FrozenRecentSnapshot<N>,
     boundary: B,

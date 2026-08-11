@@ -179,7 +179,7 @@ impl PrivateProjectionShape {
         seed
     }
 
-    fn projection_config(&self) -> Result<ProjectionConfig, PrivateQueryUnavailable> {
+    pub(super) fn projection_config(&self) -> Result<ProjectionConfig, PrivateQueryUnavailable> {
         let capacities = ProjectionCapacities::new(
             self.max_seen_outputs,
             self.max_live_outputs,
@@ -198,7 +198,7 @@ impl PrivateProjectionShape {
         .map_err(|_| PrivateQueryUnavailable)
     }
 
-    fn layout(
+    pub(super) fn layout(
         &self,
     ) -> Result<FixedProbeLayout<DIRECTORY_PROBES, EVENT_PROBES>, PrivateQueryUnavailable> {
         let identity = LayoutIdentity::new(
