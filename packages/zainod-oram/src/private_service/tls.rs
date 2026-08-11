@@ -428,12 +428,19 @@ fn require_owner_only(path: &Path) -> Result<(), PrivateTlsError> {
     })
 }
 
-/// No file-mode equivalent to enforce off Unix; the deployment target is a
-/// Linux TDX workload, so this is a portability courtesy, not a supported
-/// posture.
+/// Refuses to proceed where owner-only mode cannot be enforced.
+///
+/// The deployment target is a Linux TDX workload. Off Unix there is no mode to
+/// inspect, and the key is a long-lived secret at rest — so this fails closed
+/// rather than returning `Ok` and leaving that secret under whatever
+/// permissions the platform chose. A silently-accepted unenforceable mode is
+/// the failure this exists to prevent, and it would be invisible precisely on
+/// the builds nobody is watching.
 #[cfg(not(unix))]
-fn require_owner_only(_: &Path) -> Result<(), PrivateTlsError> {
-    Ok(())
+fn require_owner_only(path: &Path) -> Result<(), PrivateTlsError> {
+    Err(PrivateTlsError::KeyModeUnenforceable {
+        path: path.to_path_buf(),
+    })
 }
 
 /// Creates `path` readable and writable only by its owner, failing if it
@@ -449,14 +456,23 @@ fn create_owner_only(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-/// See [`require_owner_only`]'s non-Unix note: the file is still exclusive,
-/// but its mode is whatever the platform defaults to.
+/// Refuses to create the key file where its mode cannot be enforced.
+///
+/// The mint path reaches here before [`require_owner_only`] ever runs, so
+/// failing only on load would still write the secret out once under an
+/// unenforceable mode. See that function for why this is refused rather than
+/// tolerated.
 #[cfg(not(unix))]
 fn create_owner_only(path: &Path) -> std::io::Result<File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "cannot enforce owner-only permissions on {} on this platform; \
+             the private TLS key is a long-lived secret at rest and the \
+             deployment target is Linux",
+            path.display()
+        ),
+    ))
 }
 
 /// Writes the private key, owner-only, refusing to clobber.
@@ -545,6 +561,21 @@ pub(crate) enum PrivateTlsError {
         /// Its current mode, masked to the permission bits.
         mode: u32,
     },
+    /// This platform cannot enforce owner-only permissions on the key file.
+    ///
+    /// The key is a long-lived secret at rest, so an unenforceable mode is
+    /// refused rather than accepted quietly. Returning `Ok` here would let a
+    /// build the deployment does not target hold that secret under whatever
+    /// permissions the platform happened to choose, with nothing saying so.
+    ///
+    /// Gated with its only construction site: on Unix the mode *is*
+    /// enforceable, so an ungated variant would be dead code there — which is
+    /// every build this project actually ships.
+    #[cfg(not(unix))]
+    KeyModeUnenforceable {
+        /// The key file whose mode could not be enforced.
+        path: PathBuf,
+    },
     /// The published fingerprint is not the loaded certificate's.
     FingerprintMismatch {
         /// The published record that disagrees.
@@ -587,6 +618,12 @@ impl fmt::Display for PrivateTlsError {
             Self::InsecureKeyPermissions { path, mode } => write!(
                 f,
                 "private surface TLS key {} is mode {mode:o}; it must be readable only by its owner (chmod 600)",
+                path.display()
+            ),
+            #[cfg(not(unix))]
+            Self::KeyModeUnenforceable { path } => write!(
+                f,
+                "this platform cannot enforce owner-only permissions on {}; the private TLS key is a long-lived secret at rest, so an unenforceable mode is refused rather than accepted. The private surface targets a Linux TDX workload",
                 path.display()
             ),
             Self::FingerprintMismatch { path } => write!(
