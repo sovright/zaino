@@ -919,7 +919,112 @@ mod tests {
                 0,
                 0,
             ),
+            // One outpoint under two addresses. Grouping by outpoint alone puts
+            // these in one run, so the run must still reject on the address
+            // comparison rather than on its length.
+            (
+                "same-outpoint-different-addresses",
+                vec![(0, first)],
+                [
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::created(address(9), recent_created),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                0,
+            ),
+            // The create-then-spend pair inverted. Ordinal order is the whole
+            // predicate here, so it must survive being sorted by outpoint.
+            (
+                "spend-then-recreate",
+                vec![(0, first)],
+                [
+                    RecentSnapshotSlot::spent(key, recent_created),
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::dummy(),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                0,
+            ),
+            // A third occurrence of one outpoint, which the run-length arm
+            // rejects without comparing fields. The oracle rejects it through
+            // the two ordered pairs that contradict each other.
+            (
+                "outpoint-restated-three-times",
+                vec![(0, first)],
+                [
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::spent(key, recent_created),
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::dummy(),
+                ],
+                0,
+                0,
+            ),
+            // No dummy slots at all, so every ordinal participates in both
+            // facts and none is skipped by the occupancy filter.
+            (
+                "fully-populated",
+                vec![(0, first), (1, second)],
+                [
+                    RecentSnapshotSlot::created(key, recent_created),
+                    RecentSnapshotSlot::spent(key, recent_created),
+                    RecentSnapshotSlot::created(key, also_created),
+                    RecentSnapshotSlot::spent(key, first),
+                ],
+                0,
+                0,
+            ),
         ]
+    }
+
+    /// Every distinguishable slot value, for exhaustive snapshot enumeration.
+    ///
+    /// Two addresses and three outpoints that disagree in the txid and in the
+    /// output index separately, so an ordering that ignores either field is
+    /// distinguishable, plus the dummy.
+    fn exhaustive_slot_alphabet() -> Vec<RecentSnapshotSlot> {
+        let mut alphabet = vec![RecentSnapshotSlot::dummy()];
+        for address_byte in [1, 9] {
+            for outpoint in [
+                utxo_with_outpoint(1, 1, 10),
+                utxo_with_outpoint(1, 2, 10),
+                utxo_with_outpoint(2, 1, 10),
+            ] {
+                alphabet.push(RecentSnapshotSlot::created(address(address_byte), outpoint));
+                alphabet.push(RecentSnapshotSlot::spent(address(address_byte), outpoint));
+            }
+        }
+        alphabet
+    }
+
+    /// Sorting derives both facts bit-identically on every three-slot snapshot.
+    ///
+    /// The fixtures below name the interesting cases; this closes the gap by
+    /// enumerating the whole three-slot domain over an alphabet rich enough to
+    /// separate outpoint, address, kind, ordinal, and occupancy. Every
+    /// duplication and ordering pattern the run-grouping can encounter appears
+    /// here, checked against the verbatim pre-hoist predicates.
+    #[test]
+    fn every_three_slot_snapshot_derives_the_same_facts_as_the_oracles() {
+        let alphabet = exhaustive_slot_alphabet();
+        let mut checked = 0_usize;
+        for first in &alphabet {
+            for second in &alphabet {
+                for third in &alphabet {
+                    let slots = [*first, *second, *third];
+                    assert_eq!(
+                        RecentSnapshotScan::from_slots(slots),
+                        legacy_scan(slots),
+                        "{checked}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, alphabet.len().pow(3));
     }
 
     /// The precomputed facts equal the predicates they replaced, case by case.

@@ -18,7 +18,7 @@ use blake2::{Blake2s256, Digest};
 
 #[cfg(feature = "corpus-zaino")]
 use crate::canonical_chain::CanonicalNetwork;
-use crate::records::{AddressKey, TransparentUtxo, ADDRESS_KEY_BYTES};
+use crate::records::{AddressKey, TransparentUtxo, ADDRESS_KEY_BYTES, TXID_BYTES};
 
 mod publication;
 #[cfg(test)]
@@ -257,9 +257,17 @@ pub(super) struct RecentSnapshotScan<const N: usize> {
 
 impl<const N: usize> RecentSnapshotScan<N> {
     /// Precomputes the query-independent snapshot facts once, at publication.
+    ///
+    /// Both facts are equi-joins of the snapshot with itself on outpoint, so
+    /// one `(outpoint, address, ordinal)` ordering serves both and each fact
+    /// then falls out of a single linear scan over equal-outpoint runs. The
+    /// shared sort is what keeps publication at `O(N log N)`; deriving either
+    /// fact from the unordered array costs the `N^2` ordered-pair sweep this
+    /// replaces.
     pub(super) fn from_slots(slots: [RecentSnapshotSlot; N]) -> Self {
-        let semantically_valid = snapshot_is_semantically_valid(&slots);
-        let live = creation_liveness(&slots);
+        let grouped = grouped_occupied_changes(&slots);
+        let semantically_valid = snapshot_is_semantically_valid(&grouped);
+        let live = creation_liveness(&grouped);
         Self {
             slots,
             live,
@@ -312,61 +320,122 @@ impl<const N: usize> fmt::Debug for RecentSnapshotScan<N> {
     }
 }
 
+/// One occupied snapshot change, decorated with the key both facts group by.
+///
+/// Publication-time only, so this holds ordinary copies of public snapshot
+/// fields and compares them with ordinary operators. It exists to be sorted:
+/// both facts below are equi-joins on outpoint, and sorting collapses each
+/// join into a walk over consecutive equal-outpoint runs.
+struct GroupedChange {
+    txid: [u8; TXID_BYTES],
+    output_index: u32,
+    address_key: [u8; ADDRESS_KEY_BYTES],
+    ordinal: usize,
+    kind: RecentUtxoChangeKind,
+}
+
+impl GroupedChange {
+    /// Returns whether two changes restate the same outpoint.
+    fn has_same_outpoint(&self, other: &Self) -> bool {
+        self.txid == other.txid && self.output_index == other.output_index
+    }
+
+    /// Returns whether two changes restate one address's same outpoint.
+    fn has_same_outpoint_and_address(&self, other: &Self) -> bool {
+        self.has_same_outpoint(other) && self.address_key == other.address_key
+    }
+}
+
+/// Orders every occupied change by `(outpoint, address, ordinal)`.
+///
+/// Publication-time only: this takes the snapshot and nothing else, runs once
+/// per generation, and never observes a query, so an ordinary comparison sort
+/// is appropriate and its data-dependent branching carries no per-query
+/// signal. Unoccupied slots are dropped here because neither fact consults
+/// them.
+///
+/// The ordering is total and the ordinal tiebreak makes it deterministic, so
+/// a published generation derives the same facts on any host.
+fn grouped_occupied_changes<const N: usize>(slots: &[RecentSnapshotSlot; N]) -> Vec<GroupedChange> {
+    let mut grouped: Vec<GroupedChange> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, slot)| {
+            let change = slot.change()?;
+            Some(GroupedChange {
+                txid: *change.utxo().txid(),
+                output_index: change.utxo().output_index(),
+                address_key: *change.address_key().as_bytes(),
+                ordinal,
+                kind: change.kind(),
+            })
+        })
+        .collect();
+    grouped.sort_unstable_by(|left, right| {
+        left.txid
+            .cmp(&right.txid)
+            .then(left.output_index.cmp(&right.output_index))
+            .then(left.address_key.cmp(&right.address_key))
+            .then(left.ordinal.cmp(&right.ordinal))
+    });
+    grouped
+}
+
 /// Returns whether repeated outpoints are all one address's create-then-spend
 /// pair, in ordinal order.
 ///
-/// Publication-time only: it takes the snapshot and nothing else, runs once per
-/// generation, and never observes a query, so ordinary control flow carries no
-/// per-query signal.
-fn snapshot_is_semantically_valid<const N: usize>(slots: &[RecentSnapshotSlot; N]) -> bool {
+/// Equivalent to the ordered-pair sweep this replaces: that sweep constrained
+/// every earlier/later pair sharing an outpoint, and every such pair lies
+/// inside one run here.
+fn snapshot_is_semantically_valid(grouped: &[GroupedChange]) -> bool {
     let mut valid = true;
-    for (later_ordinal, later_slot) in slots.iter().enumerate() {
-        for earlier_slot in slots.iter().take(later_ordinal) {
-            let (Some(later), Some(earlier)) = (later_slot.change(), earlier_slot.change()) else {
-                continue;
-            };
-            if same_outpoint(earlier.utxo(), later.utxo()) {
-                valid &= earlier.address_key() == later.address_key()
-                    && earlier.kind() == RecentUtxoChangeKind::Created
-                    && later.kind() == RecentUtxoChangeKind::Spent;
-            }
-        }
+    for group in grouped.chunk_by(GroupedChange::has_same_outpoint) {
+        valid &= outpoint_group_is_one_create_then_spend(group);
     }
     valid
+}
+
+/// Returns whether one equal-outpoint run is a single create-then-spend pair.
+///
+/// A third occurrence is unconditionally malformed and needs no field
+/// comparison: the middle change would have to be the spend closing the first
+/// pair and the creation opening the second at once, which the ordered-pair
+/// sweep rejected through those same two pairs.
+fn outpoint_group_is_one_create_then_spend(group: &[GroupedChange]) -> bool {
+    match group {
+        [] | [_] => true,
+        [earlier, later] => {
+            earlier.address_key == later.address_key
+                && earlier.kind == RecentUtxoChangeKind::Created
+                && later.kind == RecentUtxoChangeKind::Spent
+        }
+        _ => false,
+    }
 }
 
 /// Returns, per ordinal, whether no later slot restates that ordinal's
 /// outpoint for the same address.
 ///
-/// Publication-time only, for the same reason as
-/// [`snapshot_is_semantically_valid`]. Unoccupied ordinals keep the vacuous
-/// `true`; the engine never consults them.
-fn creation_liveness<const N: usize>(slots: &[RecentSnapshotSlot; N]) -> [bool; N] {
+/// Publication-time only, for the same reason as [`grouped_occupied_changes`].
+/// Unoccupied ordinals keep the vacuous `true`; the engine never consults them.
+///
+/// Each run holds one address's restatements of one outpoint in ascending
+/// ordinal order, so exactly its last member has no later restatement — which
+/// is the predicate this replaces, evaluated once per run instead of once per
+/// ordered pair.
+fn creation_liveness<const N: usize>(grouped: &[GroupedChange]) -> [bool; N] {
     let mut live = [true; N];
-    for (ordinal, slot) in slots.iter().enumerate() {
-        let (Some(candidate), Some(destination)) = (slot.change(), live.get_mut(ordinal)) else {
+    for group in grouped.chunk_by(GroupedChange::has_same_outpoint_and_address) {
+        let Some((_, superseded)) = group.split_last() else {
             continue;
         };
-        *destination = !slots
-            .iter()
-            .skip(ordinal.saturating_add(1))
-            .any(|later_slot| {
-                later_slot.change().is_some_and(|later| {
-                    later.address_key() == candidate.address_key()
-                        && same_outpoint(later.utxo(), candidate.utxo())
-                })
-            });
+        for change in superseded {
+            if let Some(destination) = live.get_mut(change.ordinal) {
+                *destination = false;
+            }
+        }
     }
     live
-}
-
-/// Compares the outpoint half of two transparent records.
-///
-/// Deliberately separate from the engine's masked equality: this runs once per
-/// published generation with no query in scope, so it does not owe the
-/// engine's source-level data-independence contract.
-fn same_outpoint(left: &TransparentUtxo, right: &TransparentUtxo) -> bool {
-    left.txid() == right.txid() && left.output_index() == right.output_index()
 }
 
 /// Commits every fixed snapshot slot in public ordinal order.
