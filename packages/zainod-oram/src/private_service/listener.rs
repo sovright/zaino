@@ -746,10 +746,10 @@ mod tests {
     /// production wallet will eventually use to seal and open envelopes.
     ///
     /// Real envelope protection (`EnvelopeProtector`) is crate-internal to
-    /// `zaino-oram` by design and unreachable from a listener-level test;
-    /// exercising it end to end also needs a live chain subscriber to pin a
-    /// serving epoch, which `a_real_composed_runtime_serves_the_bound_surface`
-    /// above notes no unit test can stand up. XOR is self-inverse, so this one
+    /// `zaino-oram` by design; reaching it from here needs that crate's
+    /// `wallet-parity-harness` test-support seam, which
+    /// `a_real_sealed_query_over_the_wire_matches_the_ordinary_source` uses
+    /// and this older test predates. XOR is self-inverse, so this one
     /// function backs both `seal_request` and `open_response` below; it exists
     /// only to prove that the exact key material a real `BootstrapSession`
     /// call releases is the same material a matching handler needs, driven
@@ -871,18 +871,15 @@ mod tests {
     /// service's own dispatch, so a typo in that route string would have
     /// passed every existing test.
     ///
-    /// The "seal a query, open the response" half is a test-local XOR
-    /// stand-in (`seal_request`/`open_response`, backed by
-    /// `keyed_transform`), not the production AEAD -- that cipher is
-    /// crate-internal to `zaino-oram` by design and unreachable from a
-    /// listener-level test. So this test does *not* by itself close #101:
-    /// #101 still needs (a) these client helpers made reachable outside
-    /// `#[cfg(test)]`, (b) a public wallet-side seal/open a real
-    /// `EnvelopeProtector` will accept, and (c) a refreshed runtime, which
-    /// needs a live or mock chain subscriber. What this test does prove is
-    /// that the released `request_key`/`response_key` are exactly what the
-    /// server holds -- checked directly below, not just inferred from a
-    /// round trip.
+    /// The "seal a query, open the response" half here is a test-local XOR
+    /// stand-in (`seal_request`/`open_response`, backed by `keyed_transform`),
+    /// not the production AEAD. The real-cipher version of that half now
+    /// exists next door as
+    /// `a_real_sealed_query_over_the_wire_matches_the_ordinary_source`; this
+    /// test is kept for the one thing that one does not do, which is compare
+    /// the wire-released `request_key`/`response_key` byte for byte against
+    /// the exact keys the handler was given, rather than inferring equality
+    /// from a successful round trip.
     ///
     /// multi_thread required: the serve loop and the client run concurrently
     /// on separate tasks and the client blocks on responses the server must
@@ -947,6 +944,120 @@ mod tests {
         assert_eq!(opened, expected_page_for(sample_query()));
 
         surface.shutdown().await
+    }
+
+    /// The parity leg #101 exists for: a **real** private query, sealed with the
+    /// real codec and the real XChaCha20 protector, driven over the real TLS
+    /// transport and the real route dispatch, whose opened answer equals what
+    /// an ordinary Zaino source reports for the same address.
+    ///
+    /// The wallet material comes from `zaino_oram`'s `wallet-parity-harness`,
+    /// enabled only through this crate's dev-dependencies. That harness hands
+    /// out the session binding and serving checkpoint the protocol does not
+    /// publish; without them no client-constructible request exists, which is
+    /// why the neighbouring `a_wallet_bootstraps_then_queries` had to fall back
+    /// on an XOR stand-in. This test uses no stand-in of any kind.
+    ///
+    /// What it does *not* establish: that a deployable wallet exists. It does
+    /// not, and cannot until those two values are published or replaced. The
+    /// projection underneath is also the non-oblivious in-memory backend, so
+    /// nothing here bears on obliviousness.
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently on
+    /// separate tasks and the client blocks on a response the server must send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_real_sealed_query_over_the_wire_matches_the_ordinary_source(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use zaino_oram::{
+            parity_mismatch, wallet_parity_harness, WalletOutcome, WalletParityRuntime, WalletUtxo,
+            PARITY_ENVELOPE_BYTES,
+        };
+
+        let fixture = zaino_state::test_dependencies::load_ordinary_utxo_shadow_fixture().await?;
+        let journal = tempfile::TempDir::new()?;
+        let harness = wallet_parity_harness(
+            &parity_shape()?,
+            fixture.indexed_blocks(),
+            journal.path().join("replay"),
+            [0x6a; 16],
+            1,
+        )?;
+        let session = harness.wallet_session()?;
+        let bootstrap = harness.session_bootstrap()?;
+        let expected_key_epoch = bootstrap.key_epoch;
+
+        let surface = ServedSurface::start::<_, PARITY_ENVELOPE_BYTES>(harness, bootstrap).await?;
+
+        // The published half of the story still works: a wallet bootstraps and
+        // gets the epoch it must stamp on every query.
+        let wire_bootstrap = bootstrap_client(surface.address, &surface.certificate_pem).await?;
+        assert_eq!(wire_bootstrap.key_epoch, expected_key_epoch);
+
+        let mut checked_nonempty = 0;
+        for case in fixture.cases() {
+            let sealed = session.seal_query(case.address_script(), 0, None)?;
+            let answer = query_page_over_the_wire(
+                surface.address,
+                &surface.certificate_pem,
+                sealed.to_vec(),
+                wire_bootstrap.key_epoch,
+            )
+            .await?;
+            let envelope: [u8; PARITY_ENVELOPE_BYTES] = answer
+                .envelope
+                .try_into()
+                .map_err(|_| "response envelope is not the compiled width")?;
+            let page = session.open_response(&envelope)?;
+
+            assert_eq!(page.outcome, WalletOutcome::Complete, "{}", case.name());
+            assert!(!page.has_more);
+            let expected = case
+                .ordinary_utxos()
+                .iter()
+                .map(|utxo| WalletUtxo {
+                    txid: *utxo.txid(),
+                    output_index: utxo.output_index(),
+                    value_zat: utxo.value_zat(),
+                    height: utxo.height(),
+                    script: utxo.script().to_vec(),
+                })
+                .collect::<Vec<_>>();
+            checked_nonempty += usize::from(!expected.is_empty());
+            assert_eq!(
+                parity_mismatch(&page.utxos, &expected),
+                None,
+                "{} differs from the ordinary source over the wire",
+                case.name()
+            );
+        }
+        assert!(
+            checked_nonempty > 0,
+            "a parity run that only ever compared empty sets proves nothing"
+        );
+
+        surface.shutdown().await
+    }
+
+    /// The regtest shape the parity harness serves the fixture chain under.
+    ///
+    /// `max_events_per_address` is the compiled profile's store-read count and
+    /// is not a knob: the engine refuses any store whose per-key slot count
+    /// differs from it.
+    fn parity_shape() -> Result<zaino_oram::PrivateProjectionShape, Box<dyn std::error::Error>> {
+        Ok(zaino_oram::PrivateProjectionShape {
+            network: zaino_oram::PrivateNetwork::Regtest,
+            schema_version: 1,
+            key_epoch: 7,
+            projection_epoch: 11,
+            max_seen_outputs: 4_096,
+            max_live_outputs: 4_096,
+            directory_admission: 64,
+            event_admission: 4_096,
+            max_events_per_address: zaino_oram::private_mainnet_store_reads()
+                .map_err(|_| "the compiled profile reports its store reads")?,
+            directory_capacity: 256,
+            event_capacity: 8_192,
+        })
     }
 
     /// A wallet that keeps querying under a retired key must learn to

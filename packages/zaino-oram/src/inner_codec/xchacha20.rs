@@ -23,21 +23,27 @@ const ENVELOPE_ASSOCIATED_DATA_BYTES: usize =
 const _: [(); ENVELOPE_NONCE_BYTES] = [(); NONCE_BYTES];
 const _: [(); ENVELOPE_AUTHENTICATION_BYTES] = [(); AUTHENTICATION_BYTES];
 
+/// Returns the concrete protector rather than `impl EnvelopeProtector`.
+///
+/// Naming it costs nothing in hiding -- the type stays inside `inner_codec`,
+/// and the crate's public composition seam still returns `impl Trait` -- and it
+/// is what lets a wallet-side session hold the same protector the runtime does
+/// instead of a re-implementation that could drift from it.
 pub(super) fn envelope_protector(
     request_key: Zeroizing<[u8; KEY_BYTES]>,
     response_key: Zeroizing<[u8; KEY_BYTES]>,
-) -> impl EnvelopeProtector {
+) -> XChaCha20EnvelopeProtector {
     XChaCha20EnvelopeProtector::new(request_key, response_key)
 }
 
 /// Separately owned request and response envelope role-key objects.
-struct XChaCha20EnvelopeProtector {
+pub(super) struct XChaCha20EnvelopeProtector {
     request_key: XChaCha20ProtectionKey,
     response_key: XChaCha20ProtectionKey,
 }
 
 impl XChaCha20EnvelopeProtector {
-    fn new(
+    pub(super) fn new(
         request_key: Zeroizing<[u8; KEY_BYTES]>,
         response_key: Zeroizing<[u8; KEY_BYTES]>,
     ) -> Self {

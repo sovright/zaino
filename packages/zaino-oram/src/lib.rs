@@ -94,6 +94,12 @@ pub use inner_codec::private_service::{
     SessionBootstrap, PRIVATE_MAINNET_ENVELOPE_BYTES, PRIVATE_PROFILE_ID_BYTES,
     PRIVATE_RUNTIME_KEY_BYTES,
 };
+#[cfg(feature = "wallet-parity-harness")]
+pub use inner_codec::wallet_parity_harness::{
+    parity_mismatch, wallet_parity_harness, ParityHarnessError, ParityPendingResponse,
+    WalletContinuation, WalletOutcome, WalletPage, WalletParityRuntime, WalletSession, WalletUtxo,
+    PARITY_ENVELOPE_BYTES,
+};
 #[cfg(feature = "corpus-zaino")]
 pub use insertion_bound::{
     SourceBoundInsertionBudgetError, SourceBoundInsertionBudgetProfile,

@@ -54,5 +54,18 @@ zaino-oram = { version = "0.1.0", path = "../zaino-oram", features = ["corpus-za
 zaino-state = { version = "0.3.1", path = "../zaino-state", default-features = false }
 zainod = { version = "0.4.3-ironwood.1", path = "../zainod" }
 
+[dev-dependencies]
+# Test-support only. `wallet-parity-harness` hands out the session binding and
+# serving checkpoint the protocol does not publish, so it must never reach a
+# shipped binary; declaring it here and nowhere else is what guarantees that.
+# `cargo tree -e features -p zaino-oram` on a non-test build shows the feature
+# absent, and `cargo build` never resolves dev-dependencies at all.
+zaino-oram = { version = "0.1.0", path = "../zaino-oram", features = [
+    "corpus-zaino",
+    "shadow-parity",
+    "wallet-parity-harness",
+] }
+zaino-state = { version = "0.3.1", path = "../zaino-state", default-features = false, features = ["test_dependencies"] }
+
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }

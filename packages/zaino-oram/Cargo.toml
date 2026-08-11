@@ -13,6 +13,9 @@ publish = false
 default = []
 corpus-zaino = ["dep:zaino-state"]
 shadow-parity = ["corpus-zaino"]
+# Test-support only: see `inner_codec::wallet_parity_harness`. Enabled through
+# dev-dependencies so it is absent from every non-test build.
+wallet-parity-harness = ["corpus-zaino"]
 rostl-experimental = [
     "dep:bytemuck",
     "dep:rostl-oram",

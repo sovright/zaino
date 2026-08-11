@@ -95,14 +95,13 @@ impl<const ENVELOPE_BYTES: usize> EncodedRuntimeRound<ENVELOPE_BYTES> {
 }
 
 /// One completed protected envelope authorized for caller release.
-struct RuntimeRound<const ENVELOPE_BYTES: usize> {
+pub(super) struct RuntimeRound<const ENVELOPE_BYTES: usize> {
     envelope: FixedEnvelope<ENVELOPE_BYTES>,
     trace: AccessTrace,
 }
 
 impl<const ENVELOPE_BYTES: usize> RuntimeRound<ENVELOPE_BYTES> {
-    #[cfg(test)]
-    const fn envelope(&self) -> &FixedEnvelope<ENVELOPE_BYTES> {
+    pub(super) const fn envelope(&self) -> &FixedEnvelope<ENVELOPE_BYTES> {
         &self.envelope
     }
 
@@ -421,7 +420,7 @@ where
 }
 
 /// Private synchronous adapter for one process-lifetime protection context.
-struct PrivateQueryRuntime<
+pub(super) struct PrivateQueryRuntime<
     S,
     E,
     T,
@@ -516,6 +515,16 @@ where
         Ok(())
     }
 
+    /// Returns the checkpoint of the pinned serving epoch, if one is pinned.
+    ///
+    /// Not published on any wire: a request must carry this exact value or it
+    /// is answered `ProjectionNotReady`, and the harness is the only thing that
+    /// can hand it to a client.
+    #[cfg(feature = "wallet-parity-harness")]
+    pub(super) fn serving_checkpoint(&self) -> Option<PrivateQueryCheckpoint> {
+        self.epoch.as_ref().map(|epoch| epoch.checkpoint)
+    }
+
     #[cfg(feature = "corpus-zaino")]
     fn retire_epoch(&mut self) {
         self.epoch = None;
@@ -552,7 +561,7 @@ where
     }
 
     /// Handles one fixed request without owning any listener or transport.
-    fn handle(
+    pub(super) fn handle(
         &mut self,
         envelope: &FixedEnvelope<ENVELOPE_BYTES>,
     ) -> Result<RuntimeRound<ENVELOPE_BYTES>, UniformExternalFailure> {
@@ -929,7 +938,7 @@ where
 
 #[cfg(feature = "corpus-zaino")]
 impl PrivateQueryCheckpoint {
-    fn try_from_serving_identity(
+    pub(super) fn try_from_serving_identity(
         identity: RecentSnapshotIdentity,
     ) -> Result<Self, FinalizedRuntimeBuildError> {
         let network = PrivateNetwork::try_from_tag(identity.network_tag())
@@ -983,7 +992,7 @@ where
     /// an independently supplied checkpoint or store with the retained lease.
     /// The returned runtime must be retained across rounds because its replay,
     /// material-source, and fail-closed health state are runtime-local.
-    fn from_finalized_serving_epoch(
+    pub(super) fn from_finalized_serving_epoch(
         serving_epoch: ServingEpochLease<
             RECENT_SNAPSHOT_SLOTS,
             B,
@@ -999,7 +1008,7 @@ where
         Ok(runtime)
     }
 
-    fn activate_finalized_serving_epoch(
+    pub(super) fn activate_finalized_serving_epoch(
         &mut self,
         serving_epoch: ServingEpochLease<
             RECENT_SNAPSHOT_SLOTS,
@@ -1551,7 +1560,7 @@ impl std::error::Error for FinalizedRuntimeOwnerError {}
 /// Coarsened finalized-runtime construction failure without epoch identifiers.
 #[cfg(feature = "corpus-zaino")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FinalizedRuntimeBuildError;
+pub(super) struct FinalizedRuntimeBuildError;
 
 #[cfg(feature = "corpus-zaino")]
 impl std::fmt::Debug for FinalizedRuntimeBuildError {
@@ -1570,7 +1579,9 @@ impl std::fmt::Display for FinalizedRuntimeBuildError {
 #[cfg(feature = "corpus-zaino")]
 impl std::error::Error for FinalizedRuntimeBuildError {}
 
-fn recent_snapshot_identity(checkpoint: &PrivateQueryCheckpoint) -> RecentSnapshotIdentity {
+pub(super) fn recent_snapshot_identity(
+    checkpoint: &PrivateQueryCheckpoint,
+) -> RecentSnapshotIdentity {
     RecentSnapshotIdentity::new(
         checkpoint.network.tag(),
         checkpoint.height,
