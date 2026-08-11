@@ -107,7 +107,9 @@ mod private_proto;
 #[cfg(feature = "private-service")]
 mod private_service;
 #[cfg(feature = "private-service")]
-use crate::private_service::PrivateQueryListener;
+use crate::private_service::{
+    require_no_stranded_identity, PrivateQueryListener, PrivateTlsIdentity,
+};
 #[cfg(feature = "typed-qualification")]
 mod qualification_artifact;
 #[cfg(feature = "typed-qualification")]
@@ -182,8 +184,23 @@ struct PrivateServeArgs {
     sizing_dir: PathBuf,
 
     /// Directory holding this runtime's crash-durable replay journal.
+    ///
+    /// Safe to wipe to reset replay state: the TLS identity is deliberately
+    /// not kept here, so wiping this does not touch any wallet's pin.
     #[arg(long, value_name = "DIR")]
     replay_journal_dir: PathBuf,
+
+    /// Directory holding this deployment's persistent TLS identity and its
+    /// published fingerprint.
+    ///
+    /// Defaults to a sibling of --replay-journal-dir named
+    /// `<journal-dir>-tls-identity`. Deliberately a SIBLING and never inside
+    /// the journal directory, because deleting this directory invalidates
+    /// every wallet's pinned certificate and wiping the journal to reset
+    /// replay state must not do that as a side effect. Delete it only when
+    /// you intend to rotate the identity and re-publish the fingerprint.
+    #[arg(long, value_name = "DIR")]
+    tls_identity_dir: Option<PathBuf>,
 
     /// Address the private gRPC surface binds to.
     #[arg(long, value_name = "ADDR")]
@@ -1409,6 +1426,42 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         EphemeralKeyGeneration::draw().map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
     let shape = private_projection_shape(&capture, &sizing, key_generation.key_epoch)?;
 
+    // Loaded here -- before the bind and long before the chain replay -- so a
+    // deployment whose identity is missing, damaged, or half-present fails
+    // immediately rather than after paying for a full replay. Unlike the
+    // symmetric keys drawn above, this identity is *not* rotated by a restart:
+    // a broken pin is an opaque handshake failure a wallet cannot recover
+    // from, where stale keys earn it a StaleKeyEpoch and a re-bootstrap.
+    let tls_identity_dir = match args.tls_identity_dir {
+        Some(directory) => directory,
+        None => default_tls_identity_dir(&args.replay_journal_dir)?,
+    };
+    require_tls_identity_outside_journal(&tls_identity_dir, &args.replay_journal_dir)?;
+    // Earlier builds kept the identity in the journal directory. Upgrading in
+    // place must not look at an empty new location and mint over a pin that is
+    // still perfectly good one directory away.
+    require_no_stranded_identity(&tls_identity_dir, &args.replay_journal_dir)?;
+    let tls = PrivateTlsIdentity::load_or_generate(&tls_identity_dir)?;
+    let fingerprint_path = tls.publish_fingerprint(&tls_identity_dir)?;
+    print!("{}", tls.fingerprint_record());
+    println!(
+        "private_tls_fingerprint_file={}",
+        fingerprint_path.display()
+    );
+    eprintln!(
+        "NOTE: this certificate persists across restarts, so a wallet's pin stays \
+         valid until an operator rotates it deliberately by deleting the certificate \
+         and key in {} -- which invalidates every pin. That directory is deliberately \
+         a sibling of the replay journal, never inside it, so wiping the journal to \
+         reset replay state cannot break a pin as a side effect. Its \
+         private key is therefore at rest on disk, owner-only; that is acceptable \
+         only because docs/adr/0010 places the operator outside the threat model, and \
+         must be revisited as the posture tightens toward docs/adr/0007. A pin proves \
+         only that a wallet is talking to the same surface as before; it attests \
+         nothing about which binary is running. Attestation supersedes pinning.",
+        tls_identity_dir.display()
+    );
+
     let listener = PrivateQueryListener::bind(args.listen_address).await?;
     let listening_on = listener.local_addr();
 
@@ -1424,10 +1477,53 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         shape,
         key_generation.keys,
         &args.replay_journal_dir,
+        &tls,
     )
     .await;
     service.close();
     served
+}
+
+/// Where this deployment's TLS identity lives when no flag says otherwise.
+///
+/// A *sibling* of the replay journal, never a child. The action being guarded
+/// against is `rm -rf <journal-dir>` to reset replay state, and a subdirectory
+/// would go with it -- which is exactly the silent pin-breakage persisting the
+/// identity exists to prevent.
+///
+/// Derived one-to-one from the journal directory's own name rather than a
+/// fixed name beside it, so two deployments that share a parent cannot
+/// collide on a single identity and unknowingly serve each other's
+/// certificate.
+#[cfg(feature = "private-service")]
+fn default_tls_identity_dir(replay_journal_dir: &Path) -> RunnerResult<PathBuf> {
+    let name = replay_journal_dir
+        .file_name()
+        .ok_or(RunnerError::PrivateTlsIdentityDirUnderivable)?;
+    let mut sibling = name.to_os_string();
+    sibling.push("-tls-identity");
+    Ok(replay_journal_dir.with_file_name(sibling))
+}
+
+/// Refuses an identity directory that a journal wipe would destroy.
+///
+/// Lexical containment, checked on the paths as given: neither directory need
+/// exist yet, so canonicalising is not available, and the mistake this catches
+/// -- passing a subdirectory of the journal -- is the one an operator makes by
+/// typing a path, not by constructing a symlink.
+#[cfg(feature = "private-service")]
+fn require_tls_identity_outside_journal(
+    tls_identity_dir: &Path,
+    replay_journal_dir: &Path,
+) -> RunnerResult<()> {
+    if tls_identity_dir.starts_with(replay_journal_dir) {
+        return Err(RunnerError::PrivateTlsIdentityDirInsideJournal {
+            identity: tls_identity_dir.to_path_buf(),
+            journal: replay_journal_dir.to_path_buf(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "private-service")]
@@ -1505,6 +1601,7 @@ async fn serve_private_surface(
     shape: PrivateProjectionShape,
     keys: PrivateRuntimeKeys,
     replay_journal_dir: &Path,
+    tls: &PrivateTlsIdentity,
 ) -> RunnerResult<()> {
     let (projection, _source_snapshot) = replay_preverified_snapshot(
         service,
@@ -1556,7 +1653,7 @@ async fn serve_private_surface(
         "private_surface_listening={listening_on},committed_height:{committed_height},envelope_bytes:{PRIVATE_MAINNET_ENVELOPE_BYTES}"
     );
     listener
-        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(runtime, session_bootstrap, async {
+        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(runtime, session_bootstrap, tls, async {
             // A failed signal registration must stop the server rather than
             // leave it serving with no way to be asked to stop.
             if let Err(error) = tokio::signal::ctrl_c().await {
@@ -1948,6 +2045,13 @@ enum RunnerError {
     PrivateRuntimeUnavailable,
     #[cfg(feature = "private-service")]
     PrivateListenerOptInRequired,
+    #[cfg(feature = "private-service")]
+    PrivateTlsIdentityDirUnderivable,
+    #[cfg(feature = "private-service")]
+    PrivateTlsIdentityDirInsideJournal {
+        identity: PathBuf,
+        journal: PathBuf,
+    },
     IncompleteCheckpoint,
     InvalidCheckpointHash,
     TargetAboveServiceable {
@@ -2022,6 +2126,17 @@ impl fmt::Display for RunnerError {
                 f.write_str("the private-query runtime could not be composed or refreshed")
             }
             #[cfg(feature = "private-service")]
+            Self::PrivateTlsIdentityDirUnderivable => f.write_str(
+                "--replay-journal-dir has no final path component to derive a sibling TLS identity directory from; pass --tls-identity-dir explicitly",
+            ),
+            #[cfg(feature = "private-service")]
+            Self::PrivateTlsIdentityDirInsideJournal { identity, journal } => write!(
+                f,
+                "--tls-identity-dir {} is inside --replay-journal-dir {}; wiping the journal to reset replay state would delete the TLS identity and break every wallet's pinned certificate. Choose a directory outside the journal",
+                identity.display(),
+                journal.display()
+            ),
+            #[cfg(feature = "private-service")]
             Self::PrivateListenerOptInRequired => f.write_str(
                 "private listener refused: pass --allow-unaudited-oram to acknowledge that the ORAM backend is an unaudited alpha revision of rostl",
             ),
@@ -2080,6 +2195,80 @@ mod tests {
             "private listener refused: pass --allow-unaudited-oram to acknowledge that the ORAM backend is an unaudited alpha revision of rostl"
         );
         assert!(require_private_listener_opt_in(true).is_ok());
+    }
+
+    /// The identity must survive the one routine operator action that would
+    /// otherwise destroy every wallet's pin: wiping the replay journal.
+    #[cfg(feature = "private-service")]
+    #[test]
+    fn the_default_tls_identity_directory_is_a_sibling_of_the_journal() -> RunnerResult<()> {
+        let journal = Path::new("/var/lib/zaino/replay");
+        let identity = default_tls_identity_dir(journal)?;
+
+        assert_eq!(identity, Path::new("/var/lib/zaino/replay-tls-identity"));
+        // The property that matters: `rm -rf <journal>` cannot reach it.
+        assert!(!identity.starts_with(journal));
+        assert_eq!(identity.parent(), journal.parent());
+
+        // Derived from the journal's own name, so two deployments sharing a
+        // parent cannot collide on one identity and serve each other's
+        // certificate.
+        assert_ne!(
+            identity,
+            default_tls_identity_dir(Path::new("/var/lib/zaino/replay-b"))?
+        );
+
+        assert!(default_tls_identity_dir(Path::new("/")).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "private-service")]
+    #[test]
+    fn a_tls_identity_directory_inside_the_journal_is_refused() {
+        let journal = Path::new("/var/lib/zaino/replay");
+
+        for inside in ["/var/lib/zaino/replay/tls", "/var/lib/zaino/replay"] {
+            let error = require_tls_identity_outside_journal(Path::new(inside), journal)
+                .expect_err("a journal wipe must not be able to delete the identity");
+            assert!(error
+                .to_string()
+                .contains("break every wallet's pinned certificate"));
+        }
+
+        assert!(require_tls_identity_outside_journal(
+            Path::new("/var/lib/zaino/replay-tls-identity"),
+            journal
+        )
+        .is_ok());
+    }
+
+    #[cfg(feature = "private-service")]
+    #[test]
+    fn the_private_serve_cli_defaults_the_tls_identity_directory() {
+        let parsed = Cli::try_parse_from([
+            "zainod-oram",
+            "private",
+            "serve",
+            "--allow-unaudited-oram",
+            "--config",
+            "/tmp/zainod.toml",
+            "--capture-dir",
+            "/tmp/capture",
+            "--sizing-dir",
+            "/tmp/sizing",
+            "--replay-journal-dir",
+            "/tmp/replay",
+            "--listen-address",
+            "127.0.0.1:0",
+            "--progress-interval",
+            "1000",
+        ])
+        .expect("the private serve command parses without a TLS identity flag");
+        let Command::Private(private) = parsed.command else {
+            panic!("the parsed command is the private one");
+        };
+        let PrivateSubcommand::Serve(serve) = private.command;
+        assert_eq!(serve.tls_identity_dir, None);
     }
 
     #[derive(Debug, PartialEq, Eq, serde::Serialize)]

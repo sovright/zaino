@@ -28,7 +28,8 @@ so restart is rotation.
   factor rather than copy-paste.
 - Test attributes escalate only as the body justifies: `#[test]`, then
   `#[tokio::test]`, then `multi_thread` only when genuinely required.
-- **No new dependency without explicit approval.** Task 5 is gated on this.
+- **No new dependency without explicit approval.** Task 5's decision is
+  recorded there: `rcgen` with the `aws_lc_rs` feature, approved.
 - Wire conversions use named methods, never `impl From`/`TryFrom` on `proto::`
   types. CI lints this.
 - Every task ends green: `cargo test -p zaino-oram -p zainod-oram`,
@@ -386,30 +387,189 @@ git commit -m "Serve the current key epoch and releasable keys over bootstrap"
 
 ---
 
-### Task 5: TLS — GATED ON A DEPENDENCY DECISION
+### Task 5: TLS on the private listener — DONE
 
-**Do not start this task until the dependency question is answered.**
+The dependency question this task was gated on has been answered: **add
+`rcgen`**, built against **aws-lc-rs**, not ring. The workspace standardised on
+aws-lc-rs in ADR 0006 and already carries `aws-lc-rs 1.17.1`, so the ring
+alternative would have contradicted the ADR *and* added a second crypto
+backend. The operator-supplied-PEM alternative was rejected: it puts the TLS
+private key in the operator's hands, which is precisely the custody question
+ADR 0010 avoids and ADR 0007's "generates its TLS identity internally" rules
+out.
 
-The spec says the workload generates its TLS identity internally at startup.
-`rustls` 0.23 and tonic's TLS features are already in the tree via
-`zaino-serve`, but **no certificate-generation crate is present** — `rcgen` is
-absent from `Cargo.lock`. This repo requires explicit approval for new
-dependency edges.
+**Manifest** (`packages/zainod-oram/Cargo.toml`, added with `cargo add`):
 
-Two ways forward, to be decided before implementing:
+```toml
+rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs"], optional = true }
+base64 = { workspace = true, optional = true }
+```
 
-- **Add `rcgen`.** Matches the spec and ADR 0007's "generates its TLS identity
-  internally". Adds a new crate and its transitive graph.
-- **Operator-supplied PEM cert and key.** No new dependency for generation, and
-  defensible under ADR 0010 specifically because the operator is not the
-  adversary — but it departs from ADR 0007's wording, and the operator then
-  holds the TLS private key. Note this still likely needs `rustls-pemfile`,
-  which is also absent, so confirm before assuming it is dependency-free.
+with `dep:rcgen`, `dep:base64` and `tonic/tls-aws-lc` folded into the
+`private-service` feature.
 
-Whichever is chosen, the remainder is the same: terminate TLS on the private
-listener, write the certificate fingerprint to stdout and to a file in the
-deployment directory, and document the pinning story. Tasks 1-4 and 6 do not
-depend on this and can land first.
+Crates **actually compiled** that were not compiled before: `rcgen` and
+`yasna`. `base64` was already a workspace dependency and is only newly
+*referenced* here. `Cargo.lock` additionally gained nine entries it never
+builds — `x509-parser` and its tree (`asn1-rs`, `asn1-rs-derive`,
+`asn1-rs-impl`, `der-parser`, `oid-registry`, `rusticata-macros`, `bit-vec`,
+`data-encoding`, `untrusted 0.7.1`). That is a lock artifact, not a build edge:
+rcgen's `aws_lc_rs` feature *names* `x509-parser?/verify-aws`, and Cargo's
+resolver records every dependency an enabled feature names even when the weak
+`?` means feature resolution never activates it. `cargo tree -p zainod-oram
+--features private-service` shows none of them. No feature selection avoids
+this while keeping aws-lc-rs.
+
+`pem` was deliberately **not** enabled. rcgen's `pem` feature would pull the
+`pem` crate purely to base64-wrap DER; `pem_block` in
+`packages/zainod-oram/src/private_service/tls.rs` does that in one shared
+function over the `base64` encoder the workspace already has, used for both the
+certificate and the key.
+
+**What was built:**
+
+- `packages/zainod-oram/src/private_service/tls.rs` — `PrivateTlsIdentity`.
+  `load_or_generate(deployment_dir)` mints a self-signed ECDSA P-256 identity
+  in-process on first start and reuses it thereafter. The private key is
+  reachable only from inside the value: no accessor, absent from `Debug`.
+- `PrivateQueryListener::serve` now takes `&PrivateTlsIdentity` and calls
+  `Server::builder().tls_config(...)`, after
+  `zaino_common::crypto::ensure_default_crypto_provider()` — the same
+  process-level rustls provider install the public gRPC server needs
+  (zingolabs/zaino#1360). The identity is a required argument, not an
+  `Option`, so serving this surface in cleartext is unrepresentable.
+- Everything the listener already did is untouched: the 32-permit connection
+  semaphore whose permit rides with the connection, `concurrency_limit_per_connection(1)`,
+  the per-route decode caps, and the uniform refusal. TLS wraps the transport
+  and sits above the same accepted-connection stream.
+- `run_private_serve` resolves the identity directory, refuses one inside the
+  journal, refuses to mint over a stranded one, then loads or mints — all
+  *before* binding and long before chain replay, so any of those fails
+  immediately rather than after a full replay is paid for. It writes the
+  fingerprint record to stdout and publishes it into the identity directory,
+  checking rather than overwriting a record a previous start left.
+
+**The certificate persists across restarts.** An earlier revision of this task
+minted a fresh certificate on every start, tied to the key epoch for
+consistency with "restart is rotation". That was wrong and was reversed. The
+symmetric keys can rotate safely because the recovery path runs *above* TLS: a
+wallet with stale keys gets `StaleKeyEpoch` in cleartext and re-bootstraps. A
+rotating certificate breaks a wallet's pin *below* TLS — an opaque handshake
+failure, no route to `BootstrapSession` to find out why, and no way to
+distinguish rotation from substitution. That is the same anti-pattern the
+cleartext `key_epoch` removed, reintroduced one layer down. Certificate
+lifetime and key lifetime are separate concerns.
+
+So `PrivateTlsIdentity::load_or_generate(identity_dir)` mints on first start
+and reuses thereafter, persisting `private-tls-cert.pem` and
+`private-tls-key.pem` beside the published fingerprint. Rotation is an explicit
+operator action — delete both files — never a side effect of a restart.
+
+**The identity directory is a sibling of the replay journal, never inside it.**
+`--tls-identity-dir` selects it and defaults to
+`<replay-journal-dir>-tls-identity`. Co-locating it with the journal would have
+undone the whole rework: wiping the journal to reset replay state is a routine
+operator action, and `rm -rf <journal-dir>` would have taken every wallet's
+trust anchor with it — no warning, no obvious causal link, and strictly worse
+than the rotating certificate this replaced, which at least broke pins
+predictably. A *subdirectory* of the journal is no better, since that is
+exactly what a recursive delete of the parent removes, so the default is a
+sibling and an explicit `--tls-identity-dir` inside the journal is refused with
+`PrivateTlsIdentityDirInsideJournal`. The default is derived from the journal
+directory's own name, not a fixed name beside it, so two deployments sharing a
+parent cannot collide on one identity and unknowingly serve each other's
+certificate.
+
+**Migration from the co-located layout is cheap, and is not silent.** If the
+identity directory is empty while the journal directory still holds a
+certificate or key, `require_no_stranded_identity` fails closed and names both
+directories: minting there would break every pin while the correct identity sat
+untouched a directory away. Migrating is `mv` of three files —
+`private-tls-cert.pem`, `private-tls-key.pem`, `private-tls-fingerprint.txt` —
+after which every existing pin still validates. (In practice this is
+pre-release and there is nothing deployed to migrate; the guard exists so that
+statement never has to be trusted.)
+
+**It fails closed, never regenerates.** A damaged, unreadable, half-present, or
+over-permissive identity is a typed `PrivateTlsError` naming the file and what
+was wrong (`Unreadable`, `Malformed { reason }`, `Incomplete { present,
+missing }`, `InsecureKeyPermissions { mode }`, `FingerprintMismatch`). Silent
+regeneration is the dangerous path: it breaks every wallet's pin with no
+signal, which is precisely what persisting the identity is for. Validation is
+a PEM decode plus a complete-DER-SEQUENCE check — enough to catch truncation,
+concatenation, and editor damage without an ASN.1 crate; anything that slips
+past still fails closed one layer later when the acceptor is built.
+
+**A private key is now at rest on disk.** Created owner-only (0600), and the
+loader refuses one that is not. Acceptable *specifically* under ADR 0010, where
+the operator is honest-but-curious and outside the threat model — the
+adversaries in scope are network observers and other clients, and neither gains
+from a key the operator could always have read out of process memory. Flagged
+in the module header as something that **must be revisited as the posture
+tightens toward ADR 0007**, where the answer is a TEE-sealed or attested
+ephemeral key.
+
+**Nothing per-generation is in the certificate.** One SAN, the verified name
+`private-query.zaino.invalid` (`.invalid` per RFC 6761: pinned or attested,
+never resolved). The key-epoch SAN the first revision carried was removed — the
+certificate now outlives many epochs, so a baked-in one is stale from the next
+restart onward and would actively mislead a wallet reading it. Nothing replaced
+it: the service namespace id tracks the capture, which can be upgraded under a
+stable deployment directory, and `profile_label` is documented in the proto as
+diagnostic and explicitly not for pinning. A name that can go stale is worse
+than no name.
+
+**The pinning story, stated without overclaiming.** The fingerprint is stable
+across restarts, so a wallet pins once and keeps it, and a broken pin now means
+something actually changed rather than "the process bounced". A pin still only
+establishes that the wallet is talking to the *same* surface as last time — not
+*what* that surface is, which binary is running, or whether the workload is the
+measured one. Only attestation answers that, and it supersedes pinning when it
+lands. `run_private_serve` prints all of this on stderr beside the fingerprint.
+
+**Handshake timeout.** `ServerTlsConfig::timeout(10s)`. The 32-connection
+semaphore takes its permit at accept, before the handshake, so an unbounded
+handshake lets a peer that connects and never speaks hold one of the 32
+forever. Ten seconds is roughly two orders of magnitude above a legitimate TLS
+1.3 handshake even on a bad mobile link — deliberately generous, because
+refusing a slow but honest wallet costs more than tolerating a slow attacker
+who is already capped at 32 connections.
+
+**Tests** (all green):
+
+- `a_bound_listener_answers_one_exact_query`, `a_wallet_bootstraps_then_queries` —
+  a real client completes a real TLS handshake and calls `BootstrapSession` and
+  `QueryPage` through it.
+- `the_reported_fingerprint_is_the_certificate_that_is_served` — the published
+  fingerprint is SHA-256 over the DER the handshake presented.
+- `a_certificate_from_another_deployment_is_refused` — a pin from a different
+  deployment fails the handshake, which is the proof the client above trusted
+  *only* the served certificate.
+- `a_second_start_reuses_the_persisted_identity` — a second start over the same
+  directory reports the identical fingerprint, certificate, and key, while a
+  different directory does not, so the equality is reuse rather than a constant
+  certificate.
+- `a_damaged_identity_fails_closed_rather_than_regenerating` — non-base64 PEM,
+  a truncated DER body, and a half-present pair each produce a named error, and
+  the operator's files are left untouched.
+- `a_world_readable_key_is_refused`, `the_persisted_key_is_owner_only` — the
+  0600 contract in both directions.
+- `publishing_is_idempotent_and_catches_a_disagreeing_record` — a restart
+  republishes silently; a record that disagrees with the certificate on disk is
+  an error.
+- `the_default_tls_identity_directory_is_a_sibling_of_the_journal` — the
+  default is outside the journal, shares its parent, and is distinct per
+  journal directory.
+- `a_tls_identity_directory_inside_the_journal_is_refused` — both the
+  subdirectory and the identical-path cases.
+- `an_identity_stranded_at_the_superseded_location_is_refused` — an in-place
+  upgrade fails closed, the three-file move fixes it, and the fingerprint after
+  migrating is the one wallets already pinned.
+- `the_private_serve_cli_defaults_the_tls_identity_directory` — the common path
+  needs no new flag.
+- The pre-existing connection-cap and decode-cap tests still pass; the five
+  serving tests now run over TLS through one shared `ServedSurface` helper
+  (bind port 0, mint, spawn, stop off the served task — no fixed sleeps).
 
 ---
 

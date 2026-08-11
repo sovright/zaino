@@ -17,21 +17,29 @@ required-features = ["typed-qualification"]
 [features]
 default = []
 private-service = [
+    "dep:base64",
     "dep:http-body",
     "dep:prost",
+    "dep:rcgen",
     "dep:tonic",
     "dep:tonic-prost",
     "dep:tonic-prost-build",
+    # The private listener terminates TLS on its own generated identity, so
+    # tonic must be built with an acceptor. aws-lc-rs is the workspace's
+    # provider (ADR 0006); `tls-ring` would contradict it.
+    "tonic/tls-aws-lc",
 ]
 typed-qualification = ["zaino-oram/rostl-experimental"]
 
 [dependencies]
+base64 = { workspace = true, optional = true }
 blake2.workspace = true
 clap = { workspace = true, features = ["derive"] }
 futures.workspace = true
 hex.workspace = true
 http-body = { version = "1", optional = true }
 prost = { workspace = true, optional = true }
+rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs"], optional = true }
 rustix = { version = "1.1.4", features = ["fs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

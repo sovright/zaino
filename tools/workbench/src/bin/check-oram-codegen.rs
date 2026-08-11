@@ -84,16 +84,16 @@ const FIXED_EXACT_UPSERT_SYMBOL: &str =
 // attribution. This re-pin cannot re-confirm it: the guard reports which
 // instantiations exist for a path, not which record type each serves, and both
 // map to the same target either way. Treat the suffix as historical.
-const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h3737605460051b15E";
+const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h43bc1d42da279629E";
 const RANDOM_RANGE_SECOND_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17hb9510b448ebef3c3E";
 const CIRCUIT_READ_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h681ef66e9d04c538E";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h18365c90d6304c81E";
 const CIRCUIT_EVENT_READ_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17hb314dfa0f6912035E";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h79d3bb87fa7ca204E";
 const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h64bd35feec61c112E";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h1408426bfb5e61feE";
 const CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
-    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17haf4b8093684385e6E";
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17ha119a6051f7d95a7E";
 const UNWIND_DYNAMIC_SYMBOL: &str = "_Unwind_Resume@GCC_3.0";
 
 const RANDOM_RANGE_RAW_SYMBOLS: &[&str] =
