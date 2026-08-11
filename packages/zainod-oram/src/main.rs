@@ -37,9 +37,9 @@ use zaino_oram::{
 };
 #[cfg(feature = "private-service")]
 use zaino_oram::{
-    mainnet_private_query_runtime, EphemeralKeyGeneration, FinalizedProjectionBuilder,
-    MainnetPrivateQueryRuntime, PrivateNetwork, PrivateProjectionShape, PrivateRuntimeDeployment,
-    PrivateRuntimeKeys, PRIVATE_MAINNET_ENVELOPE_BYTES,
+    mainnet_private_query_runtime, private_mainnet_timeout_bucket_millis, EphemeralKeyGeneration,
+    FinalizedProjectionBuilder, MainnetPrivateQueryRuntime, PrivateNetwork, PrivateProjectionShape,
+    PrivateRuntimeDeployment, PrivateRuntimeKeys, PRIVATE_MAINNET_ENVELOPE_BYTES,
 };
 use zaino_oram::{MainnetCorpusMeasurement, MainnetCorpusScanner, MainnetSizingModel};
 use zaino_oram::{
@@ -108,7 +108,7 @@ mod private_proto;
 mod private_service;
 #[cfg(feature = "private-service")]
 use crate::private_service::{
-    require_no_stranded_identity, PrivateQueryListener, PrivateTlsIdentity,
+    require_no_stranded_identity, PrivateQueryListener, PrivateTlsIdentity, ReleaseSchedule,
 };
 #[cfg(feature = "typed-qualification")]
 mod qualification_artifact;
@@ -1648,18 +1648,29 @@ async fn serve_private_surface(
         .await
         .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
     let session_bootstrap = runtime.session_bootstrap();
+    // The release schedule is the compiled profile's own timeout bucket, read
+    // back from the profile rather than restated here, so it cannot drift from
+    // the budget bound into the profile identifier a wallet pins.
+    let release_bucket_millis = private_mainnet_timeout_bucket_millis()
+        .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
 
     println!(
-        "private_surface_listening={listening_on},committed_height:{committed_height},envelope_bytes:{PRIVATE_MAINNET_ENVELOPE_BYTES}"
+        "private_surface_listening={listening_on},committed_height:{committed_height},envelope_bytes:{PRIVATE_MAINNET_ENVELOPE_BYTES},release_bucket_millis:{release_bucket_millis}"
     );
     listener
-        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(runtime, session_bootstrap, tls, async {
-            // A failed signal registration must stop the server rather than
-            // leave it serving with no way to be asked to stop.
-            if let Err(error) = tokio::signal::ctrl_c().await {
-                eprintln!("private_surface_shutdown=signal_unavailable,error:{error}");
-            }
-        })
+        .serve::<_, PRIVATE_MAINNET_ENVELOPE_BYTES>(
+            runtime,
+            session_bootstrap,
+            ReleaseSchedule::from_timeout_bucket_millis(release_bucket_millis),
+            tls,
+            async {
+                // A failed signal registration must stop the server rather than
+                // leave it serving with no way to be asked to stop.
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    eprintln!("private_surface_shutdown=signal_unavailable,error:{error}");
+                }
+            },
+        )
         .await?;
     Ok(())
 }

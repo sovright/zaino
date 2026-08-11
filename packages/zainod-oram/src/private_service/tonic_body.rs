@@ -4,6 +4,7 @@ use std::{
     future::{ready, Ready},
     marker::PhantomData,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -20,7 +21,10 @@ use tonic_prost::{ProstDecoder, ProstEncoder};
 use zaino_oram::PrivateQueryUnavailable;
 use zaino_oram::{FixedEnvelopeRuntime, PendingFixedEnvelope, SessionBootstrap};
 
-use super::{PendingQueryPage, PrivateServiceAdapter, ValidatedFixedEnvelope};
+use super::{
+    release_schedule::ReleaseSchedule, PendingQueryPage, PrivateServiceAdapter,
+    ValidatedFixedEnvelope,
+};
 use crate::private_proto;
 
 const UNIFORM_GRPC_MESSAGE: &str = "private%20query%20unavailable";
@@ -296,14 +300,21 @@ impl PrivateSessionBootstrap {
             private_proto::BootstrapRequest,
         >::default())
         .max_decoding_message_size(fixed_envelope_wire_size(BOOTSTRAP_REQUEST_BYTES));
-        capped_unary_call(
+        // The classification is discarded here rather than acted on: bootstrap
+        // is the surface's one deliberate exemption from the query route's
+        // shape and schedule discipline. Its answer is identical for every
+        // caller, takes no client input, and is served without the admission
+        // lock, so there is neither a round to equalise nor a completion time
+        // that could report anything about a query.
+        let (response, _) = capped_unary_call(
             grpc,
             RespondBootstrap {
                 response: &self.response,
             },
             request,
         )
-        .await
+        .await;
+        response
     }
 }
 
@@ -311,6 +322,23 @@ impl std::fmt::Debug for PrivateSessionBootstrap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PrivateSessionBootstrap { ..REDACTED.. }")
     }
+}
+
+/// What one capped unary call produced, decided before the coarsener clears
+/// the extension the decision is read from.
+///
+/// Returned alongside the response so a caller can act on the classification
+/// without re-deriving it from the serialized headers the coarsener writes.
+/// Re-reading those bytes would turn the structural stale-key-epoch marker
+/// back into the header-string match it was deliberately replaced with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteOutcome {
+    /// A response the caller will encode and write.
+    Answered,
+    /// The one refusal this surface keeps deliberately distinguishable.
+    StaleKeyEpoch,
+    /// Every other failure, already collapsed to the uniform refusal.
+    Refused,
 }
 
 /// Drives one capped decode through Tonic, then rewrites the result to the
@@ -321,7 +349,7 @@ async fn capped_unary_call<C, S, B>(
     mut grpc: Grpc<C>,
     service: S,
     request: http::Request<B>,
-) -> http::Response<TonicBody>
+) -> (http::Response<TonicBody>, RouteOutcome)
 where
     C: Codec,
     S: UnaryService<C::Decode, Response = C::Encode>,
@@ -329,15 +357,22 @@ where
     B::Error: Into<StdError> + Send,
 {
     let mut response = grpc.unary(service, request).await;
-    coarsen_initial_status(&mut response);
+    let outcome = classify_route_outcome(&response);
+    coarsen_initial_status(&mut response, outcome);
     let (parts, body) = response.into_parts();
-    http::Response::from_parts(parts, TonicBody::new(UniformStatusBody::new(body)))
+    (
+        http::Response::from_parts(parts, TonicBody::new(UniformStatusBody::new(body))),
+        outcome,
+    )
 }
 
 /// Listener-free entry point that returns Tonic's lazily encoded response body.
 pub(super) struct PrivateTonicBodyAdapter<H, const N: usize> {
     adapter: PrivateServiceAdapter<H, N>,
     current_key_epoch: u64,
+    /// Shared with the listener's unroutable-request arm, so a probe of an
+    /// unknown route cannot be told from a refused query by how long it took.
+    release_schedule: Arc<ReleaseSchedule>,
 }
 
 impl<H, const N: usize> PrivateTonicBodyAdapter<H, N>
@@ -353,13 +388,28 @@ where
     /// Only the epoch is held here, not the whole `SessionBootstrap`: the keys
     /// belong to the lock-free bootstrap route ([`PrivateSessionBootstrap`]),
     /// and this type has no use for them.
-    pub(super) const fn new(handler: H, current_key_epoch: u64) -> Self {
+    pub(super) const fn new(
+        handler: H,
+        current_key_epoch: u64,
+        release_schedule: Arc<ReleaseSchedule>,
+    ) -> Self {
         Self {
             adapter: PrivateServiceAdapter::new(handler),
             current_key_epoch,
+            release_schedule,
         }
     }
 
+    /// Answers one query-page request on the fixed release schedule.
+    ///
+    /// The caller reaches this method holding the single-admission lock, so
+    /// entry here *is* the admission instant and the same fixed reference
+    /// point for every protected outcome: an answer, a refusal, an epoch
+    /// mismatch, or a round that ran out of bucket. Queue time ahead of
+    /// admission is deliberately outside the window -- it is a function of
+    /// concurrent load, which ADR 0007's profile already permits observing,
+    /// and folding it in would make one client's deadline depend on another
+    /// client's query.
     pub(super) async fn query_page<B>(
         &mut self,
         request: http::Request<B>,
@@ -368,17 +418,54 @@ where
         B: HttpBody + Send + 'static,
         B::Error: Into<StdError> + Send,
     {
+        let window = self.release_schedule.admit();
         let current_key_epoch = self.current_key_epoch;
-        let service = PrivateUnary {
-            adapter: &mut self.adapter,
-            current_key_epoch,
+        let answered = {
+            let service = PrivateUnary {
+                adapter: &mut self.adapter,
+                current_key_epoch,
+            };
+            let grpc = Grpc::new(PrivateResponseCodec::<H::PendingResponse, N>::new(
+                current_key_epoch,
+            ))
+            .max_decoding_message_size(fixed_envelope_request_wire_size(N));
+            window
+                .bounded(capped_unary_call(grpc, service, request))
+                .await
         };
-        let grpc = Grpc::new(PrivateResponseCodec::<H::PendingResponse, N>::new(
-            current_key_epoch,
-        ))
-        .max_decoding_message_size(fixed_envelope_request_wire_size(N));
-        capped_unary_call(grpc, service, request).await
+        let response = match answered {
+            // A refusal reached the deadline without asking the runtime for a
+            // round; buy the one it skipped so success and semantic failure
+            // cost the same work, not merely the same time. The stale-epoch
+            // arm is the exception, and stays one: it is refused ahead of the
+            // handler on purpose, it is already distinguishable by status, and
+            // spending a round on a request under a retired key would neither
+            // hide anything nor be owed to anyone.
+            Some((response, RouteOutcome::Refused)) => {
+                self.adapter.cover_round();
+                response
+            }
+            Some((response, RouteOutcome::Answered | RouteOutcome::StaleKeyEpoch)) => response,
+            // Fail closed. Releasing a late answer would publish exactly which
+            // rounds were expensive -- the leak the schedule exists to close.
+            None => uniform_refusal_response(),
+        };
+        window.release().await;
+        response
     }
+}
+
+/// The uniform refusal, framed exactly as a coarsened one.
+///
+/// Built from the same header constructor and wrapped in the same
+/// [`UniformStatusBody`] the coarsener uses, so an overrun is not merely
+/// *similar* to the other protected refusals but assembled from the identical
+/// parts.
+fn uniform_refusal_response() -> http::Response<TonicBody> {
+    let mut response =
+        http::Response::new(TonicBody::new(UniformStatusBody::new(TonicBody::empty())));
+    *response.headers_mut() = uniform_initial_status_headers();
+    response
 }
 
 /// Worst-case wire bytes for the `key_epoch` field: a 1-byte tag plus the
@@ -480,15 +567,26 @@ fn status_is_failure(headers: &http::HeaderMap) -> bool {
 /// and no leftover extensions (including the marker read below) riding out
 /// to the caller. Every other failure -- transport errors, handler refusals,
 /// cap violations -- still collapses to the one uniform response.
-fn coarsen_initial_status(response: &mut http::Response<TonicBody>) {
-    if status_is_failure(response.headers()) {
-        *response.headers_mut() = if extensions_carry_stale_key_epoch(response.extensions()) {
-            stale_key_epoch_initial_headers()
-        } else {
-            uniform_initial_status_headers()
-        };
+fn coarsen_initial_status(response: &mut http::Response<TonicBody>, outcome: RouteOutcome) {
+    match outcome {
+        RouteOutcome::Answered => {}
+        RouteOutcome::StaleKeyEpoch => {
+            *response.headers_mut() = stale_key_epoch_initial_headers();
+        }
+        RouteOutcome::Refused => *response.headers_mut() = uniform_initial_status_headers(),
     }
     response.extensions_mut().clear();
+}
+
+/// Reads the outcome off the response Tonic produced, before any rewriting.
+fn classify_route_outcome(response: &http::Response<TonicBody>) -> RouteOutcome {
+    if !status_is_failure(response.headers()) {
+        RouteOutcome::Answered
+    } else if extensions_carry_stale_key_epoch(response.extensions()) {
+        RouteOutcome::StaleKeyEpoch
+    } else {
+        RouteOutcome::Refused
+    }
 }
 
 /// Recognizes the stale-key-epoch outcome structurally: by the
@@ -551,14 +649,16 @@ fn coarsen_tonic_error<T>(_: T) -> Status {
 mod tests {
     use std::{
         convert::Infallible,
-        future::poll_fn,
+        future::{poll_fn, Future},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
+        time::Duration,
     };
 
     use prost::Message;
+    use tokio::time::Instant;
 
     use super::*;
     use zaino_oram::{ReleasableSessionKeys, PRIVATE_PROFILE_ID_BYTES, PRIVATE_RUNTIME_KEY_BYTES};
@@ -688,18 +788,40 @@ mod tests {
         PrivateSessionBootstrap::from_session(&session_bootstrap_fixture(), ENVELOPE_BYTES)
     }
 
+    /// Every adapter test below runs on a paused clock, so a zero bucket and a
+    /// production one cost the same wall time. A nonzero width is still the
+    /// honest fixture: it is what makes `release()` an observable wait the
+    /// schedule tests can measure rather than a no-op the others silently
+    /// depend on.
+    const FIXTURE_BUCKET_MILLIS: u64 = 250;
+
     fn fixture() -> (
         PrivateTonicBodyAdapter<MockHandler, ENVELOPE_BYTES>,
         MockState,
+    ) {
+        let (adapter, state, _) = scheduled_fixture();
+        (adapter, state)
+    }
+
+    /// As [`fixture`], keeping the shared schedule so a test can read its
+    /// overrun count.
+    fn scheduled_fixture() -> (
+        PrivateTonicBodyAdapter<MockHandler, ENVELOPE_BYTES>,
+        MockState,
+        Arc<ReleaseSchedule>,
     ) {
         let state = MockState::new();
         let handler = MockHandler {
             response: [9, 8, 7, 6],
             state: state.clone(),
         };
+        let schedule = Arc::new(ReleaseSchedule::from_timeout_bucket_millis(
+            FIXTURE_BUCKET_MILLIS,
+        ));
         (
-            PrivateTonicBodyAdapter::new(handler, FIXTURE_KEY_EPOCH),
+            PrivateTonicBodyAdapter::new(handler, FIXTURE_KEY_EPOCH, Arc::clone(&schedule)),
             state,
+            schedule,
         )
     }
 
@@ -777,7 +899,10 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    /// start_paused: this body drives a full query round, which now waits out
+    /// the release bucket. A paused clock makes that wait free and exact
+    /// rather than a real 250 ms sleep in every adapter test.
+    #[tokio::test(start_paused = true)]
     async fn first_body_poll_checks_releases_and_emits_one_exact_data_frame(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut adapter, state) = fixture();
@@ -812,7 +937,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    /// start_paused: drives query rounds that wait out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn admission_remains_closed_until_data_poll_then_reopens(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut adapter, state) = fixture();
@@ -820,7 +946,9 @@ mod tests {
 
         let rejected = adapter.query_page(request(&[4, 3, 2, 1])).await;
         assert_uniform_status(rejected.headers());
-        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        // Two: the refused request's own round, plus the cover round every
+        // uniform refusal now buys. Both find admission closed.
+        assert_eq!(state.calls.load(Ordering::SeqCst), 3);
 
         let mut first_body = first.into_body();
         let first_frame = next_frame(&mut first_body)
@@ -830,12 +958,13 @@ mod tests {
 
         let admitted = adapter.query_page(request(&[4, 3, 2, 1])).await;
         assert!(!status_is_failure(admitted.headers()));
-        assert_eq!(state.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 4);
         drop(admitted);
         Ok(())
     }
 
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn stale_release_emits_no_data_and_one_uniform_status(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut adapter, state) = fixture();
@@ -856,7 +985,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn dropping_unpolled_body_releases_without_checking_or_borrowing() {
         let (mut adapter, state) = fixture();
         let body = adapter.query_page(request(&[1, 2, 3, 4])).await.into_body();
@@ -868,18 +998,25 @@ mod tests {
         assert_eq!(state.released_borrows.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn boundary_failure_is_uniform_before_body_creation() {
         let (mut adapter, state) = fixture();
         let response = adapter.query_page(request(&[1, 2, 3])).await;
 
         assert_uniform_status(response.headers());
-        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        // One round, exactly as an answered request costs: the wrong length is
+        // caught at the wire boundary before the handler, and the cover round
+        // buys back the round that check skipped.
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        // The cover round's bytes are never released -- it is discarded, not
+        // answered -- so a refusal still borrows nothing.
         assert_eq!(state.release_checks.load(Ordering::SeqCst), 0);
         assert!(response.into_body().is_end_stream());
     }
 
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn oversized_body_is_rejected_with_the_uniform_refusal() {
         // Sized past `fixed_envelope_request_wire_size(ENVELOPE_BYTES)` (17
         // bytes: 6 for the envelope field plus the 11-byte key_epoch
@@ -893,11 +1030,14 @@ mod tests {
         let response = adapter.query_page(request(&oversized)).await;
 
         assert_uniform_status(response.headers());
-        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        // The transport cap rejected the body before the service saw it, so
+        // the round this refusal performs is entirely the cover round.
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
         assert!(response.into_body().is_end_stream());
     }
 
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn each_route_is_capped_at_its_own_size() {
         // A body sized well past bootstrap's empty cap must still be refused
         // by QueryPage, whose cap is the fixed envelope. Sharing one cap
@@ -911,8 +1051,8 @@ mod tests {
         assert_uniform_status(response.headers());
         assert_eq!(
             state.calls.load(Ordering::SeqCst),
-            0,
-            "an oversized query body reached the runtime"
+            1,
+            "an oversized query body must be refused, then covered by exactly one round"
         );
         assert!(response.into_body().is_end_stream());
     }
@@ -1007,7 +1147,8 @@ mod tests {
         assert_eq!(classify_request_epoch(CURRENT_EPOCH, CURRENT_EPOCH), None);
     }
 
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn a_stale_key_epoch_is_refused_before_the_handler_and_stays_distinguishable() {
         let (mut adapter, state) = fixture();
 
@@ -1027,7 +1168,8 @@ mod tests {
         assert!(response.into_body().is_end_stream());
     }
 
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn a_matching_key_epoch_reaches_the_handler() {
         let (mut adapter, state) = fixture();
 
@@ -1045,7 +1187,8 @@ mod tests {
     /// epoch check, and would surface as the uniform refusal instead of the
     /// distinguishable stale-epoch one. Reaching that distinguishable status
     /// is exactly the evidence that decoding succeeded within the cap.
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn a_request_epoch_of_u64_max_fits_the_decode_cap() {
         let (mut adapter, state) = fixture();
 
@@ -1062,7 +1205,8 @@ mod tests {
         assert!(response.into_body().is_end_stream());
     }
 
-    #[tokio::test]
+    /// start_paused: drives a query round that waits out the release bucket.
+    #[tokio::test(start_paused = true)]
     async fn request_body_error_metadata_and_extensions_are_removed() {
         let (mut adapter, state) = fixture();
         let response = adapter
@@ -1079,7 +1223,9 @@ mod tests {
         assert_eq!(response.headers().len(), 3);
         assert!(!response.headers().contains_key("x-private-detail"));
         assert!(response.extensions().is_empty());
-        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        // A request body that failed mid-read is a protected refusal like any
+        // other, so it pays the same one round.
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.release_checks.load(Ordering::SeqCst), 0);
         assert!(response.into_body().is_end_stream());
     }
@@ -1101,6 +1247,216 @@ mod tests {
         assert_eq!(trailers.len(), 2);
         assert!(body.is_end_stream());
         assert!(next_frame(&mut body).await.is_none());
+        Ok(())
+    }
+
+    /// A request body that cannot finish inside the release bucket.
+    ///
+    /// Built from a `Sleep` rather than a counter so it stays pending on a
+    /// paused clock exactly until the runtime advances past the deadline --
+    /// the overrun is produced by the schedule's own timer firing first, not
+    /// by a wall-clock race between two sleeps.
+    struct SlowBody {
+        never_before_the_deadline: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl SlowBody {
+        fn longer_than_the_bucket() -> Self {
+            Self {
+                never_before_the_deadline: Box::pin(tokio::time::sleep(Duration::from_millis(
+                    FIXTURE_BUCKET_MILLIS * 4,
+                ))),
+            }
+        }
+    }
+
+    impl HttpBody for SlowBody {
+        type Data = Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.never_before_the_deadline
+                .as_mut()
+                .poll(context)
+                .map(|()| None)
+        }
+    }
+
+    /// One outbound frame reduced to what a network observer can see of it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ObservedFrame {
+        Data(Vec<u8>),
+        Trailers(Vec<(String, Vec<u8>)>),
+    }
+
+    /// One complete response as it appears on the wire: initial headers, then
+    /// every frame in order.
+    ///
+    /// Compared whole rather than field by field, because "indistinguishable"
+    /// is a claim about the entire observation and an assertion that checked
+    /// only the status would pass for two responses an observer could still
+    /// tell apart by frame count or trailer set.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ObservedResponse {
+        headers: Vec<(String, Vec<u8>)>,
+        frames: Vec<ObservedFrame>,
+    }
+
+    fn header_pairs(headers: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+        let mut pairs: Vec<(String, Vec<u8>)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    async fn observe(response: http::Response<TonicBody>) -> Result<ObservedResponse, Status> {
+        let headers = header_pairs(response.headers());
+        let mut body = response.into_body();
+        let mut frames = Vec::new();
+        while let Some(frame) = next_frame(&mut body).await {
+            frames.push(match frame?.into_data() {
+                Ok(data) => ObservedFrame::Data(data.to_vec()),
+                Err(other) => ObservedFrame::Trailers(header_pairs(
+                    other
+                        .trailers_ref()
+                        .expect("a frame that is not data carries trailers"),
+                )),
+            });
+        }
+        Ok(ObservedResponse { headers, frames })
+    }
+
+    /// The schedule's whole claim, at the adapter: when the response is
+    /// written does not depend on which protected outcome produced it.
+    ///
+    /// start_paused: the assertion is on release *instants*. A paused clock
+    /// advances only to the next timer with every task idle, so `elapsed()`
+    /// below reports the schedule's arithmetic exactly rather than a
+    /// wall-clock sample that would need a tolerance and would still be flaky.
+    #[tokio::test(start_paused = true)]
+    async fn every_protected_outcome_is_released_on_the_same_deadline() {
+        let bucket = Duration::from_millis(FIXTURE_BUCKET_MILLIS);
+        let cases: [(&str, http::Request<OneFrameBody>); 3] = [
+            ("an answered query", request(&[1, 2, 3, 4])),
+            ("a wrong-length envelope", request(&[1, 2, 3])),
+            (
+                "a body over the decode cap",
+                request(&[0; ENVELOPE_BYTES + 20]),
+            ),
+        ];
+
+        for (case, request) in cases {
+            let (mut adapter, _) = fixture();
+            let started = Instant::now();
+            let response = adapter.query_page(request).await;
+            assert_eq!(
+                started.elapsed(),
+                bucket,
+                "{case} was not released on the bucket"
+            );
+            drop(response);
+        }
+    }
+
+    /// The one deliberately distinguishable outcome must not become *more*
+    /// distinguishable: it keeps its own status and it keeps everyone else's
+    /// release instant.
+    ///
+    /// start_paused: asserts on a release instant; see the test above.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_key_epoch_is_distinguishable_by_status_and_by_nothing_else() {
+        let (mut adapter, state) = fixture();
+        let started = Instant::now();
+
+        let response = adapter
+            .query_page(request_with_epoch(&[1, 2, 3, 4], FIXTURE_KEY_EPOCH + 1))
+            .await;
+
+        assert_stale_key_epoch_status(response.headers());
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(FIXTURE_BUCKET_MILLIS)
+        );
+        assert_eq!(
+            state.calls.load(Ordering::SeqCst),
+            0,
+            "a request under a retired key is still refused ahead of the handler"
+        );
+    }
+
+    /// Work that cannot fit the bucket is cancelled and answered with the
+    /// uniform refusal, at the deadline rather than after it. Releasing late
+    /// instead would publish exactly which rounds were expensive.
+    ///
+    /// start_paused: the overrun is produced by the schedule's timer firing
+    /// before the body's, which a paused clock makes deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn an_overrunning_round_fails_closed_at_the_deadline() {
+        let (mut adapter, state, schedule) = scheduled_fixture();
+        let started = Instant::now();
+
+        let response = adapter
+            .query_page(http::Request::new(SlowBody::longer_than_the_bucket()))
+            .await;
+
+        assert_uniform_status(response.headers());
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(FIXTURE_BUCKET_MILLIS)
+        );
+        assert_eq!(schedule.overruns(), 1, "an overrun must be countable");
+        assert_eq!(
+            state.release_checks.load(Ordering::SeqCst),
+            0,
+            "a cancelled round must not have borrowed its response bytes"
+        );
+        assert!(response.into_body().is_end_stream());
+    }
+
+    /// Status equality is not enough: two refusals an observer can separate by
+    /// frame count or trailer set are two refusals. This compares the whole
+    /// observation for the three ways a protected request can be refused.
+    ///
+    /// start_paused: each case waits out a release bucket.
+    #[tokio::test(start_paused = true)]
+    async fn every_uniform_refusal_is_header_and_frame_identical(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut adapter, _) = fixture();
+        let wrong_length = observe(adapter.query_page(request(&[1, 2, 3])).await).await?;
+        let (mut adapter, _) = fixture();
+        let over_cap =
+            observe(adapter.query_page(request(&[0; ENVELOPE_BYTES + 20])).await).await?;
+        let (mut adapter, _) = fixture();
+        let overrun = observe(
+            adapter
+                .query_page(http::Request::new(SlowBody::longer_than_the_bucket()))
+                .await,
+        )
+        .await?;
+
+        assert_eq!(wrong_length, over_cap);
+        assert_eq!(wrong_length, overrun);
+
+        // Not vacuous: an answered query and the stale-epoch refusal are both
+        // observably different from the uniform one, so the equalities above
+        // are saying something about the refusals rather than about a
+        // comparison that cannot fail.
+        let (mut adapter, _) = fixture();
+        let answered = observe(adapter.query_page(request(&[1, 2, 3, 4])).await).await?;
+        let (mut adapter, _) = fixture();
+        let stale = observe(
+            adapter
+                .query_page(request_with_epoch(&[1, 2, 3, 4], FIXTURE_KEY_EPOCH + 1))
+                .await,
+        )
+        .await?;
+        assert_ne!(answered, wrong_length);
+        assert_ne!(stale, wrong_length);
         Ok(())
     }
 

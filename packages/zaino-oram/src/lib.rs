@@ -88,11 +88,11 @@ pub use hybrid_sizing::{
 };
 #[cfg(feature = "corpus-zaino")]
 pub use inner_codec::private_service::{
-    mainnet_private_query_runtime, private_mainnet_store_reads, EphemeralKeyGeneration,
-    FinalizedProjection, FinalizedProjectionBuilder, MainnetPrivateQueryRuntime, PrivateNetwork,
-    PrivateProjectionShape, PrivateRuntimeDeployment, PrivateRuntimeKeys, ReleasableSessionKeys,
-    SessionBootstrap, PRIVATE_MAINNET_ENVELOPE_BYTES, PRIVATE_PROFILE_ID_BYTES,
-    PRIVATE_RUNTIME_KEY_BYTES,
+    mainnet_private_query_runtime, private_mainnet_store_reads,
+    private_mainnet_timeout_bucket_millis, EphemeralKeyGeneration, FinalizedProjection,
+    FinalizedProjectionBuilder, MainnetPrivateQueryRuntime, PrivateNetwork, PrivateProjectionShape,
+    PrivateRuntimeDeployment, PrivateRuntimeKeys, ReleasableSessionKeys, SessionBootstrap,
+    PRIVATE_MAINNET_ENVELOPE_BYTES, PRIVATE_PROFILE_ID_BYTES, PRIVATE_RUNTIME_KEY_BYTES,
 };
 #[cfg(feature = "wallet-parity-harness")]
 pub use inner_codec::wallet_parity_harness::{
