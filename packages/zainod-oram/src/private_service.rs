@@ -8,10 +8,12 @@ use zaino_oram::{PendingFixedEnvelope, PrivateQueryUnavailable};
 use crate::private_proto;
 
 mod listener;
+mod release_schedule;
 mod tls;
 mod tonic_body;
 
 pub(crate) use listener::PrivateQueryListener;
+pub(crate) use release_schedule::ReleaseSchedule;
 pub(crate) use tls::{require_no_stranded_identity, PrivateTlsIdentity};
 
 /// Exact application envelope after validation at the private wire boundary.
@@ -127,6 +129,26 @@ where
             .query_page(request.bytes)
             .map_err(coarsen_private_service_error)?;
         Ok(PendingQueryPage { pending_response })
+    }
+
+    /// Performs one complete round and discards it.
+    ///
+    /// A protected *refusal* -- a wrong envelope length, an oversized body the
+    /// transport cap rejected, a request body that failed mid-read -- would
+    /// otherwise reach its release deadline having asked the runtime for
+    /// nothing at all, while a protected *success* paid a full round. The
+    /// fixed release schedule equalises when those two are written; it does
+    /// not equalise the work behind them, and a runtime that ran no round is
+    /// distinguishable in aggregate load however uniform its bytes and its
+    /// timing are. So every refusal buys the round it skipped.
+    ///
+    /// The all-zero envelope is deliberately not a valid protected request:
+    /// the runtime performs its complete fixed round and fails to open it,
+    /// which is exactly the work an unopenable real request costs. The pending
+    /// value is dropped here, so its bytes are never released and the
+    /// runtime's admission reopens immediately.
+    fn cover_round(&mut self) {
+        drop(self.handler.query_page([0; N]));
     }
 }
 

@@ -66,6 +66,9 @@ zaino-oram = { version = "0.1.0", path = "../zaino-oram", features = [
     "wallet-parity-harness",
 ] }
 zaino-state = { version = "0.3.1", path = "../zaino-state", default-features = false, features = ["test_dependencies"] }
+# `test-util` gives the release-schedule tests a pausable clock, so release
+# instants are asserted exactly rather than raced against wall time.
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }
