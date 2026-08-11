@@ -269,6 +269,7 @@ impl PrivateSessionBootstrap {
                 request_key: bootstrap.keys.request_key.to_vec(),
                 response_key: bootstrap.keys.response_key.to_vec(),
                 profile_label: bootstrap.profile_label.to_owned(),
+                profile_id: bootstrap.profile_id.to_vec(),
                 envelope_bytes: u32::try_from(envelope_bytes).unwrap_or(u32::MAX),
                 // Reserved for a future TDX quote; present and empty in this release.
                 attestation: Vec::new(),
@@ -560,7 +561,7 @@ mod tests {
     use prost::Message;
 
     use super::*;
-    use zaino_oram::{ReleasableSessionKeys, PRIVATE_RUNTIME_KEY_BYTES};
+    use zaino_oram::{ReleasableSessionKeys, PRIVATE_PROFILE_ID_BYTES, PRIVATE_RUNTIME_KEY_BYTES};
 
     const ENVELOPE_BYTES: usize = 4;
     const FIXTURE_KEY_EPOCH: u64 = 0;
@@ -663,6 +664,11 @@ mod tests {
         }
     }
 
+    /// A stand-in for the compiled profile's digest. Deliberately unrelated to
+    /// `"test-profile"`: the two fields are independent values in production
+    /// and the fixture must not let a test pass that assumed otherwise.
+    const FIXTURE_PROFILE_ID: [u8; PRIVATE_PROFILE_ID_BYTES] = [0x5a; PRIVATE_PROFILE_ID_BYTES];
+
     fn session_bootstrap_fixture() -> SessionBootstrap {
         SessionBootstrap {
             key_epoch: FIXTURE_KEY_EPOCH,
@@ -671,6 +677,7 @@ mod tests {
                 response_key: [0x22; PRIVATE_RUNTIME_KEY_BYTES],
             },
             profile_label: "test-profile",
+            profile_id: FIXTURE_PROFILE_ID,
         }
     }
 
@@ -940,16 +947,40 @@ mod tests {
         assert!(!status_is_failure(response.headers()));
         let decoded = decode_bootstrap(response).await?;
 
-        assert_eq!(decoded.key_epoch, FIXTURE_KEY_EPOCH);
-        assert_eq!(decoded.request_key.len(), PRIVATE_RUNTIME_KEY_BYTES);
-        assert_eq!(decoded.response_key.len(), PRIVATE_RUNTIME_KEY_BYTES);
-        assert_eq!(decoded.envelope_bytes as usize, ENVELOPE_BYTES);
+        // Destructured exhaustively rather than read field by field: this is
+        // the test that says what the bootstrap surface publishes, so adding a
+        // seventh thing a wallet is handed must not slip by silently. A new
+        // field breaks this pattern at compile time and forces a decision here
+        // about what it is and why a client may have it.
+        let private_proto::BootstrapResponse {
+            key_epoch,
+            request_key,
+            response_key,
+            profile_label,
+            envelope_bytes,
+            attestation,
+            profile_id,
+        } = decoded;
+
+        assert_eq!(key_epoch, FIXTURE_KEY_EPOCH);
+        assert_eq!(request_key.len(), PRIVATE_RUNTIME_KEY_BYTES);
+        assert_eq!(response_key.len(), PRIVATE_RUNTIME_KEY_BYTES);
+        assert_eq!(envelope_bytes as usize, ENVELOPE_BYTES);
         assert!(
-            decoded.attestation.is_empty(),
+            attestation.is_empty(),
             "attestation is deferred, not populated"
         );
         // The keys served must be the releasable pair and nothing else.
-        assert_ne!(decoded.request_key, decoded.response_key);
+        assert_ne!(request_key, response_key);
+
+        // The authoritative identifier is carried at its exact width and is
+        // the runtime's own digest, byte for byte.
+        assert_eq!(profile_id.len(), PRIVATE_PROFILE_ID_BYTES);
+        assert_eq!(profile_id, FIXTURE_PROFILE_ID);
+        // Label and identifier are two distinct published values; neither is
+        // an encoding of the other.
+        assert_eq!(profile_label, "test-profile");
+        assert_ne!(profile_id.as_slice(), profile_label.as_bytes());
         Ok(())
     }
 

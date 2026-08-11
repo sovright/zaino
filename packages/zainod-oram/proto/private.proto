@@ -41,6 +41,18 @@ message BootstrapResponse {
   // Present and empty in this release; ADR 0010 defers verification, and
   // keeping the field means adding it later is not a breaking wire change.
   bytes attestation = 6;
+  // Authoritative identifier of the compiled privacy profile: a digest over
+  // every logical budget dimension the runtime compiles in.
+  //
+  // A wallet needs it to build the envelope protection context it seals a
+  // request under. The same bytes are bound into protected request state on
+  // the server side, so a request sealed under a different profile identifier
+  // does not open — which is also why publishing it costs nothing: the digest
+  // covers only compiled, deployment-wide parameters, carries no key material,
+  // and is identical for every client this runtime serves.
+  //
+  // Unlike `profile_label`, this field IS authoritative. Pin on it.
+  bytes profile_id = 7;
 }
 
 // Independent private-query surface. This is not the legacy lightwallet API.

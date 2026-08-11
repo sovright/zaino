@@ -56,7 +56,7 @@ use crate::{
     private_runtime::{FixedEnvelopeRuntime, PrivateQueryUnavailable},
     profile::{
         mainnet_utxo_history_profile, CompiledQueryShape, MAINNET_ENVELOPE_BYTES,
-        MAINNET_QUERY_SLOTS,
+        MAINNET_QUERY_SLOTS, PROFILE_ID_BYTES,
     },
     projection::{ProjectionCapacities, ProjectionConfig},
     projection_owner::{FinalizedProjectionServingStore, OfflineProjectionOwner},
@@ -81,6 +81,13 @@ pub const PRIVATE_MAINNET_ENVELOPE_BYTES: usize = MAINNET_ENVELOPE_BYTES;
 
 /// Length of each long-lived runtime key.
 pub const PRIVATE_RUNTIME_KEY_BYTES: usize = KEY_BYTES;
+
+/// Exact length of the authoritative privacy-profile identifier.
+///
+/// A wallet needs the width to size the field it copies into its envelope
+/// protection context; it is republished here so a consumer never has to name
+/// the crate-internal profile module.
+pub const PRIVATE_PROFILE_ID_BYTES: usize = PROFILE_ID_BYTES;
 
 /// Chain a private deployment projects and serves.
 ///
@@ -406,15 +413,25 @@ pub struct SessionBootstrap {
     pub keys: ReleasableSessionKeys,
     /// Human-readable name of the compiled privacy profile, for diagnostics.
     ///
-    /// Deliberately the profile's *label*, not its authoritative identifier.
-    /// The authoritative identifier is a digest over every logical budget
-    /// dimension, and it is already bound into protected request state, so a
-    /// wallet sealing a query against the wrong profile is rejected
-    /// cryptographically rather than by comparing a string. Publishing the
-    /// digest here would add a second thing to pin without adding a check the
-    /// envelope does not already make, so this field stays a label a human can
-    /// read in a log and nothing pins on.
+    /// Deliberately the profile's *label*, not its authoritative identifier:
+    /// it is for a human reading a log or a support ticket, and nothing pins
+    /// on it. [`Self::profile_id`] is the identifier, and the two are
+    /// independent values — the label is excluded from the digest, so neither
+    /// can be derived from the other.
     pub profile_label: &'static str,
+    /// Authoritative identifier of the compiled privacy profile.
+    ///
+    /// A digest over every logical budget dimension. A wallet needs it to
+    /// build the envelope protection context it seals a request under: the
+    /// same bytes are bound into protected request state on this side, so a
+    /// request sealed under the wrong profile identifier does not open. That
+    /// check is why the value has to be published — without it a wallet has no
+    /// way to construct an envelope this runtime will accept at all.
+    ///
+    /// Safe to hand to every client: the digest covers only compiled,
+    /// deployment-wide budget parameters, carries no key material, and is
+    /// identical for every session served by this runtime.
+    pub profile_id: [u8; PRIVATE_PROFILE_ID_BYTES],
 }
 
 impl std::fmt::Debug for SessionBootstrap {
@@ -596,6 +613,7 @@ where
     let session_keys = keys.releasable();
     let key_epoch = deployment.projection.key_epoch;
     let profile_label = profile.label();
+    let profile_id = *profile.profile_id();
     let shape = CompiledQueryShape::<MAINNET_QUERY_SLOTS, MAINNET_ENVELOPE_BYTES>::new(profile)
         .map_err(|_| PrivateQueryUnavailable)?;
     let inner = finalized_runtime_owner::<
@@ -617,6 +635,7 @@ where
         key_epoch,
         session_keys,
         profile_label,
+        profile_id,
     })
 }
 
@@ -649,6 +668,7 @@ where
     /// keeps its redacting `Debug`, which this struct's own `Debug` defers to.
     session_keys: ReleasableSessionKeys,
     profile_label: &'static str,
+    profile_id: [u8; PRIVATE_PROFILE_ID_BYTES],
 }
 
 impl<Source, E, T, R, N> std::fmt::Debug for MainnetRuntime<Source, E, T, R, N>
@@ -704,6 +724,7 @@ where
                 response_key: self.session_keys.response_key,
             },
             profile_label: self.profile_label,
+            profile_id: self.profile_id,
         }
     }
 
@@ -879,6 +900,19 @@ mod tests {
         assert_eq!(bootstrap.keys.request_key, releasable_request_key);
         assert_eq!(bootstrap.keys.response_key, releasable_response_key);
         assert!(!bootstrap.profile_label.is_empty());
+        // The authoritative identifier is the compiled profile's own digest,
+        // not a placeholder and not anything derived from the label: a wallet
+        // that copies it into its protection context must reproduce exactly
+        // the bytes this runtime binds into protected request state.
+        let profile =
+            mainnet_utxo_history_profile().map_err(|_| "the compiled mainnet profile validates")?;
+        assert_eq!(bootstrap.profile_id.len(), PRIVATE_PROFILE_ID_BYTES);
+        assert_eq!(&bootstrap.profile_id, profile.profile_id());
+        assert_ne!(
+            bootstrap.profile_id.as_slice(),
+            bootstrap.profile_label.as_bytes(),
+            "the label is not the identifier"
+        );
         assert_eq!(
             format!("{bootstrap:?}"),
             "SessionBootstrap { ..REDACTED.. }"

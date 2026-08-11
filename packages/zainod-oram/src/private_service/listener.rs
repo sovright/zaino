@@ -293,6 +293,9 @@ mod tests {
     const ENVELOPE_BYTES: usize = 4;
     const RESPONSE: [u8; ENVELOPE_BYTES] = [9, 8, 7, 6];
     const FIXTURE_KEY_EPOCH: u64 = 0;
+    /// A stand-in for the compiled profile's digest, unrelated to the label.
+    const FIXTURE_PROFILE_ID: [u8; zaino_oram::PRIVATE_PROFILE_ID_BYTES] =
+        [0x5a; zaino_oram::PRIVATE_PROFILE_ID_BYTES];
 
     fn session_bootstrap_fixture(key_epoch: u64) -> SessionBootstrap {
         SessionBootstrap {
@@ -302,6 +305,7 @@ mod tests {
                 response_key: [0x22; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
             },
             profile_label: "test-profile",
+            profile_id: FIXTURE_PROFILE_ID,
         }
     }
 
@@ -757,6 +761,7 @@ mod tests {
                 response_key,
             },
             profile_label: "test-profile",
+            profile_id: FIXTURE_PROFILE_ID,
         };
 
         let (stop, stopped) = tokio::sync::oneshot::channel();

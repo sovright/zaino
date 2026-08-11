@@ -47,6 +47,19 @@ pub struct BootstrapResponse {
     /// keeping the field means adding it later is not a breaking wire change.
     #[prost(bytes = "vec", tag = "6")]
     pub attestation: ::prost::alloc::vec::Vec<u8>,
+    /// Authoritative identifier of the compiled privacy profile: a digest over
+    /// every logical budget dimension the runtime compiles in.
+    ///
+    /// A wallet needs it to build the envelope protection context it seals a
+    /// request under. The same bytes are bound into protected request state on
+    /// the server side, so a request sealed under a different profile identifier
+    /// does not open — which is also why publishing it costs nothing: the digest
+    /// covers only compiled, deployment-wide parameters, carries no key material,
+    /// and is identical for every client this runtime serves.
+    ///
+    /// Unlike `profile_label`, this field IS authoritative. Pin on it.
+    #[prost(bytes = "vec", tag = "7")]
+    pub profile_id: ::prost::alloc::vec::Vec<u8>,
 }
 /// Generated server implementations.
 pub mod private_compact_tx_streamer_server {
