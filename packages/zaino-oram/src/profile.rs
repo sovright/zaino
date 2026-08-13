@@ -752,7 +752,13 @@ impl<const RESPONSE_SLOTS: usize, const ENVELOPE_BYTES: usize>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::CompletionShape;
+    use crate::{
+        records::{
+            AddressEventPage, PersistentAddressEventPage, RecordAnnotation, UtxoEvent,
+            UtxoScriptClass, TXID_BYTES,
+        },
+        trace::CompletionShape,
+    };
 
     fn definition() -> PrivacyProfileDefinition {
         PrivacyProfileDefinition {
@@ -1070,6 +1076,49 @@ mod tests {
         let profile = mainnet_utxo_history_profile()?;
 
         assert_eq!(profile.profile_id(), &MAINNET_PROFILE_ID);
+        Ok(())
+    }
+
+    /// Record shape is not a profile dimension.
+    ///
+    /// Two prior attempts at the record-annotation hoist disagreed about
+    /// whether adding an annotation to the stored event page moves the profile
+    /// identifier — and with it every lease, replay namespace, and sealed
+    /// envelope minted under it. It does not: `derive_profile_id` hashes budget
+    /// dimensions, policy tags, and the runtime schedule version, none of which
+    /// mention a persistent record. This pins that rather than asserting it, by
+    /// exhibiting two stored records whose bytes differ only in the annotation
+    /// and re-deriving the identifier across them.
+    #[test]
+    fn annotating_a_stored_record_does_not_move_the_profile_identifier(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event = UtxoEvent::created(
+            [0x5e; TXID_BYTES],
+            0,
+            21_000,
+            2_400_000,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0x5a; 20],
+        );
+        let page = AddressEventPage::real(1, 0, event)?;
+        let annotated = page.annotated(RecordAnnotation::Annotated {
+            survives: true,
+            valid: true,
+        })?;
+        let plain_bytes = PersistentAddressEventPage::from_business(&page);
+        let annotated_bytes = PersistentAddressEventPage::from_business(&annotated);
+        assert_ne!(plain_bytes, annotated_bytes);
+
+        let before = mainnet_utxo_history_profile()?;
+        let after = mainnet_utxo_history_profile()?;
+        assert_eq!(before.profile_id(), after.profile_id());
+        assert_eq!(
+            before.profile_id(),
+            &[
+                0x67, 0x4f, 0xfb, 0xb1, 0x66, 0x9b, 0xe6, 0xfe, 0x65, 0xa1, 0xaa, 0x5d, 0x01, 0xf6,
+                0xcb, 0x93,
+            ]
+        );
         Ok(())
     }
 

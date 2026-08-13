@@ -165,6 +165,37 @@ impl AtomicWorker {
             .map_err(AtomicQualificationCommandError::from_worker)
     }
 
+    /// Rewrites one stored record's per-generation annotation.
+    ///
+    /// The publication-time annotation pass is the intended caller; no query
+    /// path reaches this. The reply carries the address's fixed history so the
+    /// caller sees exactly what an ordinary read would have returned, and a
+    /// disposition classified after the write completed.
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn qualification_annotate(
+        &self,
+        address_key: &AddressKey,
+        ordinal: u64,
+        annotation: RecordAnnotation,
+    ) -> Result<AtomicQualificationAnnotateResult, AtomicQualificationCommandError> {
+        self.handle
+            .try_annotate(address_key, ordinal, annotation)
+            .map_err(AtomicQualificationCommandError::from_worker)?
+            .wait()
+            .map(|result| AtomicQualificationAnnotateResult {
+                disposition: match result.disposition {
+                    AnnotationDisposition::Written => {
+                        AtomicQualificationAnnotationDisposition::Written
+                    }
+                    AnnotationDisposition::Unchanged => {
+                        AtomicQualificationAnnotationDisposition::Unchanged
+                    }
+                },
+                history: result.history.slots,
+            })
+            .map_err(AtomicQualificationCommandError::from_worker)
+    }
+
     #[cfg(feature = "corpus-zaino")]
     pub(crate) fn qualification_shutdown(self) -> Result<AtomicQualificationSnapshot, ()> {
         self.shutdown()
@@ -309,24 +340,39 @@ struct AtomicWorkerHandle {
 }
 
 impl AtomicWorkerHandle {
+    /// Builds one reply channel, admits the command it belongs to, and returns
+    /// the ticket.
+    ///
+    /// Every command shares this; what a caller chooses is the command and
+    /// whether abandoning its ticket is terminal. A mutating command's outcome
+    /// is uncertain if its reply is never read, so those are terminal and reads
+    /// are not.
+    fn admit_with_reply<T>(
+        &self,
+        terminal_on_abandonment: bool,
+        build: impl FnOnce(SyncSender<Result<T, AtomicWorkerError>>) -> WorkerCommand,
+    ) -> Result<AtomicWorkerReply<T>, AtomicWorkerError> {
+        let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
+        self.admit(build(reply))?;
+        Ok(AtomicWorkerReply {
+            response,
+            shared: Arc::clone(&self.shared),
+            consumed: false,
+            terminal_on_abandonment,
+        })
+    }
+
     fn try_read_live_slot(
         &self,
         address_key: &AddressKey,
         logical_slot: usize,
         maximum_finalized_height: u32,
     ) -> Result<AtomicWorkerReply<Option<TransparentUtxo>>, AtomicWorkerError> {
-        let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
-        self.admit(WorkerCommand::ReadLiveSlot {
+        self.admit_with_reply(false, |reply| WorkerCommand::ReadLiveSlot {
             address_key: *address_key,
             logical_slot,
             maximum_finalized_height,
             reply,
-        })?;
-        Ok(AtomicWorkerReply {
-            response,
-            shared: Arc::clone(&self.shared),
-            consumed: false,
-            terminal_on_abandonment: false,
         })
     }
 
@@ -334,13 +380,20 @@ impl AtomicWorkerHandle {
         &self,
         address: StandardAddress,
     ) -> Result<AtomicWorkerReply<FixedEventHistory>, AtomicWorkerError> {
-        let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
-        self.admit(WorkerCommand::ReadHistory { address, reply })?;
-        Ok(AtomicWorkerReply {
-            response,
-            shared: Arc::clone(&self.shared),
-            consumed: false,
-            terminal_on_abandonment: false,
+        self.admit_with_reply(false, |reply| WorkerCommand::ReadHistory { address, reply })
+    }
+
+    fn try_annotate(
+        &self,
+        address_key: &AddressKey,
+        ordinal: u64,
+        annotation: RecordAnnotation,
+    ) -> Result<AtomicWorkerReply<AnnotateResult>, AtomicWorkerError> {
+        self.admit_with_reply(true, |reply| WorkerCommand::Annotate {
+            address_key: *address_key,
+            ordinal,
+            annotation,
+            reply,
         })
     }
 
@@ -349,17 +402,10 @@ impl AtomicWorkerHandle {
         address: StandardAddress,
         event: UtxoEvent,
     ) -> Result<AtomicWorkerReply<AppendResult>, AtomicWorkerError> {
-        let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
-        self.admit(WorkerCommand::Append {
+        self.admit_with_reply(true, |reply| WorkerCommand::Append {
             address,
             event,
             reply,
-        })?;
-        Ok(AtomicWorkerReply {
-            response,
-            shared: Arc::clone(&self.shared),
-            consumed: false,
-            terminal_on_abandonment: true,
         })
     }
 
@@ -410,17 +456,10 @@ impl AtomicWorkerHandle {
         entered: SyncSender<()>,
         release: Receiver<()>,
     ) -> Result<AtomicWorkerReply<()>, AtomicWorkerError> {
-        let (reply, response) = mpsc::sync_channel(REPLY_CHANNEL_CAPACITY);
-        self.admit(WorkerCommand::PanicWorkerLoop {
+        self.admit_with_reply(false, |reply| WorkerCommand::PanicWorkerLoop {
             entered,
             release,
             reply,
-        })?;
-        Ok(AtomicWorkerReply {
-            response,
-            shared: Arc::clone(&self.shared),
-            consumed: false,
-            terminal_on_abandonment: false,
         })
     }
 }
@@ -499,6 +538,21 @@ pub(crate) enum AtomicQualificationAppendDisposition {
 #[cfg(feature = "corpus-zaino")]
 pub(crate) struct AtomicQualificationAppendResult {
     pub(crate) disposition: AtomicQualificationAppendDisposition,
+    pub(crate) history: Vec<Option<UtxoEvent>>,
+}
+
+/// Aggregate annotation disposition retained only for the qualification facade.
+#[cfg(feature = "corpus-zaino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicQualificationAnnotationDisposition {
+    Written,
+    Unchanged,
+}
+
+/// Identifier-free annotation outcome retained only for the qualification facade.
+#[cfg(feature = "corpus-zaino")]
+pub(crate) struct AtomicQualificationAnnotateResult {
+    pub(crate) disposition: AtomicQualificationAnnotationDisposition,
     pub(crate) history: Vec<Option<UtxoEvent>>,
 }
 
@@ -648,6 +702,12 @@ enum WorkerCommand {
         event: UtxoEvent,
         reply: SyncSender<Result<AppendResult, AtomicWorkerError>>,
     },
+    Annotate {
+        address_key: AddressKey,
+        ordinal: u64,
+        annotation: RecordAnnotation,
+        reply: SyncSender<Result<AnnotateResult, AtomicWorkerError>>,
+    },
     Shutdown {
         reply: SyncSender<()>,
     },
@@ -733,6 +793,18 @@ where
                 mark_dequeued(shared);
                 let result =
                     execute_command(executor, shared, |executor| executor.append(address, event));
+                send_reply(reply, result);
+            }
+            WorkerCommand::Annotate {
+                address_key,
+                ordinal,
+                annotation,
+                reply,
+            } => {
+                mark_dequeued(shared);
+                let result = execute_command(executor, shared, |executor| {
+                    executor.annotate(&address_key, ordinal, annotation)
+                });
                 send_reply(reply, result);
             }
             WorkerCommand::Shutdown { reply } => {
@@ -861,6 +933,10 @@ fn drain_failed_commands(receiver: &Receiver<WorkerCommand>, shared: &WorkerShar
                 send_reply(reply, Err(AtomicWorkerError::FailedClosed));
             }
             Ok(WorkerCommand::Append { reply, .. }) => {
+                resolve_queued_failure(shared);
+                send_reply(reply, Err(AtomicWorkerError::FailedClosed));
+            }
+            Ok(WorkerCommand::Annotate { reply, .. }) => {
                 resolve_queued_failure(shared);
                 send_reply(reply, Err(AtomicWorkerError::FailedClosed));
             }
@@ -1204,7 +1280,7 @@ mod tests {
         }
     }
 
-    impl<T: Copy> UniqueTable<T> for TestTable<T> {
+    impl<T: Copy + PartialEq> UniqueTable<T> for TestTable<T> {
         fn capacity(&self) -> usize {
             self.capacity
         }
@@ -1250,6 +1326,21 @@ mod tests {
                 }
             }
             self.records.insert(index, value);
+            Ok(())
+        }
+
+        fn update_present(
+            &mut self,
+            index: usize,
+            expected_prior: T,
+            replacement: T,
+        ) -> Result<(), BackendFailure> {
+            self.record(OperationKind::Write);
+            self.write_calls += 1;
+            if self.records.get(&index) != Some(&expected_prior) {
+                return Err(BackendFailure);
+            }
+            self.records.insert(index, replacement);
             Ok(())
         }
     }

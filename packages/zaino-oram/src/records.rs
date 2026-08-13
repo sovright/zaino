@@ -43,7 +43,20 @@ const UTXO_EVENT_FLAG_MINED: u8 = 1 << 0;
 const UTXO_EVENT_FLAG_SPENT: u8 = 1 << 1;
 const UTXO_EVENT_KNOWN_FLAGS: u8 = UTXO_EVENT_FLAG_MINED | UTXO_EVENT_FLAG_SPENT;
 const ADDRESS_CELL_FORMAT_VERSION: u8 = 1;
-const ADDRESS_CELL_FLAG_OCCUPIED: u8 = 1;
+const ADDRESS_CELL_FLAG_OCCUPIED: u8 = 1 << 0;
+/// The stored record carries a published join answer for the current generation.
+const ADDRESS_CELL_FLAG_ANNOTATED: u8 = 1 << 1;
+/// The annotated record survives the published recent snapshot.
+const ADDRESS_CELL_FLAG_SURVIVES: u8 = 1 << 2;
+/// The annotated record's recent-snapshot relation is semantically valid.
+const ADDRESS_CELL_FLAG_VALID: u8 = 1 << 3;
+/// A directory cell has no annotation, so only the occupancy bit is legal.
+const ADDRESS_DIRECTORY_CELL_FLAGS: u8 = ADDRESS_CELL_FLAG_OCCUPIED;
+/// An event page may additionally carry the three annotation bits.
+const ADDRESS_EVENT_CELL_FLAGS: u8 = ADDRESS_CELL_FLAG_OCCUPIED
+    | ADDRESS_CELL_FLAG_ANNOTATED
+    | ADDRESS_CELL_FLAG_SURVIVES
+    | ADDRESS_CELL_FLAG_VALID;
 const FIXED_UTXO_PAGE_FORMAT_VERSION: u8 = 1;
 #[cfg(feature = "corpus-zaino")]
 const PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN: &[u8] =
@@ -2106,6 +2119,65 @@ impl fmt::Debug for AddressDirectory {
     }
 }
 
+/// The publication-time answer to the finalized/recent join for one record.
+///
+/// Both bits are a function of `(record, its owner, the published recent
+/// snapshot)` — public per-generation data — so storing them beside the record
+/// leaks nothing a query did not already imply, and makes the per-query join
+/// `O(1)` instead of a re-scan of the whole snapshot. The unannotated state is
+/// distinct from `Annotated { survives: false, valid: false }`: it means no pass
+/// has run for the current generation, which a consumer must not read as a
+/// join answer.
+///
+/// Computing the annotation is deliberately out of scope here. This type is the
+/// storage contract the computation will write through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum RecordAnnotation {
+    #[default]
+    Unannotated,
+    Annotated {
+        survives: bool,
+        valid: bool,
+    },
+}
+
+impl RecordAnnotation {
+    /// Encodes the annotation into its address-cell flag bits.
+    const fn flag_bits(self) -> u8 {
+        match self {
+            Self::Unannotated => 0,
+            Self::Annotated { survives, valid } => {
+                let mut bits = ADDRESS_CELL_FLAG_ANNOTATED;
+                if survives {
+                    bits |= ADDRESS_CELL_FLAG_SURVIVES;
+                }
+                if valid {
+                    bits |= ADDRESS_CELL_FLAG_VALID;
+                }
+                bits
+            }
+        }
+    }
+
+    /// Decodes the annotation from already header-validated flag bits.
+    ///
+    /// The survives/valid bits are meaningless without the annotated bit, so a
+    /// cell that sets either of them alone is noncanonical rather than
+    /// silently unannotated.
+    const fn from_flag_bits(flags: u8) -> Result<Self, PersistentAddressEventPageError> {
+        let annotated = flags & ADDRESS_CELL_FLAG_ANNOTATED != 0;
+        let survives = flags & ADDRESS_CELL_FLAG_SURVIVES != 0;
+        let valid = flags & ADDRESS_CELL_FLAG_VALID != 0;
+        if !annotated {
+            if survives || valid {
+                return Err(PersistentAddressEventPageError::NoncanonicalAnnotation);
+            }
+            return Ok(Self::Unannotated);
+        }
+        Ok(Self::Annotated { survives, valid })
+    }
+}
+
 /// One immutable event-table cell.
 ///
 /// One event per cell is the compatibility baseline for the current append-only
@@ -2114,11 +2186,33 @@ impl fmt::Debug for AddressDirectory {
 /// authenticate the stored directory slot or event ordinal against a logical
 /// read key, nor the event script against a directory address key. The future
 /// layout must validate all three bindings before using the event.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// The annotation is the one mutable field. It is deliberately excluded from
+/// [`PartialEq`] — see the hand-written impl below — so replay identity keeps
+/// its append-only meaning.
+#[derive(Clone, Copy, Eq)]
 pub(super) struct AddressEventPage {
     event: Option<UtxoEvent>,
     directory_slot: u32,
     event_ordinal: u32,
+    annotation: RecordAnnotation,
+}
+
+/// Compares two pages by their replay identity only.
+///
+/// The append path decides `AppendDisposition::ExactReplay` and its
+/// at-most-one-duplicate uniqueness check from record identity. The annotation
+/// is derived per generation and rewritten in place, so including it would make
+/// a re-annotated record stop matching its own replay and silently change what
+/// a replay is. Byte-exact comparison still exists where it is needed: the
+/// persistent encoding keeps its derived `PartialEq`, and the store's
+/// compare-and-set reads every byte.
+impl PartialEq for AddressEventPage {
+    fn eq(&self, other: &Self) -> bool {
+        self.event == other.event
+            && self.directory_slot == other.directory_slot
+            && self.event_ordinal == other.event_ordinal
+    }
 }
 
 impl AddressEventPage {
@@ -2127,6 +2221,7 @@ impl AddressEventPage {
             event: None,
             directory_slot: 0,
             event_ordinal: 0,
+            annotation: RecordAnnotation::Unannotated,
         }
     }
 
@@ -2142,7 +2237,27 @@ impl AddressEventPage {
             event: Some(event),
             directory_slot,
             event_ordinal,
+            annotation: RecordAnnotation::Unannotated,
         })
+    }
+
+    /// Returns this page carrying `annotation`.
+    ///
+    /// Only an occupied page can be annotated: a dummy cell has no record for
+    /// the join to answer about, and an annotated dummy would not round-trip
+    /// through the canonical all-zero payload check.
+    pub(super) fn annotated(
+        self,
+        annotation: RecordAnnotation,
+    ) -> Result<Self, AddressEventPageError> {
+        if !self.is_occupied() {
+            return Err(AddressEventPageError::AnnotatedDummy);
+        }
+        Ok(Self { annotation, ..self })
+    }
+
+    pub(super) const fn annotation(&self) -> RecordAnnotation {
+        self.annotation
     }
 
     pub(super) const fn is_occupied(&self) -> bool {
@@ -2179,6 +2294,7 @@ fn is_standard_address_event(event: &UtxoEvent) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AddressEventPageError {
     NonStandardEvent,
+    AnnotatedDummy,
 }
 
 impl fmt::Display for AddressEventPageError {
@@ -2186,6 +2302,9 @@ impl fmt::Display for AddressEventPageError {
         match self {
             Self::NonStandardEvent => {
                 f.write_str("private address-event page requires a standard address event")
+            }
+            Self::AnnotatedDummy => {
+                f.write_str("private address-event dummy cannot carry an annotation")
             }
         }
     }
@@ -2218,9 +2337,9 @@ impl PersistentAddressDirectory {
     }
 
     pub(super) fn into_business(self) -> Result<AddressDirectory, PersistentAddressDirectoryError> {
-        let occupied =
-            decode_address_cell_header(&self.0).map_err(PersistentAddressDirectoryError::Header)?;
-        if !occupied {
+        let flags = decode_address_cell_header(&self.0, ADDRESS_DIRECTORY_CELL_FLAGS)
+            .map_err(PersistentAddressDirectoryError::Header)?;
+        if flags & ADDRESS_CELL_FLAG_OCCUPIED == 0 {
             if self.0[2..].iter().any(|byte| *byte != 0) {
                 return Err(PersistentAddressDirectoryError::NoncanonicalDummy);
             }
@@ -2282,7 +2401,11 @@ impl PersistentAddressEventPage {
         let mut bytes = [0; PERSISTENT_ADDRESS_EVENT_PAGE_BYTES];
         bytes[0] = ADDRESS_CELL_FORMAT_VERSION;
         if let Some(event) = src.event() {
-            bytes[1] = ADDRESS_CELL_FLAG_OCCUPIED;
+            // The annotation lives in spare flag bits rather than in new
+            // payload bytes, so the record width — and with it the ORAM block
+            // size every timing and sizing figure is measured against — is
+            // unchanged.
+            bytes[1] = ADDRESS_CELL_FLAG_OCCUPIED | src.annotation().flag_bits();
             bytes[2..6].copy_from_slice(&src.directory_slot().to_le_bytes());
             bytes[6..10].copy_from_slice(&src.event_ordinal().to_le_bytes());
             bytes[10..].copy_from_slice(&PersistentUtxoEvent::from_business(event).0);
@@ -2291,9 +2414,13 @@ impl PersistentAddressEventPage {
     }
 
     pub(super) fn into_business(self) -> Result<AddressEventPage, PersistentAddressEventPageError> {
-        let occupied =
-            decode_address_cell_header(&self.0).map_err(PersistentAddressEventPageError::Header)?;
-        if !occupied {
+        let flags = decode_address_cell_header(&self.0, ADDRESS_EVENT_CELL_FLAGS)
+            .map_err(PersistentAddressEventPageError::Header)?;
+        let annotation = RecordAnnotation::from_flag_bits(flags)?;
+        if flags & ADDRESS_CELL_FLAG_OCCUPIED == 0 {
+            if annotation != RecordAnnotation::Unannotated {
+                return Err(PersistentAddressEventPageError::NoncanonicalAnnotation);
+            }
             if self.0[2..].iter().any(|byte| *byte != 0) {
                 return Err(PersistentAddressEventPageError::NoncanonicalDummy);
             }
@@ -2308,14 +2435,31 @@ impl PersistentAddressEventPage {
         let event = PersistentUtxoEvent(event)
             .into_business()
             .map_err(PersistentAddressEventPageError::InvalidEvent)?;
-        AddressEventPage::real(
+        let page = AddressEventPage::real(
             u32::from_le_bytes(directory_slot),
             u32::from_le_bytes(event_ordinal),
             event,
         )
-        .map_err(|AddressEventPageError::NonStandardEvent| {
+        .map_err(map_address_event_page_error)?;
+        match annotation {
+            RecordAnnotation::Unannotated => Ok(page),
+            annotation => page
+                .annotated(annotation)
+                .map_err(map_address_event_page_error),
+        }
+    }
+}
+
+const fn map_address_event_page_error(
+    error: AddressEventPageError,
+) -> PersistentAddressEventPageError {
+    match error {
+        AddressEventPageError::NonStandardEvent => {
             PersistentAddressEventPageError::NonStandardEvent
-        })
+        }
+        AddressEventPageError::AnnotatedDummy => {
+            PersistentAddressEventPageError::NoncanonicalAnnotation
+        }
     }
 }
 
@@ -2347,14 +2491,23 @@ impl rostl_primitives::traits::Cmov for PersistentAddressEventPage {
     }
 }
 
-fn decode_address_cell_header(bytes: &[u8]) -> Result<bool, PersistentAddressCellHeaderError> {
+/// Validates the shared cell header and returns its flag byte.
+///
+/// `known_flags` is the caller's complete legal flag set: a directory cell has
+/// only the occupancy bit, an event page also has the three annotation bits.
+/// Any bit outside that set is rejected, so an unknown flag can never be
+/// silently ignored by the cell kind that does not define it.
+fn decode_address_cell_header(
+    bytes: &[u8],
+    known_flags: u8,
+) -> Result<u8, PersistentAddressCellHeaderError> {
     if bytes[0] != ADDRESS_CELL_FORMAT_VERSION {
         return Err(PersistentAddressCellHeaderError::UnsupportedVersion { actual: bytes[0] });
     }
-    if bytes[1] & !ADDRESS_CELL_FLAG_OCCUPIED != 0 {
+    if bytes[1] & !known_flags != 0 {
         return Err(PersistentAddressCellHeaderError::InvalidFlags { actual: bytes[1] });
     }
-    Ok(bytes[1] & ADDRESS_CELL_FLAG_OCCUPIED != 0)
+    Ok(bytes[1])
 }
 
 /// Invalid common header bytes in a protected address cell.
@@ -2411,6 +2564,7 @@ impl std::error::Error for PersistentAddressDirectoryError {
 pub(super) enum PersistentAddressEventPageError {
     Header(PersistentAddressCellHeaderError),
     NoncanonicalDummy,
+    NoncanonicalAnnotation,
     NonStandardEvent,
     InvalidEvent(PersistentUtxoEventError),
 }
@@ -2421,6 +2575,9 @@ impl fmt::Display for PersistentAddressEventPageError {
             Self::Header(error) => write!(f, "persistent address-event page is invalid: {error}"),
             Self::NoncanonicalDummy => {
                 f.write_str("persistent address-event dummy has nonzero payload")
+            }
+            Self::NoncanonicalAnnotation => {
+                f.write_str("persistent address-event page has a noncanonical annotation")
             }
             Self::NonStandardEvent => {
                 f.write_str("persistent address-event page contains a nonstandard event")
@@ -2440,7 +2597,7 @@ impl std::error::Error for PersistentAddressEventPageError {
         match self {
             Self::Header(error) => Some(error),
             Self::InvalidEvent(error) => Some(error),
-            Self::NoncanonicalDummy | Self::NonStandardEvent => None,
+            Self::NoncanonicalDummy | Self::NoncanonicalAnnotation | Self::NonStandardEvent => None,
         }
     }
 }
@@ -4227,14 +4384,28 @@ mod tests {
                 PersistentAddressCellHeaderError::UnsupportedVersion { actual: 2 }
             ))
         );
+        // Bit 4 and above are outside the event page's complete flag set.
         let mut wrong_flags = valid_dummy.0;
-        wrong_flags[1] = 2;
+        wrong_flags[1] = 1 << 4;
         assert_eq!(
             PersistentAddressEventPage(wrong_flags).into_business(),
             Err(PersistentAddressEventPageError::Header(
-                PersistentAddressCellHeaderError::InvalidFlags { actual: 2 }
+                PersistentAddressCellHeaderError::InvalidFlags { actual: 1 << 4 }
             ))
         );
+        // The annotation bits are inside that set but meaningless on a dummy.
+        for annotation_bits in [
+            ADDRESS_CELL_FLAG_ANNOTATED,
+            ADDRESS_CELL_FLAG_SURVIVES,
+            ADDRESS_CELL_FLAG_VALID,
+        ] {
+            let mut annotated_dummy = valid_dummy.0;
+            annotated_dummy[1] = annotation_bits;
+            assert_eq!(
+                PersistentAddressEventPage(annotated_dummy).into_business(),
+                Err(PersistentAddressEventPageError::NoncanonicalAnnotation)
+            );
+        }
         for index in 2..PERSISTENT_ADDRESS_EVENT_PAGE_BYTES {
             let mut noncanonical = valid_dummy.0;
             noncanonical[index] = 1;
@@ -4243,6 +4414,101 @@ mod tests {
                 Err(PersistentAddressEventPageError::NoncanonicalDummy)
             );
         }
+    }
+
+    /// The annotation is the one mutable field on a stored record, and the one
+    /// field replay identity must not see. Both halves are asserted here: the
+    /// bytes change, and the business comparison does not.
+    #[test]
+    fn annotation_round_trips_without_entering_replay_identity() {
+        let page =
+            AddressEventPage::real(7, 2, sample_created_event()).expect("sample event is standard");
+        assert_eq!(page.annotation(), RecordAnnotation::Unannotated);
+
+        for annotation in [
+            RecordAnnotation::Annotated {
+                survives: false,
+                valid: false,
+            },
+            RecordAnnotation::Annotated {
+                survives: true,
+                valid: false,
+            },
+            RecordAnnotation::Annotated {
+                survives: false,
+                valid: true,
+            },
+            RecordAnnotation::Annotated {
+                survives: true,
+                valid: true,
+            },
+        ] {
+            let annotated = page.annotated(annotation).expect("occupied page annotates");
+            assert_eq!(annotated.annotation(), annotation);
+            // Replay identity ignores it.
+            assert_eq!(annotated, page);
+            // The stored bytes do not.
+            let persistent = PersistentAddressEventPage::from_business(&annotated);
+            assert_ne!(persistent, PersistentAddressEventPage::from_business(&page));
+            // Only the flag byte moves: the record width, and with it the ORAM
+            // block size, is unchanged.
+            assert_eq!(
+                persistent.0[2..],
+                PersistentAddressEventPage::from_business(&page).0[2..]
+            );
+            let decoded = persistent.into_business().expect("annotated page decodes");
+            assert_eq!(decoded.annotation(), annotation);
+            assert_eq!(decoded, annotated);
+        }
+    }
+
+    #[test]
+    fn a_dummy_page_refuses_an_annotation() {
+        assert_eq!(
+            AddressEventPage::dummy().annotated(RecordAnnotation::Annotated {
+                survives: true,
+                valid: true,
+            }),
+            Err(AddressEventPageError::AnnotatedDummy)
+        );
+    }
+
+    /// The survives/valid bits are meaningless without the annotated bit, so a
+    /// record that sets one alone is corruption rather than an unannotated
+    /// record with stray bits.
+    #[test]
+    fn annotation_bits_without_the_annotated_bit_are_rejected() {
+        let page =
+            AddressEventPage::real(1, 0, sample_created_event()).expect("sample event is standard");
+        let encoded = PersistentAddressEventPage::from_business(&page);
+        for stray in [ADDRESS_CELL_FLAG_SURVIVES, ADDRESS_CELL_FLAG_VALID] {
+            let mut bytes = encoded.0;
+            bytes[1] |= stray;
+            assert_eq!(
+                PersistentAddressEventPage(bytes).into_business(),
+                Err(PersistentAddressEventPageError::NoncanonicalAnnotation)
+            );
+        }
+    }
+
+    /// A directory cell has no annotation, so the bits an event page defines
+    /// must not be silently accepted there.
+    #[test]
+    fn a_directory_cell_rejects_the_event_annotation_bits() {
+        let encoded = PersistentAddressDirectory::from_business(&AddressDirectory::real(
+            3,
+            AddressKey::new([0x44; ADDRESS_KEY_BYTES]),
+        ));
+        let mut bytes = encoded.0;
+        bytes[1] |= ADDRESS_CELL_FLAG_ANNOTATED;
+        assert_eq!(
+            PersistentAddressDirectory(bytes).into_business(),
+            Err(PersistentAddressDirectoryError::Header(
+                PersistentAddressCellHeaderError::InvalidFlags {
+                    actual: ADDRESS_CELL_FLAG_OCCUPIED | ADDRESS_CELL_FLAG_ANNOTATED
+                }
+            ))
+        );
     }
 
     #[test]
