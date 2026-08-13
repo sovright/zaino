@@ -1,0 +1,49 @@
+name: ORAM - Codegen Guard Stability Experiment
+
+# ADR 0901's codegen-unit partition experiment. Manual only: this is a
+# diagnostic that deliberately perturbs the source tree and reports evidence,
+# not a gate. It must never block a merge, and it is not on any push or
+# pull_request trigger for that reason.
+#
+# It lives in CI because the guards read x86-64 ELF release output and the
+# maintainers' hosts are arm64 macOS, so there is nowhere else to run it.
+#
+# Read the result against ADR 0901's decision rule, which the script prints.
+# A "MOVED at 1" or "STABLE at both" outcome means the partition hypothesis is
+# not supported and the diagnosis reopens — it does not mean the run failed.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stability:
+    name: codegen-units stability (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify native architecture and pinned toolchain
+        run: |
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+          rustup show active-toolchain
+          rustc --version --verbose
+
+      - name: Verify binutils are available
+        run: |
+          nm --version | head -1
+          objdump --version | head -1
+
+      - name: Run the stability experiment
+        run: ./tools/scripts/codegen-guard-stability-experiment.sh
