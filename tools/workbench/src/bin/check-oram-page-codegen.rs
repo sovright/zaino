@@ -31,7 +31,7 @@ use std::{
 };
 use workbench::{command as tool, encoded_byte_len, is_gnu_prefix, run};
 
-const EXPECTED_SYMBOL_SIZE: u64 = 0xca9;
+const EXPECTED_SYMBOL_SIZE: u64 = 0xe69;
 const EXPECTED_BRANCHES: usize = 26;
 const EXPECTED_RETURNS: usize = 1;
 const MEMCPY: &str = "memcpy@GLIBC_2.14";
@@ -1257,16 +1257,37 @@ mod tests {
         assert!(parse_invocation(vec![OsString::from("--emit-profiles")]).is_err());
     }
 
+    /// Address of each guarded symbol in the synthetic `nm` listings below.
+    ///
+    /// The three symbols sit exactly adjacent, so every address is a function
+    /// of [`EXPECTED_SYMBOL_SIZE`]. Deriving them rather than hard-coding hex
+    /// is what keeps the range and overlap assertions meaningful when the
+    /// pinned size is regenerated: a literal listing silently stops being
+    /// adjacent the moment the constant moves.
+    const FIRST_SYMBOL_ADDRESS: u64 = 0x100;
+
+    fn symbol_address(index: u64) -> u64 {
+        FIRST_SYMBOL_ADDRESS + index * EXPECTED_SYMBOL_SIZE
+    }
+
+    /// One `nm -nSC` line per guarded symbol, at the pinned size.
+    fn expected_listing() -> String {
+        [PageKind::Base, PageKind::Add, PageKind::Spend]
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                format!(
+                    "{:016x} {EXPECTED_SYMBOL_SIZE:016x} t {}\n",
+                    symbol_address(index as u64),
+                    kind.symbol()
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn exact_three_symbols_are_required() {
-        let listing = format!(
-            "0000000000000100 0000000000000ca9 t {}\n\
-             0000000000000da9 0000000000000ca9 t {}\n\
-             0000000000001a52 0000000000000ca9 t {}\n",
-            PageKind::Base.symbol(),
-            PageKind::Add.symbol(),
-            PageKind::Spend.symbol(),
-        );
+        let listing = expected_listing();
         let parsed = parse_guarded_symbols(&listing).expect("exact symbols are valid");
         assert_eq!(parsed.len(), 3);
         assert_eq!(
@@ -1276,7 +1297,8 @@ mod tests {
 
         let missing = listing.replace(
             &format!(
-                "0000000000001a52 0000000000000ca9 t {}\n",
+                "{:016x} {EXPECTED_SYMBOL_SIZE:016x} t {}\n",
+                symbol_address(2),
                 PageKind::Spend.symbol()
             ),
             "",
@@ -1288,26 +1310,26 @@ mod tests {
 
     #[test]
     fn symbol_identity_size_kind_and_ranges_fail_closed() {
-        let good = format!(
-            "0000000000000100 0000000000000ca9 t {}\n\
-             0000000000000da9 0000000000000ca9 t {}\n\
-             0000000000001a52 0000000000000ca9 t {}\n",
-            PageKind::Base.symbol(),
-            PageKind::Add.symbol(),
-            PageKind::Spend.symbol(),
-        );
+        let good = expected_listing();
         assert!(parse_guarded_symbols(
             &good.replace(PageKind::Base.symbol(), "other::fixed_base_page_append")
         )
         .is_err());
-        assert!(
-            parse_guarded_symbols(&good.replacen("0000000000000ca9", "0000000000000ca8", 1))
-                .is_err()
-        );
+        // One byte short of the pinned size must fail closed.
+        assert!(parse_guarded_symbols(&good.replacen(
+            &format!("{EXPECTED_SYMBOL_SIZE:016x}"),
+            &format!("{:016x}", EXPECTED_SYMBOL_SIZE - 1),
+            1
+        ))
+        .is_err());
         assert!(parse_guarded_symbols(&good.replacen(" t ", " D ", 1)).is_err());
-        assert!(
-            parse_guarded_symbols(&good.replace("0000000000000da9", "0000000000000101")).is_err()
-        );
+        // Moving the second symbol inside the first symbol's range must fail
+        // closed: the guard requires three disjoint, ordered symbols.
+        assert!(parse_guarded_symbols(&good.replace(
+            &format!("{:016x}", symbol_address(1)),
+            &format!("{:016x}", FIRST_SYMBOL_ADDRESS + 1)
+        ))
+        .is_err());
     }
 
     #[test]

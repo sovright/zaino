@@ -114,6 +114,34 @@ jobs:
           --bin check-oram-codegen --
           --profile fixed-exact-upsert target/release/zainod-oram
 
+      # TEMPORARY -- remove before this branch merges. Emits the candidate
+      # profiles and the raw disassembly so the 448-byte growth in
+      # `fixed_add_page_append` can get the manual assembly review ADR 0901
+      # requires before any profile is admitted. Runs before the check step so
+      # it still produces artifacts on a run the check then fails.
+      - name: Emit candidate page profiles for review
+        run: |
+          mkdir -p /tmp/pin-review/candidate
+          cargo run --locked --release \
+            --manifest-path tools/workbench/Cargo.toml \
+            --bin check-oram-page-codegen -- \
+            --emit-profiles target/release/zainod-oram /tmp/pin-review/candidate
+          for sym in fixed_base_page_append fixed_add_page_append fixed_spend_page_append; do
+            objdump -d --no-show-raw-insn -C target/release/zainod-oram \
+              | awk -v s="$sym" '$0 ~ s"[^ ]*>:" {p=1} p; p && /^$/ {exit}' \
+              > "/tmp/pin-review/$sym.raw.asm"
+          done
+          nm -nSC --defined-only target/release/zainod-oram \
+            | grep -E 'fixed_(base|add|spend)_page_append' > /tmp/pin-review/sizes.txt
+          cat /tmp/pin-review/sizes.txt
+          wc -l /tmp/pin-review/candidate/* /tmp/pin-review/*.raw.asm
+
+      - name: Upload candidate profiles for review
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: page-pin-review
+          path: /tmp/pin-review/
+
       - name: Check the fixed-page transform codegen profile
         run: >-
           cargo run --locked --release
