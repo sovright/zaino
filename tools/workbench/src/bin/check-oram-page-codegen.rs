@@ -77,6 +77,16 @@ const EXPECTED_RIP_CONSTANTS: &[RipConstant] = &[
         bytes: &SECOND_MASK,
     },
 ];
+
+/// Every mnemonic the guarded symbols may contain. Anything absent fails
+/// closed, and this list is asserted set-equal to the mnemonics in the
+/// committed profiles, so an entry cannot be added speculatively.
+///
+/// The SIMD entries are all data-independent by construction: the shifts and
+/// unpacks take their counts and lane permutations from immediates or the
+/// opcode itself, never from an operand that could carry secret data. That is
+/// why `pshufb`, whose shuffle mask comes from a register, is deliberately
+/// absent -- adding it would admit a data-steerable permutation.
 const MEASURED_MNEMONICS: &[&str] = &[
     "add",
     "and",
@@ -113,6 +123,7 @@ const MEASURED_MNEMONICS: &[&str] = &[
     "orps",
     "packuswb",
     "pand",
+    "pandn",
     "pcmpeqb",
     "pinsrw",
     "pmovmskb",
@@ -121,6 +132,7 @@ const MEASURED_MNEMONICS: &[&str] = &[
     "pshufd",
     "pshufhw",
     "pshuflw",
+    "pslld",
     "pslldq",
     "psllq",
     "psllw",
@@ -129,13 +141,8 @@ const MEASURED_MNEMONICS: &[&str] = &[
     "psrlw",
     "punpckhbw",
     "punpcklbw",
+    "punpckldq",
     "punpcklqdq",
-    // Fixed-permutation unpack, completing the punpcklbw -> punpcklwd ->
-    // punpckldq -> punpcklqdq ladder the other three members of which are
-    // already admitted here. The lane rearrangement is encoded in the opcode
-    // rather than taken from an operand, so it cannot be steered by secret
-    // data -- unlike `pshufb`, whose mask comes from a register and which is
-    // deliberately absent from this list.
     "punpcklwd",
     "push",
     "pxor",
