@@ -130,6 +130,13 @@ const MEASURED_MNEMONICS: &[&str] = &[
     "punpckhbw",
     "punpcklbw",
     "punpcklqdq",
+    // Fixed-permutation unpack, completing the punpcklbw -> punpcklwd ->
+    // punpckldq -> punpcklqdq ladder the other three members of which are
+    // already admitted here. The lane rearrangement is encoded in the opcode
+    // rather than taken from an operand, so it cannot be steered by secret
+    // data -- unlike `pshufb`, whose mask comes from a register and which is
+    // deliberately absent from this list.
+    "punpcklwd",
     "push",
     "pxor",
     "ret",
