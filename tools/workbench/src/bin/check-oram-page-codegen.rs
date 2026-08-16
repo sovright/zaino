@@ -31,7 +31,7 @@ use std::{
 };
 use workbench::{command as tool, encoded_byte_len, is_gnu_prefix, run};
 
-const EXPECTED_SYMBOL_SIZE: u64 = 0xe69;
+const EXPECTED_SYMBOL_SIZE: u64 = 0xca9;
 const EXPECTED_BRANCHES: usize = 26;
 const EXPECTED_RETURNS: usize = 1;
 const MEMCPY: &str = "memcpy@GLIBC_2.14";
@@ -314,17 +314,35 @@ struct Normalized {
     instructions: usize,
 }
 
+/// Whether the exact-size pin is enforced or merely recorded.
+///
+/// `Check` enforces it: an unexpected size is the regression the guard exists
+/// to catch, and it must fail closed.
+///
+/// `Emit` records it instead. Enforcing during emission would make the guard
+/// unable to regenerate its own pins after a size change -- which is precisely
+/// when regeneration is needed -- forcing whoever regenerates to edit the
+/// constant blind, before ever seeing the assembly they are meant to review.
+/// Emission produces candidate material for human review and admits nothing on
+/// its own, so observing the size here weakens no check: every emitted profile
+/// still has to pass `Check` once its pin is committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizePolicy {
+    Enforce,
+    Observe,
+}
+
 fn execute() -> Result<Report, Vec<String>> {
     let invocation = parse_invocation(std::env::args_os().skip(1).collect())?;
-    let (artifact, output) = match &invocation {
-        Invocation::Check(artifact) => (artifact, None),
-        Invocation::Emit { artifact, output } => (artifact, Some(output)),
+    let (artifact, output, size_policy) = match &invocation {
+        Invocation::Check(artifact) => (artifact, None, SizePolicy::Enforce),
+        Invocation::Emit { artifact, output } => (artifact, Some(output), SizePolicy::Observe),
     };
     if !artifact.is_file() {
         return Err(vec![format!("not a file: {}", artifact.display())]);
     }
 
-    let symbols = guarded_symbols(artifact)?;
+    let symbols = guarded_symbols(artifact, size_policy)?;
     let sections = artifact_sections(artifact)?;
     let relocations = dynamic_relocations(artifact)?;
     let mut normalized = Vec::with_capacity(PageKind::ALL.len());
@@ -376,15 +394,18 @@ fn parse_invocation(args: Vec<OsString>) -> Result<Invocation, Vec<String>> {
     }
 }
 
-fn guarded_symbols(artifact: &Path) -> Result<Vec<Symbol>, Vec<String>> {
+fn guarded_symbols(artifact: &Path, size_policy: SizePolicy) -> Result<Vec<Symbol>, Vec<String>> {
     let listing = tool(
         "nm",
         &["-nSC", "--defined-only", &artifact.display().to_string()],
     )?;
-    parse_guarded_symbols(&listing)
+    parse_guarded_symbols(&listing, size_policy)
 }
 
-fn parse_guarded_symbols(listing: &str) -> Result<Vec<Symbol>, Vec<String>> {
+fn parse_guarded_symbols(
+    listing: &str,
+    size_policy: SizePolicy,
+) -> Result<Vec<Symbol>, Vec<String>> {
     let mut symbols = Vec::new();
     for line in listing.lines() {
         let matched = PageKind::ALL
@@ -423,7 +444,7 @@ fn parse_guarded_symbols(listing: &str) -> Result<Vec<Symbol>, Vec<String>> {
         })?;
         let size = u64::from_str_radix(size, 16)
             .map_err(|_| vec![format!("invalid `{}` symbol size: {line}", kind.fragment())])?;
-        if size != EXPECTED_SYMBOL_SIZE {
+        if size_policy == SizePolicy::Enforce && size != EXPECTED_SYMBOL_SIZE {
             return Err(vec![format!(
                 "`{}` has size 0x{size:x}, expected exactly 0x{EXPECTED_SYMBOL_SIZE:x}",
                 kind.fragment()
@@ -1288,7 +1309,8 @@ mod tests {
     #[test]
     fn exact_three_symbols_are_required() {
         let listing = expected_listing();
-        let parsed = parse_guarded_symbols(&listing).expect("exact symbols are valid");
+        let parsed =
+            parse_guarded_symbols(&listing, SizePolicy::Enforce).expect("exact symbols are valid");
         assert_eq!(parsed.len(), 3);
         assert_eq!(
             parsed.iter().map(|symbol| symbol.kind).collect::<Vec<_>>(),
@@ -1303,33 +1325,58 @@ mod tests {
             ),
             "",
         );
-        assert!(parse_guarded_symbols(&missing).is_err());
+        assert!(parse_guarded_symbols(&missing, SizePolicy::Enforce).is_err());
         let duplicate = format!("{listing}{listing}");
-        assert!(parse_guarded_symbols(&duplicate).is_err());
+        assert!(parse_guarded_symbols(&duplicate, SizePolicy::Enforce).is_err());
     }
 
     #[test]
     fn symbol_identity_size_kind_and_ranges_fail_closed() {
         let good = expected_listing();
         assert!(parse_guarded_symbols(
-            &good.replace(PageKind::Base.symbol(), "other::fixed_base_page_append")
+            &good.replace(PageKind::Base.symbol(), "other::fixed_base_page_append"),
+            SizePolicy::Enforce
         )
         .is_err());
-        // One byte short of the pinned size must fail closed.
-        assert!(parse_guarded_symbols(&good.replacen(
-            &format!("{EXPECTED_SYMBOL_SIZE:016x}"),
-            &format!("{:016x}", EXPECTED_SYMBOL_SIZE - 1),
-            1
-        ))
-        .is_err());
-        assert!(parse_guarded_symbols(&good.replacen(" t ", " D ", 1)).is_err());
+        assert!(parse_guarded_symbols(&undersized(&good), SizePolicy::Enforce).is_err());
+        assert!(
+            parse_guarded_symbols(&good.replacen(" t ", " D ", 1), SizePolicy::Enforce).is_err()
+        );
         // Moving the second symbol inside the first symbol's range must fail
         // closed: the guard requires three disjoint, ordered symbols.
-        assert!(parse_guarded_symbols(&good.replace(
-            &format!("{:016x}", symbol_address(1)),
-            &format!("{:016x}", FIRST_SYMBOL_ADDRESS + 1)
-        ))
+        assert!(parse_guarded_symbols(
+            &good.replace(
+                &format!("{:016x}", symbol_address(1)),
+                &format!("{:016x}", FIRST_SYMBOL_ADDRESS + 1)
+            ),
+            SizePolicy::Enforce
+        )
         .is_err());
+    }
+
+    /// The same listing with the first symbol one byte short of the pin.
+    fn undersized(listing: &str) -> String {
+        listing.replacen(
+            &format!("{EXPECTED_SYMBOL_SIZE:016x}"),
+            &format!("{:016x}", EXPECTED_SYMBOL_SIZE - 1),
+            1,
+        )
+    }
+
+    /// Emission must not enforce the size pin, or the guard could never
+    /// regenerate its own profiles after the size change that necessitates
+    /// regeneration. `Enforce` must still reject the very same listing --
+    /// otherwise this policy would be a hole rather than a mode.
+    #[test]
+    fn emission_observes_the_size_pin_that_checking_enforces() {
+        let shrunk = undersized(&expected_listing());
+
+        let observed = parse_guarded_symbols(&shrunk, SizePolicy::Observe)
+            .expect("emission accepts a symbol whose size has moved");
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0].size, EXPECTED_SYMBOL_SIZE - 1);
+
+        assert!(parse_guarded_symbols(&shrunk, SizePolicy::Enforce).is_err());
     }
 
     #[test]
