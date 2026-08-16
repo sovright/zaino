@@ -52,6 +52,28 @@ pub(crate) trait UniqueTable<T> {
     fn occupied_records(&mut self) -> Result<u64, BackendFailure>;
 
     fn insert_unique(&mut self, index: usize, value: T) -> Result<(), BackendFailure>;
+
+    /// Replaces an already-occupied record in place, keyed by its exact prior value.
+    ///
+    /// This is the store's only mutation of a published record. It exists so a
+    /// per-generation annotation can be written back onto a record that was
+    /// folded from an append-only history; the history itself stays
+    /// append-only, and occupancy is unchanged by construction.
+    ///
+    /// The operation is a compare-and-set: `expected_prior` is the exact record
+    /// the caller just read, and a backend that does not observe it must fail
+    /// rather than write. Implementations must not let the access pattern
+    /// depend on `replacement`, on whether the slot was occupied, or on whether
+    /// the comparison succeeded — every admitted call performs the same fixed
+    /// schedule and classifies afterwards. Failure is terminal for the whole
+    /// two-table generation, exactly as for [`Self::insert_unique`], because a
+    /// write outcome is then uncertain.
+    fn update_present(
+        &mut self,
+        index: usize,
+        expected_prior: T,
+        replacement: T,
+    ) -> Result<(), BackendFailure>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,11 +128,80 @@ impl fmt::Debug for AppendResult {
     }
 }
 
+/// Whether the requested annotation changed the stored record.
+///
+/// Classified only after the complete fixed schedule has run, exactly as
+/// [`AppendDisposition`] is. Nothing skips the write when the stored annotation
+/// already matches: that would make the access pattern depend on the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnotationDisposition {
+    Written,
+    Unchanged,
+}
+
+#[derive(PartialEq, Eq)]
+struct AnnotateResult {
+    disposition: AnnotationDisposition,
+    history: FixedEventHistory,
+}
+
+impl fmt::Debug for AnnotateResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AnnotateResult { ..REDACTED.. }")
+    }
+}
+
+/// The mutation a single exclusive command may perform, if any.
+///
+/// One command is one complete fixed read schedule over the address's probe
+/// sets, followed by at most the writes this mode names. The modes are
+/// deliberately closed: there is no general write.
+#[derive(Clone, Copy)]
+enum AtomicMutation {
+    /// Read only: no table write.
+    None,
+    /// Append one event to the address's history, creating the directory
+    /// entry when the address is new.
+    Append(UtxoEvent),
+    /// Rewrite the per-generation annotation on one already-stored record.
+    Annotate {
+        ordinal: u64,
+        annotation: RecordAnnotation,
+    },
+}
+
+impl AtomicMutation {
+    /// Returns the event this mode appends, if it appends one.
+    ///
+    /// Replay identity is decided against this value, so an annotation — which
+    /// never appends — can never be mistaken for one.
+    const fn appended_event(self) -> Option<UtxoEvent> {
+        match self {
+            Self::Append(event) => Some(event),
+            Self::None | Self::Annotate { .. } => None,
+        }
+    }
+
+    /// Returns whether this mode writes to a table at all.
+    const fn writes(self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Append(_) | Self::Annotate { .. } => true,
+        }
+    }
+}
+
+impl fmt::Debug for AtomicMutation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AtomicMutation { ..REDACTED.. }")
+    }
+}
+
 struct AtomicPlan<const DIRECTORY_PROBES: usize> {
     profile_binding: [u8; 32],
     address_key: AddressKey,
     directory: DirectoryProbePlan<DIRECTORY_PROBES>,
-    append: Option<UtxoEvent>,
+    mutation: AtomicMutation,
 }
 
 impl<const DIRECTORY_PROBES: usize> fmt::Debug for AtomicPlan<DIRECTORY_PROBES> {
@@ -132,6 +223,29 @@ enum DirectoryPreflight {
 enum NextEventPreflight {
     Vacant(EventVacancy),
     Full,
+}
+
+/// Everything one complete fixed read schedule established, before any write.
+///
+/// Splitting the schedule from the write is what lets append and annotate share
+/// one implementation of the read side: the mode picks a tail, never a
+/// different set of accesses.
+struct PlanScan {
+    history: FixedEventHistory,
+    directory: DirectoryPreflight,
+    found_events: u64,
+    exact_replays: u64,
+    next_event: Option<NextEventPreflight>,
+    /// The occupied cell an annotation names, when the scan matched it.
+    annotation_target: Option<BoundEventPage>,
+    /// Authoritative occupancies, read whenever the command may write.
+    write_occupancies: Option<(u64, u64)>,
+}
+
+impl fmt::Debug for PlanScan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PlanScan { ..REDACTED.. }")
+    }
 }
 
 /// Owns one directory-backend handle and one event-backend handle.
@@ -197,7 +311,7 @@ where
         &mut self,
         address_key: &AddressKey,
     ) -> Result<FixedEventHistory, AtomicStoreError> {
-        let plan = self.plan_for_key(address_key, None);
+        let plan = self.plan_for_key(address_key, AtomicMutation::None);
         self.execute(plan).map(|result| result.history)
     }
 
@@ -246,29 +360,58 @@ where
         address: StandardAddress,
         event: UtxoEvent,
     ) -> Result<AppendResult, AtomicStoreError> {
-        let plan = self.plan(address, Some(event));
+        let plan = self.plan(address, AtomicMutation::Append(event));
         self.execute(plan)
+    }
+
+    /// Rewrites the per-generation annotation on one stored record in place.
+    ///
+    /// The record is addressed exactly as a read is — by address key and
+    /// logical ordinal — and the complete fixed read schedule runs first, so an
+    /// annotation is a read command that ends in one compare-and-set. The
+    /// annotation value never selects a probe, an ordinal, or a slot.
+    fn annotate(
+        &mut self,
+        address_key: &AddressKey,
+        ordinal: u64,
+        annotation: RecordAnnotation,
+    ) -> Result<AnnotateResult, AtomicStoreError> {
+        self.ensure_ready()?;
+        if ordinal >= u64::from(self.layout.max_events_per_address) {
+            return Err(AtomicStoreError::InvalidLogicalSlot);
+        }
+        let plan = self.plan_for_key(
+            address_key,
+            AtomicMutation::Annotate {
+                ordinal,
+                annotation,
+            },
+        );
+        match catch_unwind(AssertUnwindSafe(|| self.execute_annotate(plan))) {
+            Ok(result) => result,
+            Err(_) => Err(self.discard(AtomicStoreError::UnexpectedPanic)),
+        }
     }
 
     fn plan(
         &self,
         address: StandardAddress,
-        append: Option<UtxoEvent>,
+        mutation: AtomicMutation,
     ) -> AtomicPlan<DIRECTORY_PROBES> {
         let address_key = self.layout.address_key(address);
-        self.plan_for_key(&address_key, append)
+        self.plan_for_key(&address_key, mutation)
     }
 
     fn plan_for_key(
         &self,
         address_key: &AddressKey,
-        append: Option<UtxoEvent>,
+        mutation: AtomicMutation,
     ) -> AtomicPlan<DIRECTORY_PROBES> {
         AtomicPlan {
             profile_binding: self.layout.profile_binding,
             address_key: *address_key,
             directory: self.layout.directory_plan_for_key(address_key),
-            append,
+            mutation,
         }
     }
 
@@ -277,7 +420,7 @@ where
         plan: AtomicPlan<DIRECTORY_PROBES>,
     ) -> Result<AppendResult, AtomicStoreError> {
         self.ensure_ready()?;
-        if let Some(event) = plan.append {
+        if let Some(event) = plan.mutation.appended_event() {
             let owner =
                 StandardAddress::from_event(&event).map_err(|_| AtomicStoreError::Conflict)?;
             if self.layout.address_key(owner) != plan.address_key {
@@ -294,7 +437,29 @@ where
         &mut self,
         plan: AtomicPlan<DIRECTORY_PROBES>,
     ) -> Result<AppendResult, AtomicStoreError> {
-        let directory_indices = self.validate_plan(&plan)?;
+        let scan = self.scan_for_plan(&plan)?;
+        self.finish_append(plan, scan)
+    }
+
+    fn execute_annotate(
+        &mut self,
+        plan: AtomicPlan<DIRECTORY_PROBES>,
+    ) -> Result<AnnotateResult, AtomicStoreError> {
+        let scan = self.scan_for_plan(&plan)?;
+        self.finish_annotate(plan, scan)
+    }
+
+    /// Runs the complete fixed read schedule and every preflight check.
+    ///
+    /// Every mutation mode shares this exact schedule: the same directory
+    /// probes, the same probe set for every logical ordinal, and the same
+    /// occupancy reads whenever the command may write. What the mode selects is
+    /// only which write, if any, runs afterwards.
+    fn scan_for_plan(
+        &mut self,
+        plan: &AtomicPlan<DIRECTORY_PROBES>,
+    ) -> Result<PlanScan, AtomicStoreError> {
+        let directory_indices = self.validate_plan(plan)?;
         let max_events = usize::try_from(self.layout.max_events_per_address)
             .map_err(|_| AtomicStoreError::ResultAllocationFailed)?;
         let mut history = Vec::new();
@@ -306,10 +471,10 @@ where
         let directory_reads = self.read_directory(directory_indices)?;
         let directory_scan = self.layout.scan_directory(&plan.directory, directory_reads);
         let mut terminal = None;
-        let mut directory = match directory_scan {
+        let directory = match directory_scan {
             Ok(DirectoryScan::Found(bound)) => DirectoryPreflight::Found(bound),
             Ok(DirectoryScan::Vacant(vacancy)) => {
-                let prospective = if plan.append.is_some() {
+                let prospective = if plan.mutation.appended_event().is_some() {
                     match self.layout.prospective_directory(&vacancy) {
                         Ok(prospective) => Some(prospective),
                         Err(_) => {
@@ -336,6 +501,7 @@ where
         let mut found_events = 0_u64;
         let mut exact_replays = 0_u64;
         let mut next_event = None;
+        let mut annotation_target = None;
         for (ordinal_index, history_slot) in history.iter_mut().enumerate() {
             let ordinal = u64::try_from(ordinal_index)
                 .map_err(|_| self.discard(AtomicStoreError::CorruptLayout))?;
@@ -367,18 +533,25 @@ where
             let event_reads = self.read_events(event_indices)?;
             let scan = self.layout.scan_event(&event_plan, event_reads);
             match scan {
-                Ok(EventScan::Found(page)) => {
+                Ok(EventScan::Found(bound)) => {
                     if !matches!(directory, DirectoryPreflight::Found(_)) {
                         latch_error(&mut terminal, AtomicStoreError::ProspectiveEventOrphan);
                     }
                     if gap_seen {
                         latch_error(&mut terminal, AtomicStoreError::NonContiguousEventHistory);
                     }
-                    match page.event().copied() {
+                    if matches!(plan.mutation, AtomicMutation::Annotate { ordinal: target, .. } if target == ordinal)
+                    {
+                        annotation_target = Some(bound);
+                    }
+                    match bound.page().event().copied() {
                         Some(found) => {
                             *history_slot = Some(found);
                             found_events = found_events.saturating_add(1);
-                            if plan.append == Some(found) {
+                            // Replay identity is the appended event, never the
+                            // stored annotation, so re-annotating a record can
+                            // never change what an exact replay is.
+                            if plan.mutation.appended_event() == Some(found) {
                                 exact_replays = exact_replays.saturating_add(1);
                             }
                         }
@@ -410,7 +583,7 @@ where
         if matches!(directory, DirectoryPreflight::Found(_)) && found_events == 0 {
             latch_error(&mut terminal, AtomicStoreError::CorruptLayout);
         }
-        let append_occupancies = if plan.append.is_some() {
+        let write_occupancies = if plan.mutation.writes() {
             let occupancies = self.backend_occupancies()?;
             if found_events > occupancies.1
                 || (matches!(directory, DirectoryPreflight::Found(_)) && occupancies.0 == 0)
@@ -425,8 +598,71 @@ where
             return Err(self.discard(error));
         }
 
-        let fixed_history = FixedEventHistory { slots: history };
-        let Some(event) = plan.append else {
+        Ok(PlanScan {
+            history: FixedEventHistory { slots: history },
+            directory,
+            found_events,
+            exact_replays,
+            next_event,
+            annotation_target,
+            write_occupancies,
+        })
+    }
+
+    /// Writes the requested annotation onto the record the scan bound.
+    fn finish_annotate(
+        &mut self,
+        plan: AtomicPlan<DIRECTORY_PROBES>,
+        scan: PlanScan,
+    ) -> Result<AnnotateResult, AtomicStoreError> {
+        let AtomicMutation::Annotate { annotation, .. } = plan.mutation else {
+            return Err(self.discard(AtomicStoreError::InvalidPlan));
+        };
+        let Some(bound) = scan.annotation_target else {
+            return Err(self.discard(AtomicStoreError::AbsentRecord));
+        };
+        if scan.write_occupancies.is_none() {
+            return Err(self.discard(AtomicStoreError::OccupancyInvariant));
+        }
+        let previous = bound.page().annotation();
+        let prepared = self
+            .layout
+            .prepare_event_annotation(EventScan::Found(bound), annotation)
+            .map_err(|error| self.map_mutation_error(error))?;
+        let (index, expected_prior, value) = self
+            .layout
+            .backend_event_annotation(prepared)
+            .map_err(|_| self.discard(AtomicStoreError::CorruptLayout))?;
+        self.update_event(index, expected_prior, value)?;
+
+        // Classified only after the write, so the two dispositions cannot be
+        // told apart by the schedule that produced them.
+        let disposition = if previous == annotation {
+            AnnotationDisposition::Unchanged
+        } else {
+            AnnotationDisposition::Written
+        };
+        Ok(AnnotateResult {
+            disposition,
+            history: scan.history,
+        })
+    }
+
+    fn finish_append(
+        &mut self,
+        plan: AtomicPlan<DIRECTORY_PROBES>,
+        scan: PlanScan,
+    ) -> Result<AppendResult, AtomicStoreError> {
+        let PlanScan {
+            history: fixed_history,
+            mut directory,
+            found_events,
+            exact_replays,
+            next_event,
+            write_occupancies,
+            ..
+        } = scan;
+        let Some(event) = plan.mutation.appended_event() else {
             return Ok(AppendResult {
                 disposition: AppendDisposition::ExactReplay,
                 history: fixed_history,
@@ -456,7 +692,7 @@ where
             }
         };
 
-        let Some((directory_occupancy, event_occupancy)) = append_occupancies else {
+        let Some((directory_occupancy, event_occupancy)) = write_occupancies else {
             return Err(self.discard(AtomicStoreError::OccupancyInvariant));
         };
         let inserted_ordinal = usize::try_from(found_events)
@@ -596,6 +832,30 @@ where
         }
     }
 
+    /// Compare-and-sets one already-occupied event cell.
+    ///
+    /// Mirrors [`Self::insert_event`]: the backend call is wrapped so a failure
+    /// or panic discards the whole two-table generation, because after either
+    /// one the stored record is of uncertain content.
+    fn update_event(
+        &mut self,
+        index: usize,
+        expected_prior: PersistentAddressEventPage,
+        value: PersistentAddressEventPage,
+    ) -> Result<(), AtomicStoreError> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            self.events.update_present(index, expected_prior, value)
+        })) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(self.discard(AtomicStoreError::BackendFailure {
+                table: TableKind::Event,
+            })),
+            Err(_) => Err(self.discard(AtomicStoreError::BackendPanic {
+                table: TableKind::Event,
+            })),
+        }
+    }
+
     fn insert_event(
         &mut self,
         index: usize,
@@ -660,6 +920,7 @@ where
             MutationPlanError::EventOwnerMismatch | MutationPlanError::AlreadyPresent { .. } => {
                 self.discard(AtomicStoreError::Conflict)
             }
+            MutationPlanError::AbsentRecord { .. } => self.discard(AtomicStoreError::AbsentRecord),
             MutationPlanError::VacancyProfileMismatch { .. }
             | MutationPlanError::PreparedProfileMismatch { .. }
             | MutationPlanError::BackendIndexOutsideHostDomain { .. }
@@ -702,6 +963,7 @@ enum AtomicStoreError {
     AddressEventLimitReached,
     ProspectiveEventOrphan,
     NonContiguousEventHistory,
+    AbsentRecord,
     OccupancyInvariant,
     Conflict,
     CorruptLayout,
@@ -733,6 +995,7 @@ impl fmt::Display for AtomicStoreError {
             Self::NonContiguousEventHistory => {
                 f.write_str("address event history is not contiguous")
             }
+            Self::AbsentRecord => f.write_str("no stored record to update in place"),
             Self::OccupancyInvariant => f.write_str("authoritative occupancy is inconsistent"),
             Self::Conflict => f.write_str("append conflicts with owned table state"),
             Self::CorruptLayout => f.write_str("protected layout is corrupt"),
@@ -767,7 +1030,7 @@ impl<T> QualificationMemoryTable<T> {
 }
 
 #[cfg(feature = "corpus-zaino")]
-impl<T: Copy> UniqueTable<T> for QualificationMemoryTable<T> {
+impl<T: Copy + PartialEq> UniqueTable<T> for QualificationMemoryTable<T> {
     fn capacity(&self) -> usize {
         self.slots.len()
     }
@@ -789,6 +1052,32 @@ impl<T: Copy> UniqueTable<T> for QualificationMemoryTable<T> {
         *slot = Some(value);
         self.occupied = next_occupied;
         Ok(())
+    }
+
+    /// Rewrites one slot with no branch between the observed cases.
+    ///
+    /// This backend is a plain `Vec` and makes no physical-obliviousness claim,
+    /// so what it can preserve is the *shape* the oblivious backend commits to
+    /// and the executor above depends on: one bounds-checked slot access, one
+    /// unconditional store of a selected value, and an outcome classified only
+    /// after that store. There is no early return on a miss and no branch on
+    /// `replacement`, so a mismatch and a match perform the same accesses.
+    /// Occupancy is never touched, matching the oblivious backend's update
+    /// path.
+    fn update_present(
+        &mut self,
+        index: usize,
+        expected_prior: T,
+        replacement: T,
+    ) -> Result<(), BackendFailure> {
+        let slot = self.slots.get_mut(index).ok_or(BackendFailure)?;
+        let matched = *slot == Some(expected_prior);
+        *slot = if matched { Some(replacement) } else { *slot };
+        if matched {
+            Ok(())
+        } else {
+            Err(BackendFailure)
+        }
     }
 }
 
@@ -837,6 +1126,7 @@ mod tests {
         Read { table: TableKind, index: usize },
         Count { table: TableKind },
         Write { table: TableKind, index: usize },
+        Update { table: TableKind, index: usize },
     }
 
     struct FakeTable<T> {
@@ -845,9 +1135,11 @@ mod tests {
         records: BTreeMap<usize, T>,
         reads: Vec<usize>,
         writes: Vec<usize>,
+        updates: Vec<usize>,
         trace: Rc<RefCell<Vec<FakeOperation>>>,
         reported_occupancy: Option<u64>,
         fail_next_insert: bool,
+        fail_next_update: bool,
         mutate_then_fail_next_insert: bool,
         mutate_then_panic_next_insert: bool,
         panic_next_read: bool,
@@ -861,9 +1153,11 @@ mod tests {
                 records: BTreeMap::new(),
                 reads: Vec::new(),
                 writes: Vec::new(),
+                updates: Vec::new(),
                 trace,
                 reported_occupancy: None,
                 fail_next_insert: false,
+                fail_next_update: false,
                 mutate_then_fail_next_insert: false,
                 mutate_then_panic_next_insert: false,
                 panic_next_read: false,
@@ -871,7 +1165,7 @@ mod tests {
         }
     }
 
-    impl<T: Copy> UniqueTable<T> for FakeTable<T> {
+    impl<T: Copy + PartialEq> UniqueTable<T> for FakeTable<T> {
         fn capacity(&self) -> usize {
             self.capacity
         }
@@ -923,6 +1217,28 @@ mod tests {
                 panic!("injected backend insert panic");
             }
             self.records.insert(index, value);
+            Ok(())
+        }
+
+        fn update_present(
+            &mut self,
+            index: usize,
+            expected_prior: T,
+            replacement: T,
+        ) -> Result<(), BackendFailure> {
+            self.updates.push(index);
+            self.trace.borrow_mut().push(FakeOperation::Update {
+                table: self.table,
+                index,
+            });
+            if self.fail_next_update {
+                self.fail_next_update = false;
+                return Err(BackendFailure);
+            }
+            if self.records.get(&index) != Some(&expected_prior) {
+                return Err(BackendFailure);
+            }
+            self.records.insert(index, replacement);
             Ok(())
         }
     }
@@ -1112,6 +1428,162 @@ mod tests {
         assert_eq!(overflow.occupied_records(), Ok(u64::MAX));
     }
 
+    const fn annotation(survives: bool, valid: bool) -> RecordAnnotation {
+        RecordAnnotation::Annotated { survives, valid }
+    }
+
+    /// An annotation is a read command that ends in one compare-and-set.
+    ///
+    /// The whole point of the primitive is that it costs one write and leaves
+    /// the read schedule identical to an ordinary read, so both are asserted
+    /// against the same `fixed_read_count()` the read tests use.
+    #[test]
+    fn annotating_a_stored_record_costs_the_read_schedule_plus_one_update(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut executor = executor(6, 12)?;
+        let owner = address(0xc1);
+        let first = event(owner, 0xc2);
+        let second = event(owner, 0xc3);
+        executor.append(owner, first)?;
+        executor.append(owner, second)?;
+        let address_key = executor.layout.address_key(owner);
+        executor.directory.trace.borrow_mut().clear();
+        let writes_before = executor.events.writes.len();
+
+        let result = executor.annotate(&address_key, 1, annotation(true, false))?;
+        assert_eq!(result.disposition, AnnotationDisposition::Written);
+        assert_eq!(result.history.events()[..2], [Some(first), Some(second)]);
+        assert_eq!(executor.events.updates.len(), 1);
+        // Occupancy is unchanged, and no insert ran.
+        assert_eq!(executor.events.writes.len(), writes_before);
+        assert_eq!(executor.events.records.len(), 2);
+        {
+            let trace = executor.directory.trace.borrow();
+            // The complete fixed read schedule, both occupancy counts, then
+            // exactly one update.
+            assert_eq!(trace.len(), fixed_read_count() + 3);
+            assert!(matches!(
+                trace[fixed_read_count() + 2],
+                FakeOperation::Update {
+                    table: TableKind::Event,
+                    ..
+                }
+            ));
+        }
+
+        // Re-annotating with the same value still writes; only the reported
+        // disposition differs, and it is classified after the write.
+        executor.directory.trace.borrow_mut().clear();
+        let repeat = executor.annotate(&address_key, 1, annotation(true, false))?;
+        assert_eq!(repeat.disposition, AnnotationDisposition::Unchanged);
+        assert_eq!(executor.events.updates.len(), 2);
+        assert_eq!(
+            executor.directory.trace.borrow().len(),
+            fixed_read_count() + 3
+        );
+        Ok(())
+    }
+
+    /// Re-annotating a record must not change what an exact replay is.
+    #[test]
+    fn an_annotated_record_still_replays_exactly() -> Result<(), Box<dyn std::error::Error>> {
+        let mut executor = executor(6, 12)?;
+        let owner = address(0xc4);
+        let only = event(owner, 0xc5);
+        executor.append(owner, only)?;
+        let address_key = executor.layout.address_key(owner);
+        executor.annotate(&address_key, 0, annotation(false, true))?;
+
+        let replay = executor.append(owner, only)?;
+        assert_eq!(replay.disposition, AppendDisposition::ExactReplay);
+        assert_eq!(executor.events.records.len(), 1);
+        assert_eq!(executor.events.writes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn annotating_an_absent_record_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let owner = address(0xc6);
+
+        // No directory entry at all.
+        let mut empty = executor(6, 12)?;
+        let address_key = empty.layout.address_key(owner);
+        assert_eq!(
+            empty.annotate(&address_key, 0, annotation(true, true)),
+            Err(AtomicStoreError::AbsentRecord)
+        );
+        assert!(empty.events.updates.is_empty());
+        assert_eq!(empty.state, ExecutorState::Discarded);
+
+        // One stored ordinal, annotation requested for the next one.
+        let mut populated = executor(6, 12)?;
+        populated.append(owner, event(owner, 0xc7))?;
+        let address_key = populated.layout.address_key(owner);
+        assert_eq!(
+            populated.annotate(&address_key, 1, annotation(true, true)),
+            Err(AtomicStoreError::AbsentRecord)
+        );
+        assert!(populated.events.updates.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_ordinal_outside_the_profile_is_rejected_before_io(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut executor = executor(6, 12)?;
+        let address_key = executor.layout.address_key(address(0xc8));
+
+        assert_eq!(
+            executor.annotate(&address_key, MAX_EVENTS, annotation(true, true)),
+            Err(AtomicStoreError::InvalidLogicalSlot)
+        );
+        assert!(executor.directory.trace.borrow().is_empty());
+        assert_eq!(executor.state, ExecutorState::Ready);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_annotation_write_discards_the_generation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut executor = executor(6, 12)?;
+        let owner = address(0xc9);
+        executor.append(owner, event(owner, 0xca))?;
+        let address_key = executor.layout.address_key(owner);
+        executor.events.fail_next_update = true;
+
+        assert_eq!(
+            executor.annotate(&address_key, 0, annotation(true, true)),
+            Err(AtomicStoreError::BackendFailure {
+                table: TableKind::Event
+            })
+        );
+        assert_eq!(executor.state, ExecutorState::Discarded);
+        Ok(())
+    }
+
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn qualification_memory_table_updates_only_the_exact_prior_record() {
+        let mut table = QualificationMemoryTable::<u8>::try_new(2)
+            .expect("two-slot test table allocation succeeds");
+        table
+            .insert_unique(0, 7)
+            .expect("first in-range test insert succeeds");
+
+        // A wrong prior refuses without mutating.
+        assert_eq!(table.update_present(0, 8, 9), Err(BackendFailure));
+        assert_eq!(table.read(0), Ok(Some(7)));
+        // A vacant slot refuses without becoming occupied.
+        assert_eq!(table.update_present(1, 7, 9), Err(BackendFailure));
+        assert_eq!(table.read(1), Ok(None));
+        // Out of range refuses.
+        assert_eq!(table.update_present(2, 7, 9), Err(BackendFailure));
+        // The exact prior succeeds and leaves occupancy alone.
+        assert_eq!(table.update_present(0, 7, 9), Ok(()));
+        assert_eq!(table.read(0), Ok(Some(9)));
+        assert_eq!(table.occupied_records(), Ok(1));
+    }
+
     #[cfg(feature = "corpus-zaino")]
     #[test]
     fn memory_backed_worker_completes_append_read_and_shutdown(
@@ -1141,6 +1613,55 @@ mod tests {
             .qualification_read_history(owner)
             .map_err(|_| "read failed")?;
         assert_eq!(history[0], Some(first));
+        shutdown_atomic_worker(worker).map_err(|_| "shutdown failed")?;
+        Ok(())
+    }
+
+    /// The command and reply path carries an annotation end to end.
+    ///
+    /// Local coverage of the mutation mode uses the qualification-memory
+    /// backend; the oblivious `rostl` backend is Linux x86-64 only and its
+    /// schedule is qualified by `check-oram-codegen` in CI.
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn memory_backed_worker_carries_an_annotation_command_and_reply(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let layout = layout(6, 12, 11)?;
+        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::try_new(8)
+            .map_err(|_| "directory table allocation failed")?;
+        let events = QualificationMemoryTable::<PersistentAddressEventPage>::try_new(16)
+            .map_err(|_| "event table allocation failed")?;
+        let address_key = layout.address_key(address(0x12));
+        let worker = spawn_qualification_worker(
+            layout,
+            directory,
+            events,
+            AtomicQueueCapacity::try_new(1).map_err(|_| "queue capacity")?,
+        )
+        .map_err(|_| "spawn failed")?;
+        let owner = address(0x12);
+        let only = event(owner, 0x24);
+        worker
+            .qualification_append(owner, only)
+            .map_err(|()| "append failed")?;
+
+        let annotated = worker
+            .qualification_annotate(&address_key, 0, annotation(true, true))
+            .map_err(|_| "annotate failed")?;
+        assert_eq!(
+            annotated.disposition,
+            worker::AtomicQualificationAnnotationDisposition::Written
+        );
+        assert_eq!(annotated.history[0], Some(only));
+
+        // The stored event is untouched, and a replay is still a replay.
+        let replay = worker
+            .qualification_append(owner, only)
+            .map_err(|()| "replay failed")?;
+        assert_eq!(
+            replay.disposition,
+            AtomicQualificationAppendDisposition::ExactReplay
+        );
         shutdown_atomic_worker(worker).map_err(|_| "shutdown failed")?;
         Ok(())
     }
@@ -1676,7 +2197,7 @@ mod tests {
             profile_binding: foreign.profile_binding,
             address_key,
             directory: foreign.directory_plan_for_key(&address_key),
-            append: None,
+            mutation: AtomicMutation::None,
         };
 
         assert_eq!(
@@ -1695,7 +2216,7 @@ mod tests {
         let executor = executor(6, 12)?;
         let owner = address(0xab);
         let sensitive_event = event(owner, 0xcd);
-        let plan = executor.plan(owner, Some(sensitive_event));
+        let plan = executor.plan(owner, AtomicMutation::Append(sensitive_event));
         assert_eq!(format!("{plan:?}"), "AtomicPlan { ..REDACTED.. }");
 
         let history = FixedEventHistory {

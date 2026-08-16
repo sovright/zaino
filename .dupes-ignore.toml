@@ -90,14 +90,6 @@ members = [
 ]
 
 [[ignore]]
-fingerprint = "e20b34319024a46d"
-reason = "TRACKED. Tracked debt. Type-distinct pair differing only in table kind and its concrete Persistent* types; deduplicating needs a generic or trait over the table, which is worth doing deliberately rather than inside an upstream-sync merge."
-members = [
-    "AtomicWorkerHandle::try_append (method) at packages/zaino-oram/src/layout/atomic_store/worker.rs:347-364",
-    "AtomicWorkerHandle::try_panic_worker_loop (method) at packages/zaino-oram/src/layout/atomic_store/worker.rs:408-425",
-]
-
-[[ignore]]
 fingerprint = "8bcde84a194f0dc6"
 reason = "PERMANENT. Structural coincidence, not shared logic. Two unrelated 7-field constructors in different crates and domains (chain block header vs ORAM continuation state). Nothing to share."
 members = [

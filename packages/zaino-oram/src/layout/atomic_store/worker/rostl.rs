@@ -410,7 +410,6 @@ where
         }
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn insert_or_update_record(
         &mut self,
         key: usize,
@@ -418,29 +417,39 @@ where
     ) -> Result<ExactUpsertDisposition, RostlStoreError> {
         self.validate_key(key)?;
 
-        let capacity = u64::try_from(self.capacity).map_err(|_| {
-            self.failed_closed = true;
-            RostlStoreError::OccupancyInvariant
-        })?;
-        let occupied_records = self.occupied_records;
-        match admit_exact_upsert(occupied_records, capacity) {
-            Ok(()) => {}
-            Err(RostlStoreError::UpsertReserveExhausted) => {
-                return Err(RostlStoreError::UpsertReserveExhausted);
-            }
-            Err(error) => {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let capacity = u64::try_from(self.capacity).map_err(|_| {
                 self.failed_closed = true;
-                return Err(error);
+                RostlStoreError::OccupancyInvariant
+            })?;
+            let occupied_records = self.occupied_records;
+            match admit_exact_upsert(occupied_records, capacity) {
+                Ok(()) => {}
+                Err(RostlStoreError::UpsertReserveExhausted) => {
+                    return Err(RostlStoreError::UpsertReserveExhausted);
+                }
+                Err(error) => {
+                    self.failed_closed = true;
+                    return Err(error);
+                }
             }
+
+            let result =
+                catch_upstream(|| fixed_exact_upsert(self, key, request, occupied_records));
+            let commit = self.finish_upstream(result)?;
+            let disposition = commit.classify().inspect_err(|_| {
+                self.failed_closed = true;
+            })?;
+            self.occupied_records = commit.occupied_records;
+            Ok(disposition)
         }
 
-        let result = catch_upstream(|| fixed_exact_upsert(self, key, request, occupied_records));
-        let commit = self.finish_upstream(result)?;
-        let disposition = commit.classify().inspect_err(|_| {
-            self.failed_closed = true;
-        })?;
-        self.occupied_records = commit.occupied_records;
-        Ok(disposition)
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            let _ = request;
+            Err(RostlStoreError::UnsupportedPlatform)
+        }
     }
 
     fn occupied_record_count(&self) -> Result<u64, RostlStoreError> {
@@ -552,6 +561,38 @@ where
     fn insert_unique(&mut self, index: usize, value: T) -> Result<(), BackendFailure> {
         self.insert_record_unique(index, value)
             .map_err(|_| BackendFailure)
+    }
+
+    /// Rewrites one record through the already-qualified exact-upsert schedule.
+    ///
+    /// Obliviousness comes from [`fixed_exact_upsert`], not from this wrapper:
+    /// every admitted call performs exactly one read/remap followed by one
+    /// write-or-insert/remap regardless of whether the key was present, whether
+    /// the prior bytes matched, or what the replacement contains. The hit flag
+    /// and the byte comparison reach only `Cmov` and bitwise boolean
+    /// composition; the outcome is classified after the complete schedule. Its
+    /// symbol is disassembled and pinned by the `fixed-exact-upsert` gate in
+    /// `check-oram-codegen`.
+    ///
+    /// Admission is decided from public occupancy alone
+    /// ([`admit_exact_upsert`]), so a refusal never depends on the key.
+    fn update_present(
+        &mut self,
+        index: usize,
+        expected_prior: T,
+        replacement: T,
+    ) -> Result<(), BackendFailure> {
+        self.insert_or_update_record(
+            index,
+            InsertOrUpdateRequest::update(expected_prior, replacement),
+        )
+        .map_err(|_| BackendFailure)
+        .and_then(|disposition| match disposition {
+            ExactUpsertDisposition::Updated => Ok(()),
+            // An insertion means the record the caller read was gone. The
+            // schedule already ran, so this is reported rather than prevented.
+            ExactUpsertDisposition::Inserted => Err(BackendFailure),
+        })
     }
 }
 

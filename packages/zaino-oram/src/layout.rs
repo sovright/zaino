@@ -21,7 +21,7 @@ use blake2::{
 use crate::records::{
     finalized_live_utxo_at, AddressDirectory, AddressEventPage, AddressKey,
     FinalizedEventHistoryError, PersistentAddressDirectory, PersistentAddressEventPage,
-    TransparentUtxo, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
+    RecordAnnotation, TransparentUtxo, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
 };
 
 mod atomic_store;
@@ -611,6 +611,7 @@ enum MutationPlanError {
     CoverPlanNotInsertable,
     AdmissionLimitReached { table: TableKind },
     EventOwnerMismatch,
+    AbsentRecord { table: TableKind },
 }
 
 impl fmt::Display for MutationPlanError {
@@ -648,6 +649,9 @@ impl fmt::Display for MutationPlanError {
             }
             Self::EventOwnerMismatch => {
                 f.write_str("event owner does not match the prepared directory identity")
+            }
+            Self::AbsentRecord { table } => {
+                write!(f, "{table:?} table has no record to update in place")
             }
         }
     }
@@ -782,9 +786,33 @@ impl fmt::Debug for DirectoryScan {
 
 /// Successful event scan after every fixed probe was validated.
 enum EventScan {
-    Found(AddressEventPage),
+    Found(BoundEventPage),
     Vacant(EventVacancy),
     Full,
+}
+
+/// Opaque witness that one caller-supplied complete clean event scan matched.
+///
+/// It carries the physical slot the match came from, which is what an in-place
+/// annotation needs and an insertion does not: an insert claims a vacancy, an
+/// annotation rewrites the exact occupied cell it just read.
+#[derive(Clone, Copy)]
+struct BoundEventPage {
+    profile_binding: [u8; 32],
+    page: AddressEventPage,
+    slot: EventTableSlot,
+}
+
+impl BoundEventPage {
+    const fn page(&self) -> &AddressEventPage {
+        &self.page
+    }
+}
+
+impl fmt::Debug for BoundEventPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BoundEventPage { ..REDACTED.. }")
+    }
 }
 
 impl fmt::Debug for EventScan {
@@ -832,6 +860,24 @@ struct PreparedDirectoryInsert {
 impl fmt::Debug for PreparedDirectoryInsert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PreparedDirectoryInsert { ..REDACTED.. }")
+    }
+}
+
+/// In-place event annotation prepared without touching a backend.
+///
+/// It carries both the exact prior bytes the scan observed and the replacement,
+/// so the backend write is a compare-and-set rather than a blind overwrite. The
+/// two encodings differ only in the annotation flag bits.
+struct PreparedEventAnnotation {
+    profile_binding: [u8; 32],
+    slot: EventTableSlot,
+    expected_prior: PersistentAddressEventPage,
+    value: PersistentAddressEventPage,
+}
+
+impl fmt::Debug for PreparedEventAnnotation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedEventAnnotation { ..REDACTED.. }")
     }
 }
 
@@ -1436,7 +1482,7 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
                 } else if !owner_matches {
                     latch(&mut corruption, LayoutCorruption::EventOwnerMismatch);
                 } else if matched.is_none() {
-                    matched = decoded[index];
+                    matched = decoded[index].map(|page| (page, physical_slot));
                 }
             }
         }
@@ -1462,7 +1508,11 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
         let result = match corruption {
             Some(error) => Err(error),
             None => Ok(match matched {
-                Some(event) => EventScan::Found(event),
+                Some((page, slot)) => EventScan::Found(BoundEventPage {
+                    profile_binding: self.profile_binding,
+                    page,
+                    slot,
+                }),
                 None => match first_miss {
                     Some(slot) => EventScan::Vacant(EventVacancy {
                         profile_binding: self.profile_binding,
@@ -1558,6 +1608,65 @@ impl<const DIRECTORY_PROBES: usize, const EVENT_PROBES: usize>
                 })
             }
         }
+    }
+
+    /// Prepares the in-place annotation of one already-scanned occupied cell.
+    ///
+    /// An annotation never creates, moves, or removes a record, so there is no
+    /// admission check here: occupancy is unchanged by construction. A scan
+    /// that did not match is a caller error rather than an insertion
+    /// opportunity — the annotation pass only ever rewrites records it read.
+    fn prepare_event_annotation(
+        &self,
+        scan: EventScan,
+        annotation: RecordAnnotation,
+    ) -> Result<PreparedEventAnnotation, MutationPlanError> {
+        match scan {
+            EventScan::Vacant(_) | EventScan::Full => Err(MutationPlanError::AbsentRecord {
+                table: TableKind::Event,
+            }),
+            EventScan::Found(bound) => {
+                if !fixed_bytes_equal(&bound.profile_binding, &self.profile_binding) {
+                    return Err(MutationPlanError::VacancyProfileMismatch {
+                        table: TableKind::Event,
+                    });
+                }
+                let annotated = bound
+                    .page
+                    .annotated(annotation)
+                    .map_err(|_| MutationPlanError::EventOwnerMismatch)?;
+                Ok(PreparedEventAnnotation {
+                    profile_binding: self.profile_binding,
+                    slot: bound.slot,
+                    expected_prior: PersistentAddressEventPage::from_business(&bound.page),
+                    value: PersistentAddressEventPage::from_business(&annotated),
+                })
+            }
+        }
+    }
+
+    fn backend_event_annotation(
+        &self,
+        prepared: PreparedEventAnnotation,
+    ) -> Result<
+        (
+            usize,
+            PersistentAddressEventPage,
+            PersistentAddressEventPage,
+        ),
+        MutationPlanError,
+    > {
+        if !fixed_bytes_equal(&prepared.profile_binding, &self.profile_binding) {
+            return Err(MutationPlanError::PreparedProfileMismatch {
+                table: TableKind::Event,
+            });
+        }
+        let index = prepared.slot.backend_index().map_err(|_| {
+            MutationPlanError::BackendIndexOutsideHostDomain {
+                table: TableKind::Event,
+            }
+        })?;
+        Ok((index, prepared.expected_prior, prepared.value))
     }
 
     fn backend_directory_insert(
@@ -2643,7 +2752,7 @@ mod tests {
         reads[3] = ProbeRead::Found(PersistentAddressEventPage::from_business(&matching_page));
 
         match layout.scan_event(&plan, reads)? {
-            EventScan::Found(page) => assert_eq!(page.event(), Some(&matching_event)),
+            EventScan::Found(bound) => assert_eq!(bound.page().event(), Some(&matching_event)),
             EventScan::Vacant(_) | EventScan::Full => panic!("late event match must bind"),
         }
         assert_eq!(

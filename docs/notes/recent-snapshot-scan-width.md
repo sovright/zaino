@@ -189,15 +189,22 @@ bucket, and caps a single-worker FIFO service at roughly 25-50 queries/second.
 Expensive but not absurd — and it is a real design point, unlike the current
 one.
 
-This is genuine oblivious-algorithms work, not a refactor. It is also
-**structurally blocked** on a store primitive that does not exist:
-`UniqueTable` (`packages/zaino-oram/src/layout/atomic_store.rs`) exposes
-`capacity`, `read`, `occupied_records` and `insert_unique` and *no update
-primitive*, and records are folded from an append-only event history, so there
-is no way to write an annotation back onto a published record. Adding one is a
-contract decision about the store, not a refactor of the engine. Nothing in this
-branch implements the hoist; it is modelled, because the verdict turns on it and
-a model that cannot state the alternative cannot state the verdict.
+This is genuine oblivious-algorithms work, not a refactor. It *was*
+**structurally blocked** on a store primitive that did not exist: `UniqueTable`
+(`packages/zaino-oram/src/layout/atomic_store.rs`) exposed `capacity`, `read`,
+`occupied_records` and `insert_unique` and *no update primitive*, and records
+are folded from an append-only event history, so there was no way to write an
+annotation back onto a published record.
+
+**That block is removed.** `UniqueTable::update_present` is a compare-and-set
+on an occupied slot, implemented for both backends; `AddressEventPage` carries
+a `RecordAnnotation` in spare flag bits, outside replay identity and outside
+the event log root; and the executor and worker carry an annotate mutation
+mode. ADR 0902 states the extended store contract — *store union annotations is
+a pure function of `(source, generation)`* — and verifies it against the
+source-bound cold-rebuild qualification. The annotation *computation*, the
+publication-time pass, and the engine change remain to be built; the model
+below is unchanged, because none of the numbers move until they are.
 
 ### D. Explicit admission policy — required in any case
 
@@ -331,8 +338,9 @@ day the measurement lands, the answer is `budget.fits(measured)`.
    leakage cost, removed the quadratic; the ceiling is now 1,532 slots.
 3. Treat C as the blocking design item for a mainnet recent-state scan. Until it
    exists, the private service cannot serve mainnet, and no `EvidenceScope`
-   mainnet-readiness flag should be set. (None currently is.) C is blocked in
-   turn on a `UniqueTable` update primitive, which is a store-contract decision.
+   mainnet-readiness flag should be set. (None currently is.) C's store-contract
+   prerequisite — a `UniqueTable` update primitive and an annotation field — has
+   landed under ADR 0902; the computation and the publication pass have not.
 4. **Do not move `ACCEPTED_COMPARISON_HEADROOM` or the rebuild interval yet.**
    §E prices both; the residual 9.93% they would close belongs to a design that
    does not exist. When the hoist lands, raise the headroom to 5 with a timing
@@ -362,6 +370,9 @@ differently-keyed index.
 
 ## Where this lives in code
 
+- `docs/adr/0902-store-annotations-are-a-pure-function-of-source-and-generation.md`
+  — the store contract the hoist needs, and the obligations the annotation pass
+  must satisfy for it to hold.
 - `packages/zaino-oram/src/scan_width.rs` — the sizing model, the policy, both
   cost polynomials, the two levers, the annotation-feasibility threshold, the
   committed-capture constants, and the tests. All integer arithmetic; no float

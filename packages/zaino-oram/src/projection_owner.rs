@@ -478,7 +478,7 @@ mod tests {
         }
     }
 
-    impl<T: Copy> UniqueTable<T> for FakeTable<T> {
+    impl<T: Copy + PartialEq> UniqueTable<T> for FakeTable<T> {
         fn capacity(&self) -> usize {
             self.capacity
         }
@@ -514,6 +514,22 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn update_present(
+            &mut self,
+            index: usize,
+            expected_prior: T,
+            replacement: T,
+        ) -> Result<(), BackendFailure> {
+            if self.cells.get(&index) != Some(&expected_prior) {
+                return Err(BackendFailure);
+            }
+            let mut stats = self.observation.0.lock().map_err(|_| BackendFailure)?;
+            stats.writes = stats.writes.checked_add(1).ok_or(BackendFailure)?;
+            drop(stats);
+            let _ = self.cells.insert(index, replacement);
+            Ok(())
         }
     }
 
