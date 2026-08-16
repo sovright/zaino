@@ -11,8 +11,11 @@
 //! - local branch targets become offsets from the guarded symbol;
 //! - fixed indirect libc calls become their relocation-proven, versioned
 //!   dynamic identities;
-//! - the two RIP-relative SIMD masks become their exact referenced bytes only
-//!   when they come from loaded, allocated, relocation-free read-only data.
+//! - each reviewed RIP-relative constant load becomes its exact referenced
+//!   bytes, only when they come from loaded, allocated, relocation-free
+//!   read-only data. The loads are pinned as an ordered sequence
+//!   (`EXPECTED_RIP_CONSTANTS`) of mnemonic, destination register and exact
+//!   bytes; a load with no entry at its position fails closed.
 //!
 //! The measured wrappers contain one fixed-size `memset` and three fixed-size
 //! `memcpy` calls. Their caller-side argument setup is pinned by the complete
@@ -38,6 +41,41 @@ const FIRST_MASK: [u8; 16] = [
 ];
 const SECOND_MASK: [u8; 16] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
+/// One reviewed RIP-relative constant load, pinned by position.
+///
+/// Every field is load-bearing. `bytes` pins the constant's value, and its
+/// length is also the width the guard reads and therefore cannot be inferred
+/// from the instruction — an attacker-chosen width would otherwise decide how
+/// much of the constant gets compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RipConstant {
+    mnemonic: &'static str,
+    destination: &'static str,
+    bytes: &'static [u8],
+}
+
+/// The complete, ordered set of RIP-relative constant loads the guarded
+/// symbols may perform.
+///
+/// Previously this was two hard-coded 16-byte `pand` masks compared as
+/// `masks == [FIRST_MASK, SECOND_MASK]`. Expressing it as a sequence lets a
+/// reviewed symbol load constants of other widths through other instructions
+/// -- auto-vectorisation introduces exactly that -- without loosening what is
+/// checked. Each entry still pins mnemonic, destination register and every
+/// byte, and a load with no entry at its position fails closed.
+const EXPECTED_RIP_CONSTANTS: &[RipConstant] = &[
+    RipConstant {
+        mnemonic: "pand",
+        destination: "%xmm7",
+        bytes: &FIRST_MASK,
+    },
+    RipConstant {
+        mnemonic: "pand",
+        destination: "%xmm3",
+        bytes: &SECOND_MASK,
+    },
 ];
 const MEASURED_MNEMONICS: &[&str] = &[
     "add",
@@ -667,7 +705,7 @@ fn normalize_instructions(
     let mut calls = Vec::new();
     let mut branches = 0usize;
     let mut returns = 0usize;
-    let mut masks = Vec::new();
+    let mut rip_constants = 0usize;
 
     for instruction in instructions {
         if !is_measured_mnemonic(&instruction.mnemonic) {
@@ -704,9 +742,14 @@ fn normalize_instructions(
             returns += 1;
             String::new()
         } else if instruction.operands.contains("%rip") {
-            let (normalized, bytes) =
-                normalize_rip_mask(instruction, sections, relocations, &mut read_bytes)?;
-            masks.push(bytes);
+            let normalized = normalize_rip_constant(
+                instruction,
+                rip_constants,
+                sections,
+                relocations,
+                &mut read_bytes,
+            )?;
+            rip_constants += 1;
             normalized
         } else {
             if instruction.operands.contains('#') {
@@ -739,7 +782,7 @@ fn normalize_instructions(
         text.push('\n');
     }
 
-    validate_measured_shape(symbol.kind, &calls, branches, returns, &masks)?;
+    validate_measured_shape(symbol.kind, &calls, branches, returns, rip_constants)?;
 
     Ok(Normalized {
         text,
@@ -795,7 +838,7 @@ fn validate_measured_shape(
     calls: &[LibcCall],
     branches: usize,
     returns: usize,
-    masks: &[[u8; 16]],
+    rip_constants: usize,
 ) -> Result<(), Vec<String>> {
     if calls != LibcCall::EXPECTED {
         return Err(vec![format!(
@@ -815,10 +858,11 @@ fn validate_measured_shape(
             kind.symbol()
         )]);
     }
-    if masks != [FIRST_MASK, SECOND_MASK] {
+    if rip_constants != EXPECTED_RIP_CONSTANTS.len() {
         return Err(vec![format!(
-            "{}: fixed RIP-relative SIMD mask sequence changed",
-            kind.symbol()
+            "{}: expected exactly {} reviewed RIP-relative constants; found {rip_constants}",
+            kind.symbol(),
+            EXPECTED_RIP_CONSTANTS.len()
         )]);
     }
     Ok(())
@@ -872,54 +916,77 @@ fn resolve_libc_call(
     Ok(target)
 }
 
-fn normalize_rip_mask(
+/// Normalize the `index`-th RIP-relative constant load in a guarded symbol.
+///
+/// The expected constant is selected by position, and its pinned length is the
+/// number of bytes read and compared. A load beyond the reviewed sequence has
+/// no entry and fails closed, so extra constants cannot slip in unmeasured.
+fn normalize_rip_constant(
     instruction: &Instruction,
+    index: usize,
     sections: &[Section],
     relocations: &DynamicRelocations,
     read_bytes: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, Vec<String>>,
-) -> Result<(String, [u8; 16]), Vec<String>> {
-    if instruction.has_prefix() || instruction.bare_mnemonic() != "pand" {
+) -> Result<String, Vec<String>> {
+    let Some(expected) = EXPECTED_RIP_CONSTANTS.get(index) else {
         return Err(vec![format!(
-            "unapproved RIP-relative data instruction at 0x{:x}: {} {}",
-            instruction.address, instruction.mnemonic, instruction.operands
+            "RIP-relative constant #{index} at 0x{:x} is beyond the {} reviewed constants: {} {}",
+            instruction.address,
+            EXPECTED_RIP_CONSTANTS.len(),
+            instruction.mnemonic,
+            instruction.operands
+        )]);
+    };
+    if instruction.has_prefix() || instruction.bare_mnemonic() != expected.mnemonic {
+        return Err(vec![format!(
+            "unapproved RIP-relative data instruction at 0x{:x}: {} {}, expected `{}`",
+            instruction.address, instruction.mnemonic, instruction.operands, expected.mnemonic
         )]);
     }
     let next = instruction
         .next_address()
         .ok_or_else(|| vec!["RIP-relative instruction range overflows".to_string()])?;
     let (operand_text, comment) = instruction.operands.split_once('#').ok_or_else(|| {
-        vec!["RIP-relative mask is missing the objdump-resolved target comment".to_string()]
+        vec!["RIP-relative constant is missing the objdump-resolved target comment".to_string()]
     })?;
     let (source, destination) = operand_text.trim().rsplit_once(',').ok_or_else(|| {
-        vec!["RIP-relative mask does not have exact source,destination operands".to_string()]
+        vec!["RIP-relative constant does not have exact source,destination operands".to_string()]
     })?;
-    if !matches!(destination, "%xmm3" | "%xmm7") {
+    if destination != expected.destination {
         return Err(vec![format!(
-            "RIP-relative mask has unapproved destination `{destination}`"
+            "RIP-relative constant #{index} has destination `{destination}`, expected `{}`",
+            expected.destination
         )]);
     }
     let target = rip_relative_target(source, next, false)
-        .map_err(|reason| vec![format!("RIP-relative mask: {reason}")])?;
+        .map_err(|reason| vec![format!("RIP-relative constant: {reason}")])?;
     let (comment_address, _) = comment_target(comment).ok_or_else(|| {
-        vec!["RIP-relative mask has a malformed objdump-resolved target comment".to_string()]
+        vec!["RIP-relative constant has a malformed objdump-resolved target comment".to_string()]
     })?;
     if comment_address != target {
         return Err(vec![
-            "RIP-relative mask comment address conflicts with its encoded target".to_string(),
+            "RIP-relative constant comment address conflicts with its encoded target".to_string(),
         ]);
     }
-    validate_readonly_constant_span(sections, relocations, target, 16)?;
-    let bytes = read_bytes(target, 16)?;
-    let bytes: [u8; 16] = bytes.try_into().map_err(|bytes: Vec<u8>| {
-        vec![format!(
-            "RIP-relative mask read returned {} bytes, expected 16",
+    let width = expected.bytes.len();
+    let length = u64::try_from(width)
+        .map_err(|_| vec!["reviewed constant width does not fit u64".to_string()])?;
+    validate_readonly_constant_span(sections, relocations, target, length)?;
+    let bytes = read_bytes(target, width)?;
+    if bytes.len() != width {
+        return Err(vec![format!(
+            "RIP-relative constant #{index} read returned {} bytes, expected {width}",
             bytes.len()
-        )]
-    })?;
-    Ok((
-        format!("<const:{}>,{destination}", encode_hex(&bytes)),
-        bytes,
-    ))
+        )]);
+    }
+    if bytes != expected.bytes {
+        return Err(vec![format!(
+            "RIP-relative constant #{index} is {}, expected {}",
+            encode_hex(&bytes),
+            encode_hex(expected.bytes)
+        )]);
+    }
+    Ok(format!("<const:{}>,{destination}", encode_hex(&bytes)))
 }
 
 fn validate_readonly_constant_span(
@@ -1329,29 +1396,76 @@ Idx Name          Size      VMA               LMA               File off  Algn
     }
 
     #[test]
-    fn rip_masks_bind_exact_target_bytes_and_destination() {
-        let mask = instruction(0x100, 8, "pand", "0xf8(%rip),%xmm7 # 200 <anonymous>");
+    fn rip_constants_bind_exact_target_bytes_destination_and_position() {
         let sections = [readonly_data_section(0x200, 0x100)];
         let relocations = DynamicRelocations::new();
-        let normalized =
-            normalize_rip_mask(&mask, &sections, &relocations, &mut |address, length| {
-                assert_eq!((address, length), (0x200, 16));
-                Ok(FIRST_MASK.to_vec())
-            })
-            .expect("measured mask is valid");
-        assert_eq!(normalized.1, FIRST_MASK);
-        assert_eq!(
-            normalized.0,
-            "<const:ffffffffffffffffffffffffffff0000>,%xmm7"
-        );
 
-        let wrong_destination = instruction(0x100, 8, "pand", "0xf8(%rip),%xmm2 # 200 <anonymous>");
-        assert!(
-            normalize_rip_mask(&wrong_destination, &sections, &relocations, &mut |_, _| {
+        // Constant 0 is pinned to `pand` into %xmm7 carrying FIRST_MASK, and
+        // its pinned length is what gets read.
+        let first = instruction(0x100, 8, "pand", "0xf8(%rip),%xmm7 # 200 <anonymous>");
+        let normalized = normalize_rip_constant(
+            &first,
+            0,
+            &sections,
+            &relocations,
+            &mut |address, length| {
+                assert_eq!((address, length), (0x200, FIRST_MASK.len()));
                 Ok(FIRST_MASK.to_vec())
-            })
+            },
+        )
+        .expect("the reviewed first constant is valid");
+        assert_eq!(normalized, "<const:ffffffffffffffffffffffffffff0000>,%xmm7");
+
+        // Right instruction, wrong destination register.
+        let wrong_destination = instruction(0x100, 8, "pand", "0xf8(%rip),%xmm2 # 200 <anonymous>");
+        assert!(normalize_rip_constant(
+            &wrong_destination,
+            0,
+            &sections,
+            &relocations,
+            &mut |_, _| Ok(FIRST_MASK.to_vec())
+        )
+        .is_err());
+
+        // Right shape, wrong bytes: the value is pinned, not just the shape.
+        assert!(
+            normalize_rip_constant(&first, 0, &sections, &relocations, &mut |_, _| Ok(
+                SECOND_MASK.to_vec()
+            ))
             .is_err()
         );
+
+        // The same instruction at the wrong position is rejected: constant 1
+        // expects %xmm3 and SECOND_MASK.
+        assert!(
+            normalize_rip_constant(&first, 1, &sections, &relocations, &mut |_, _| Ok(
+                FIRST_MASK.to_vec()
+            ))
+            .is_err()
+        );
+
+        // A load beyond the reviewed sequence has no entry and fails closed --
+        // this is what stops an extra constant slipping in unmeasured.
+        assert!(normalize_rip_constant(
+            &first,
+            EXPECTED_RIP_CONSTANTS.len(),
+            &sections,
+            &relocations,
+            &mut |_, _| Ok(FIRST_MASK.to_vec())
+        )
+        .is_err());
+
+        // A different mnemonic at a position pinned to `pand` is rejected, so
+        // widening the guard to a new instruction requires a reviewed entry.
+        let wrong_mnemonic = instruction(0x100, 8, "movd", "0xf8(%rip),%xmm7 # 200 <anonymous>");
+        assert!(normalize_rip_constant(
+            &wrong_mnemonic,
+            0,
+            &sections,
+            &relocations,
+            &mut |_, _| Ok(FIRST_MASK.to_vec())
+        )
+        .is_err());
     }
 
     #[test]
@@ -1452,15 +1566,15 @@ Contents of section .rodata:
     }
 
     #[test]
-    fn measured_shape_rejects_call_branch_return_and_mask_drift() {
+    fn measured_shape_rejects_call_branch_return_and_constant_drift() {
         let calls = LibcCall::EXPECTED;
-        let masks = [FIRST_MASK, SECOND_MASK];
+        let constants = EXPECTED_RIP_CONSTANTS.len();
         assert!(validate_measured_shape(
             PageKind::Base,
             &calls,
             EXPECTED_BRANCHES,
             EXPECTED_RETURNS,
-            &masks,
+            constants,
         )
         .is_ok());
 
@@ -1469,7 +1583,7 @@ Contents of section .rodata:
             &calls[1..],
             EXPECTED_BRANCHES,
             EXPECTED_RETURNS,
-            &masks,
+            constants,
         )
         .is_err());
         assert!(validate_measured_shape(
@@ -1477,18 +1591,28 @@ Contents of section .rodata:
             &calls,
             EXPECTED_BRANCHES - 1,
             EXPECTED_RETURNS,
-            &masks,
+            constants,
         )
         .is_err());
         assert!(
-            validate_measured_shape(PageKind::Base, &calls, EXPECTED_BRANCHES, 0, &masks,).is_err()
+            validate_measured_shape(PageKind::Base, &calls, EXPECTED_BRANCHES, 0, constants)
+                .is_err()
         );
+        // Too few and too many reviewed constants must both fail closed.
         assert!(validate_measured_shape(
             PageKind::Base,
             &calls,
             EXPECTED_BRANCHES,
             EXPECTED_RETURNS,
-            &masks[..1],
+            constants - 1,
+        )
+        .is_err());
+        assert!(validate_measured_shape(
+            PageKind::Base,
+            &calls,
+            EXPECTED_BRANCHES,
+            EXPECTED_RETURNS,
+            constants + 1,
         )
         .is_err());
     }
