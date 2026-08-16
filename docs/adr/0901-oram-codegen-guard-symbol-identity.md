@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted (design). Implementation pending a Linux x86-64 qualification run.
+Accepted (design), with **decision 2 withdrawn**: its qualification experiment
+was run and refuted the hypothesis it was conditional on. Decisions 1, 3 and 4
+stand; their implementation remains pending a Linux x86-64 qualification run.
+See "Event 4, resolved".
 
 Fork-only record, allocated from the reserved `0900+` range per
 `docs/adr/README.md`. Supersedes nothing. The detailed argument and the
@@ -41,6 +44,10 @@ property they protect:
    `fixed_add_page_append` size mismatch that a rebase fixed;
 4. a branch adding `release_schedule.rs` to `zainod-oram` produced a genuine
    448-byte growth in `fixed_add_page_append` whose own source was untouched;
+   **as first recorded this was misleading** — see "Event 4, resolved" below:
+   `records.rs` was untouched but its *crate* was not, and the growth is
+   ordinary same-crate optimisation, not the cross-crate mystery this wording
+   implies;
 5. `random_range` was pinned as one identity while two instantiations exist.
 
 Events 1 and 2 share a cause: mangled hashes embed a disambiguator derived from
@@ -88,7 +95,12 @@ attribution is recorded as a follow-up, not adopted: it does not by itself
 remove the churn, and it would invalidate and require re-review of all three
 page profiles.
 
-### 2. Pin the codegen-unit partition rather than adding inlining boundaries
+### 2. Pin the codegen-unit partition rather than adding inlining boundaries — REFUTED, NOT ADOPTED
+
+**The qualification experiment this decision was conditional on has been run,
+and it does not support the decision. `codegen-units = 1` is not adopted.** The
+reasoning below is retained as the record of what was believed and why; the
+verdict is in "Event 4, resolved".
 
 `#[inline(never)]` is already present on all five guarded functions, so event 4
 occurred despite it and more of it is not the remedy. The guarded page symbols
@@ -150,6 +162,69 @@ Deriving rather than deleting keeps a cheap pre-disassembly shape check while
 leaving exactly one source of truth, the reviewed `.asm` file, and avoids the
 duplicated counting logic that the duplicate-logic lint would reject.
 
+## Event 4, resolved
+
+Run `31953340068` executed the decision-2 experiment on Linux x86-64 via
+`tools/scripts/codegen-guard-stability-experiment.sh`: build, measure the
+guarded symbols, add inert reachable code volume, rebuild, measure again, diff
+— strictly within each `codegen-units` setting, never against pins generated at
+a different one.
+
+**Result: stable at 16 and stable at 1.** Injected volume did not move the
+guarded symbols at either setting. By this record's own rule that refutes the
+partition hypothesis, so decision 2 is withdrawn rather than adopted on faith,
+and the diagnosis reopens here.
+
+**The premise was wrong, not just the conclusion.** Event 4 was recorded as
+`release_schedule.rs` being added to `zainod-oram` while `records.rs` was
+untouched — which reads as unrelated code in a *different crate* perturbing the
+symbol. But the same branch adds 176 lines to `zaino-oram`, the crate
+`records.rs` lives in, 149 of them in `inner_codec/runtime.rs`. The experiment
+perturbed `zainod-oram`, following this record's framing, and correctly found
+no effect: cross-crate volume is not what moved anything.
+
+**What actually happened**, from the disassembly of all three symbols:
+
+- All three grew identically to `0xe69`, not just `fixed_add_page_append`. The
+  guard aborts on the first symbol, which is why this looked isolated.
+- Branches, returns and calls are unchanged: exactly 26, 1 and 4, matching
+  `EXPECTED_BRANCHES`, `EXPECTED_RETURNS` and `LibcCall::EXPECTED`. The growth
+  is entirely straight-line.
+- The new instructions are a vectorised byte-wise record serialisation:
+  constant shifts (`shr $0x28/$0x30/$0x38`, `psrld $0x8/$0x10/$0x18`) split 64-
+  and 32-bit fields into bytes, and a `punpcklbw` → `punpcklwd` → `punpckldq` →
+  `punpcklqdq` ladder reassembles them into 128-bit vectors. Shift counts are
+  immediates; memory operands are constant displacements from a base register.
+  Nothing is indexed, shifted or branched on by data.
+
+So new code in `zaino-oram` changed the optimiser's cost decisions for that
+crate and enabled auto-vectorisation of loops in `records.rs`. That is ordinary
+same-crate behaviour, not partition instability, and it is **benign** under the
+property these guards protect.
+
+Two consequences that are not benign, and remain open:
+
+1. The vectorised code loads a **third** RIP-relative constant — `movd`, 4
+   bytes, into `%xmm9`, from an anonymous LLVM constant pool. The guard admits
+   RIP-relative data loads only as `pand` into `%xmm3`/`%xmm7` reading 16
+   bytes, and `validate_measured_shape` asserts `masks == [FIRST_MASK,
+   SECOND_MASK]` — exactly two, exactly those values. Admitting a third
+   constant means generalising that invariant to N constants of declared width,
+   each with pinned bytes and the same read-only, relocation-free provenance
+   proof. That is a change to the mechanism proving the SIMD constants have not
+   moved, and it needs its own reviewed change.
+2. `MEASURED_MNEMONICS` gains `pandn`, `pslld`, `punpckldq` and `punpcklwd`,
+   all data-independent by construction: counts and permutations come from
+   immediates or the opcode, never from an operand that could carry secret
+   data. `pshufb`, whose mask is register-supplied, stays out — that is the
+   line. Three entries (`cmpq`, `pinsrw`, `psllq`) no longer appear and must be
+   removed to preserve the allowlist's set-equality with the profiles.
+
+A follow-up experiment perturbing `zaino-oram` rather than `zainod-oram` would
+confirm the same-crate explanation directly. It has not been run: the
+disassembly already establishes the growth is benign, so its value is
+explanatory rather than gating.
+
 ## What remains deliberately strict
 
 Nothing below is relaxed, and no proposal that would relax it may be adopted on
@@ -188,11 +263,15 @@ transitive assumption.
 - Events 1, 2 and 5 are eliminated by decision 1, with 5 additionally becoming
   a detected failure rather than a silent pass.
 - Event 3 becomes a distinct, early, correctly named CI failure.
-- Event 4 is eliminated if the partition hypothesis holds; if the experiment
-  does not reproduce it, decision 2 is not adopted on faith and the diagnosis
-  reopens.
-- A one-time cost: all three page profiles are re-emitted and re-reviewed as
-  assembly under the new build settings.
+- Event 4 is **not** eliminated: the experiment did not reproduce the
+  hypothesis, decision 2 is withdrawn, and the cause is instead ordinary
+  same-crate optimisation enabling auto-vectorisation. Build settings are
+  unchanged as a result.
+- A one-time cost stands regardless, for a different reason: all three page
+  profiles must be re-emitted and re-reviewed as assembly, because the
+  vectorised codegen is the new baseline. The assembly review is done; the
+  profiles cannot be admitted until the third RIP-relative constant is
+  representable.
 - Re-pinning after a dependency bump stops being routine work, so a guard
   failure again carries information.
 
@@ -200,5 +279,15 @@ transitive assumption.
 
 The instantiation counts asserted by decision 1 must be read off a real
 qualifying Linux x86-64 build, never assumed from the current pin list —
-assuming them would repeat exactly the mistake event 5 records. The partition
-experiment for decision 2 likewise requires Linux x86-64 and has not been run.
+assuming them would repeat exactly the mistake event 5 records.
+
+The partition experiment for decision 2 **has now been run** (run
+`31953340068`) and refuted the hypothesis; decision 2 is withdrawn and nothing
+remains open under it.
+
+What replaces it, before the page profiles can be regenerated: generalise the
+RIP-relative constant mechanism from exactly two 16-byte `pand` masks to N
+constants of declared width, each with pinned bytes and the existing
+provenance proof. Until that exists, `--emit-profiles` cannot produce an
+admissible profile for the vectorised codegen, and `check-oram-page-codegen`
+correctly fails on any branch carrying it.

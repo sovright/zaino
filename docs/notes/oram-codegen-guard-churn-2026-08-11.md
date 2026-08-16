@@ -201,6 +201,15 @@ So churn 4 — a genuine 448-byte growth of `fixed_add_page_append` after
 source untouched — happened **despite** the outermost boundary being pinned.
 Adding `#[inline(never)]` where it already exists cannot be the remedy.
 
+> **Correction (2026-08-16).** "With the transform's own source untouched" is
+> accurate but misleading, and it misdirected the whole diagnosis below. The
+> same branch adds 176 lines to `zaino-oram` — the crate `records.rs` lives in
+> — 149 of them in `inner_codec/runtime.rs`. This was never unrelated code in
+> another crate perturbing a symbol; it is new code in the *same* crate
+> changing the optimiser's cost decisions. The experiment designed from this
+> framing perturbed `zainod-oram` and, correctly, found nothing. See
+> "Event 4, resolved" in ADR 0901.
+
 ### Where the variance actually comes from
 
 The three guarded symbols are thin wrappers. Each calls one shared generic:
@@ -271,6 +280,13 @@ forwarding stubs and **guarding nothing** — a silent, total loss of detection
 that would still show a green check. If any inline attribute is added below
 `fixed_page_append`, the guard must simultaneously gain an assertion that the
 guarded symbol still contains the sixteen-pass structure. Simpler not to.
+
+> **Outcome (2026-08-16).** Run `31953340068` executed this experiment. Step 2
+> did **not** reproduce a size change at `codegen-units = 16`, and step 3 showed
+> none at `1` — stable at both. By the decision rule below, the partition
+> hypothesis is refuted and 2a is not adopted. Note the caveat above: the
+> perturbation went into `zainod-oram` as specified here, which is the wrong
+> crate for the change that actually caused churn 4.
 
 **Experiment that decides between them.** On Linux x86-64, at a single commit:
 
