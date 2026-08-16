@@ -119,24 +119,36 @@ jobs:
       # `fixed_add_page_append` can get the manual assembly review ADR 0901
       # requires before any profile is admitted. Runs before the check step so
       # it still produces artifacts on a run the check then fails.
+      # Raw evidence FIRST, and in its own step. The emit below is gated -- it
+      # refuses on a size mismatch or an unrecognised mnemonic -- so running it
+      # ahead of the disassembly would let a gate suppress the very evidence
+      # needed to judge that gate. That is the trap this ordering avoids.
+      - name: Disassemble the guarded page symbols
+        run: |
+          mkdir -p /tmp/pin-review
+          nm -nSC --defined-only target/release/zainod-oram \
+            | grep -E 'fixed_(base|add|spend)_page_append' | tee /tmp/pin-review/sizes.txt
+          objdump -d --no-show-raw-insn -C target/release/zainod-oram \
+            > /tmp/pin-review/zainod-oram.full.asm
+          for sym in fixed_base_page_append fixed_add_page_append fixed_spend_page_append; do
+            awk -v s="$sym" '$0 ~ s"[^ ]*>:" {p=1} p && /^$/ {exit} p' \
+              /tmp/pin-review/zainod-oram.full.asm > "/tmp/pin-review/$sym.raw.asm"
+            echo "== $sym: $(wc -l < "/tmp/pin-review/$sym.raw.asm") lines, \
+          $(grep -cE '^\s+[0-9a-f]+:\s+j' "/tmp/pin-review/$sym.raw.asm") branch(es)"
+          done
+          rm /tmp/pin-review/zainod-oram.full.asm
+
       - name: Emit candidate page profiles for review
+        continue-on-error: true
         run: |
           mkdir -p /tmp/pin-review/candidate
           cargo run --locked --release \
             --manifest-path tools/workbench/Cargo.toml \
             --bin check-oram-page-codegen -- \
             --emit-profiles target/release/zainod-oram /tmp/pin-review/candidate
-          for sym in fixed_base_page_append fixed_add_page_append fixed_spend_page_append; do
-            objdump -d --no-show-raw-insn -C target/release/zainod-oram \
-              | awk -v s="$sym" '$0 ~ s"[^ ]*>:" {p=1} p; p && /^$/ {exit}' \
-              > "/tmp/pin-review/$sym.raw.asm"
-          done
-          nm -nSC --defined-only target/release/zainod-oram \
-            | grep -E 'fixed_(base|add|spend)_page_append' > /tmp/pin-review/sizes.txt
-          cat /tmp/pin-review/sizes.txt
-          wc -l /tmp/pin-review/candidate/* /tmp/pin-review/*.raw.asm
 
       - name: Upload candidate profiles for review
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: page-pin-review
