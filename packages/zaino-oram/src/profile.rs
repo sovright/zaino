@@ -266,7 +266,12 @@ impl PrivacyProfile {
     }
 
     /// Returns the fixed public request timeout bucket.
-    const fn timeout_bucket_millis(&self) -> u64 {
+    ///
+    /// This is the width of the private surface's release schedule, not merely
+    /// a give-up deadline: a protected response becomes eligible to write when
+    /// this bucket elapses from the instant its round was admitted, so the
+    /// observable completion time is the bucket rather than the work.
+    pub(super) const fn timeout_bucket_millis(&self) -> u64 {
         self.timeout_bucket_millis
     }
 

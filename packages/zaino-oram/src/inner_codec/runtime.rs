@@ -2945,6 +2945,155 @@ mod tests {
         handle_and_decode(&mut runtime, &request)
     }
 
+    /// One named protected outcome and the way to prepare a round of it.
+    type MeasuredOutcome = (&'static str, fn() -> PreparedRound);
+
+    /// One protected outcome, prepared but not yet run.
+    type PreparedRound =
+        Result<(TestRuntime, FixedEnvelope<ENVELOPE_BYTES>), Box<dyn std::error::Error>>;
+
+    /// Per-address store width the measurement below runs at.
+    ///
+    /// Wider than the `4` the correctness tests use, and for a different
+    /// reason: at four slots every outcome lands inside one microsecond of
+    /// every other and the measurement reports the clock's resolution rather
+    /// than the engine's. It is still far narrower than the compiled mainnet
+    /// profile, which cannot be measured here at all -- see the measurement's
+    /// own doc comment.
+    const MEASURED_STORE_READS: usize = 512;
+
+    /// Prepares one initial round on a fresh runtime.
+    fn prepared_initial_round(
+        entries: &[(usize, TransparentUtxo)],
+        query: UtxoQuery,
+    ) -> PreparedRound {
+        let runtime = runtime(MEASURED_STORE_READS, entries)?;
+        let request = request_envelope(&runtime, checkpoint(), query, None, 1)?;
+        Ok((runtime, request))
+    }
+
+    /// Three matches against two response slots: the first page fills and
+    /// reports more to come.
+    fn prepared_capped_first_page() -> PreparedRound {
+        prepared_initial_round(
+            &[(0, utxo(1, 10)), (1, utxo(2, 11)), (2, utxo(3, 12))],
+            UtxoQuery::new(address(1), 0),
+        )
+    }
+
+    /// The second page of the same walk: the last real page, terminal.
+    ///
+    /// The first page is run untimed here, so what a caller measures is the
+    /// continuing/terminal difference alone rather than the cost of getting to
+    /// the second page.
+    fn prepared_terminal_page() -> PreparedRound {
+        let query = UtxoQuery::new(address(1), 0);
+        let (mut runtime, first) = prepared_capped_first_page()?;
+        let (_, page) = handle_and_decode(&mut runtime, &first)?;
+        let token = page
+            .continuation
+            .clone()
+            .ok_or("a capped first page carries a continuation token")?;
+        let second = request_envelope(&runtime, checkpoint(), query, Some(token), 2)?;
+        Ok((runtime, second))
+    }
+
+    /// A protected round whose response seal is unavailable: the complete
+    /// fixed round runs and the answer is withheld.
+    fn prepared_protection_failure() -> PreparedRound {
+        let (runtime, request) =
+            prepared_initial_round(&[(0, utxo(1, 10))], UtxoQuery::new(address(1), 0))?;
+        runtime
+            .security
+            .envelope_protector()
+            .make_seal_unavailable();
+        Ok((runtime, request))
+    }
+
+    fn prepared_hit() -> PreparedRound {
+        prepared_initial_round(&[(0, utxo(1, 10))], UtxoQuery::new(address(1), 0))
+    }
+
+    fn prepared_miss() -> PreparedRound {
+        prepared_initial_round(&[(0, utxo(1, 10))], UtxoQuery::new(address(9), 0))
+    }
+
+    fn prepared_empty() -> PreparedRound {
+        prepared_initial_round(&[], UtxoQuery::new(address(1), 0))
+    }
+
+    fn prepared_invalid_domain() -> PreparedRound {
+        prepared_initial_round(
+            &[(0, utxo(1, 10))],
+            UtxoQuery::from_untrusted_address_key(&[7; 31], 0),
+        )
+    }
+
+    /// Runs one prepared round and reports only how long it took.
+    ///
+    /// The build is deliberately outside the timed region: it is fixture cost,
+    /// not the round a network observer would be timing.
+    fn timed_round(
+        prepare: fn() -> PreparedRound,
+    ) -> Result<std::time::Duration, Box<dyn std::error::Error>> {
+        let (mut runtime, request) = prepare()?;
+        let started = std::time::Instant::now();
+        let round = runtime.handle(&request);
+        let elapsed = started.elapsed();
+        drop(round);
+        Ok(elapsed)
+    }
+
+    /// Reports the per-outcome distribution of one complete protected round.
+    ///
+    /// This is a measurement, not an assertion, and it is `#[ignore]`d for
+    /// that reason: a stopwatch on a shared developer machine has no
+    /// threshold it could fail against that would not be either vacuous or
+    /// flaky. Its job is to say what the release schedule in `zainod-oram`
+    /// has to cover -- and, just as importantly, to show whether the spread
+    /// across outcomes is something this layer controls at all.
+    ///
+    /// Run it with:
+    /// `cargo test -p zaino-oram measure_per_outcome_round_latency -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement, not an assertion; run explicitly with --ignored --nocapture"]
+    fn measure_per_outcome_round_latency() -> Result<(), Box<dyn std::error::Error>> {
+        const WARMUP: usize = 16;
+        const SAMPLES: usize = 128;
+        let cases: [MeasuredOutcome; 7] = [
+            ("hit", prepared_hit),
+            ("miss", prepared_miss),
+            ("empty", prepared_empty),
+            (
+                "cap-hit (pagination continuing)",
+                prepared_capped_first_page,
+            ),
+            ("pagination terminal", prepared_terminal_page),
+            ("invalid domain", prepared_invalid_domain),
+            ("protection failure", prepared_protection_failure),
+        ];
+
+        println!("outcome,samples,min_us,median_us,p95_us,max_us");
+        for (name, prepare) in cases {
+            for _ in 0..WARMUP {
+                timed_round(prepare)?;
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                samples.push(timed_round(prepare)?);
+            }
+            samples.sort_unstable();
+            println!(
+                "{name},{SAMPLES},{},{},{},{}",
+                samples[0].as_micros(),
+                samples[SAMPLES / 2].as_micros(),
+                samples[SAMPLES * 95 / 100].as_micros(),
+                samples[SAMPLES - 1].as_micros()
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn xchacha20_runtime_round_trips_continuations_and_rejects_tampering(
     ) -> Result<(), Box<dyn std::error::Error>> {

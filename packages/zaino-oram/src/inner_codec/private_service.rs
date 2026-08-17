@@ -240,6 +240,22 @@ pub fn private_mainnet_store_reads() -> Result<usize, PrivateQueryUnavailable> {
         .store_reads())
 }
 
+/// Width of the compiled mainnet profile's fixed release schedule, in
+/// milliseconds.
+///
+/// This is the profile's `timeout_bucket_millis` and nothing new: the private
+/// surface writes a protected response when this bucket elapses from the
+/// instant the round was admitted, so the observable completion time is a
+/// compiled, deployment-wide constant rather than a function of the work the
+/// query happened to cost. A serving binary reads it here rather than
+/// compiling a second copy of the number, so the schedule cannot drift from
+/// the budget bound into the profile identifier.
+pub fn private_mainnet_timeout_bucket_millis() -> Result<u64, PrivateQueryUnavailable> {
+    Ok(mainnet_utxo_history_profile()
+        .map_err(|_| PrivateQueryUnavailable)?
+        .timeout_bucket_millis())
+}
+
 /// Deployment identity, durable locations, and the projection they scope.
 ///
 /// The projection shape lives here rather than beside it because the runtime

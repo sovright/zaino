@@ -44,6 +44,7 @@ use tonic::{
 use zaino_oram::{FixedEnvelopeRuntime, SessionBootstrap};
 
 use super::{
+    release_schedule::ReleaseSchedule,
     tls::PrivateTlsIdentity,
     tonic_body::{PrivateSessionBootstrap, PrivateTonicBodyAdapter},
 };
@@ -91,10 +92,17 @@ impl PrivateQueryListener {
     /// all -- see [`PrivateTlsIdentity`]. Taking the identity by value rather
     /// than as an `Option` makes serving this surface in cleartext
     /// unrepresentable rather than merely discouraged.
+    ///
+    /// `release_schedule` carries the compiled profile's timeout bucket. It is
+    /// taken as a parameter rather than read from a constant here because the
+    /// authoritative width lives in the profile whose identifier the runtime
+    /// publishes; a second copy compiled into the listener could disagree with
+    /// the budget a wallet pinned.
     pub(crate) async fn serve<H, const N: usize>(
         self,
         handler: H,
         session_bootstrap: SessionBootstrap,
+        release_schedule: ReleaseSchedule,
         tls: &PrivateTlsIdentity,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
@@ -102,7 +110,8 @@ impl PrivateQueryListener {
         H: FixedEnvelopeRuntime<N> + Send + 'static,
         H::PendingResponse: Send + 'static,
     {
-        let service = PrivateQueryService::<H, N>::new(handler, session_bootstrap);
+        let service =
+            PrivateQueryService::<H, N>::new(handler, session_bootstrap, release_schedule);
         // Building the TLS acceptor requires a process-level rustls
         // CryptoProvider (zingolabs/zaino#1360), exactly as the public gRPC
         // server needs one.
@@ -202,6 +211,12 @@ impl fmt::Debug for PrivateQueryListener {
 /// bootstrap method around it.
 struct PrivateQueryService<H, const N: usize> {
     adapter: Arc<Mutex<PrivateTonicBodyAdapter<H, N>>>,
+    /// Held beside the adapter as well as inside it. The unroutable-request
+    /// arm has no adapter to borrow but must still answer on the schedule:
+    /// with the query route gated and route probing not, an observer could
+    /// tell "no such method" from "query refused" by how fast the refusal
+    /// came back, even though the path itself is inside TLS.
+    release_schedule: Arc<ReleaseSchedule>,
     /// Held beside the mutex, not inside it. The bootstrap answer is fixed for
     /// the runtime's process lifetime and identical for every caller, so it
     /// needs no exclusion; putting it behind the handler lock would make a
@@ -215,13 +230,20 @@ where
     H: FixedEnvelopeRuntime<N>,
     H::PendingResponse: Send + 'static,
 {
-    fn new(handler: H, session_bootstrap: SessionBootstrap) -> Self {
+    fn new(
+        handler: H,
+        session_bootstrap: SessionBootstrap,
+        release_schedule: ReleaseSchedule,
+    ) -> Self {
+        let release_schedule = Arc::new(release_schedule);
         Self {
             adapter: Arc::new(Mutex::new(PrivateTonicBodyAdapter::new(
                 handler,
                 session_bootstrap.key_epoch,
+                Arc::clone(&release_schedule),
             ))),
             bootstrap: Arc::new(PrivateSessionBootstrap::from_session(&session_bootstrap, N)),
+            release_schedule,
         }
     }
 }
@@ -233,6 +255,7 @@ impl<H, const N: usize> Clone for PrivateQueryService<H, N> {
         Self {
             adapter: Arc::clone(&self.adapter),
             bootstrap: Arc::clone(&self.bootstrap),
+            release_schedule: Arc::clone(&self.release_schedule),
         }
     }
 }
@@ -262,18 +285,26 @@ where
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let adapter = Arc::clone(&self.adapter);
         let bootstrap = Arc::clone(&self.bootstrap);
+        let release_schedule = Arc::clone(&self.release_schedule);
         Box::pin(async move {
             match request.uri().path() {
                 QUERY_PAGE_ROUTE => {
                     let mut adapter = adapter.lock().await;
                     Ok(adapter.query_page(request).await)
                 }
-                // Deliberately does not take the handler lock: see this
-                // module's header and `PrivateSessionBootstrap`.
+                // Deliberately does not take the handler lock, and deliberately
+                // is not on the release schedule: see this module's header and
+                // `PrivateSessionBootstrap`.
                 BOOTSTRAP_ROUTE => Ok(bootstrap.answer(request).await),
-                // An unknown route answers exactly as a refused query does,
-                // so route probing cannot distinguish them.
-                _ => Ok(unavailable_response()),
+                // An unknown route answers exactly as a refused query does --
+                // the same bytes, and now on the same schedule, so route
+                // probing cannot distinguish them by shape or by latency.
+                _ => {
+                    let window = release_schedule.admit();
+                    let response = unavailable_response();
+                    window.release().await;
+                    Ok(response)
+                }
             }
         })
     }
@@ -310,6 +341,11 @@ mod tests {
     use super::{super::tls::PRIVATE_SURFACE_DNS_NAME, *};
 
     const ENVELOPE_BYTES: usize = 4;
+    /// Narrow enough that the serving tests below are not dominated by the
+    /// schedule, wide enough that a round genuinely waits on it. These tests
+    /// are about transport and routing; the schedule's own arithmetic is
+    /// proven on a paused clock in `release_schedule`.
+    const TEST_RELEASE_BUCKET_MILLIS: u64 = 20;
     const RESPONSE: [u8; ENVELOPE_BYTES] = [9, 8, 7, 6];
     const FIXTURE_KEY_EPOCH: u64 = 0;
     /// A stand-in for the compiled profile's digest, unrelated to the label.
@@ -404,6 +440,21 @@ mod tests {
             H: FixedEnvelopeRuntime<N> + Send + 'static,
             H::PendingResponse: Send + 'static,
         {
+            Self::start_with_bucket(handler, session_bootstrap, TEST_RELEASE_BUCKET_MILLIS).await
+        }
+
+        /// As [`Self::start`], with an explicit release bucket for the one
+        /// test that asserts on the schedule itself rather than merely
+        /// tolerating it.
+        async fn start_with_bucket<H, const N: usize>(
+            handler: H,
+            session_bootstrap: SessionBootstrap,
+            release_bucket_millis: u64,
+        ) -> Result<Self, Box<dyn std::error::Error>>
+        where
+            H: FixedEnvelopeRuntime<N> + Send + 'static,
+            H::PendingResponse: Send + 'static,
+        {
             let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
             let address = listener.local_addr();
             let deployment = tempfile::TempDir::new()?;
@@ -413,9 +464,15 @@ mod tests {
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let served = tokio::spawn(async move {
                 listener
-                    .serve::<_, N>(handler, session_bootstrap, &tls, async {
-                        let _ = stopped.await;
-                    })
+                    .serve::<_, N>(
+                        handler,
+                        session_bootstrap,
+                        ReleaseSchedule::from_timeout_bucket_millis(release_bucket_millis),
+                        &tls,
+                        async {
+                            let _ = stopped.await;
+                        },
+                    )
                     .await
             });
             Ok(Self {
@@ -508,21 +565,7 @@ mod tests {
         key_epoch: u64,
     ) -> Result<private_proto::FixedEnvelope, tonic::Status> {
         let mut client = connected_private_client(address, certificate_pem).await?;
-        let codec = tonic_prost::ProstCodec::<
-            private_proto::FixedEnvelope,
-            private_proto::FixedEnvelope,
-        >::default();
-        client
-            .unary(
-                tonic::Request::new(private_proto::FixedEnvelope {
-                    envelope,
-                    key_epoch,
-                }),
-                http::uri::PathAndQuery::from_static(QUERY_PAGE_ROUTE),
-                codec,
-            )
-            .await
-            .map(tonic::Response::into_inner)
+        query_on(&mut client, QUERY_PAGE_ROUTE, envelope, key_epoch).await
     }
 
     /// Drives one real `BootstrapSession` unary call against the bound
@@ -1038,6 +1081,105 @@ mod tests {
         surface.shutdown().await
     }
 
+    /// Issues one unary call on an already-connected client.
+    ///
+    /// Split out of [`query_page_over_the_wire`] so a caller can time the call
+    /// alone: connecting and handshaking are per-connection costs the release
+    /// schedule neither covers nor claims to.
+    async fn query_on(
+        client: &mut tonic::client::Grpc<tonic::transport::Channel>,
+        route: &'static str,
+        envelope: Vec<u8>,
+        key_epoch: u64,
+    ) -> Result<private_proto::FixedEnvelope, tonic::Status> {
+        // Tonic reserves a slot per call, so a client driving more than one
+        // request must re-ready between them.
+        client
+            .ready()
+            .await
+            .map_err(|_| tonic::Status::internal("ready"))?;
+        let codec = tonic_prost::ProstCodec::<
+            private_proto::FixedEnvelope,
+            private_proto::FixedEnvelope,
+        >::default();
+        client
+            .unary(
+                tonic::Request::new(private_proto::FixedEnvelope {
+                    envelope,
+                    key_epoch,
+                }),
+                http::uri::PathAndQuery::from_static(route),
+                codec,
+            )
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// The schedule must survive the whole route, not merely the adapter: the
+    /// answer a real client receives over real TLS is written no sooner than
+    /// the bucket.
+    ///
+    /// This is a *lower*-bound assertion on a wall clock, deliberately. An
+    /// upper bound would be asserting the machine is not busy, which is not a
+    /// property of this code. The exact-deadline claim is proved on a paused
+    /// clock in `release_schedule` and `tonic_body`; what this adds is that
+    /// nothing between the adapter and the socket short-circuits it.
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently
+    /// on separate tasks and the client blocks on a response the server sends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_served_query_and_a_probed_route_both_wait_out_the_bucket(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        /// Wide enough that scheduler jitter cannot account for the wait, and
+        /// still a fraction of a production bucket.
+        const BUCKET_MILLIS: u64 = 300;
+        let bucket = std::time::Duration::from_millis(BUCKET_MILLIS);
+        let surface = ServedSurface::start_with_bucket::<_, ENVELOPE_BYTES>(
+            handler(),
+            session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+            BUCKET_MILLIS,
+        )
+        .await?;
+        let mut client =
+            connected_private_client(surface.address, &surface.certificate_pem).await?;
+
+        let started = std::time::Instant::now();
+        let answered = query_on(
+            &mut client,
+            QUERY_PAGE_ROUTE,
+            vec![1, 2, 3, 4],
+            FIXTURE_KEY_EPOCH,
+        )
+        .await?;
+        let answered_elapsed = started.elapsed();
+        assert_eq!(answered.envelope, RESPONSE);
+        assert!(
+            answered_elapsed >= bucket,
+            "an answered query was written after {answered_elapsed:?}, inside the {bucket:?} bucket"
+        );
+
+        // Route probing is on the schedule too: with the query route gated and
+        // an unknown one not, an observer could separate them by latency even
+        // though the path itself is inside TLS.
+        let started = std::time::Instant::now();
+        let probed = query_on(
+            &mut client,
+            "/zaino.private.v1.PrivateCompactTxStreamer/NoSuchMethod",
+            vec![1, 2, 3, 4],
+            FIXTURE_KEY_EPOCH,
+        )
+        .await
+        .expect_err("an unknown route answers as a refused query does");
+        let probed_elapsed = started.elapsed();
+        assert_eq!(probed.message(), "private query unavailable");
+        assert!(
+            probed_elapsed >= bucket,
+            "an unknown route answered after {probed_elapsed:?}, inside the {bucket:?} bucket"
+        );
+
+        surface.shutdown().await
+    }
+
     /// The regtest shape the parity harness serves the fixture chain under.
     ///
     /// `max_events_per_address` is the compiled profile's store-read count and
@@ -1058,6 +1200,91 @@ mod tests {
             directory_capacity: 256,
             event_capacity: 8_192,
         })
+    }
+
+    /// Reports the per-outcome distribution of one complete served round:
+    /// request written by the client through response received by it, over
+    /// real TLS and the real routing.
+    ///
+    /// A measurement, not an assertion, and `#[ignore]`d for that reason --
+    /// see the matching note on `zaino-oram`'s
+    /// `measure_per_outcome_round_latency`, which measures the engine half.
+    /// This half measures everything the engine half does not: decode, cap,
+    /// routing, encoding, framing, and the TLS write.
+    ///
+    /// Run it with:
+    /// `cargo test -p zainod-oram --features private-service measure_per_outcome_wire_latency -- --ignored --nocapture`
+    ///
+    /// multi_thread required: the serve loop and the client run concurrently
+    /// on separate tasks and the client blocks on responses the server sends.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "measurement, not an assertion; run explicitly with --ignored --nocapture"]
+    async fn measure_per_outcome_wire_latency() -> Result<(), Box<dyn std::error::Error>> {
+        const SAMPLES: usize = 32;
+        const BUCKET_MILLIS: u64 = 50;
+        let oversized = vec![0u8; ENVELOPE_BYTES + 64];
+        let cases: [(&str, &'static str, Vec<u8>, u64); 5] = [
+            (
+                "answered",
+                QUERY_PAGE_ROUTE,
+                vec![1, 2, 3, 4],
+                FIXTURE_KEY_EPOCH,
+            ),
+            (
+                "wrong length",
+                QUERY_PAGE_ROUTE,
+                vec![1, 2, 3],
+                FIXTURE_KEY_EPOCH,
+            ),
+            (
+                "over decode cap",
+                QUERY_PAGE_ROUTE,
+                oversized,
+                FIXTURE_KEY_EPOCH,
+            ),
+            (
+                "stale key epoch",
+                QUERY_PAGE_ROUTE,
+                vec![1, 2, 3, 4],
+                FIXTURE_KEY_EPOCH + 1,
+            ),
+            (
+                "unknown route",
+                "/zaino.private.v1.PrivateCompactTxStreamer/NoSuchMethod",
+                vec![1, 2, 3, 4],
+                FIXTURE_KEY_EPOCH,
+            ),
+        ];
+
+        println!("bucket_millis={BUCKET_MILLIS}");
+        println!("outcome,samples,min_us,median_us,p95_us,max_us");
+        for (name, route, envelope, key_epoch) in cases {
+            let surface = ServedSurface::start_with_bucket::<_, ENVELOPE_BYTES>(
+                handler(),
+                session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+                BUCKET_MILLIS,
+            )
+            .await?;
+            let mut client =
+                connected_private_client(surface.address, &surface.certificate_pem).await?;
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = std::time::Instant::now();
+                let answered = query_on(&mut client, route, envelope.clone(), key_epoch).await;
+                samples.push(started.elapsed());
+                drop(answered);
+            }
+            samples.sort_unstable();
+            println!(
+                "{name},{SAMPLES},{},{},{},{}",
+                samples[0].as_micros(),
+                samples[SAMPLES / 2].as_micros(),
+                samples[SAMPLES * 95 / 100].as_micros(),
+                samples[SAMPLES - 1].as_micros()
+            );
+            surface.shutdown().await?;
+        }
+        Ok(())
     }
 
     /// A wallet that keeps querying under a retired key must learn to
