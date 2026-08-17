@@ -1,7 +1,7 @@
 use crate::{
     profile::{CompiledQueryShape, PrivacyProfile, PrivacyProfileError},
     recent_snapshot::{RecentSnapshotScan, RecentSnapshotSlot, RecentUtxoChangeKind},
-    records::{QueryOutcome, TransparentUtxo, UtxoQuery, UtxoResultPage},
+    records::{QueryOutcome, RecordAnnotation, TransparentUtxo, UtxoQuery, UtxoResultPage},
     store::{ObliviousStore, StoreSlot},
     trace::{TraceDimension, TraceError, TraceRecorder},
 };
@@ -262,6 +262,25 @@ fn finalized_snapshot_relation<const RECENT_SNAPSHOT_SLOTS: usize>(
         survives &= !(same & is_valid_spend);
     }
     (survives, valid)
+}
+
+/// Computes the annotation the publication pass stores on one record.
+///
+/// This is the whole of ADR 0902's obligation 1: a pure function of the
+/// record, its owning address, and the generation's published snapshot. It
+/// takes no clock, no iteration order, no host input and no prior annotation,
+/// which is what makes the result reproducible from `(source, generation)`.
+///
+/// It shares [`finalized_snapshot_relation`] with the query path rather than
+/// restating the join, so publication and serving cannot drift apart: the
+/// stored answer is by construction the one the query would have computed.
+pub(crate) fn annotate_record<const RECENT_SNAPSHOT_SLOTS: usize>(
+    owner: &crate::records::AddressKey,
+    record: &TransparentUtxo,
+    recent_snapshot: &[RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
+) -> RecordAnnotation {
+    let (survives, valid) = finalized_snapshot_relation(owner, record, recent_snapshot);
+    RecordAnnotation::Annotated { survives, valid }
 }
 
 fn same_outpoint(left: &TransparentUtxo, right: &TransparentUtxo) -> bool {
@@ -718,6 +737,48 @@ mod tests {
             assert_eq!(engine.store.read_slots(), &expected_schedule_slots());
         }
         Ok(())
+    }
+
+    /// The annotation the publication pass will store is exactly the join the
+    /// query used to recompute per slot, so this pins the three outcomes that
+    /// distinguish it. `Unannotated` is deliberately unreachable here: the
+    /// function always answers, and absence means no pass has run.
+    #[test]
+    fn the_stored_annotation_is_the_join_the_query_no_longer_recomputes() {
+        let owner = address(1);
+        let held = utxo(1, 10);
+
+        // Nothing in the snapshot touches this outpoint.
+        let untouched = [RecentSnapshotSlot::spent(owner, utxo(2, 11))];
+        assert_eq!(
+            annotate_record(&owner, &held, &untouched),
+            RecordAnnotation::Annotated {
+                survives: true,
+                valid: true
+            }
+        );
+
+        // The owner spends it: the record must not survive, and the snapshot
+        // remains semantically valid.
+        let spent_by_owner = [RecentSnapshotSlot::spent(owner, held)];
+        assert_eq!(
+            annotate_record(&owner, &held, &spent_by_owner),
+            RecordAnnotation::Annotated {
+                survives: false,
+                valid: true
+            }
+        );
+
+        // Some other address claims to spend it. That is a malformed snapshot,
+        // not a spend, so the record survives and validity fails closed.
+        let spent_by_stranger = [RecentSnapshotSlot::spent(address(9), held)];
+        assert_eq!(
+            annotate_record(&owner, &held, &spent_by_stranger),
+            RecordAnnotation::Annotated {
+                survives: true,
+                valid: false
+            }
+        );
     }
 
     #[test]
