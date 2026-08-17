@@ -138,6 +138,29 @@ jobs:
           done
           rm /tmp/pin-review/zainod-oram.full.asm
 
+      # The reviewed RIP-relative constants must be pinned by position,
+      # destination and exact bytes, so the review needs all three read off the
+      # binary. objdump resolves each target in a trailing comment; dump 16
+      # bytes at each so the pinned width is a review decision rather than a
+      # guess.
+      - name: Dump the RIP-relative constants the guarded symbols load
+        run: |
+          : > /tmp/pin-review/rip-constants.txt
+          for sym in fixed_base_page_append fixed_add_page_append fixed_spend_page_append; do
+            echo "== $sym" >> /tmp/pin-review/rip-constants.txt
+            grep -nE '\(%rip\)' "/tmp/pin-review/$sym.raw.asm" \
+              | grep -v ':\s*call' >> /tmp/pin-review/rip-constants.txt || true
+          done
+          echo "== referenced constant bytes" >> /tmp/pin-review/rip-constants.txt
+          grep -oE '# [0-9a-f]+ <' /tmp/pin-review/*.raw.asm \
+            | grep -oE '[0-9a-f]+' | sort -u | while read -r addr; do
+            end=$(printf '%x' $((0x$addr + 16)))
+            echo "-- 0x$addr .. 0x$end" >> /tmp/pin-review/rip-constants.txt
+            objdump -s --start-address="0x$addr" --stop-address="0x$end" \
+              target/release/zainod-oram >> /tmp/pin-review/rip-constants.txt 2>&1 || true
+          done
+          cat /tmp/pin-review/rip-constants.txt
+
       - name: Emit candidate page profiles for review
         continue-on-error: true
         run: |
