@@ -647,6 +647,18 @@ fn linear_interval_blocks(
 /// rebuild interval, or generations fall behind faster than they publish and
 /// the hoist is not a design option however cheap it makes a query.
 ///
+/// The write term is flat in `snapshot_slots` rather than a second per-address
+/// term, and that rests on ADR 0902 obligation 7: the pass issues a write only
+/// for a record whose outpoint appears in one of the two snapshots, plus records
+/// appended since the last pass. A record named by neither snapshot is
+/// `(survives, valid) = (true, true)` under both and needs no write. Were the pass instead to
+/// write unconditionally at every ordinal of every visited address --- padding
+/// each address out to the fixed page width --- writes would become per-address
+/// and of the same order as the reads, roughly halving the threshold below.
+/// Obligation 7 records why that padding is unnecessary: publication runs over
+/// public data, so a per-address write count that varies leaks nothing the
+/// chain does not already publish.
+///
 /// `distinct_addresses` is the number this model cannot supply: see
 /// [`Self::maximum_annotatable_distinct_addresses`] for the threshold it must
 /// be compared against, and `docs/notes/recent-snapshot-scan-width.md` for the
