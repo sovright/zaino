@@ -201,11 +201,22 @@ here so the pass can be reviewed against them.
 4. **The event table's admission limit must be at most `capacity − 2`.**
    `admit_exact_upsert` reserves one spare slot so that an unexpected absence
    can materialize a record before post-schedule classification fails the
-   generation closed. `validate_admission_limit` today only enforces
-   `admission_limit < capacity`, so a profile sized at exactly `capacity − 1`
-   would admit every insert and then refuse every annotation with
-   `UpsertReserveExhausted`. Whoever sizes the annotated profile owns this;
-   it is a sizing precondition, not a store bug.
+   generation closed. A profile sized at exactly `capacity − 1` would admit
+   every insert and then refuse every annotation with `UpsertReserveExhausted`.
+
+   **Enforced, not merely documented** (revised 2026-08-19). This ADR
+   originally left the bound to whoever sized the profile. That was wrong: a
+   precondition whose own validator permits violating it fails silently at the
+   first annotation write rather than loudly at configuration.
+   `validate_admission_limit` now rejects it, via `reserved_slots(kind)` — the
+   event table reserves two slots, the directory table one, because the
+   directory holds no annotations and is never upserted. The rejection is a
+   distinct `LayoutConfigError::AdmissionLimitLeavesNoUpsertReserve` so the
+   reserve violation is not confused with the plain below-capacity bound.
+
+   Consequence: the smallest valid event table is now capacity 4. A two-slot
+   event table cannot admit a record and keep the reserve, so it is rejected
+   at construction.
 5. **A failed annotation write discards the generation.** Already enforced:
    `ExclusiveTwoTableExecutor::update_event` discards on backend failure or
    panic exactly as `insert_event` does, because after either the stored record
