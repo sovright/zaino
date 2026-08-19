@@ -284,9 +284,18 @@ timing result attached.
 ### F. The measurement that is still missing
 
 The hoist's publication cost is `distinct_addresses_per_generation *
-store_reads` oblivious reads — each touched address's finalized history, re-read
+store_reads` oblivious reads — each visited address's finalized history, re-read
 to decide the join — plus at most one write per published slot. **That number is
-not in the tree.** `MAINNET_CAPTURE_MAX_TOTAL_DELTA_EVENTS` is a pinned
+not in the tree.**
+
+`distinct_addresses_per_generation` is the union ADR 0902 obligation 6 requires,
+not the generation's finalized delta: `addresses(snapshot_g) ∪
+addresses(snapshot_g−1) ∪ addresses appended since the last completed pass`. A
+snapshot entry dropped by a reorg changes an annotation while emitting no
+finalized delta event, so a delta-only count understates the pass. Both snapshot
+terms are bounded by the snapshot slot count, so the union does not change the
+order of the cost — but the run below must accumulate the union, or it measures
+the wrong quantity. `MAINNET_CAPTURE_MAX_TOTAL_DELTA_EVENTS` is a pinned
 constant, no capture file is committed, and the report's
 `distinct_standard_addresses` is a whole-replay figure over 3.4 M blocks, not a
 per-generation one.
@@ -347,7 +356,8 @@ day the measurement lands, the answer is `budget.fits(measured)`.
    result attached — that is the recommended lever, for the reasons in §E.
 5. Run the rescan in §F, adding a per-generation `max_distinct_addresses` field.
    It decides whether the hoist is affordable at all, and the threshold
-   (1,221,061) is already asserted in code so the answer is immediate.
+   (1,221,061) is already asserted in code so the answer is immediate. Count the
+   ADR 0902 obligation 6 union, not the finalized delta — see §F.
 6. Rescan to populate `per_address_delta_event_histogram` in the same run — it is
    real evidence, it just answers a different question: how many round trips an
    address's *recent* results take, i.e. `response_slots`, not the scan width.

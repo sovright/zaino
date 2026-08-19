@@ -221,6 +221,40 @@ here so the pass can be reviewed against them.
    `ExclusiveTwoTableExecutor::update_event` discards on backend failure or
    panic exactly as `insert_event` does, because after either the stored record
    is of uncertain content.
+6. **The pass must visit `addresses(snapshot_g) ∪ addresses(snapshot_g−1) ∪
+   addresses appended since the last completed pass`** (added 2026-08-19).
+
+   The cost model in `scan_width.rs` scopes one pass to
+   `distinct_addresses * store_reads` — the addresses a generation *touches*,
+   not every stored address. That scope is what makes the hoist affordable, but
+   the naive reading of "touched" — addresses in the generation's finalized
+   delta — is not sufficient, and the gap is silent:
+
+   > Address A holds finalized record R. Generation *g−1*'s snapshot contained
+   > a spend of R, so R was annotated `survives = false`. In generation *g*
+   > that spend is reorged away. It never finalizes, so it produces no
+   > finalized delta event for A. If A is not otherwise touched, R keeps
+   > `survives = false` and stays invisible to its owner until unrelated
+   > activity happens to touch A.
+
+   The union above closes it, and it is complete by construction. An
+   annotation is a pure function of `(record, owner, snapshot)` (obligation 1),
+   so for a record already annotated at *g−1* the value can differ at *g* only
+   if the snapshot's content for that owner differs. Any owner whose content
+   differs between the two snapshots appears in at least one of them, because
+   `RecentSnapshotSlot` carries the owning `AddressKey` on every occupied slot.
+   The third term covers records that had no annotation at *g−1* because they
+   were not yet in the finalized store.
+
+   This does not widen the budget. Both snapshot terms are bounded by the
+   snapshot's slot count `N`, and the append term is the finalized delta the
+   cost model already counts. Deriving the touched set from the snapshots
+   themselves — rather than from the finalized delta alone — is what makes the
+   pass correct at no extra order of cost.
+
+   Reorg-dropped entries are the motivating case, but the union is stated over
+   the snapshots rather than over reorgs specifically, so it holds for any
+   reason a snapshot entry disappears without finalizing.
 
 ## Consequences
 

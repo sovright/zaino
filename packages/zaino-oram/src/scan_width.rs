@@ -651,6 +651,15 @@ fn linear_interval_blocks(
 /// [`Self::maximum_annotatable_distinct_addresses`] for the threshold it must
 /// be compared against, and `docs/notes/recent-snapshot-scan-width.md` for the
 /// run that would measure it.
+///
+/// It is *not* the generation's finalized delta addresses. ADR 0902 obligation
+/// 6 requires the pass to visit `addresses(snapshot_g) ∪
+/// addresses(snapshot_g−1) ∪ addresses appended since the last completed pass`,
+/// because a snapshot entry that disappears without finalizing — a reorg —
+/// changes an annotation while emitting no finalized delta event. Both snapshot
+/// terms are bounded by `snapshot_slots`, so the union does not change the
+/// order of this budget, but the measurement must count the union or it
+/// understates the pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AnnotationPublicationBudget {
     interval_blocks: u32,
