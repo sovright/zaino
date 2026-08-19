@@ -443,9 +443,40 @@ impl fmt::Debug for UtxoEvent {
 
 #[derive(Clone, Copy)]
 struct FinalizedCreation {
+    ordinal: usize,
     event: UtxoEvent,
     utxo: TransparentUtxo,
     spent: bool,
+}
+
+/// One live output and the history ordinal of the creation that produced it.
+///
+/// The two indices differ: spent creations keep their history ordinal but
+/// contribute no live slot. The query addresses outputs by live slot, while the
+/// annotation pass writes to the stored event at its ordinal, so anything that
+/// crosses between them needs both (ADR 0902).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct FinalizedLiveSlot {
+    ordinal: usize,
+    utxo: TransparentUtxo,
+}
+
+impl FinalizedLiveSlot {
+    /// Returns the history ordinal of the creating event.
+    pub(super) const fn ordinal(self) -> usize {
+        self.ordinal
+    }
+
+    /// Returns the live output the creation yields.
+    pub(super) const fn utxo(self) -> TransparentUtxo {
+        self.utxo
+    }
+}
+
+impl fmt::Debug for FinalizedLiveSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FinalizedLiveSlot { ..REDACTED.. }")
+    }
 }
 
 /// Identifier-free failure while folding one complete padded finalized history.
@@ -457,12 +488,11 @@ pub(super) enum FinalizedEventHistoryError {
     Invalid,
 }
 
-/// Folds a complete padded event history into one creation-order dense live slot.
+/// Selects one creation-order dense live slot from a complete padded history.
 ///
-/// Every event is validated before the selected slot is returned. Padding must
-/// be a contiguous suffix, creations must be unique, and each spend must match
-/// one earlier live creation. A spend at the creation height is valid because a
-/// later transaction in the same finalized block can consume the output.
+/// A thin selector over [`finalized_live_slots`], which holds the validation
+/// contract. Both the fold and this selection are fixed-width in the history
+/// length, so neither reveals how many outputs the address holds.
 pub(super) fn finalized_live_utxo_at(
     history: &[Option<UtxoEvent>],
     logical_slot: usize,
@@ -471,7 +501,27 @@ pub(super) fn finalized_live_utxo_at(
     if logical_slot >= history.len() {
         return Err(FinalizedEventHistoryError::Invalid);
     }
+    Ok(finalized_live_slots(history, maximum_finalized_height)?
+        .get(logical_slot)
+        .copied()
+        .flatten()
+        .map(FinalizedLiveSlot::utxo))
+}
 
+/// Folds a complete padded event history into its creation-order live slots.
+///
+/// Every event is validated before any slot is returned. Padding must be a
+/// contiguous suffix, creations must be unique, and each spend must match one
+/// earlier live creation. A spend at the creation height is valid because a
+/// later transaction in the same finalized block can consume the output.
+///
+/// The result is always the history's width, holding the live slots as a dense
+/// prefix, so its length is the public fixed page width rather than the address's
+/// live-output count.
+pub(super) fn finalized_live_slots(
+    history: &[Option<UtxoEvent>],
+    maximum_finalized_height: u32,
+) -> Result<Vec<Option<FinalizedLiveSlot>>, FinalizedEventHistoryError> {
     let mut creations = Vec::new();
     creations
         .try_reserve_exact(history.len())
@@ -480,7 +530,7 @@ pub(super) fn finalized_live_utxo_at(
     let mut padding_started = false;
     let mut last_height = None;
     let mut invalid = false;
-    for entry in history {
+    for (ordinal, entry) in history.iter().enumerate() {
         let mut first_empty = None;
         let mut matching_index = None;
         let mut matching_count = 0_usize;
@@ -521,6 +571,7 @@ pub(super) fn finalized_live_utxo_at(
                 match (first_empty, utxo) {
                     (Some(index), Some(utxo)) if matching_count == 0 => {
                         creations[index] = Some(FinalizedCreation {
+                            ordinal,
                             event: *event,
                             utxo,
                             spent: false,
@@ -548,12 +599,22 @@ pub(super) fn finalized_live_utxo_at(
         }
     }
 
-    let mut selected = None;
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(history.len())
+        .map_err(|_| FinalizedEventHistoryError::AllocationFailed)?;
+    selected.resize(history.len(), None::<FinalizedLiveSlot>);
     let mut live_slot = 0_usize;
     for creation in creations.into_iter().flatten() {
         if !creation.spent {
-            if live_slot == logical_slot {
-                selected = Some(creation.utxo);
+            match selected.get_mut(live_slot) {
+                Some(entry) => {
+                    *entry = Some(FinalizedLiveSlot {
+                        ordinal: creation.ordinal,
+                        utxo: creation.utxo,
+                    });
+                }
+                None => invalid = true,
             }
             match live_slot.checked_add(1) {
                 Some(next) => live_slot = next,
@@ -3078,6 +3139,58 @@ mod tests {
             Ok(third.created_utxo())
         );
         assert_eq!(finalized_live_utxo_at(&history, 2, 102), Ok(None));
+    }
+
+    /// The annotation pass writes to a *history ordinal*, but the query reads a
+    /// *live slot*, and the two are not the same index: spent creations occupy
+    /// history ordinals while contributing no live slot. Here live slot 1 is the
+    /// event at ordinal 3, so a pass that annotated by live slot would write the
+    /// wrong record.
+    #[test]
+    fn every_live_slot_names_the_history_ordinal_of_the_creation_behind_it() {
+        let first = created_event(
+            0x11,
+            1,
+            11,
+            100,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xa1; 20],
+        );
+        let second = created_event(
+            0x22,
+            2,
+            22,
+            101,
+            UtxoScriptClass::PayToScriptHash,
+            [0xb2; 20],
+        );
+        let third = created_event(
+            0x33,
+            2,
+            33,
+            102,
+            UtxoScriptClass::PayToPublicKeyHash,
+            [0xa1; 20],
+        );
+        let history = [
+            Some(first),
+            Some(second),
+            Some(matching_spend(first, 102)),
+            Some(third),
+            None,
+            None,
+        ];
+
+        let live = finalized_live_slots(&history, 102).expect("history is canonical");
+
+        // The vector is the fixed history width, not the live count, so its
+        // length reveals nothing about how many outputs the address holds.
+        assert_eq!(live.len(), history.len());
+        assert_eq!(live[0].map(FinalizedLiveSlot::ordinal), Some(1));
+        assert_eq!(live[1].map(FinalizedLiveSlot::ordinal), Some(3));
+        assert!(live[2..].iter().all(Option::is_none));
+        assert_eq!(live[0].map(FinalizedLiveSlot::utxo), second.created_utxo());
+        assert_eq!(live[1].map(FinalizedLiveSlot::utxo), third.created_utxo());
     }
 
     #[test]
