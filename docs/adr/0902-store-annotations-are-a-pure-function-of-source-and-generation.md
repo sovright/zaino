@@ -256,6 +256,53 @@ here so the pass can be reviewed against them.
    the snapshots rather than over reorgs specifically, so it holds for any
    reason a snapshot entry disappears without finalizing.
 
+7. **One write per live slot, gated on an actual change, never at a padding
+   ordinal** (added 2026-08-19). Obligation 3 already licenses the shape --- the
+   pass runs over public data and its access pattern may depend on the
+   generation's public shape --- but it is worth stating what that permits and
+   what it still forbids, because the two are easy to swap.
+
+   *Permitted: a per-address write count that varies.* Which addresses the store
+   holds, and how many live outputs each has, are a projection of the public
+   chain. The ORAM hides *which address a client queries*; the pass has no
+   client. Every individual access still goes through the same oblivious
+   primitive, so the position map is unaffected --- only the count varies, and
+   the count is public. The pass therefore writes once per live slot rather than
+   padding every address out to the fixed page width.
+
+   *Required: issue a write only where the annotation can differ, decided from
+   the snapshots.* A record whose outpoint appears in neither `snapshot_g` nor
+   `snapshot_g−1` is annotated `(survives, valid) = (true, true)` under both, so
+   it needs no write. The records that can differ are exactly those whose
+   outpoint appears in one of the two snapshots, plus records appended since the
+   last completed pass, which have no annotation yet. Both are derivable from
+   the snapshots and the append delta alone.
+
+   This is what keeps the cost model's write term the flat `snapshot_slots` ---
+   "at most one write per published slot" --- rather than a second per-address
+   term. Note that the pass must decide this *before* issuing the command: the
+   store does report `AnnotationDisposition::Unchanged` for a write that changes
+   nothing, but by then the oblivious upsert schedule has already run and been
+   paid for. Filtering on the reply is not filtering. Filtering from the
+   snapshots also means the pass never needs to read a stored annotation back,
+   which it presently could not: `FixedEventHistory` carries `UtxoEvent`s and
+   drops the annotation, and threading it back out is the read side's work.
+
+   *Forbidden: annotating a padding ordinal.* `update_present` is a
+   compare-and-set on an occupied slot, and `fixed_exact_upsert`'s
+   expected-absent path *inserts*. Annotating padding would materialize a record
+   that does not exist and break the contiguous-padding invariant
+   `finalized_live_slots` validates. The pass addresses records through that
+   fold, which returns exactly the occupied creation ordinals, so it satisfies
+   this by construction rather than by a check.
+
+   Note the two indices the pass has to keep apart. It writes to a *history
+   ordinal*; the query reads a *live slot*; a spent creation keeps its ordinal
+   while contributing no live slot. `FinalizedLiveSlot` carries both for exactly
+   this reason. A pass that annotated by live slot would write the wrong record
+   for any address ever spent from, and silently, since both are plausible
+   in-range indices.
+
 ## Consequences
 
 - `UniqueTable` gains `update_present`, a compare-and-set on an occupied slot.
