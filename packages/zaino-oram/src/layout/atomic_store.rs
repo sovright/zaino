@@ -1666,6 +1666,59 @@ mod tests {
         Ok(())
     }
 
+    /// The annotation pass holds address *keys*, taken from the recent snapshot
+    /// slots, and never the `StandardAddress` behind them. It therefore needs a
+    /// history read that starts from the key, and that read must reach exactly
+    /// the records the address-keyed read reaches.
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn a_history_read_starting_from_the_address_key_reaches_the_same_records(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let layout = layout(6, 12, 11)?;
+        let directory = QualificationMemoryTable::<PersistentAddressDirectory>::try_new(8)
+            .map_err(|_| "directory table allocation failed")?;
+        let events = QualificationMemoryTable::<PersistentAddressEventPage>::try_new(16)
+            .map_err(|_| "event table allocation failed")?;
+        let owner = address(0x12);
+        let address_key = layout.address_key(owner);
+        let absent_key = layout.address_key(address(0x77));
+        let worker = spawn_qualification_worker(
+            layout,
+            directory,
+            events,
+            AtomicQueueCapacity::try_new(1).map_err(|_| "queue capacity")?,
+        )
+        .map_err(|_| "spawn failed")?;
+        let only = event(owner, 0x24);
+        worker
+            .qualification_append(owner, only)
+            .map_err(|()| "append failed")?;
+
+        let by_key = worker
+            .serving_read_history(&address_key)
+            .map_err(|()| "read by key failed")?;
+        let by_address = worker
+            .qualification_read_history(owner)
+            .map_err(|()| "read by address failed")?;
+
+        assert_eq!(by_key, by_address);
+        assert_eq!(by_key[0], Some(only));
+        // The width is the profile's fixed page, not the stored event count.
+        assert_eq!(by_key.len(), usize::try_from(MAX_EVENTS)?);
+        assert!(by_key[1..].iter().all(Option::is_none));
+
+        // An address with nothing stored still reads a full-width padded page,
+        // so the read reveals no occupancy through its shape.
+        let absent = worker
+            .serving_read_history(&absent_key)
+            .map_err(|()| "read of absent address failed")?;
+        assert_eq!(absent.len(), usize::try_from(MAX_EVENTS)?);
+        assert!(absent.iter().all(Option::is_none));
+
+        shutdown_atomic_worker(worker).map_err(|_| "shutdown failed")?;
+        Ok(())
+    }
+
     fn reads_from_records<T: Copy, const PROBES: usize>(
         records: &BTreeMap<usize, T>,
         indices: [usize; PROBES],

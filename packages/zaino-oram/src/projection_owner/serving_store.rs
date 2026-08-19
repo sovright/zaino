@@ -1,12 +1,12 @@
 //! Read-only serving handoff for one completed finalized projection generation.
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use crate::{
     canonical_chain::PublicChainCheckpoint,
     checkpoint::ProjectionCheckpointPublisher,
     recent_snapshot::{FinalizedServingStore, RecentSnapshotIdentity},
-    records::AddressKey,
+    records::{finalized_live_slots, AddressKey, RecordAnnotation, TransparentUtxo},
     store::{ObliviousStore, StoreSlot},
 };
 
@@ -61,7 +61,69 @@ impl FinalizedProjectionServingStore {
     pub(crate) const fn committed_checkpoint(&self) -> PublicChainCheckpoint {
         self.checkpoint
     }
+
+    /// Runs one generation's record-annotation pass over `visit`.
+    ///
+    /// This is the only write this facade performs, and it is the reason the
+    /// facade rather than a separate handle owns it. Construction consumed the
+    /// append-capable owner precisely so no writer could exist beside the
+    /// serving reads; publication still has to annotate, so the capability lives
+    /// here, reachable only through `&mut self` and never through
+    /// [`ObliviousStore`], which is all a query ever sees.
+    ///
+    /// `annotate` decides both the value and whether to write at all. Returning
+    /// `None` skips the record, which is how ADR 0902 obligation 7's filter is
+    /// applied: a record named by neither the current nor the previous snapshot
+    /// cannot have changed, and issuing a write for it would pay for an
+    /// oblivious upsert schedule to change nothing. The caller owns that
+    /// decision because it holds the snapshots; this store is not generic over
+    /// the snapshot width and does not need to be.
+    ///
+    /// Records are addressed through [`finalized_live_slots`], so only occupied
+    /// creation ordinals are ever written --- annotating a padding ordinal would
+    /// insert a record that does not exist (obligation 7).
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn annotate_generation(
+        &mut self,
+        visit: &BTreeSet<AddressKey>,
+        annotate: &dyn Fn(&AddressKey, &TransparentUtxo) -> Option<RecordAnnotation>,
+    ) -> Result<(), AnnotationPassFailed> {
+        for address_key in visit {
+            let history = self
+                .worker
+                .serving_read_history(address_key)
+                .map_err(|()| AnnotationPassFailed)?;
+            let live = finalized_live_slots(&history, self.checkpoint.height())
+                .map_err(|_| AnnotationPassFailed)?;
+            for slot in live.iter().flatten() {
+                let Some(annotation) = annotate(address_key, &slot.utxo()) else {
+                    continue;
+                };
+                let ordinal = u64::try_from(slot.ordinal()).map_err(|_| AnnotationPassFailed)?;
+                self.worker
+                    .serving_annotate(address_key, ordinal, annotation)
+                    .map_err(|()| AnnotationPassFailed)?;
+            }
+        }
+        Ok(())
+    }
 }
+
+/// One generation's annotation pass did not complete.
+///
+/// Identifier-free by construction: the pass fails as a whole and the caller
+/// discards the generation (ADR 0902 obligations 2 and 5), so nothing about
+/// which address or record failed is reportable or useful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnnotationPassFailed;
+
+impl fmt::Display for AnnotationPassFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the generation's annotation pass did not complete")
+    }
+}
+
+impl std::error::Error for AnnotationPassFailed {}
 
 impl ObliviousStore for FinalizedProjectionServingStore {
     type Error = FinalizedProjectionServingStoreUnavailable;
