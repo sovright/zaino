@@ -940,6 +940,65 @@ mod tests {
         );
     }
 
+    /// ADR 0902 obligation 7. The pass offers only occupied creation ordinals to
+    /// the annotation function --- never a spent creation, never padding ---
+    /// and issues a write only where that function asks for one.
+    #[cfg(feature = "corpus-zaino")]
+    #[test]
+    fn the_annotation_pass_writes_only_where_it_is_asked_to() -> FixtureResult<()> {
+        let blocks = projection_chain()?;
+        let (mut owner, _directory, events) = fake_owner(None)?;
+        let mut target = None;
+        for block in &blocks {
+            target = Some(owner.apply_finalized(block)?);
+        }
+        let target = target.ok_or("fixture chain must be nonempty")?;
+        owner.finish(target)?;
+        let mut store = owner.into_serving_store()?;
+
+        let address_a = fixture_address_key(StandardScriptKind::PayToPublicKeyHash, [0xa1; 20]);
+        // This address's only creation was spent, so it holds a stored event but
+        // no live slot. The pass must never offer it.
+        let spent_address = fixture_address_key(StandardScriptKind::PayToScriptHash, [0xb2; 20]);
+        let visit = std::collections::BTreeSet::from([address_a, spent_address]);
+
+        // Declining every record must perform no writes at all: the filter has
+        // to run before the command, because a write that changes nothing has
+        // still paid for a complete oblivious upsert schedule.
+        let offered = Mutex::new(Vec::new());
+        let before = events.stats()?;
+        store.annotate_generation(&visit, &|key, utxo| {
+            offered
+                .lock()
+                .expect("offered records mutex poisoned")
+                .push((*key, *utxo));
+            None
+        })?;
+        assert_eq!(events.stats()?.writes, before.writes);
+
+        let offered = offered
+            .into_inner()
+            .expect("offered records mutex poisoned")
+            .into_iter()
+            .collect::<Vec<_>>();
+        // Exactly the two live slots of `address_a`, in creation order. The
+        // spent address contributed nothing, and neither did padding.
+        assert_eq!(offered.len(), 2);
+        assert!(offered.iter().all(|(key, _)| *key == address_a));
+
+        // Asking for one write performs exactly one.
+        let before = events.stats()?;
+        let first_offered = offered[0].1;
+        store.annotate_generation(&visit, &|_, utxo| {
+            (*utxo == first_offered).then_some(crate::records::RecordAnnotation::Annotated {
+                survives: true,
+                valid: true,
+            })
+        })?;
+        assert_eq!(events.stats()?.writes - before.writes, 1);
+        Ok(())
+    }
+
     #[test]
     fn serving_store_reads_dense_live_slots_with_one_complete_command_each() -> FixtureResult<()> {
         let blocks = projection_chain()?;

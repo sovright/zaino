@@ -118,6 +118,45 @@ impl AtomicWorker {
             .map_err(AtomicQualificationCommandError::from_worker)
     }
 
+    /// Reads one address's complete fixed history, starting from its key.
+    ///
+    /// The annotation pass holds address keys taken from the recent snapshot's
+    /// slots and never the `StandardAddress` behind them, so it cannot use
+    /// `read_history`. The reply is always the profile's fixed page width with
+    /// padding as a contiguous suffix, so its shape reveals no occupancy.
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn serving_read_history(
+        &self,
+        address_key: &AddressKey,
+    ) -> Result<Vec<Option<UtxoEvent>>, ()> {
+        self.handle
+            .try_read_history_by_key(address_key)
+            .map_err(|_| ())?
+            .wait()
+            .map(|history| history.slots)
+            .map_err(|_| ())
+    }
+
+    /// Writes one stored record's per-generation annotation.
+    ///
+    /// The publication-time annotation pass is the only caller; no query path
+    /// reaches this. It is the write half of the pass, paired with
+    /// [`Self::serving_read_history`].
+    #[cfg(feature = "corpus-zaino")]
+    pub(crate) fn serving_annotate(
+        &self,
+        address_key: &AddressKey,
+        ordinal: u64,
+        annotation: RecordAnnotation,
+    ) -> Result<(), ()> {
+        self.handle
+            .try_annotate(address_key, ordinal, annotation)
+            .map_err(|_| ())?
+            .wait()
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
     /// Reads one creation-order dense live slot through the complete fixed profile.
     #[cfg(feature = "corpus-zaino")]
     pub(crate) fn serving_read_slot(
@@ -381,6 +420,16 @@ impl AtomicWorkerHandle {
         address: StandardAddress,
     ) -> Result<AtomicWorkerReply<FixedEventHistory>, AtomicWorkerError> {
         self.admit_with_reply(false, |reply| WorkerCommand::ReadHistory { address, reply })
+    }
+
+    fn try_read_history_by_key(
+        &self,
+        address_key: &AddressKey,
+    ) -> Result<AtomicWorkerReply<FixedEventHistory>, AtomicWorkerError> {
+        self.admit_with_reply(false, |reply| WorkerCommand::ReadHistoryByKey {
+            address_key: *address_key,
+            reply,
+        })
     }
 
     fn try_annotate(
@@ -697,6 +746,10 @@ enum WorkerCommand {
         address: StandardAddress,
         reply: SyncSender<Result<FixedEventHistory, AtomicWorkerError>>,
     },
+    ReadHistoryByKey {
+        address_key: AddressKey,
+        reply: SyncSender<Result<FixedEventHistory, AtomicWorkerError>>,
+    },
     Append {
         address: StandardAddress,
         event: UtxoEvent,
@@ -783,6 +836,13 @@ where
                 mark_dequeued(shared);
                 let result =
                     execute_command(executor, shared, |executor| executor.read_history(address));
+                send_reply(reply, result);
+            }
+            WorkerCommand::ReadHistoryByKey { address_key, reply } => {
+                mark_dequeued(shared);
+                let result = execute_command(executor, shared, |executor| {
+                    executor.read_history_by_key(&address_key)
+                });
                 send_reply(reply, result);
             }
             WorkerCommand::Append {
@@ -928,7 +988,10 @@ fn drain_failed_commands(receiver: &Receiver<WorkerCommand>, shared: &WorkerShar
                 resolve_queued_failure(shared);
                 send_reply(reply, Err(AtomicWorkerError::FailedClosed));
             }
-            Ok(WorkerCommand::ReadHistory { reply, .. }) => {
+            Ok(
+                WorkerCommand::ReadHistory { reply, .. }
+                | WorkerCommand::ReadHistoryByKey { reply, .. },
+            ) => {
                 resolve_queued_failure(shared);
                 send_reply(reply, Err(AtomicWorkerError::FailedClosed));
             }
