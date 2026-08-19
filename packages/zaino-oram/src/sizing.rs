@@ -735,19 +735,19 @@ mod tests {
 
     #[test]
     fn fit_uses_backend_expansion_and_headroom_adjusted_memory() -> Result<(), SizingError> {
-        let fitting = SizingParameters::new(2, 1, 2, 1, 1, 1, 12_500, 436, 3_000)?;
-        let too_small = SizingParameters::new(2, 1, 2, 1, 1, 1, 12_500, 435, 3_000)?;
+        let fitting = SizingParameters::new(2, 1, 4, 2, 1, 1, 20_000, 1_172, 3_000)?;
+        let too_small = SizingParameters::new(2, 1, 4, 2, 1, 1, 20_000, 1_171, 3_000)?;
         let histogram = BTreeMap::from([(1, 1)]);
 
         let fitting_estimate = fitting.estimate(1, &histogram)?;
         let too_small_estimate = too_small.estimate(1, &histogram)?;
 
-        assert_eq!(fitting_estimate.logical_total_bytes(), 244);
-        assert_eq!(fitting_estimate.backend_expanded_bytes(), 305);
-        assert_eq!(fitting_estimate.usable_memory_bytes(), 305);
+        assert_eq!(fitting_estimate.logical_total_bytes(), 410);
+        assert_eq!(fitting_estimate.backend_expanded_bytes(), 820);
+        assert_eq!(fitting_estimate.usable_memory_bytes(), 820);
         assert!(fitting_estimate.fits_modeled_memory());
         assert!(fitting_estimate.fits_modeled_constraints());
-        assert_eq!(too_small_estimate.usable_memory_bytes(), 304);
+        assert_eq!(too_small_estimate.usable_memory_bytes(), 819);
         assert!(!too_small_estimate.fits_modeled_memory());
         assert!(!too_small_estimate.fits_modeled_constraints());
         Ok(())
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn every_unbounded_calculation_reports_overflow() -> Result<(), SizingError> {
-        let unit = SizingParameters::new(2, 1, 2, 1, 1, 1, 10_000, u64::MAX, 0)?;
+        let unit = SizingParameters::new(2, 1, 4, 2, 1, 1, 10_000, u64::MAX, 0)?;
         assert_eq!(
             unit.estimate(u64::MAX, &BTreeMap::from([(0, u64::MAX), (1, 1)]),),
             Err(SizingError::ArithmeticOverflow {
@@ -773,8 +773,8 @@ mod tests {
             2,
             1,
             u64::MAX,
+            4,
             2,
-            1,
             1,
             1,
             1,
@@ -793,8 +793,8 @@ mod tests {
             2,
             1,
             1,
+            4,
             2,
-            1,
             u64::MAX,
             1,
             1,
@@ -814,8 +814,8 @@ mod tests {
             2,
             1,
             near_maximum_record_width,
+            4,
             2,
-            1,
             100,
             1,
             1,
@@ -830,7 +830,7 @@ mod tests {
             })
         );
 
-        let position_map = SizingParameters::new(2, 1, 2, 1, 1, u64::MAX, 10_000, u64::MAX, 0)?;
+        let position_map = SizingParameters::new(2, 1, 4, 2, 1, u64::MAX, 10_000, u64::MAX, 0)?;
         assert_eq!(
             position_map.estimate(1, &BTreeMap::from([(1, 1)])),
             Err(SizingError::ArithmeticOverflow {
@@ -838,9 +838,9 @@ mod tests {
             })
         );
 
-        let near_maximum_width = (u64::MAX - 100) / 4;
+        let near_maximum_width = (u64::MAX - 100) / 6;
         let logical_total =
-            SizingParameters::new(2, 1, 2, 1, 1, near_maximum_width, 10_000, u64::MAX, 0)?;
+            SizingParameters::new(2, 1, 4, 2, 1, near_maximum_width, 10_000, u64::MAX, 0)?;
         assert_eq!(
             logical_total.estimate(1, &BTreeMap::from([(1, 1)])),
             Err(SizingError::ArithmeticOverflow {
@@ -853,7 +853,7 @@ mod tests {
             maximum_capacity,
             maximum_capacity - 1,
             maximum_capacity,
-            maximum_capacity - 1,
+            maximum_capacity - 2,
             1,
             1,
             u64::MAX,

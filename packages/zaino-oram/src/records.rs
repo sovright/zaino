@@ -63,7 +63,7 @@ const PERSISTENT_UTXO_EVENT_COMMITMENT_DOMAIN: &[u8] =
     b"zaino-oram-persistent-utxo-event-commitment-v1";
 
 /// A domain-separated digest of a canonical transparent locking script.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct AddressKey([u8; ADDRESS_KEY_BYTES]);
 
 impl AddressKey {

@@ -249,6 +249,22 @@ fn validate_table_capacity(kind: TableKind, capacity: u64) -> Result<u32, Layout
         .map_err(|_| LayoutConfigError::CapacityOutsideSlotDomain { table: kind })
 }
 
+/// Physical slots a table must keep free beyond its admission limit.
+///
+/// Every table reserves the one slot that keeps `admission_limit` strictly
+/// below capacity. The event table reserves a second: it is the only table the
+/// annotation pass upserts, and `admit_exact_upsert` lets an unexpected absence
+/// materialize a record before post-schedule classification fails the
+/// generation closed. Without that spare, a profile sized at exactly
+/// `capacity - 1` admits every insert and then refuses every annotation with
+/// `UpsertReserveExhausted` (ADR 0902 obligation 4).
+const fn reserved_slots(kind: TableKind) -> u64 {
+    match kind {
+        TableKind::Directory => 1,
+        TableKind::Event => 2,
+    }
+}
+
 fn validate_admission_limit(
     kind: TableKind,
     capacity: u32,
@@ -259,6 +275,9 @@ fn validate_admission_limit(
     }
     if admission_limit >= u64::from(capacity) {
         return Err(LayoutConfigError::AdmissionLimitOutsideTable { table: kind });
+    }
+    if admission_limit > u64::from(capacity).saturating_sub(reserved_slots(kind)) {
+        return Err(LayoutConfigError::AdmissionLimitLeavesNoUpsertReserve { table: kind });
     }
     u32::try_from(admission_limit)
         .map_err(|_| LayoutConfigError::AdmissionLimitOutsideTable { table: kind })
@@ -429,6 +448,7 @@ pub(super) enum LayoutConfigError {
     ProbeCountExceedsCapacity { table: TableKind },
     ZeroAdmissionLimit { table: TableKind },
     AdmissionLimitOutsideTable { table: TableKind },
+    AdmissionLimitLeavesNoUpsertReserve { table: TableKind },
     ZeroEventsPerAddress,
     EventsPerAddressOutsideDomain,
     EventsPerAddressExceedsAdmission,
@@ -470,6 +490,10 @@ impl fmt::Display for LayoutConfigError {
             Self::AdmissionLimitOutsideTable { table } => {
                 write!(f, "{table:?} table admission limit must be below capacity")
             }
+            Self::AdmissionLimitLeavesNoUpsertReserve { table } => write!(
+                f,
+                "{table:?} table admission limit leaves no spare slot for an upsert"
+            ),
             Self::ZeroEventsPerAddress => {
                 f.write_str("layout events-per-address limit must be nonzero")
             }
@@ -2343,8 +2367,8 @@ mod tests {
         let layout = FullProbeLayout::new(
             LayoutIdentity::new(LayoutNetwork::Mainnet, 1, 1, 1, [0x21; 32])?,
             DirectoryTableConfiguration::<8>::new(8, 7)?,
-            EventTableConfiguration::<8>::new(8, 7)?,
-            7,
+            EventTableConfiguration::<8>::new(8, 6)?,
+            6,
         )?;
         let directory = layout.directory_plan(p2pkh(0x33));
         assert_eq!(
@@ -2363,7 +2387,7 @@ mod tests {
             address_key: directory.address_key,
         };
         let event = layout
-            .event_plan(&bound, 6)
+            .event_plan(&bound, 5)
             .expect("ordinal below the profile maximum is valid");
         assert_eq!(
             event
@@ -2462,6 +2486,27 @@ mod tests {
         Ok(())
     }
 
+    /// ADR 0902 obligation 4: the event table must keep a spare slot beyond its
+    /// admission limit, because `admit_exact_upsert` consumes one to materialize
+    /// an unexpectedly absent record before classification fails the generation
+    /// closed. A profile sized at exactly `capacity - 1` would admit every insert
+    /// and then refuse every annotation with `UpsertReserveExhausted`, so the
+    /// precondition is rejected here rather than at the first annotation write.
+    #[test]
+    fn the_event_table_reserves_the_spare_slot_the_annotation_write_consumes() {
+        assert_eq!(
+            EventTableConfiguration::<4>::new(16, 15),
+            Err(LayoutConfigError::AdmissionLimitLeavesNoUpsertReserve {
+                table: TableKind::Event
+            })
+        );
+        assert!(EventTableConfiguration::<4>::new(16, 14).is_ok());
+
+        // The directory table holds no annotations, so it is never upserted and
+        // keeps the plain below-capacity bound.
+        assert!(DirectoryTableConfiguration::<4>::new(8, 7).is_ok());
+    }
+
     #[test]
     fn minimum_and_maximum_supported_table_shapes_are_accepted(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2471,7 +2516,7 @@ mod tests {
             DirectoryTableConfiguration::<1>::new(2, 1)?,
             EventTableConfiguration::<MAXIMUM_PROBE_COUNT>::new(
                 MAXIMUM_TABLE_CAPACITY,
-                MAXIMUM_TABLE_CAPACITY - 1,
+                MAXIMUM_TABLE_CAPACITY - 2,
             )?,
             1,
         )?;

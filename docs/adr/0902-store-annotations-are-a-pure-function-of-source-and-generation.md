@@ -201,15 +201,60 @@ here so the pass can be reviewed against them.
 4. **The event table's admission limit must be at most `capacity − 2`.**
    `admit_exact_upsert` reserves one spare slot so that an unexpected absence
    can materialize a record before post-schedule classification fails the
-   generation closed. `validate_admission_limit` today only enforces
-   `admission_limit < capacity`, so a profile sized at exactly `capacity − 1`
-   would admit every insert and then refuse every annotation with
-   `UpsertReserveExhausted`. Whoever sizes the annotated profile owns this;
-   it is a sizing precondition, not a store bug.
+   generation closed. A profile sized at exactly `capacity − 1` would admit
+   every insert and then refuse every annotation with `UpsertReserveExhausted`.
+
+   **Enforced, not merely documented** (revised 2026-08-19). This ADR
+   originally left the bound to whoever sized the profile. That was wrong: a
+   precondition whose own validator permits violating it fails silently at the
+   first annotation write rather than loudly at configuration.
+   `validate_admission_limit` now rejects it, via `reserved_slots(kind)` — the
+   event table reserves two slots, the directory table one, because the
+   directory holds no annotations and is never upserted. The rejection is a
+   distinct `LayoutConfigError::AdmissionLimitLeavesNoUpsertReserve` so the
+   reserve violation is not confused with the plain below-capacity bound.
+
+   Consequence: the smallest valid event table is now capacity 4. A two-slot
+   event table cannot admit a record and keep the reserve, so it is rejected
+   at construction.
 5. **A failed annotation write discards the generation.** Already enforced:
    `ExclusiveTwoTableExecutor::update_event` discards on backend failure or
    panic exactly as `insert_event` does, because after either the stored record
    is of uncertain content.
+6. **The pass must visit `addresses(snapshot_g) ∪ addresses(snapshot_g−1) ∪
+   addresses appended since the last completed pass`** (added 2026-08-19).
+
+   The cost model in `scan_width.rs` scopes one pass to
+   `distinct_addresses * store_reads` — the addresses a generation *touches*,
+   not every stored address. That scope is what makes the hoist affordable, but
+   the naive reading of "touched" — addresses in the generation's finalized
+   delta — is not sufficient, and the gap is silent:
+
+   > Address A holds finalized record R. Generation *g−1*'s snapshot contained
+   > a spend of R, so R was annotated `survives = false`. In generation *g*
+   > that spend is reorged away. It never finalizes, so it produces no
+   > finalized delta event for A. If A is not otherwise touched, R keeps
+   > `survives = false` and stays invisible to its owner until unrelated
+   > activity happens to touch A.
+
+   The union above closes it, and it is complete by construction. An
+   annotation is a pure function of `(record, owner, snapshot)` (obligation 1),
+   so for a record already annotated at *g−1* the value can differ at *g* only
+   if the snapshot's content for that owner differs. Any owner whose content
+   differs between the two snapshots appears in at least one of them, because
+   `RecentSnapshotSlot` carries the owning `AddressKey` on every occupied slot.
+   The third term covers records that had no annotation at *g−1* because they
+   were not yet in the finalized store.
+
+   This does not widen the budget. Both snapshot terms are bounded by the
+   snapshot's slot count `N`, and the append term is the finalized delta the
+   cost model already counts. Deriving the touched set from the snapshots
+   themselves — rather than from the finalized delta alone — is what makes the
+   pass correct at no extra order of cost.
+
+   Reorg-dropped entries are the motivating case, but the union is stated over
+   the snapshots rather than over reorgs specifically, so it holds for any
+   reason a snapshot entry disappears without finalizing.
 
 ## Consequences
 

@@ -12,7 +12,7 @@
 //! This remains a listener-free research model; it does not supply a
 //! process-wide service owner or keep the lease through a transport write.
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use blake2::{Blake2s256, Digest};
 
@@ -438,6 +438,39 @@ fn creation_liveness<const N: usize>(grouped: &[GroupedChange]) -> [bool; N] {
     live
 }
 
+/// Returns every address whose stored annotations one pass must recompute.
+///
+/// ADR 0902 obligation 6. An annotation is a pure function of `(record, owner,
+/// published snapshot)`, so a record already annotated for the previous
+/// generation can only need a new value if the snapshot's content for its owner
+/// changed. Every such owner appears in one of the two snapshots, because each
+/// occupied slot carries the owning address key. The delta of newly stored
+/// records supplies the rest: those had no annotation to keep.
+///
+/// Taking `previous` rather than the generation's finalized delta is what makes
+/// the pass correct. A snapshot entry that disappears without finalizing --- a
+/// reorged spend --- changes an annotation while emitting no finalized delta
+/// event, so a delta-only visit set leaves the record marked `survives = false`
+/// and invisible to its owner. `previous` is `None` only for the first
+/// generation, which has no prior annotations to correct.
+///
+/// This is publication-time work over public data (obligation 3), so it uses an
+/// ordinary ordered set. The ordering is by address key, not by slot ordinal, so
+/// the visit order is reproducible from `(source, generation)` and does not leak
+/// the snapshot's internal layout.
+pub(super) fn annotation_visit_set<const N: usize>(
+    current: &[RecentSnapshotSlot; N],
+    previous: Option<&[RecentSnapshotSlot; N]>,
+    appended_since_last_pass: impl IntoIterator<Item = AddressKey>,
+) -> BTreeSet<AddressKey> {
+    let snapshots = std::iter::once(current).chain(previous);
+    snapshots
+        .flat_map(|slots| slots.iter().filter_map(RecentSnapshotSlot::change))
+        .map(|change| *change.address_key())
+        .chain(appended_since_last_pass)
+        .collect()
+}
+
 /// Commits every fixed snapshot slot in public ordinal order.
 pub(super) fn content_digest<const N: usize>(slots: &[RecentSnapshotSlot; N]) -> [u8; 32] {
     let mut hasher = Blake2s256::new();
@@ -546,6 +579,39 @@ mod tests {
             recent_tip_hash_display,
         )
         .expect("lineage fixture is internally consistent")
+    }
+
+    /// ADR 0902 obligation 6. The address whose only appearance is in the
+    /// *previous* snapshot is the one a finalized-delta-only pass would miss:
+    /// its spend was reorged away, so it emits no delta event, and the record it
+    /// marked `survives = false` would stay invisible to its owner.
+    #[test]
+    fn the_visit_set_keeps_the_owner_whose_recent_spend_vanished_without_finalizing() {
+        let reorged = address(0xa1);
+        let still_present = address(0xa2);
+        let newly_stored = address(0xa3);
+        let spend = utxo(0xb1, 0, 1, 1, &[0x51]);
+
+        let previous = [
+            RecentSnapshotSlot::spent(reorged, spend),
+            RecentSnapshotSlot::created(still_present, spend),
+        ];
+        let current = [
+            RecentSnapshotSlot::created(still_present, spend),
+            RecentSnapshotSlot::dummy(),
+        ];
+
+        assert_eq!(
+            annotation_visit_set(&current, Some(&previous), [newly_stored]),
+            BTreeSet::from([reorged, still_present, newly_stored])
+        );
+
+        // Without the prior generation there is nothing to correct, and the
+        // unoccupied slot contributes no owner.
+        assert_eq!(
+            annotation_visit_set(&current, None, []),
+            BTreeSet::from([still_present])
+        );
     }
 
     fn utxo(

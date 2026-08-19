@@ -1761,7 +1761,7 @@ mod tests {
     #[test]
     fn event_failure_releases_event_state_but_directory_lane_finishes(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let allocation = FixedLayoutAllocation::new(1_024, 1_023, 8, 7, 1)?;
+        let allocation = FixedLayoutAllocation::new(1_024, 1_023, 8, 6, 1)?;
         let mut trial = SeedTrial::new(
             CurveSpec {
                 capacity_multiplier: 1,
