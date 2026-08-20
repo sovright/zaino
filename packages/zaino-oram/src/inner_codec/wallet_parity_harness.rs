@@ -549,7 +549,7 @@ fn memory_backed_serving_store(
 /// block as finalized, so there is no non-finalized state for the recent
 /// snapshot to carry.
 fn published_serving_epoch(
-    store: FinalizedProjectionServingStore,
+    mut store: FinalizedProjectionServingStore,
 ) -> Result<
     crate::recent_snapshot::ServingEpochLease<
         MAINNET_QUERY_SLOTS,
@@ -571,6 +571,19 @@ fn published_serving_epoch(
         lineage,
         [RecentSnapshotSlot::dummy(); MAINNET_QUERY_SLOTS],
     );
+    // Run the real annotation pass before publishing. The query reads stored
+    // annotations and never recomputes the join (ADR 0902), so an unannotated
+    // record would answer `ProjectionNotReady` rather than its UTXOs. Every
+    // address this projection appended to is the pass's visit set: there is no
+    // previous generation to correct, and the snapshot is empty.
+    let visit = store.appended_addresses().clone();
+    let slots = *snapshot.scan().slots();
+    store
+        .annotate_generation(&visit, &|owner, record| {
+            Some(crate::engine::annotate_record(owner, record, &slots))
+        })
+        .map_err(|_| ParityHarnessError::ServingEpoch)?;
+
     let boundary = StaticBoundary::new();
     let currentness = StaticCurrentness {
         identity: snapshot.identity(),

@@ -1815,9 +1815,17 @@ mod tests {
 
     fn serving_epoch<const N: usize>(
         snapshot: FrozenRecentSnapshot<N>,
-        store: PlaintextMockStore,
+        mut store: PlaintextMockStore,
     ) -> ServingEpochLease<N, TestBoundary, PlaintextMockStore, DeterministicServingEpochCurrentness>
     {
+        // Stand in for the publication pass. Queries read annotations and never
+        // recompute the join, so this generation's annotations must exist before
+        // the epoch serves anything (ADR 0902).
+        store
+            .publish_annotations(&|owner, record| {
+                crate::engine::annotate_record(owner, record, snapshot.scan().slots())
+            })
+            .expect("mock entries round-trip through their persistent form");
         serving_epoch_with_store(snapshot, store)
     }
 

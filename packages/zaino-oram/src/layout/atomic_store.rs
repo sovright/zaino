@@ -88,12 +88,27 @@ enum ExecutorState {
 /// Fixed-profile history returned only inside the offline experiment.
 #[derive(PartialEq, Eq)]
 struct FixedEventHistory {
-    slots: Vec<Option<UtxoEvent>>,
+    slots: Vec<Option<AnnotatedEvent>>,
 }
 
 impl FixedEventHistory {
-    fn events(&self) -> &[Option<UtxoEvent>] {
+    fn events(&self) -> &[Option<AnnotatedEvent>] {
         &self.slots
+    }
+
+    /// Drops the annotations, leaving the events the qualification harnesses
+    /// compare against.
+    ///
+    /// Those harnesses assert stored *event* identity, which an annotation must
+    /// never enter --- re-annotating a record cannot change what an exact replay
+    /// is. Handing them the pair would invite exactly that confusion, so the
+    /// narrowing is explicit here and the annotated form stays on the serving
+    /// path that needs it.
+    fn into_events(self) -> Vec<Option<UtxoEvent>> {
+        self.slots
+            .into_iter()
+            .map(|slot| slot.map(AnnotatedEvent::event))
+            .collect()
     }
 }
 
@@ -117,7 +132,7 @@ struct AppendResult {
 
 impl AppendResult {
     #[cfg(test)]
-    fn events(&self) -> &[Option<UtxoEvent>] {
+    fn events(&self) -> &[Option<AnnotatedEvent>] {
         self.history.events()
     }
 }
@@ -320,7 +335,7 @@ where
         address_key: &AddressKey,
         logical_slot: usize,
         maximum_finalized_height: u32,
-    ) -> Result<Option<TransparentUtxo>, AtomicStoreError> {
+    ) -> Result<Option<FinalizedLiveSlot>, AtomicStoreError> {
         self.ensure_ready()?;
         let slots_per_key = usize::try_from(self.layout.max_events_per_address)
             .map_err(|_| AtomicStoreError::ResultAllocationFailed)?;
@@ -336,8 +351,8 @@ where
         if invalid_owner {
             return Err(self.discard(AtomicStoreError::InvalidEventHistory));
         }
-        match finalized_live_utxo_at(history.events(), logical_slot, maximum_finalized_height) {
-            Ok(utxo) => Ok(utxo),
+        match finalized_live_slot_at(history.events(), logical_slot, maximum_finalized_height) {
+            Ok(slot) => Ok(slot),
             Err(FinalizedEventHistoryError::AllocationFailed) => {
                 Err(self.discard(AtomicStoreError::ResultAllocationFailed))
             }
@@ -347,9 +362,13 @@ where
         }
     }
 
-    fn event_owner_is_valid(&self, entry: &Option<UtxoEvent>, address_key: &AddressKey) -> bool {
+    fn event_owner_is_valid(
+        &self,
+        entry: &Option<AnnotatedEvent>,
+        address_key: &AddressKey,
+    ) -> bool {
         match entry {
-            Some(event) => StandardAddress::from_event(event)
+            Some(entry) => StandardAddress::from_event(&entry.event())
                 .is_ok_and(|owner| self.layout.address_key(owner) == *address_key),
             None => true,
         }
@@ -546,7 +565,8 @@ where
                     }
                     match bound.page().event().copied() {
                         Some(found) => {
-                            *history_slot = Some(found);
+                            *history_slot =
+                                Some(AnnotatedEvent::new(found, bound.page().annotation()));
                             found_events = found_events.saturating_add(1);
                             // Replay identity is the appended event, never the
                             // stored annotation, so re-annotating a record can
@@ -701,7 +721,9 @@ where
         let Some(inserted_slot) = inserted_history.slots.get_mut(inserted_ordinal) else {
             return Err(self.discard(AtomicStoreError::OccupancyInvariant));
         };
-        *inserted_slot = Some(event);
+        // A freshly appended record carries no annotation: the publication pass
+        // has not run for any generation that includes it yet.
+        *inserted_slot = Some(AnnotatedEvent::new(event, RecordAnnotation::Unannotated));
 
         let prepared_event = self
             .layout
@@ -1345,7 +1367,8 @@ mod tests {
 
         let selected = executor
             .read_live_slot(&address_key, 0, 200)?
-            .ok_or("second creation must remain live")?;
+            .ok_or("second creation must remain live")?
+            .utxo();
         assert_eq!(selected.txid(), &[0x22; TXID_BYTES]);
         assert_eq!(selected.output_index(), u32::from(0x22_u8));
         assert_eq!(selected.value_zat(), 10_000 + u64::from(0x22_u8));
@@ -1452,7 +1475,13 @@ mod tests {
 
         let result = executor.annotate(&address_key, 1, annotation(true, false))?;
         assert_eq!(result.disposition, AnnotationDisposition::Written);
-        assert_eq!(result.history.events()[..2], [Some(first), Some(second)]);
+        assert_eq!(
+            result.history.events()[..2]
+                .iter()
+                .map(|slot| slot.map(AnnotatedEvent::event))
+                .collect::<Vec<_>>(),
+            [Some(first), Some(second)]
+        );
         assert_eq!(executor.events.updates.len(), 1);
         // Occupancy is unchanged, and no insert ran.
         assert_eq!(executor.events.writes.len(), writes_before);
@@ -1701,8 +1730,14 @@ mod tests {
             .qualification_read_history(owner)
             .map_err(|()| "read by address failed")?;
 
-        assert_eq!(by_key, by_address);
-        assert_eq!(by_key[0], Some(only));
+        assert_eq!(
+            by_key
+                .iter()
+                .map(|slot| slot.map(AnnotatedEvent::event))
+                .collect::<Vec<_>>(),
+            by_address
+        );
+        assert_eq!(by_key[0].map(AnnotatedEvent::event), Some(only));
         // The width is the profile's fixed page, not the stored event count.
         assert_eq!(by_key.len(), usize::try_from(MAX_EVENTS)?);
         assert!(by_key[1..].iter().all(Option::is_none));
@@ -1764,7 +1799,10 @@ mod tests {
 
         let inserted = executor.append(owner, first)?;
         assert_eq!(inserted.disposition, AppendDisposition::Inserted);
-        assert_eq!(inserted.history.events()[0], Some(first));
+        assert_eq!(
+            inserted.history.events()[0].map(AnnotatedEvent::event),
+            Some(first)
+        );
         assert_eq!(executor.directory.reads.len(), DIRECTORY_PROBES);
         assert_eq!(
             executor.events.reads.len(),
@@ -1836,7 +1874,7 @@ mod tests {
         }
 
         let history = executor.read_history(owner)?;
-        assert_eq!(history.events()[0], Some(first));
+        assert_eq!(history.events()[0].map(AnnotatedEvent::event), Some(first));
         assert_eq!(executor.directory.reads.len(), DIRECTORY_PROBES * 3);
         assert_eq!(
             executor.events.reads.len(),
@@ -1855,7 +1893,13 @@ mod tests {
         let result = executor.append(owner, second)?;
 
         assert_eq!(result.disposition, AppendDisposition::Inserted);
-        assert_eq!(result.history.events()[..2], [Some(first), Some(second)]);
+        assert_eq!(
+            result.history.events()[..2]
+                .iter()
+                .map(|slot| slot.map(AnnotatedEvent::event))
+                .collect::<Vec<_>>(),
+            [Some(first), Some(second)]
+        );
         assert_eq!(executor.directory.records.len(), 1);
         assert_eq!(executor.events.records.len(), 2);
         assert_eq!(executor.directory.writes.len(), 1);
@@ -2273,7 +2317,10 @@ mod tests {
         assert_eq!(format!("{plan:?}"), "AtomicPlan { ..REDACTED.. }");
 
         let history = FixedEventHistory {
-            slots: vec![Some(sensitive_event)],
+            slots: vec![Some(AnnotatedEvent::new(
+                sensitive_event,
+                RecordAnnotation::Unannotated,
+            ))],
         };
         assert_eq!(format!("{history:?}"), "FixedEventHistory { ..REDACTED.. }");
         let result = AppendResult {

@@ -9,7 +9,7 @@
 //! suitable for serving queries.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     num::NonZeroUsize,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -29,8 +29,9 @@ use crate::{
         NoopProjectionCheckpointPublisher, ProjectionCheckpointPublisher, ProjectionEventLogRoot,
         ProjectionPublication,
     },
+    layout::standard_address_key_for_event,
     records::{
-        persistent_utxo_event_commitment, TransparentUtxo, UtxoEvent, UtxoRecordError,
+        persistent_utxo_event_commitment, AddressKey, TransparentUtxo, UtxoEvent, UtxoRecordError,
         UtxoScriptClass,
     },
 };
@@ -877,6 +878,14 @@ pub(super) struct ProjectionCheckpointCoordinator<S, P = NoopProjectionCheckpoin
     projection: OfflineFinalizedProjection,
     sink: Option<S>,
     publisher: Option<P>,
+    /// Every address this projection has appended an event for.
+    ///
+    /// ADR 0902 obligation 6's third term: a record appended since the last
+    /// completed annotation pass has no annotation yet, so the next pass has to
+    /// visit its address. The events are the only place that set is known ---
+    /// the store's tables offer no enumeration --- so it is accumulated here as
+    /// they are applied.
+    appended: BTreeSet<AddressKey>,
 }
 
 impl<S> ProjectionCheckpointCoordinator<S, NoopProjectionCheckpointPublisher>
@@ -898,6 +907,7 @@ where
             projection: OfflineFinalizedProjection::new(config),
             sink: Some(sink),
             publisher: Some(publisher),
+            appended: BTreeSet::new(),
         }
     }
 
@@ -1008,20 +1018,30 @@ where
     /// Extracts the exact configuration, checkpoint, and sink only after finish.
     pub(super) fn into_ready_parts(
         mut self,
-    ) -> Option<(ProjectionConfig, PublicChainCheckpoint, S)> {
+    ) -> Option<(
+        ProjectionConfig,
+        PublicChainCheckpoint,
+        S,
+        BTreeSet<AddressKey>,
+    )> {
         let ready = self
             .projection
             .ready_checkpoint()
             .ok()
             .map(|checkpoint| checkpoint.chain());
         self.drop_publisher();
+        let appended = std::mem::take(&mut self.appended);
         match (ready, self.sink.take()) {
-            (Some(checkpoint), Some(sink)) => Some((self.projection.config, checkpoint, sink)),
+            (Some(checkpoint), Some(sink)) => {
+                Some((self.projection.config, checkpoint, sink, appended))
+            }
             (Some(_), None) | (None, _) => None,
         }
     }
 
     fn append_staged_events(&mut self, events: &[UtxoEvent]) -> Result<(), ()> {
+        let network = self.projection.config.network().layout_network();
+        let schema_version = self.projection.config.schema_version();
         let Some(sink) = self.sink.as_mut() else {
             return Err(());
         };
@@ -1029,6 +1049,11 @@ where
             if sink.append_and_wait(event).is_err() {
                 return Err(());
             }
+            let Some(owner_key) = standard_address_key_for_event(network, schema_version, &event)
+            else {
+                return Err(());
+            };
+            self.appended.insert(owner_key);
         }
         Ok(())
     }

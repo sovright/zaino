@@ -114,7 +114,7 @@ impl AtomicWorker {
             .try_read_history(address)
             .map_err(AtomicQualificationCommandError::from_worker)?
             .wait()
-            .map(|history| history.slots)
+            .map(FixedEventHistory::into_events)
             .map_err(AtomicQualificationCommandError::from_worker)
     }
 
@@ -128,7 +128,7 @@ impl AtomicWorker {
     pub(crate) fn serving_read_history(
         &self,
         address_key: &AddressKey,
-    ) -> Result<Vec<Option<UtxoEvent>>, ()> {
+    ) -> Result<Vec<Option<AnnotatedEvent>>, ()> {
         self.handle
             .try_read_history_by_key(address_key)
             .map_err(|_| ())?
@@ -164,7 +164,7 @@ impl AtomicWorker {
         address_key: &AddressKey,
         slot: usize,
         maximum_finalized_height: u32,
-    ) -> Result<Option<TransparentUtxo>, ()> {
+    ) -> Result<Option<FinalizedLiveSlot>, ()> {
         self.handle
             .try_read_live_slot(address_key, slot, maximum_finalized_height)
             .map_err(|_| ())?
@@ -199,7 +199,7 @@ impl AtomicWorker {
                         AtomicQualificationAppendDisposition::ExactReplay
                     }
                 },
-                history: result.history.slots,
+                history: result.history.into_events(),
             })
             .map_err(AtomicQualificationCommandError::from_worker)
     }
@@ -230,7 +230,7 @@ impl AtomicWorker {
                         AtomicQualificationAnnotationDisposition::Unchanged
                     }
                 },
-                history: result.history.slots,
+                history: result.history.into_events(),
             })
             .map_err(AtomicQualificationCommandError::from_worker)
     }
@@ -406,7 +406,7 @@ impl AtomicWorkerHandle {
         address_key: &AddressKey,
         logical_slot: usize,
         maximum_finalized_height: u32,
-    ) -> Result<AtomicWorkerReply<Option<TransparentUtxo>>, AtomicWorkerError> {
+    ) -> Result<AtomicWorkerReply<Option<FinalizedLiveSlot>>, AtomicWorkerError> {
         self.admit_with_reply(false, |reply| WorkerCommand::ReadLiveSlot {
             address_key: *address_key,
             logical_slot,
@@ -740,7 +740,7 @@ enum WorkerCommand {
         address_key: AddressKey,
         logical_slot: usize,
         maximum_finalized_height: u32,
-        reply: SyncSender<Result<Option<TransparentUtxo>, AtomicWorkerError>>,
+        reply: SyncSender<Result<Option<FinalizedLiveSlot>, AtomicWorkerError>>,
     },
     ReadHistory {
         address: StandardAddress,
@@ -1527,7 +1527,8 @@ mod tests {
         let selected = worker
             .serving_read_slot(&address_key, 0, 172)
             .map_err(|()| "valid serving read failed")?
-            .ok_or("created output must be live")?;
+            .ok_or("created output must be live")?
+            .utxo();
         assert_eq!(selected.txid(), &[0x48; TXID_BYTES]);
         assert_eq!(
             lock_test(&observation)
@@ -1582,7 +1583,10 @@ mod tests {
             2
         );
         let history = worker.handle().try_read_history(owner)?.wait()?;
-        assert_eq!(history.events()[0], Some(projected));
+        assert_eq!(
+            history.events()[0].map(AnnotatedEvent::event),
+            Some(projected)
+        );
         worker.shutdown()?;
         Ok(())
     }
@@ -1700,10 +1704,19 @@ mod tests {
 
         let first = handle.try_append(first_owner, first_event)?;
         let second = handle.try_append(second_owner, second_event)?;
-        assert_eq!(first.wait()?.events()[0], Some(first_event));
-        assert_eq!(second.wait()?.events()[0], Some(second_event));
+        assert_eq!(
+            first.wait()?.events()[0].map(AnnotatedEvent::event),
+            Some(first_event)
+        );
+        assert_eq!(
+            second.wait()?.events()[0].map(AnnotatedEvent::event),
+            Some(second_event)
+        );
         let history = handle.try_read_history(first_owner)?.wait()?;
-        assert_eq!(history.events()[0], Some(first_event));
+        assert_eq!(
+            history.events()[0].map(AnnotatedEvent::event),
+            Some(first_event)
+        );
 
         let calls = lock_test(&observation);
         let owner = calls
@@ -2033,12 +2046,18 @@ mod tests {
         let retained = handle.try_append(owner, event(owner, 0x39))?;
         let later = handle.try_read_history(owner)?;
         wait_for(&handle, |snapshot| snapshot.completed == 2);
-        assert_eq!(later.wait()?.events()[0], Some(event(owner, 0x39)));
+        assert_eq!(
+            later.wait()?.events()[0].map(AnnotatedEvent::event),
+            Some(event(owner, 0x39))
+        );
 
         let snapshot = worker.shutdown()?;
         assert_eq!(snapshot.lifecycle, WorkerLifecycle::Stopped);
         assert_eq!(snapshot.reply_delivery_failed, 0);
-        assert_eq!(retained.wait()?.events()[0], Some(event(owner, 0x39)));
+        assert_eq!(
+            retained.wait()?.events()[0].map(AnnotatedEvent::event),
+            Some(event(owner, 0x39))
+        );
         assert_eq!(handle.snapshot().reply_delivery_failed, 0);
         Ok(())
     }

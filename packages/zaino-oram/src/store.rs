@@ -1,7 +1,7 @@
 #[cfg(test)]
 use std::fmt;
 
-use crate::records::{AddressKey, TransparentUtxo};
+use crate::records::{AddressKey, RecordAnnotation, TransparentUtxo};
 #[cfg(test)]
 use crate::records::{PersistentAddressKey, PersistentTransparentUtxo, UtxoRecordError};
 
@@ -10,6 +10,7 @@ use crate::records::{PersistentAddressKey, PersistentTransparentUtxo, UtxoRecord
 pub(super) struct StoreSlot {
     occupied: bool,
     record: TransparentUtxo,
+    annotation: RecordAnnotation,
 }
 
 impl StoreSlot {
@@ -17,13 +18,15 @@ impl StoreSlot {
         Self {
             occupied: false,
             record: TransparentUtxo::dummy(),
+            annotation: RecordAnnotation::Unannotated,
         }
     }
 
-    pub(super) fn occupied(record: TransparentUtxo) -> Self {
+    pub(super) fn occupied(record: TransparentUtxo, annotation: RecordAnnotation) -> Self {
         Self {
             occupied: true,
             record,
+            annotation,
         }
     }
 
@@ -33,6 +36,15 @@ impl StoreSlot {
 
     pub(super) const fn record(&self) -> &TransparentUtxo {
         &self.record
+    }
+
+    /// Returns the annotation the publication pass wrote on this record.
+    ///
+    /// `Unannotated` on an occupied slot means no pass has covered this record
+    /// for the current generation. The query fails closed on that rather than
+    /// recomputing the join it was built to avoid (ADR 0902).
+    pub(super) const fn annotation(&self) -> RecordAnnotation {
+        self.annotation
     }
 }
 
@@ -62,6 +74,7 @@ struct StoredEntry {
     address_key: PersistentAddressKey,
     slot: usize,
     utxo: PersistentTransparentUtxo,
+    annotation: RecordAnnotation,
 }
 
 /// A deterministic plaintext store for unit tests and offline research.
@@ -126,7 +139,28 @@ impl PlaintextMockStore {
             address_key: PersistentAddressKey::from_business(address_key),
             slot,
             utxo: PersistentTransparentUtxo::from_business(utxo),
+            annotation: RecordAnnotation::Unannotated,
         });
+        Ok(())
+    }
+
+    /// Stands in for the publication pass over this generation's snapshot.
+    ///
+    /// Engine tests read annotations rather than compute the join, so something
+    /// has to have written them. This writes exactly what the real pass would
+    /// (ADR 0902 obligation 1), leaving the query under test to do only the
+    /// reading.
+    pub(super) fn publish_annotations(
+        &mut self,
+        annotate: &dyn Fn(&AddressKey, &TransparentUtxo) -> RecordAnnotation,
+    ) -> Result<(), PlaintextMockStoreError> {
+        for entry in &mut self.entries {
+            let record = entry
+                .utxo
+                .into_business()
+                .map_err(PlaintextMockStoreError::CorruptRecord)?;
+            entry.annotation = annotate(&entry.address_key.into_business(), &record);
+        }
         Ok(())
     }
 
@@ -173,13 +207,13 @@ impl ObliviousStore for PlaintextMockStore {
         let mut selected = None;
         for entry in &self.entries {
             if entry.address_key.into_business() == *address_key && entry.slot == slot {
-                selected = Some(entry.utxo);
+                selected = Some((entry.utxo, entry.annotation));
             }
         }
         match selected {
-            Some(persistent) => persistent
+            Some((persistent, annotation)) => persistent
                 .into_business()
-                .map(StoreSlot::occupied)
+                .map(|record| StoreSlot::occupied(record, annotation))
                 .map_err(PlaintextMockStoreError::CorruptRecord),
             None => Ok(StoreSlot::dummy()),
         }
