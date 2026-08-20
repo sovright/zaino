@@ -73,6 +73,12 @@ where
 
     /// Returns the injected store for adjacent logical-schedule assertions.
     #[cfg(test)]
+    /// Lends the store so a test can publish a generation's annotations.
+    #[cfg(test)]
+    pub(super) const fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
     pub(super) const fn store(&self) -> &S {
         &self.store
     }
@@ -114,12 +120,19 @@ where
                 }
             };
             let candidate: TransparentUtxo = *store_slot.record();
-            let (survives_recent_snapshot, finalized_relation_valid) = finalized_snapshot_relation(
-                query.address_key(),
-                &candidate,
-                recent_snapshot.slots(),
-            );
-            recent_snapshot_valid &= !store_slot.is_occupied() | finalized_relation_valid;
+            // ADR 0902: this join was computed once, at publication, and stored
+            // on the record. Reading it here is the whole of the hoist -- it
+            // replaces the `store_reads * N` rescan this loop used to run on
+            // every slot, which was the query's last quadratic term.
+            let (annotated, survives_recent_snapshot, finalized_relation_valid) =
+                store_slot.annotation().bits();
+            // Fail closed on an occupied record the publication pass has not
+            // covered for this generation: it carries no answer, and recomputing
+            // the join here would silently restore the cost the hoist exists to
+            // remove. `ProjectionNotReady` is what an incompletely published
+            // generation already reports.
+            recent_snapshot_valid &=
+                !store_slot.is_occupied() | (annotated & finalized_relation_valid);
             let matches = store_slot.is_occupied()
                 & query.domain_valid()
                 & (candidate.height() >= query.minimum_height())
@@ -242,10 +255,10 @@ fn consider_candidate<const RESPONSE_SLOTS: usize>(
     state.next_cursor_found = ct::select_bool(state.next_cursor_found, true, set_cursor);
 }
 
-fn finalized_snapshot_relation<const RECENT_SNAPSHOT_SLOTS: usize>(
+fn finalized_snapshot_relation(
     address_key: &crate::records::AddressKey,
     candidate: &TransparentUtxo,
-    recent_snapshot: &[RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
+    recent_snapshot: &[RecentSnapshotSlot],
 ) -> (bool, bool) {
     let mut survives = true;
     let mut valid = true;
@@ -274,10 +287,10 @@ fn finalized_snapshot_relation<const RECENT_SNAPSHOT_SLOTS: usize>(
 /// It shares [`finalized_snapshot_relation`] with the query path rather than
 /// restating the join, so publication and serving cannot drift apart: the
 /// stored answer is by construction the one the query would have computed.
-pub(crate) fn annotate_record<const RECENT_SNAPSHOT_SLOTS: usize>(
+pub(crate) fn annotate_record(
     owner: &crate::records::AddressKey,
     record: &TransparentUtxo,
-    recent_snapshot: &[RecentSnapshotSlot; RECENT_SNAPSHOT_SLOTS],
+    recent_snapshot: &[RecentSnapshotSlot],
 ) -> RecordAnnotation {
     let (survives, valid) = finalized_snapshot_relation(owner, record, recent_snapshot);
     RecordAnnotation::Annotated { survives, valid }
@@ -411,6 +424,13 @@ mod tests {
             trace.record_recent_snapshot_read(ordinal)?;
         }
         trace.complete_recent_snapshot_scan(RECENT_SNAPSHOT_SLOTS)?;
+        // Stand in for the publication pass. The query under test reads
+        // annotations and never recomputes the join, so this generation's
+        // annotations have to exist before it runs (ADR 0902).
+        engine
+            .store_mut()
+            .publish_annotations(&|owner, record| annotate_record(owner, record, recent_snapshot))
+            .expect("mock entries round-trip through their persistent form");
         engine.execute_from(
             query,
             cursor,
@@ -430,6 +450,103 @@ mod tests {
         ] {
             trace.record_runtime_phase(phase)?;
         }
+        Ok(())
+    }
+
+    /// Runs one query against annotations chosen by the caller, with no
+    /// publication pass in between.
+    fn execute_with_annotation(
+        engine: &mut TestEngine,
+        query: &UtxoQuery,
+        annotation: RecordAnnotation,
+    ) -> Result<QueryExecution<RESPONSE_SLOTS>, Box<dyn std::error::Error>> {
+        let mut trace = TraceRecorder::new();
+        open_engine_execution(&mut trace)?;
+        trace.complete_recent_snapshot_scan(0)?;
+        engine
+            .store_mut()
+            .publish_annotations(&|_, _| annotation)
+            .expect("mock entries round-trip through their persistent form");
+        Ok(engine.execute_from(query, 0, &RecentSnapshotScan::from_slots([]), &mut trace)?)
+    }
+
+    /// The whole of ADR 0902: the query returns the annotation it was given.
+    ///
+    /// The snapshot here is empty, so recomputing the join would say the record
+    /// survives and is valid. Storing the opposite and watching the answer
+    /// change is what proves the join is read rather than recomputed --- a query
+    /// that still computed it would ignore all three annotations below.
+    #[test]
+    fn the_query_answers_from_the_stored_annotation_and_not_a_recomputed_join(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let query = UtxoQuery::new(key, 0);
+
+        let mut published = engine_with(&[(0, utxo(1, 10))])?;
+        let execution = execute_with_annotation(
+            &mut published,
+            &query,
+            RecordAnnotation::Annotated {
+                survives: true,
+                valid: true,
+            },
+        )?;
+        assert_fixed_logical_schedule(&execution, QueryOutcome::Complete, 1, None);
+
+        // `survives = false` is what the pass writes for a record the recent
+        // snapshot spends. The query drops it without consulting the snapshot.
+        let mut spent = engine_with(&[(0, utxo(1, 10))])?;
+        let execution = execute_with_annotation(
+            &mut spent,
+            &query,
+            RecordAnnotation::Annotated {
+                survives: false,
+                valid: true,
+            },
+        )?;
+        assert_fixed_logical_schedule(&execution, QueryOutcome::Complete, 0, None);
+
+        // `valid = false` is the generation's own inconsistency, which is not a
+        // per-record answer but a reason to serve nothing.
+        let mut invalid = engine_with(&[(0, utxo(1, 10))])?;
+        let execution = execute_with_annotation(
+            &mut invalid,
+            &query,
+            RecordAnnotation::Annotated {
+                survives: true,
+                valid: false,
+            },
+        )?;
+        assert_fixed_logical_schedule(&execution, QueryOutcome::ProjectionNotReady, 0, None);
+        Ok(())
+    }
+
+    /// An occupied record the publication pass never covered has no answer.
+    ///
+    /// Failing closed is the point: recomputing the join here would work, and
+    /// would silently restore the per-query cost the hoist exists to remove,
+    /// while serving an answer the generation never published.
+    #[test]
+    fn an_unannotated_record_fails_closed_rather_than_recomputing_the_join(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = address(1);
+        let mut engine = engine_with(&[(0, utxo(1, 10))])?;
+        let execution = execute_with_annotation(
+            &mut engine,
+            &UtxoQuery::new(key, 0),
+            RecordAnnotation::Unannotated,
+        )?;
+        assert_fixed_logical_schedule(&execution, QueryOutcome::ProjectionNotReady, 0, None);
+
+        // An address with nothing stored is unaffected: there is no occupied
+        // record to be missing an annotation, so the empty answer is complete.
+        let mut empty = engine_with(&[])?;
+        let execution = execute_with_annotation(
+            &mut empty,
+            &UtxoQuery::new(key, 0),
+            RecordAnnotation::Unannotated,
+        )?;
+        assert_fixed_logical_schedule(&execution, QueryOutcome::Complete, 0, None);
         Ok(())
     }
 

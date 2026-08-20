@@ -1253,10 +1253,23 @@ mod tests {
             StandardAddress, StandardScriptKind,
         },
         records::{
-            AddressDirectory, AddressEventPage, AddressKey, PersistentBaseUtxoPage16, UtxoEvent,
-            UtxoScriptClass, TXID_BYTES,
+            AddressDirectory, AddressEventPage, AddressKey, AnnotatedEvent,
+            PersistentBaseUtxoPage16, UtxoEvent, UtxoScriptClass, TXID_BYTES,
         },
     };
+
+    /// Narrows a fixed history to its stored events.
+    ///
+    /// These assertions are about stored event identity, which an annotation
+    /// must never enter -- re-annotating a record cannot change what an exact
+    /// replay is.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn stored_events(history: &[Option<AnnotatedEvent>]) -> Vec<Option<UtxoEvent>> {
+        history
+            .iter()
+            .map(|slot| slot.map(AnnotatedEvent::event))
+            .collect()
+    }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
@@ -1811,9 +1824,9 @@ mod tests {
         );
 
         let appended = handle.try_append(address, event)?.wait()?;
-        assert_eq!(appended.events(), &[Some(event), None]);
+        assert_eq!(stored_events(appended.events()), [Some(event), None]);
         let read = handle.try_read_history(address)?.wait()?;
-        assert_eq!(read.events(), &[Some(event), None]);
+        assert_eq!(stored_events(read.events()), [Some(event), None]);
         let snapshot = worker.shutdown()?;
         assert_eq!(snapshot.completed, 2);
         assert_eq!(snapshot.failed, 0);

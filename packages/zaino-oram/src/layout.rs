@@ -19,10 +19,25 @@ use blake2::{
 };
 
 use crate::records::{
-    finalized_live_utxo_at, AddressDirectory, AddressEventPage, AddressKey,
-    FinalizedEventHistoryError, PersistentAddressDirectory, PersistentAddressEventPage,
-    RecordAnnotation, TransparentUtxo, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
+    finalized_live_slot_at, AddressDirectory, AddressEventPage, AddressKey, AnnotatedEvent,
+    FinalizedEventHistoryError, FinalizedLiveSlot, PersistentAddressDirectory,
+    PersistentAddressEventPage, RecordAnnotation, UtxoEvent, UtxoScriptClass, ADDRESS_KEY_BYTES,
 };
+
+/// Returns the address key one stored event's standard owner derives to.
+///
+/// `None` for a nonstandard script, which this layout does not index. The
+/// projection needs this to record which addresses it has appended events for
+/// (ADR 0902 obligation 6) without reaching into the layout's error type.
+pub(super) fn standard_address_key_for_event(
+    network: LayoutNetwork,
+    schema_version: u32,
+    event: &UtxoEvent,
+) -> Option<AddressKey> {
+    StandardAddress::from_event(event)
+        .ok()
+        .map(|owner| derive_standard_address_key(network, schema_version, owner))
+}
 
 mod atomic_store;
 

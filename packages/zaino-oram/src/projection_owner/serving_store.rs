@@ -22,6 +22,7 @@ pub(crate) struct FinalizedProjectionServingStore {
     identity: RecentSnapshotIdentity,
     slots_per_key: usize,
     worker: crate::layout::AtomicWorker,
+    appended: BTreeSet<AddressKey>,
 }
 
 impl<P> OfflineProjectionOwner<P>
@@ -32,7 +33,7 @@ where
     pub(crate) fn into_serving_store(
         self,
     ) -> Result<FinalizedProjectionServingStore, FinalizedProjectionServingStoreBuildError> {
-        let (config, checkpoint, worker) = self
+        let (config, checkpoint, worker, appended) = self
             .coordinator
             .into_ready_parts()
             .ok_or(FinalizedProjectionServingStoreBuildError)?;
@@ -52,6 +53,7 @@ where
             ),
             slots_per_key: config.capacities().max_events_per_address(),
             worker,
+            appended,
         })
     }
 }
@@ -60,6 +62,16 @@ impl FinalizedProjectionServingStore {
     /// Returns the public checkpoint captured by the consumed Ready owner.
     pub(crate) const fn committed_checkpoint(&self) -> PublicChainCheckpoint {
         self.checkpoint
+    }
+
+    /// Returns every address this projection appended an event for.
+    ///
+    /// ADR 0902 obligation 6's third term. A record appended since the last
+    /// completed annotation pass carries no annotation, so the next pass has to
+    /// visit its address; the store's tables offer no enumeration, so this set
+    /// is accumulated as the events are applied and carried here.
+    pub(crate) const fn appended_addresses(&self) -> &BTreeSet<AddressKey> {
+        &self.appended
     }
 
     /// Runs one generation's record-annotation pass over `visit`.
@@ -142,7 +154,7 @@ impl ObliviousStore for FinalizedProjectionServingStore {
             .serving_read_slot(address_key, slot, self.checkpoint.height())
             .map_err(|()| FinalizedProjectionServingStoreUnavailable)?
         {
-            Some(record) => Ok(StoreSlot::occupied(record)),
+            Some(slot) => Ok(StoreSlot::occupied(slot.utxo(), slot.annotation())),
             None => Ok(StoreSlot::dummy()),
         }
     }

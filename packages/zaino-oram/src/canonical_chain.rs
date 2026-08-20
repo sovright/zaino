@@ -13,6 +13,15 @@ pub(super) enum CanonicalNetwork {
 }
 
 impl CanonicalNetwork {
+    /// Returns the layout network this canonical network derives keys under.
+    pub(super) const fn layout_network(self) -> crate::layout::LayoutNetwork {
+        match self {
+            Self::Mainnet => crate::layout::LayoutNetwork::Mainnet,
+            Self::Testnet => crate::layout::LayoutNetwork::Testnet,
+            Self::Regtest => crate::layout::LayoutNetwork::Regtest,
+        }
+    }
+
     pub(super) fn genesis_hash(self) -> BlockHash {
         let display_order = match self {
             Self::Mainnet => [

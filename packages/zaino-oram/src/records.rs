@@ -441,11 +441,44 @@ impl fmt::Debug for UtxoEvent {
     }
 }
 
+/// One stored event together with the annotation written on its page.
+///
+/// The fold needs both: it validates and folds the *events*, but the answer the
+/// query wants is the annotation the publication pass left on the creating
+/// event's page (ADR 0902). Carrying them as one value keeps them from drifting
+/// apart across the read path the way a parallel slice would.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct AnnotatedEvent {
+    event: UtxoEvent,
+    annotation: RecordAnnotation,
+}
+
+impl AnnotatedEvent {
+    pub(super) const fn new(event: UtxoEvent, annotation: RecordAnnotation) -> Self {
+        Self { event, annotation }
+    }
+
+    pub(super) const fn event(self) -> UtxoEvent {
+        self.event
+    }
+
+    pub(super) const fn annotation(self) -> RecordAnnotation {
+        self.annotation
+    }
+}
+
+impl fmt::Debug for AnnotatedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AnnotatedEvent { ..REDACTED.. }")
+    }
+}
+
 #[derive(Clone, Copy)]
 struct FinalizedCreation {
     ordinal: usize,
     event: UtxoEvent,
     utxo: TransparentUtxo,
+    annotation: RecordAnnotation,
     spent: bool,
 }
 
@@ -459,6 +492,7 @@ struct FinalizedCreation {
 pub(super) struct FinalizedLiveSlot {
     ordinal: usize,
     utxo: TransparentUtxo,
+    annotation: RecordAnnotation,
 }
 
 impl FinalizedLiveSlot {
@@ -470,6 +504,16 @@ impl FinalizedLiveSlot {
     /// Returns the live output the creation yields.
     pub(super) const fn utxo(self) -> TransparentUtxo {
         self.utxo
+    }
+
+    /// Returns the annotation stored on the creating event's page.
+    ///
+    /// `Unannotated` means the publication pass has not written this record for
+    /// the current generation. The query must fail closed on it rather than
+    /// recompute the join, or the hoist would silently reintroduce the cost it
+    /// exists to remove (ADR 0902).
+    pub(super) const fn annotation(self) -> RecordAnnotation {
+        self.annotation
     }
 }
 
@@ -493,19 +537,21 @@ pub(super) enum FinalizedEventHistoryError {
 /// A thin selector over [`finalized_live_slots`], which holds the validation
 /// contract. Both the fold and this selection are fixed-width in the history
 /// length, so neither reveals how many outputs the address holds.
-pub(super) fn finalized_live_utxo_at(
-    history: &[Option<UtxoEvent>],
+///
+/// Yields the whole slot rather than its output, because the query wants the
+/// annotation stored on the creating event's page and not only the record.
+pub(super) fn finalized_live_slot_at(
+    history: &[Option<AnnotatedEvent>],
     logical_slot: usize,
     maximum_finalized_height: u32,
-) -> Result<Option<TransparentUtxo>, FinalizedEventHistoryError> {
+) -> Result<Option<FinalizedLiveSlot>, FinalizedEventHistoryError> {
     if logical_slot >= history.len() {
         return Err(FinalizedEventHistoryError::Invalid);
     }
     Ok(finalized_live_slots(history, maximum_finalized_height)?
         .get(logical_slot)
         .copied()
-        .flatten()
-        .map(FinalizedLiveSlot::utxo))
+        .flatten())
 }
 
 /// Folds a complete padded event history into its creation-order live slots.
@@ -519,7 +565,7 @@ pub(super) fn finalized_live_utxo_at(
 /// prefix, so its length is the public fixed page width rather than the address's
 /// live-output count.
 pub(super) fn finalized_live_slots(
-    history: &[Option<UtxoEvent>],
+    history: &[Option<AnnotatedEvent>],
     maximum_finalized_height: u32,
 ) -> Result<Vec<Option<FinalizedLiveSlot>>, FinalizedEventHistoryError> {
     let mut creations = Vec::new();
@@ -537,7 +583,8 @@ pub(super) fn finalized_live_slots(
         for (index, creation) in creations.iter().enumerate() {
             match creation {
                 Some(creation)
-                    if entry.is_some_and(|event| creation.event.has_same_outpoint(&event)) =>
+                    if entry
+                        .is_some_and(|entry| creation.event.has_same_outpoint(&entry.event())) =>
                 {
                     matching_count = matching_count.saturating_add(1);
                     if matching_index.is_none() {
@@ -553,10 +600,11 @@ pub(super) fn finalized_live_slots(
             }
         }
 
-        let Some(event) = entry else {
+        let Some(entry) = entry else {
             padding_started = true;
             continue;
         };
+        let event = &entry.event();
         invalid |= padding_started
             || !event.has_canonical_finalized_state()
             || event.height > maximum_finalized_height
@@ -574,6 +622,7 @@ pub(super) fn finalized_live_slots(
                             ordinal,
                             event: *event,
                             utxo,
+                            annotation: entry.annotation(),
                             spent: false,
                         });
                     }
@@ -612,6 +661,7 @@ pub(super) fn finalized_live_slots(
                     *entry = Some(FinalizedLiveSlot {
                         ordinal: creation.ordinal,
                         utxo: creation.utxo,
+                        annotation: creation.annotation,
                     });
                 }
                 None => invalid = true,
@@ -2220,6 +2270,21 @@ impl RecordAnnotation {
         }
     }
 
+    /// Decomposes the annotation into its three independent bits.
+    ///
+    /// The query reads all three on every slot it sweeps, so it needs them as
+    /// values rather than as a variant to match on. This produces values and
+    /// selects no work --- the same discipline [`Self::flag_bits`] already uses
+    /// on the way in.
+    pub(super) const fn bits(self) -> (bool, bool, bool) {
+        let flags = self.flag_bits();
+        (
+            flags & ADDRESS_CELL_FLAG_ANNOTATED != 0,
+            flags & ADDRESS_CELL_FLAG_SURVIVES != 0,
+            flags & ADDRESS_CELL_FLAG_VALID != 0,
+        )
+    }
+
     /// Decodes the annotation from already header-validated flag bits.
     ///
     /// The survives/valid bits are meaningless without the annotated bit, so a
@@ -3084,6 +3149,23 @@ mod tests {
         )
     }
 
+    /// Wraps a raw event history as the unannotated pages the fold now reads.
+    fn unannotated<const N: usize>(events: [Option<UtxoEvent>; N]) -> [Option<AnnotatedEvent>; N] {
+        events.map(|entry| {
+            entry.map(|event| AnnotatedEvent::new(event, RecordAnnotation::Unannotated))
+        })
+    }
+
+    /// Selects a live slot's output, for assertions that predate annotations.
+    fn live_utxo_at(
+        history: &[Option<AnnotatedEvent>],
+        logical_slot: usize,
+        maximum_finalized_height: u32,
+    ) -> Result<Option<TransparentUtxo>, FinalizedEventHistoryError> {
+        finalized_live_slot_at(history, logical_slot, maximum_finalized_height)
+            .map(|slot| slot.map(FinalizedLiveSlot::utxo))
+    }
+
     fn matching_spend(created: UtxoEvent, height: u32) -> UtxoEvent {
         UtxoEvent::spent(
             *created.txid(),
@@ -3121,24 +3203,18 @@ mod tests {
             UtxoScriptClass::PayToPublicKeyHash,
             [0xa1; 20],
         );
-        let history = [
+        let history = unannotated([
             Some(first),
             Some(second),
             Some(matching_spend(first, 102)),
             Some(third),
             None,
             None,
-        ];
+        ]);
 
-        assert_eq!(
-            finalized_live_utxo_at(&history, 0, 102),
-            Ok(second.created_utxo())
-        );
-        assert_eq!(
-            finalized_live_utxo_at(&history, 1, 102),
-            Ok(third.created_utxo())
-        );
-        assert_eq!(finalized_live_utxo_at(&history, 2, 102), Ok(None));
+        assert_eq!(live_utxo_at(&history, 0, 102), Ok(second.created_utxo()));
+        assert_eq!(live_utxo_at(&history, 1, 102), Ok(third.created_utxo()));
+        assert_eq!(live_utxo_at(&history, 2, 102), Ok(None));
     }
 
     /// The annotation pass writes to a *history ordinal*, but the query reads a
@@ -3172,14 +3248,14 @@ mod tests {
             UtxoScriptClass::PayToPublicKeyHash,
             [0xa1; 20],
         );
-        let history = [
+        let history = unannotated([
             Some(first),
             Some(second),
             Some(matching_spend(first, 102)),
             Some(third),
             None,
             None,
-        ];
+        ]);
 
         let live = finalized_live_slots(&history, 102).expect("history is canonical");
 
@@ -3203,11 +3279,11 @@ mod tests {
             UtxoScriptClass::PayToScriptHash,
             [0xc3; 20],
         );
-        let history = [Some(created), Some(matching_spend(created, 200)), None];
+        let history = unannotated([Some(created), Some(matching_spend(created, 200)), None]);
 
-        assert_eq!(finalized_live_utxo_at(&history, 0, 200), Ok(None));
+        assert_eq!(live_utxo_at(&history, 0, 200), Ok(None));
         assert_eq!(
-            finalized_live_utxo_at(&[Some(created), None, None], 0, 200),
+            live_utxo_at(&unannotated([Some(created), None, None]), 0, 200),
             Ok(created.created_utxo())
         );
     }
@@ -3243,12 +3319,12 @@ mod tests {
         ];
         for history in histories {
             assert_eq!(
-                finalized_live_utxo_at(&history, 0, 302),
+                live_utxo_at(&unannotated(history), 0, 302),
                 Err(FinalizedEventHistoryError::Invalid)
             );
         }
         assert_eq!(
-            finalized_live_utxo_at(&[Some(created)], 1, 300),
+            live_utxo_at(&unannotated([Some(created)]), 1, 300),
             Err(FinalizedEventHistoryError::Invalid)
         );
 
@@ -3261,11 +3337,11 @@ mod tests {
             [0xd4; 20],
         );
         assert_eq!(
-            finalized_live_utxo_at(&[Some(later), Some(created)], 0, 301),
+            live_utxo_at(&unannotated([Some(later), Some(created)]), 0, 301),
             Err(FinalizedEventHistoryError::Invalid)
         );
         assert_eq!(
-            finalized_live_utxo_at(&[Some(later), None], 0, 300),
+            live_utxo_at(&unannotated([Some(later), None]), 0, 300),
             Err(FinalizedEventHistoryError::Invalid)
         );
     }
