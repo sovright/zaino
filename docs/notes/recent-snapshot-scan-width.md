@@ -7,7 +7,7 @@ design change; does **not** change `MAINNET_QUERY_SLOTS`.
 
 The recent-snapshot scan width was an unmeasured constant (`256`) whose comment
 claimed a rescan would ground it. That claim was wrong twice over, and the
-design change that would fix it is blocked and still short.
+design change that would fix it is partly built and still short.
 
 1. **The statistic everyone was reaching for is the wrong marginal.** The
    comment, and issue #105 following it, cite `max_per_address_delta_events`
@@ -25,12 +25,15 @@ design change that would fix it is blocked and still short.
    recommendation B below landed; the hoist removed the quadratic, and the
    demand still does not fit.
 
-3. **The one design change that would close it is blocked, and still 9.93%
+3. **The one design change that would close it is partly built, and still 9.93%
    short.** Annotating each recent record with the join's answer at publication
    makes the per-query cost `N + store_reads` instead of `(store_reads + 1) * N`
    — 1,733,560 comparisons against a 1,576,960 budget. That closes 1,130x down
-   to under 10%, and not to zero. It is also not implementable against the
-   current store: `UniqueTable` has no update primitive. §C and §E below.
+   to under 10%, and not to zero. ~~It is also not implementable against the
+   current store: `UniqueTable` has no update primitive.~~ The store primitive,
+   the annotation computation and the engine read path have since landed; the
+   production publication-time pass has not, so no query on `main` is served
+   from a stored annotation. §C and §E below.
 4. **Whether even that is affordable turns on a number nobody has measured** —
    the distinct addresses a generation touches. §F states the run that would
    produce it and the exact threshold (1,221,061) above which the hoist stops
@@ -202,9 +205,36 @@ a `RecordAnnotation` in spare flag bits, outside replay identity and outside
 the event log root; and the executor and worker carry an annotate mutation
 mode. ADR 0902 states the extended store contract — *store union annotations is
 a pure function of `(source, generation)`* — and verifies it against the
-source-bound cold-rebuild qualification. The annotation *computation*, the
-publication-time pass, and the engine change remain to be built; the model
-below is unchanged, because none of the numbers move until they are.
+source-bound cold-rebuild qualification.
+
+~~The annotation *computation*, the publication-time pass, and the engine
+change remain to be built.~~ **Two of the three are done.** The annotation
+computation is `engine::annotate_record`, which delegates to
+`finalized_snapshot_relation` rather than restating the join, so the value
+publication stores is by construction the value the query would have computed.
+The engine change is done too: the query reads the stored pair off the slot
+(`store_slot.annotation().bits()`) instead of calling
+`finalized_snapshot_relation` per finalized slot read, and an occupied record
+carrying `Unannotated` fails closed as `ProjectionNotReady` rather than
+recomputing the join — recomputing there would work, which is exactly why it
+must not happen, since it would silently restore the per-query cost the hoist
+removes. A write path exists as well:
+`FinalizedProjectionServingStore::annotate_generation`, reachable only through
+`&mut self` and never through `ObliviousStore`.
+
+**What remains is the production publication-time pass.**
+`store::publish_annotations` has no non-test caller —
+`packages/zaino-oram/src/recent_snapshot/publication/controller.rs` contains no
+annotation code at all — so on `main` the annotation is written only by engine
+tests, the codec runtime tests, and the wallet-parity harness. Until the
+publication controller runs the pass for every published generation, a
+production query would find every occupied record `Unannotated` and fail
+closed.
+
+The model below is unchanged. It prices a design; none of its numbers move
+until the pass runs in production and that design is measured, and §F's
+measurement — which decides whether one pass fits one rebuild interval — has
+not been run.
 
 ### D. Explicit admission policy — required in any case
 
@@ -349,7 +379,14 @@ day the measurement lands, the answer is `budget.fits(measured)`.
    exists, the private service cannot serve mainnet, and no `EvidenceScope`
    mainnet-readiness flag should be set. (None currently is.) C's store-contract
    prerequisite — a `UniqueTable` update primitive and an annotation field — has
-   landed under ADR 0902; the computation and the publication pass have not.
+   landed under ADR 0902; ~~the computation and the publication pass have
+   not.~~ **The computation is done** (`engine::annotate_record`), **and so is
+   the engine read path** — the query reads the stored annotation and fails
+   closed on `Unannotated` instead of recomputing the join. **The production
+   publication pass is the one part still missing:** `publish_annotations` has
+   no non-test caller and the publication controller does not annotate. C is
+   still the blocking design item, and the 9.93% residual is unchanged, because
+   nothing here has been measured at mainnet width.
 4. **Do not move `ACCEPTED_COMPARISON_HEADROOM` or the rebuild interval yet.**
    §E prices both; the residual 9.93% they would close belongs to a design that
    does not exist. When the hoist lands, raise the headroom to 5 with a timing
