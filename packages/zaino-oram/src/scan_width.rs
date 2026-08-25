@@ -124,7 +124,7 @@ const TARGET_BLOCK_SPACING_SECONDS: u64 = 75;
 /// `2^14`, where the measured curve does not reach. It is threaded through
 /// [`AnnotationPublicationBudget`] as data rather than assumed inside it,
 /// precisely so a real figure replaces it without touching the model.
-const REFERENCE_OBLIVIOUS_OPERATION_NANOS: u64 = 17_184;
+pub(super) const REFERENCE_OBLIVIOUS_OPERATION_NANOS: u64 = 17_184;
 
 /// Which finalized/recent join a per-query cost is computed for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
