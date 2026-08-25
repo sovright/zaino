@@ -659,10 +659,13 @@ fn linear_interval_blocks(
 /// public data, so a per-address write count that varies leaks nothing the
 /// chain does not already publish.
 ///
-/// `distinct_addresses` is the number this model cannot supply: see
-/// [`Self::maximum_annotatable_distinct_addresses`] for the threshold it must
-/// be compared against, and `docs/notes/recent-snapshot-scan-width.md` for the
-/// run that would measure it.
+/// `distinct_addresses` is the number this model cannot supply itself. A
+/// replay measures it as
+/// `hybrid_sizing::SourceBoundHybridSizingReport::selected_annotation_pass_distinct_addresses`,
+/// and [`Self::maximum_annotatable_distinct_addresses`] is the threshold it is
+/// compared against. That measurement is the *steady-state* pass — one pass
+/// completing per generation. The first pass after a cold rebuild visits the
+/// whole store instead, and this budget does not size it.
 ///
 /// It is *not* the generation's finalized delta addresses. ADR 0902 obligation
 /// 6 requires the pass to visit `addresses(snapshot_g) ∪

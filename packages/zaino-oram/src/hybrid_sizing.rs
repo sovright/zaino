@@ -192,21 +192,48 @@ struct RebuildIntervalReport {
     max_per_address_add_events: u64,
     max_per_address_spend_events: u64,
     max_per_address_delta_events: u64,
-    /// Widest generation's record-annotation pass, in distinct addresses.
+    /// Widest generation's **steady-state** record-annotation pass, in distinct
+    /// addresses.
     ///
     /// This is the ADR 0902 obligation 6 union — `addresses(snapshot_g) ∪
     /// addresses(snapshot_g−1) ∪ addresses appended since the last completed
     /// pass` — and **not** the generation's finalized delta addresses. A
     /// snapshot entry dropped by a reorg changes an annotation while emitting
     /// no finalized delta event, so a delta-only count measures a different,
-    /// smaller quantity than the pass performs. Over a replay of finalized
-    /// blocks the two snapshot terms are the two consecutive generations'
-    /// touched-address sets and the append term is the later of them, so the
-    /// union this field maximises is `addresses(g) ∪ addresses(g−1)`.
+    /// smaller quantity than the pass performs.
     ///
-    /// `scan_width::AnnotationPublicationBudget::fits` consumes it: it is the
-    /// number that decides whether the record-annotation hoist fits one rebuild
-    /// interval, against a threshold the model already states.
+    /// Over a replay of finalized blocks the two snapshot terms are the two
+    /// consecutive generations' touched-address sets, so the union this field
+    /// maximises is `addresses(g) ∪ addresses(g−1)` — two sets, not three. The
+    /// third term collapses into the first **under one stated condition: that a
+    /// pass completes for every generation.**
+    /// `projection::ProjectionCheckpointCoordinator::append_staged_events`
+    /// inserts one owner key per appended event and nothing else, so the
+    /// addresses appended during generation `g` are exactly the addresses `g`'s
+    /// delta names. The test
+    /// `the_append_term_is_subsumed_by_the_generation_that_appended_it` pins
+    /// that.
+    ///
+    /// Where the condition does **not** hold this figure is a lower bound, and
+    /// the two cases are worth naming because they bound different things:
+    ///
+    /// - **The first pass after a cold rebuild.**
+    ///   `ProjectionCheckpointCoordinator` takes its appended set once, at
+    ///   `into_serving_store`, and never resets it per pass, so that pass's
+    ///   term three is every address in the store —
+    ///   `inner_codec::wallet_parity_harness` runs exactly that shape, with no
+    ///   previous generation and an empty snapshot. Its cost is bounded by the
+    ///   replay's `distinct_standard_addresses`, not by this field, and it is a
+    ///   one-off rather than a per-generation cost.
+    /// - **A pass that fails.** Obligation 2 keeps the previous generation
+    ///   current, so the next pass must reach further back than one generation.
+    ///   One missed pass is still covered — the skipped generation's snapshot
+    ///   is the next pass's `previous` — but two consecutive misses are not.
+    ///
+    /// `scan_width::AnnotationPublicationBudget::fits` consumes it for the
+    /// question §F asks, which is the steady-state one: whether one pass fits
+    /// one rebuild interval. The bootstrap pass is a separate and larger
+    /// question this field does not answer.
     ///
     /// Zero means unmeasured, not "no addresses": captures published before
     /// this field existed carry no union, and rejecting them would invalidate
@@ -533,14 +560,20 @@ impl SourceBoundHybridSizingReport {
         ))
     }
 
-    /// Returns the address set one record-annotation pass must visit, for the
-    /// selected interval's widest generation.
+    /// Returns the address set one steady-state record-annotation pass must
+    /// visit, for the selected interval's widest generation.
     ///
     /// This is the input `scan_width::AnnotationPublicationBudget::fits`
     /// answers with: above the budget's threshold the record-annotation hoist
     /// does not fit its own publication window and stops being a design
     /// option. The count is the ADR 0902 obligation 6 union across two
     /// consecutive generations, not either generation's finalized delta.
+    ///
+    /// "Steady state" is load-bearing and is not a hedge: the count holds while
+    /// a pass completes every generation, and is a lower bound for the first
+    /// pass after a cold rebuild, which visits the whole store.
+    /// [`RebuildIntervalReport::max_distinct_addresses`] states the condition
+    /// and both exceptions.
     ///
     /// `None` means the capture predates the measurement, which the consumer
     /// must treat as unmeasured rather than as an affordable pass.
@@ -707,7 +740,7 @@ impl fmt::Display for SourceBoundHybridSizingReport {
             if interval.max_distinct_addresses > 0 {
                 writeln!(
                     f,
-                    "annotation_pass=interval_blocks:{},max_distinct_addresses:{}",
+                    "steady_state_annotation_pass=interval_blocks:{},max_distinct_addresses:{}",
                     interval.interval_blocks, interval.max_distinct_addresses,
                 )?;
             }
@@ -2380,9 +2413,18 @@ impl SparseGenerationTracker {
     ///
     /// The pass a published generation must run visits its own snapshot's
     /// addresses, the previous snapshot's, and anything appended since — ADR
-    /// 0902 obligation 6. The previous generation's set is the one term the
-    /// finalized delta cannot supply: an entry that a reorg drops leaves that
-    /// generation without ever emitting a finalized delta event of its own.
+    /// 0902 obligation 6, three terms. The previous generation's set is the one
+    /// term the finalized delta cannot supply: an entry that a reorg drops
+    /// leaves that generation without ever emitting a finalized delta event of
+    /// its own.
+    ///
+    /// Two sets are counted here rather than three because the append term is
+    /// subsumed by the first *while a pass completes every generation*: the
+    /// addresses appended during generation `g` are exactly the addresses `g`'s
+    /// delta names. `RebuildIntervalReport::max_distinct_addresses` states that
+    /// condition in full, along with the two cases — a cold rebuild's first
+    /// pass, and two consecutive failed passes — that break it and make this a
+    /// lower bound.
     ///
     /// Called while `positions` still marks the open generation, so an address
     /// carried over from the previous generation is recognised by a live
@@ -2907,6 +2949,65 @@ mod tests {
         // The pass for the second generation must still visit the first
         // generation's address, whose snapshot entry it can no longer see.
         assert_eq!(report.max_distinct_addresses, 2);
+        Ok(())
+    }
+
+    /// The append term is subsumed by the generation that appended it.
+    ///
+    /// This is the condition under which the two-set computation above equals
+    /// ADR 0902 obligation 6's three-term union.
+    /// `projection::ProjectionCheckpointCoordinator::append_staged_events`
+    /// inserts one owner key per appended event and nothing else, so the
+    /// addresses appended *during* generation `g` are exactly the addresses
+    /// `g`'s own delta names — term three is term one. A generation standing
+    /// alone therefore visits its touched addresses and no more: three events
+    /// across two addresses is a visit set of two, not three and not zero.
+    #[test]
+    fn the_append_term_is_subsumed_by_the_generation_that_appended_it(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let mut interval = RebuildIntervalAccumulator::new(1)?;
+        interval.register_address(0)?;
+        interval.register_address(1)?;
+        interval.record(0, true)?;
+        interval.record(1, true)?;
+        interval.record(0, false)?;
+        let _ = interval.finish_block()?;
+        let report = interval.finish()?;
+
+        assert_eq!(report.generation_count, 1);
+        assert_eq!(report.max_total_delta_events, 3);
+        assert_eq!(report.max_distinct_addresses, 2);
+        Ok(())
+    }
+
+    /// The measurement is a steady-state figure, strictly below a first pass.
+    ///
+    /// The subsumption above holds only while one pass completes per
+    /// generation. It does not hold for the first pass after a cold rebuild:
+    /// `ProjectionCheckpointCoordinator` takes its appended set once, at
+    /// `into_serving_store`, so that pass's term three is every address in the
+    /// store — as `inner_codec::wallet_parity_harness` does, with no previous
+    /// generation and an empty snapshot. Three generations over disjoint
+    /// addresses separate the two answers: the steady-state union is two, the
+    /// store holds three. Nothing here should ever report the whole store, and
+    /// nothing should collapse the union back to one generation.
+    #[test]
+    fn the_steady_state_union_sits_below_a_first_pass_over_the_whole_store(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let mut interval = RebuildIntervalAccumulator::new(1)?;
+        let stored_addresses = 3_u64;
+        for address_index in 0..3 {
+            interval.register_address(address_index)?;
+            interval.record(address_index, true)?;
+            let _ = interval.finish_block()?;
+        }
+        let report = interval.finish()?;
+
+        assert_eq!(report.generation_count, 3);
+        assert_eq!(report.max_distinct_addresses, 2);
+        assert!(report.max_distinct_addresses < stored_addresses);
+        // And still above the single generation a delta-only count would give.
+        assert!(report.max_distinct_addresses > report.max_total_delta_events);
         Ok(())
     }
 
