@@ -192,6 +192,54 @@ struct RebuildIntervalReport {
     max_per_address_add_events: u64,
     max_per_address_spend_events: u64,
     max_per_address_delta_events: u64,
+    /// Widest generation's **steady-state** record-annotation pass, in distinct
+    /// addresses.
+    ///
+    /// This is the ADR 0902 obligation 6 union — `addresses(snapshot_g) ∪
+    /// addresses(snapshot_g−1) ∪ addresses appended since the last completed
+    /// pass` — and **not** the generation's finalized delta addresses. A
+    /// snapshot entry dropped by a reorg changes an annotation while emitting
+    /// no finalized delta event, so a delta-only count measures a different,
+    /// smaller quantity than the pass performs.
+    ///
+    /// Over a replay of finalized blocks the two snapshot terms are the two
+    /// consecutive generations' touched-address sets, so the union this field
+    /// maximises is `addresses(g) ∪ addresses(g−1)` — two sets, not three. The
+    /// third term collapses into the first **under one stated condition: that a
+    /// pass completes for every generation.**
+    /// `projection::ProjectionCheckpointCoordinator::append_staged_events`
+    /// inserts one owner key per appended event and nothing else, so the
+    /// addresses appended during generation `g` are exactly the addresses `g`'s
+    /// delta names. The test
+    /// `the_append_term_is_subsumed_by_the_generation_that_appended_it` pins
+    /// that.
+    ///
+    /// Where the condition does **not** hold this figure is a lower bound, and
+    /// the two cases are worth naming because they bound different things:
+    ///
+    /// - **The first pass after a cold rebuild.**
+    ///   `ProjectionCheckpointCoordinator` takes its appended set once, at
+    ///   `into_serving_store`, and never resets it per pass, so that pass's
+    ///   term three is every address in the store —
+    ///   `inner_codec::wallet_parity_harness` runs exactly that shape, with no
+    ///   previous generation and an empty snapshot. Its cost is bounded by the
+    ///   replay's `distinct_standard_addresses`, not by this field, and it is a
+    ///   one-off rather than a per-generation cost.
+    /// - **A pass that fails.** Obligation 2 keeps the previous generation
+    ///   current, so the next pass must reach further back than one generation.
+    ///   One missed pass is still covered — the skipped generation's snapshot
+    ///   is the next pass's `previous` — but two consecutive misses are not.
+    ///
+    /// `scan_width::AnnotationPublicationBudget::fits` consumes it for the
+    /// question §F asks, which is the steady-state one: whether one pass fits
+    /// one rebuild interval. The bootstrap pass is a separate and larger
+    /// question this field does not answer.
+    ///
+    /// Zero means unmeasured, not "no addresses": captures published before
+    /// this field existed carry no union, and rejecting them would invalidate
+    /// evidence that is otherwise byte-identical and still reproducible.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    max_distinct_addresses: u64,
     /// Full per-address delta-event distribution over every generation of this
     /// interval, ascending by `delta_events`.
     ///
@@ -512,6 +560,31 @@ impl SourceBoundHybridSizingReport {
         ))
     }
 
+    /// Returns the address set one steady-state record-annotation pass must
+    /// visit, for the selected interval's widest generation.
+    ///
+    /// This is the input `scan_width::AnnotationPublicationBudget::fits`
+    /// answers with: above the budget's threshold the record-annotation hoist
+    /// does not fit its own publication window and stops being a design
+    /// option. The count is the ADR 0902 obligation 6 union across two
+    /// consecutive generations, not either generation's finalized delta.
+    ///
+    /// "Steady state" is load-bearing and is not a hedge: the count holds while
+    /// a pass completes every generation, and is a lower bound for the first
+    /// pass after a cold rebuild, which visits the whole store.
+    /// [`RebuildIntervalReport::max_distinct_addresses`] states the condition
+    /// and both exceptions.
+    ///
+    /// `None` means the capture predates the measurement, which the consumer
+    /// must treat as unmeasured rather than as an affordable pass.
+    pub(super) fn selected_annotation_pass_distinct_addresses(
+        &self,
+    ) -> Result<Option<u64>, SourceBoundHybridSizingError> {
+        self.validate()?;
+        let interval = select_rebuild_interval(&self.rebuild_interval_reports)?;
+        Ok((interval.max_distinct_addresses > 0).then_some(interval.max_distinct_addresses))
+    }
+
     /// Returns the selected interval's per-address delta-event distribution.
     ///
     /// Empty means the capture predates the field, which the sizing consumer
@@ -662,6 +735,15 @@ impl fmt::Display for SourceBoundHybridSizingReport {
                 interval.max_per_address_spend_events,
                 interval.max_per_address_delta_events,
             )?;
+            // Emitted only when measured, so a capture predating the union
+            // renders exactly the bytes it always did.
+            if interval.max_distinct_addresses > 0 {
+                writeln!(
+                    f,
+                    "steady_state_annotation_pass=interval_blocks:{},max_distinct_addresses:{}",
+                    interval.interval_blocks, interval.max_distinct_addresses,
+                )?;
+            }
             for bucket in &interval.per_address_delta_event_histogram {
                 writeln!(
                     f,
@@ -1200,6 +1282,19 @@ impl RebuildIntervalReport {
                     .checked_add(self.max_per_address_spend_events)
                     .ok_or(SourceBoundHybridSizingError::InvalidReport)?
             || self.page_candidates.len() != PAGE_CANDIDATES.len()
+            // Zero is the unmeasured case and passes. A measured union spans
+            // two generations, so it is bounded by twice the widest
+            // generation's delta events and, since every counted address had
+            // at least one delta event somewhere in the replay, by the
+            // replay's total. Neither bound is reachable in practice; both
+            // reject a report whose union was computed against the wrong
+            // population.
+            || self.max_distinct_addresses > delta_events
+            || self.max_distinct_addresses
+                > self
+                    .max_total_delta_events
+                    .checked_mul(2)
+                    .ok_or(SourceBoundHybridSizingError::InvalidReport)?
             || !self.per_address_delta_event_histogram_is_consistent(delta_events)?
         {
             return Ok(false);
@@ -1317,6 +1412,7 @@ struct RebuildIntervalAccumulator {
     max_per_address_add_events: u64,
     max_per_address_spend_events: u64,
     max_per_address_delta_events: u64,
+    max_distinct_addresses: u64,
     per_address_delta_event_counts: BTreeMap<u64, u64>,
     page_candidates: Vec<DeltaPageCandidateReport>,
     tracker: SparseGenerationTracker,
@@ -1344,6 +1440,7 @@ impl RebuildIntervalAccumulator {
             max_per_address_add_events: 0,
             max_per_address_spend_events: 0,
             max_per_address_delta_events: 0,
+            max_distinct_addresses: 0,
             per_address_delta_event_counts: BTreeMap::new(),
             page_candidates,
             tracker: SparseGenerationTracker::new(),
@@ -1402,6 +1499,7 @@ impl RebuildIntervalAccumulator {
             max_per_address_add_events: self.max_per_address_add_events,
             max_per_address_spend_events: self.max_per_address_spend_events,
             max_per_address_delta_events: self.max_per_address_delta_events,
+            max_distinct_addresses: self.max_distinct_addresses,
             per_address_delta_event_histogram,
             page_candidates: self.page_candidates,
         };
@@ -1426,6 +1524,7 @@ impl RebuildIntervalAccumulator {
         self.max_per_address_delta_events = self
             .max_per_address_delta_events
             .max(summary.max_per_address_delta_events);
+        self.max_distinct_addresses = self.max_distinct_addresses.max(summary.distinct_addresses);
         for (&delta_events, &address_count) in &summary.per_address_delta_event_counts {
             accumulate_delta_event_count(
                 &mut self.per_address_delta_event_counts,
@@ -2198,6 +2297,14 @@ fn checked_linear_projection(
 struct SparseGenerationTracker {
     positions: Vec<u32>,
     entries: Vec<GenerationEntry>,
+    /// Address indices the previously summarized generation touched.
+    ///
+    /// Retained so `summarize_and_clear` can report the ADR 0902 obligation 6
+    /// address set — `addresses(g) ∪ addresses(g−1)` — without a second pass
+    /// over the source. Its length is one generation's touched addresses, and
+    /// the union is computed by probing `positions`, which still marks the
+    /// current generation's addresses at that point.
+    previous_generation_addresses: Vec<u32>,
 }
 
 impl SparseGenerationTracker {
@@ -2205,6 +2312,7 @@ impl SparseGenerationTracker {
         Self {
             positions: Vec::new(),
             entries: Vec::new(),
+            previous_generation_addresses: Vec::new(),
         }
     }
 
@@ -2281,6 +2389,7 @@ impl SparseGenerationTracker {
         for entry in &self.entries {
             summary.record(*entry)?;
         }
+        summary.distinct_addresses = self.annotation_pass_addresses()?;
         for entry in &self.entries {
             let index = usize::try_from(entry.address_index)
                 .map_err(|_| SourceBoundHybridSizingError::AnalysisFailed)?;
@@ -2290,8 +2399,56 @@ impl SparseGenerationTracker {
                 .ok_or(SourceBoundHybridSizingError::AnalysisFailed)?;
             *position = EMPTY_POSITION;
         }
+        self.previous_generation_addresses.clear();
+        self.previous_generation_addresses
+            .try_reserve(self.entries.len())
+            .map_err(|_| SourceBoundHybridSizingError::AllocationFailed)?;
+        self.previous_generation_addresses
+            .extend(self.entries.iter().map(|entry| entry.address_index));
         self.entries.clear();
         Ok(summary)
+    }
+
+    /// Returns `|addresses(g) ∪ addresses(g−1)|` for the open generation.
+    ///
+    /// The pass a published generation must run visits its own snapshot's
+    /// addresses, the previous snapshot's, and anything appended since — ADR
+    /// 0902 obligation 6, three terms. The previous generation's set is the one
+    /// term the finalized delta cannot supply: an entry that a reorg drops
+    /// leaves that generation without ever emitting a finalized delta event of
+    /// its own.
+    ///
+    /// Two sets are counted here rather than three because the append term is
+    /// subsumed by the first *while a pass completes every generation*: the
+    /// addresses appended during generation `g` are exactly the addresses `g`'s
+    /// delta names. `RebuildIntervalReport::max_distinct_addresses` states that
+    /// condition in full, along with the two cases — a cold rebuild's first
+    /// pass, and two consecutive failed passes — that break it and make this a
+    /// lower bound.
+    ///
+    /// Called while `positions` still marks the open generation, so an address
+    /// carried over from the previous generation is recognised by a live
+    /// position rather than by a second membership structure, and each address
+    /// is counted once.
+    fn annotation_pass_addresses(&self) -> Result<u64, SourceBoundHybridSizingError> {
+        let mut carried_over = 0_u64;
+        for &address_index in &self.previous_generation_addresses {
+            let index = usize::try_from(address_index)
+                .map_err(|_| SourceBoundHybridSizingError::AnalysisFailed)?;
+            let position = *self
+                .positions
+                .get(index)
+                .ok_or(SourceBoundHybridSizingError::AnalysisFailed)?;
+            if position == EMPTY_POSITION {
+                carried_over = carried_over
+                    .checked_add(1)
+                    .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)?;
+            }
+        }
+        u64::try_from(self.entries.len())
+            .map_err(|_| SourceBoundHybridSizingError::AnalysisFailed)?
+            .checked_add(carried_over)
+            .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)
     }
 }
 
@@ -2311,6 +2468,10 @@ struct GenerationSummary {
     max_per_address_add_events: u64,
     max_per_address_spend_events: u64,
     max_per_address_delta_events: u64,
+    /// Addresses one record-annotation pass for this generation must visit:
+    /// the ADR 0902 obligation 6 union with the preceding generation, which is
+    /// strictly wider than the addresses this generation's own delta names.
+    distinct_addresses: u64,
     /// Addresses touched by this generation, keyed by their delta-event count.
     per_address_delta_event_counts: BTreeMap<u64, u64>,
     page_candidates: [GenerationPageSummary; PAGE_CANDIDATES.len()],
@@ -2325,6 +2486,7 @@ impl GenerationSummary {
             max_per_address_add_events: 0,
             max_per_address_spend_events: 0,
             max_per_address_delta_events: 0,
+            distinct_addresses: 0,
             per_address_delta_event_counts: BTreeMap::new(),
             page_candidates: [GenerationPageSummary::EMPTY; PAGE_CANDIDATES.len()],
         }
@@ -2580,6 +2742,11 @@ fn ceil_div(value: u64, divisor: u64) -> Result<u64, SourceBoundHybridSizingErro
         .ok_or(SourceBoundHybridSizingError::ArithmeticOverflow)
 }
 
+/// Serde predicate keeping an unmeasured counter out of a serialized capture.
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2589,8 +2756,9 @@ mod tests {
     use crate::{
         canonical_chain::CanonicalNetwork,
         scan_width::{
-            per_address_pagination_coverage, recent_snapshot_scan_width, JoinStrategy,
-            ScanWidthDecision, ScanWidthError, ScanWidthPolicy,
+            mainnet_sizing_model, per_address_pagination_coverage, recent_snapshot_scan_width,
+            JoinStrategy, ScanWidthDecision, ScanWidthError, ScanWidthPolicy,
+            REFERENCE_OBLIVIOUS_OPERATION_NANOS,
         },
         zaino_corpus::MainnetCorpusScanner,
         zaino_fixtures::{indexed_block, output, transaction},
@@ -2753,6 +2921,122 @@ mod tests {
         Ok(())
     }
 
+    /// The annotation pass's address set spans two generations, not one.
+    ///
+    /// ADR 0902 obligation 6 scopes one pass to `addresses(snapshot_g) ∪
+    /// addresses(snapshot_g−1) ∪ addresses appended since the last completed
+    /// pass`. A snapshot entry dropped by a reorg changes an annotation while
+    /// emitting no finalized delta event, so an address can need re-annotating
+    /// in a generation whose finalized delta never names it. This fixture is
+    /// exactly that shape: one address per generation, never the same one
+    /// twice, so the delta-only answer is 1 and the obligation-6 answer is 2.
+    /// A delta-only implementation fails here.
+    #[test]
+    fn distinct_addresses_count_the_two_generation_union_not_the_delta_alone(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let mut interval = RebuildIntervalAccumulator::new(1)?;
+        interval.register_address(0)?;
+        interval.register_address(1)?;
+        interval.record(0, true)?;
+        let _ = interval.finish_block()?;
+        interval.record(1, true)?;
+        let _ = interval.finish_block()?;
+        let report = interval.finish()?;
+
+        assert_eq!(report.generation_count, 2);
+        // Each generation's own delta names exactly one address.
+        assert_eq!(report.max_total_delta_events, 1);
+        // The pass for the second generation must still visit the first
+        // generation's address, whose snapshot entry it can no longer see.
+        assert_eq!(report.max_distinct_addresses, 2);
+        Ok(())
+    }
+
+    /// The append term is subsumed by the generation that appended it.
+    ///
+    /// This is the condition under which the two-set computation above equals
+    /// ADR 0902 obligation 6's three-term union.
+    /// `projection::ProjectionCheckpointCoordinator::append_staged_events`
+    /// inserts one owner key per appended event and nothing else, so the
+    /// addresses appended *during* generation `g` are exactly the addresses
+    /// `g`'s own delta names — term three is term one. A generation standing
+    /// alone therefore visits its touched addresses and no more: three events
+    /// across two addresses is a visit set of two, not three and not zero.
+    #[test]
+    fn the_append_term_is_subsumed_by_the_generation_that_appended_it(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let mut interval = RebuildIntervalAccumulator::new(1)?;
+        interval.register_address(0)?;
+        interval.register_address(1)?;
+        interval.record(0, true)?;
+        interval.record(1, true)?;
+        interval.record(0, false)?;
+        let _ = interval.finish_block()?;
+        let report = interval.finish()?;
+
+        assert_eq!(report.generation_count, 1);
+        assert_eq!(report.max_total_delta_events, 3);
+        assert_eq!(report.max_distinct_addresses, 2);
+        Ok(())
+    }
+
+    /// The measurement is a steady-state figure, strictly below a first pass.
+    ///
+    /// The subsumption above holds only while one pass completes per
+    /// generation. It does not hold for the first pass after a cold rebuild:
+    /// `ProjectionCheckpointCoordinator` takes its appended set once, at
+    /// `into_serving_store`, so that pass's term three is every address in the
+    /// store — as `inner_codec::wallet_parity_harness` does, with no previous
+    /// generation and an empty snapshot. Three generations over disjoint
+    /// addresses separate the two answers: the steady-state union is two, the
+    /// store holds three. Nothing here should ever report the whole store, and
+    /// nothing should collapse the union back to one generation.
+    #[test]
+    fn the_steady_state_union_sits_below_a_first_pass_over_the_whole_store(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let mut interval = RebuildIntervalAccumulator::new(1)?;
+        let stored_addresses = 3_u64;
+        for address_index in 0..3 {
+            interval.register_address(address_index)?;
+            interval.record(address_index, true)?;
+            let _ = interval.finish_block()?;
+        }
+        let report = interval.finish()?;
+
+        assert_eq!(report.generation_count, 3);
+        assert_eq!(report.max_distinct_addresses, 2);
+        assert!(report.max_distinct_addresses < stored_addresses);
+        // And still above the single generation a delta-only count would give.
+        assert!(report.max_distinct_addresses > report.max_total_delta_events);
+        Ok(())
+    }
+
+    /// The union counts a carried-over address once, not twice.
+    ///
+    /// Two consecutive generations that share an address must not sum to
+    /// `|addresses(g)| + |addresses(g−1)|` — the pass visits each address once.
+    #[test]
+    fn an_address_touched_by_both_generations_is_counted_once(
+    ) -> Result<(), SourceBoundHybridSizingError> {
+        let mut interval = RebuildIntervalAccumulator::new(1)?;
+        for address_index in 0..3 {
+            interval.register_address(address_index)?;
+        }
+        interval.record(0, true)?;
+        interval.record(1, true)?;
+        let _ = interval.finish_block()?;
+        interval.record(1, false)?;
+        interval.record(2, true)?;
+        let _ = interval.finish_block()?;
+        let report = interval.finish()?;
+
+        assert_eq!(report.generation_count, 2);
+        assert_eq!(report.max_total_delta_events, 2);
+        // {0,1} ∪ {1,2} is three addresses, not the four a naive sum reports.
+        assert_eq!(report.max_distinct_addresses, 3);
+        Ok(())
+    }
+
     #[test]
     fn sparse_positions_reset_without_scanning_the_registered_domain(
     ) -> Result<(), SourceBoundHybridSizingError> {
@@ -2878,6 +3162,7 @@ mod tests {
             max_per_address_add_events: 80,
             max_per_address_spend_events: 48,
             max_per_address_delta_events: 128,
+            max_distinct_addresses: 0,
             per_address_delta_event_histogram: Vec::new(),
             page_candidates: vec![DeltaPageCandidateReport {
                 entries_per_page: SELECTED_PAGE_ENTRIES,
@@ -3071,6 +3356,7 @@ mod tests {
                 max_per_address_add_events: 1,
                 max_per_address_spend_events: 0,
                 max_per_address_delta_events: 1,
+                max_distinct_addresses: 1,
                 per_address_delta_event_histogram: vec![DeltaEventBucket {
                     delta_events: 1,
                     address_count: 1,
@@ -3360,6 +3646,81 @@ mod tests {
             let narrowed = per_address_pagination_coverage(&distribution, maximum - 1)?;
             assert!(narrowed.covered_addresses() < coverage.covered_addresses());
         }
+        Ok(())
+    }
+
+    /// The measurement decides the hoist, by computation rather than assertion.
+    ///
+    /// `AnnotationPublicationBudget` states the threshold; this feeds it the
+    /// measured union and takes the verdict from `fits`. It answers a
+    /// *different* question from the per-address histogram above, which sizes
+    /// pagination depth (`response_slots`) and not publication cost.
+    #[test]
+    fn the_measured_distinct_address_count_answers_the_annotation_budget(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let report = source_report(&blocks, &measurement)?;
+        let measured = report
+            .selected_annotation_pass_distinct_addresses()?
+            .ok_or("a replayed capture measures the annotation-pass address set")?;
+        let interval = select_rebuild_interval(&report.rebuild_interval_reports)?;
+
+        // The union spans two generations, so it exceeds neither twice the
+        // widest generation's delta events nor the replay's distinct addresses.
+        assert!(measured >= 1);
+        assert!(measured <= interval.max_total_delta_events * 2);
+        assert!(measured <= report.distinct_standard_addresses);
+
+        let budget = mainnet_sizing_model()?
+            .annotation_publication_budget(REFERENCE_OBLIVIOUS_OPERATION_NANOS)?;
+        let threshold = budget.maximum_annotatable_distinct_addresses()?;
+        assert_eq!(budget.fits(measured)?, measured <= threshold);
+        assert!(budget.fits(measured)?);
+        assert!(!budget.fits(threshold + 1)?);
+        Ok(())
+    }
+
+    /// A capture predating the union must not read as an affordable pass.
+    #[test]
+    fn a_capture_predating_the_distinct_address_count_reports_no_measurement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let mut report = source_report(&blocks, &measurement)?;
+        for interval in &mut report.rebuild_interval_reports {
+            interval.max_distinct_addresses = 0;
+        }
+
+        report.validate()?;
+        assert_eq!(report.selected_annotation_pass_distinct_addresses()?, None);
+        let encoded = serde_json::to_vec(&report)?;
+        assert!(!encoded
+            .windows(b"max_distinct_addresses".len())
+            .any(|window| window == b"max_distinct_addresses"));
+        let decoded: SourceBoundHybridSizingReport = serde_json::from_slice(&encoded)?;
+        assert_eq!(decoded, report);
+        Ok(())
+    }
+
+    /// A union wider than two generations of deltas cannot have been measured.
+    #[test]
+    fn report_validation_rejects_an_impossible_distinct_address_count(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (blocks, measurement) = source_fixture()?;
+        let mut report = source_report(&blocks, &measurement)?;
+        let interval = report
+            .rebuild_interval_reports
+            .first_mut()
+            .ok_or("fixed interval report must exist")?;
+        interval.max_distinct_addresses = interval
+            .max_total_delta_events
+            .checked_mul(2)
+            .and_then(|bound| bound.checked_add(1))
+            .ok_or("union bound overflowed")?;
+
+        assert_eq!(
+            report.validate(),
+            Err(SourceBoundHybridSizingError::InvalidReport)
+        );
         Ok(())
     }
 

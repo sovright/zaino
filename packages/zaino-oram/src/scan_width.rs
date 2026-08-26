@@ -124,7 +124,7 @@ const TARGET_BLOCK_SPACING_SECONDS: u64 = 75;
 /// `2^14`, where the measured curve does not reach. It is threaded through
 /// [`AnnotationPublicationBudget`] as data rather than assumed inside it,
 /// precisely so a real figure replaces it without touching the model.
-const REFERENCE_OBLIVIOUS_OPERATION_NANOS: u64 = 17_184;
+pub(super) const REFERENCE_OBLIVIOUS_OPERATION_NANOS: u64 = 17_184;
 
 /// Which finalized/recent join a per-query cost is computed for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,10 +659,13 @@ fn linear_interval_blocks(
 /// public data, so a per-address write count that varies leaks nothing the
 /// chain does not already publish.
 ///
-/// `distinct_addresses` is the number this model cannot supply: see
-/// [`Self::maximum_annotatable_distinct_addresses`] for the threshold it must
-/// be compared against, and `docs/notes/recent-snapshot-scan-width.md` for the
-/// run that would measure it.
+/// `distinct_addresses` is the number this model cannot supply itself. A
+/// replay measures it as
+/// `hybrid_sizing::SourceBoundHybridSizingReport::selected_annotation_pass_distinct_addresses`,
+/// and [`Self::maximum_annotatable_distinct_addresses`] is the threshold it is
+/// compared against. That measurement is the *steady-state* pass — one pass
+/// completing per generation. The first pass after a cold rebuild visits the
+/// whole store instead, and this budget does not size it.
 ///
 /// It is *not* the generation's finalized delta addresses. ADR 0902 obligation
 /// 6 requires the pass to visit `addresses(snapshot_g) ∪
