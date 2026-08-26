@@ -18,6 +18,14 @@
   [2026-07-28 work log](oram-gate1-hybrid-sizing-status-2026-07-28.md).
 - Completed Gate 1 Mainnet hybrid-sizing result:
   [2026-07-29 result and provisional logical finalist](oram-gate1-hybrid-sizing-result-2026-07-29.md).
+- Completed Gate 2 dynamic timing campaign result:
+  [2026-07-28 timing evidence](oram-gate2-timing-evidence-2026-07-28.md).
+- Recorded fixed-work versus SLO constraint:
+  [2026-07-31 consistency note](oram-fixed-work-slo-consistency-2026-07-31.md).
+- Codegen-guard churn analysis and its ADR:
+  [2026-08-11 churn note](oram-codegen-guard-churn-2026-08-11.md).
+- Recent-snapshot scan-width analysis:
+  [what the evidence actually says](recent-snapshot-scan-width.md).
 
 This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
@@ -521,6 +529,183 @@ model input only: it implements no serving store, generation switch, compactor,
 growth projection, backend calibration, RSS/TDX measurement, failure bound, or
 readiness claim. The bounded scope and next evidence step are recorded in the
 [dated hybrid-sizing work log](oram-gate1-hybrid-sizing-status-2026-07-28.md).
+
+The Gate 2 remediation stack removes secret-dependent control flow from the
+ORAM insertion path and then builds the apparatus that would detect its return.
+A compiled-output guard fails the build when the access path leaves its
+approved codegen profile; it pins a complete per-instruction profile including
+memory addressing, a closed mnemonic allowlist, exact `Cmov` loop bounds, call
+multiplicity, byte-range coverage, and a non-vacuity check. Because it reads
+x86-64 ELF release output, it runs only on Linux x86-64 and a maintainer host
+on another architecture cannot exercise it. On top of that the stack adds a
+paired timing experiment driver and then hardens the evidence it produces:
+matched long-lived tables, predeclared measurement matrices, a durable attempt
+ledger, an independent evaluator, and a null control that discards the arm
+label and performs identical work through both arms. The driver builds a fresh
+table per measurement and times only the single insertion; both arms insert the
+same probe key and hold occupancy equal, differing only in the filler set,
+which removes key identity and table growth as confounds. This is measurement
+apparatus, not a result.
+
+The campaign result is recorded and clears nothing. The null control puts the
+harness baseline at `|AUC - 0.5| <= 0.026` and also exposes a systematic +33 to
++63 ns mean difference between first- and second-measured positions with no
+hit/miss distinction present, so the mean difference is not a usable statistic
+here and the rank statistics carry the result. The directory arms separate at
+capacity 1,024 across seven seeds, five to six times baseline, because insert
+and overwrite genuinely differ in cost inside upstream `write_or_insert`.
+Wall-clock stops resolving that difference by capacity 4,096 and it does not
+return at 8,192 or 16,384. The honest reading is *not measurable by this method
+at these sizes*, not *oblivious*: production capacity is 16,777,216, three
+orders of magnitude beyond where the signal vanished, and a rising noise floor
+masks a leak rather than removing it, so a PMU or cache-timing adversary could
+recover what wall-clock cannot. The operator-supplied assumption that upstream
+`rostl` is trusted on secret-dependent branches is recorded as an explicit
+named premise while 68 unclassified upstream branches remain. This is
+wall-clock evidence from one harness on one host class; it supplies no PMU,
+cache, or physical-trace result, and Gate 2 moves only by written review. Exact
+figures and the premise are in the
+[dated timing-evidence note](oram-gate2-timing-evidence-2026-07-28.md).
+
+The same sweep produces a constraint that two already-recorded numbers cannot
+both satisfy. The Gate 1 capture records a fixed-work floor of 13,440,092
+logical accesses per request; the Gate 1 qualification inputs propose a
+completed-query p99 of 1,000 ms; together they allow 74 ns per logical access.
+Measured per-insertion cost is 4,849 ns at capacity 1,024 fully cache-resident,
+rising to 12,424 ns at 16,384 — the fastest operation measured anywhere, at a
+configuration 16,384 times smaller than the production directory, already
+exceeds that budget by 65x. This does not show the design infeasible. It shows
+that the flat 4 + 4H schedule and a one-second p99 cannot both hold, and that
+fixed work and service SLO are one joint decision rather than two independent
+qualification rows. The measurements are sufficient to establish the
+constraint, not to satisfy it, and it closes no blocking row. The derivation is
+in the [dated consistency note](oram-fixed-work-slo-consistency-2026-07-31.md).
+
+A separate slice addresses guard churn without weakening detection. Five
+recorded guard failures were unrelated to the properties the guards protect,
+and two ended in a wrong conclusion being reported — once genuine drift called
+churn, once the reverse. The proposal note and ADR 0901 identify pinned callees
+by mangled path prefix plus a complete asserted instantiation count instead of
+full hashes, require both guards to report provenance and CI to refuse a stale
+base, and derive the expected symbol size, branch count and return count from
+the reviewed profile rather than restating them. The ADR's second decision —
+pinning the codegen-unit partition — was made conditional on a Linux x86-64
+experiment, which ships as a script plus a `workflow_dispatch`-only job that is
+a diagnostic and on no push or pull-request trigger. The experiment was then
+run and reported: stable at codegen-units 16 and stable at 1, injected code
+volume moving nothing at either setting, so by the record's own decision rule
+the partition hypothesis is refuted, decision 2 is withdrawn rather than
+adopted on faith, and `[profile.release] codegen-units = 1` is not set. The
+premise is corrected in place as well: churn event 4 had been recorded as
+unrelated cross-crate code moving a symbol when the same branch also added
+same-crate code, and the disassembly shows all three guarded symbols growing
+identically, branches, returns and calls unchanged at exactly 26, 1 and 4, and
+the new instructions being an auto-vectorised byte-wise record serialisation.
+
+Two guard-mechanism repairs follow from that reading, and neither admits the
+codegen it was prompted by. The RIP-relative constant pin becomes an ordered
+sequence — each entry carrying mnemonic, destination register and exact bytes,
+matched by position, with the pinned byte length also the width compared and a
+load at an unpinned position failing closed — replacing two hard-coded 16-byte
+`pand` masks whose pairing was itself unchecked and which could not express the
+third, 4-byte constant the vectorised form loads. The pinned sequence is
+unchanged in content, so the committed profiles still match; the change adds
+the capacity to express a third constant without adding one. Separately, the
+guard's emission path is split from its enforcing path by an explicit size
+policy, so candidate profiles can be regenerated after a size change without
+editing the pin blind first, while checking still enforces it; the guard's own
+fixtures now derive their symbol addresses from the size constant so their
+adjacency and overlap assertions stay meaningful across regenerations. The
+committed pins still describe the pre-vectorisation codegen: `EXPECTED_SYMBOL_SIZE`
+remains `0xca9`, no regenerated profile has been admitted, ADR 0901 requires
+manual assembly review before any is, and the measured mnemonic set needs four
+additions and three removals before it could regain set-equality. This slice
+supplies detection mechanism and one refuted hypothesis; it supplies no
+compiled-obliviousness result and clears no part of Gate 2. The failure
+inventory is in the
+[dated churn note](oram-codegen-guard-churn-2026-08-11.md) and the decisions in
+[ADR 0901](../adr/0901-oram-codegen-guard-symbol-identity.md).
+
+On the query side, the recent-snapshot scan width — previously marked only as
+unmeasured — is derived from the committed Gate 1 capture and then refused. The
+recent snapshot is one flat all-address array, so the statistic that sizes it
+is the widest generation's *total* delta events at the selected 288-block
+interval, not the per-address maximum the earlier comment cited; the
+per-address histogram is a marginal over the wrong axis and cannot size this
+dimension at any resolution. The new sizing module is deterministic and
+integer-only, takes the exact maximum over generations plus a growth margin
+rather than a quantile — because a narrow recent width means the generation
+cannot be published at all, for anyone, where a narrow finalized width costs
+one address a round trip — and returns an explicit unserviceable verdict rather
+than a truncated width. `MAINNET_QUERY_SLOTS` is left at 256 and the
+fail-closed conversion is kept. Two follow-on slices change the cost rather
+than the verdict: the two query-independent `N^2` sweeps are hoisted out of the
+query into a per-generation precomputed scan, dropping the per-query polynomial
+to `(store_reads + 1) * N` and raising the admissible ceiling, with results
+proved unchanged against verbatim copies of the removed predicates kept as
+oracles; and publication's own pair sweep is replaced by a shared sort on
+outpoint, making publication `O(N log N)` and verified bit-identical against
+those same oracles exhaustively over all 2,197 three-slot snapshots plus named
+fixtures. Publication is off the request path and reads only public snapshot
+data, so its comparison sort carries no per-query signal. A further slice
+models the whole argument in code: both join strategies, both ceilings, both
+costs and the verdict become one computed value, the two levers that could
+close the residual are priced and neither is tuned, and the annotation pass's
+feasibility threshold is stated as a testable function of an unmeasured
+distinct-address count. ADR 0900 is corrected in the same slice: address →
+txids is a different fold over the same stored history, not a second
+address-keyed projection with its own width. The committed mainnet capture
+remains unservable under every modelled join, no readiness flag is set, and no
+width, threshold or budget constant is moved. The numbers, the levers and what
+the analysis does not claim are in the
+[scan-width note](recent-snapshot-scan-width.md).
+
+The record-annotation stack then builds the design change that analysis names
+as the blocking item, up to but not including its production publication pass.
+The store gains an oblivious in-place update — a compare-and-set on an occupied
+slot, routed on the typed backend through the already-qualified exact-upsert
+schedule the codegen guard disassembles and pins — and records gain a
+three-bit annotation carried in spare address-cell flag bits, so the record
+width that feeds the ORAM block size and the guard's `Cmov` loop bound is
+unchanged and the pinned profile identifier does not move. Business equality
+ignores the annotation and replay identity is still decided against the
+appended event, so exact-replay and uniqueness keep their meaning. The set of
+writes a command may perform is closed as an explicit mutation enum, and the
+annotate command runs the same complete fixed read schedule as a read before
+its single compare-and-set. ADR 0902 states the extended contract — store union
+annotations are a pure function of source and generation — verified against the
+source-bound cold-rebuild qualification rather than assumed, and records both
+what it does not cover and the obligations an annotation pass must satisfy.
+Subsequent slices supply those pieces: the annotation computation itself, which
+delegates to the query's own join so the stored value is by construction the
+value the query would have computed; a validated admission reserve, so a
+profile sized one slot below capacity is rejected at configuration instead of
+refusing every annotation at the first write; the history ordinal behind every
+live slot, without which a pass built on the existing fold would have written
+the wrong record for any address ever spent from; the pass's permitted access
+shape, which allows a varying per-address write count because the pass has no
+client and runs over public chain shape, and forbids annotating a padding
+ordinal; and a write path on the serving-store facade reachable only through
+`&mut self`, never through the store handle a query sees, with a caller-owned
+filter that declines a record before any oblivious schedule is paid for.
+
+The hoist itself then lands on the read side: the annotation travels through
+the fold and out to the engine, and the query reads the stored pair instead of
+rescanning the snapshot once per finalized slot. An occupied record carrying no
+annotation fails closed as not-ready rather than recomputing the join, because
+recomputing would silently restore the per-query cost the hoist exists to
+remove while answering from a generation that never published the record. What
+has *not* landed is the production publication-time pass: the store's
+annotation entry point has no non-test caller, and the recent-snapshot
+publication controller contains no annotation code, so on `main` the annotation
+is written only by tests and harnesses. The distinct-address measurement that
+decides whether one annotation pass fits one rebuild interval is also still
+unmeasured. This stack therefore supplies a store contract, a computation, an
+access-shape obligation, a write path and an engine read path; it supplies no
+mainnet capacity result, no wall-clock measurement of an annotated-join query,
+and no readiness claim, and it moves neither the scan width nor the comparison
+headroom. The contract is in
+[ADR 0902](../adr/0902-store-annotations-are-a-pure-function-of-source-and-generation.md).
 
 The fork contains no production
 encryption, durable ORAM, network service, attestation, or production privacy
