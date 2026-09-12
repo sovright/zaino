@@ -614,13 +614,14 @@ that the kernel boots the assembled image, that the quote measures the intended
 UKI/rootfs/configuration, that ConfigFS remains usable after privilege drop, or
 that the C3 host closes PMU and other side channels.
 
-Native Linux tests at workload source `ef4d81b9` exercised the shipped agent as
-UID 0 through all-five capability-set removal, inherited-descriptor refusal,
-the synchronized seccomp filter (including `perf_event_open` refusal), and its
-owned TLS listener. The confinement suite passed 10/10 and the native-init
-suite passed 3/3. This clears the native source/runtime confinement gate on the
-CI kernel. It does not exercise the custom kernel, switch-root assembly, TDX,
-or post-drop ConfigFS/CCEL access in a real guest.
+The native Linux probe at workload source `ef4d81b9` exercised the shipped
+agent as UID 0 through its main-thread check that all five capability sets are
+empty and confirmed that the same process reaches its filtered listener.
+Separately, the confinement suite passed 10/10, covering inherited-descriptor
+refusal and synchronized seccomp behavior including `perf_event_open` refusal;
+the native-init suite passed 3/3. This clears the native source/runtime
+confinement test gate on the CI kernel. It does not exercise the custom kernel,
+switch-root assembly, TDX, or post-drop ConfigFS/CCEL access in a real guest.
 
 The current retained ORAM runner is deliberately an unqualified diagnostic.
 Its native tests and access-path check passed, but its exact-upsert codegen
