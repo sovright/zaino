@@ -28,7 +28,7 @@ zcashd_support = ["zaino-fetch/zcashd_support"]
 prometheus = ["metrics"]
 
 # test_dependencies - Exposes internal functionality for testing.
-test_dependencies = []
+test_dependencies = ["dep:tempfile"]
 
 # **Experimental and alpha features**
 # Exposes the **complete** set of experimental / alpha features currently implemented in Zaino.
@@ -90,6 +90,7 @@ arc-swap = { workspace = true }
 reqwest.workspace = true
 bitflags = { workspace = true }
 fs2 = "0.4.3"
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
