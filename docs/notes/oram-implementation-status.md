@@ -23,6 +23,31 @@ This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
 clear any Phase 0 gate.
 
+## 2026-09-12 — finalized-record preparation at coherent publication
+
+The native live-refresh regression at integration head `2cca5a82` reached the
+advanced present query, then refused response release with
+`projection_not_ready=true`, `store_failure=false`, and
+`recent_scan_failed=false`
+([run 34715423716](https://github.com/sovright/zaino/actions/runs/34715423716)).
+Source inspection found that the live controller never invoked the existing
+finalized-record annotation pass. An occupied unannotated record deliberately
+fails closed under ADR-0902; initial recent-only queries did not exercise that
+path. The failed run skipped the remaining native suite and runner packaging.
+
+Publication now requires the finalized store to prepare every live record
+against the exact converted recent snapshot before the final source-currentness
+check. A failed pass consumes the candidate ticket and publishes no generation.
+Preparation uses the existing deterministic annotation function and stays on
+the owner side of publication, outside query handling. Portable regressions use
+the actual serving-store fixture to distinguish spent and surviving records,
+and inject preparation failure and post-preparation source drift. These tests
+and the existing controller fixtures passed (13/13) on macOS; strict
+all-feature/all-target Clippy and formatting also passed. They cover candidate
+preparation; the typed Linux live-refresh test remains the
+integration gate. This correction does not establish an accepted guest,
+physical obliviousness, mainnet capacity, or a private wallet workflow.
+
 ## 2026-09-12 — evidence, activated bootstrap, and client codec composition
 
 The outside-operator execution stack now includes a bounded raw-evidence route

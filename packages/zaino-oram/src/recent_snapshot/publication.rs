@@ -467,6 +467,12 @@ pub(crate) trait ServingEpochCurrentness<B> {
 /// the returned identity attached to the exact store generation they expose.
 pub(crate) trait FinalizedServingStore: ObliviousStore {
     fn serving_identity(&self) -> RecentSnapshotIdentity;
+
+    /// Completes owner-side record preparation against the exact candidate.
+    /// Failure discards the generation before publication or query admission.
+    #[cfg(feature = "corpus-zaino")]
+    fn prepare_recent_snapshot(&mut self, recent: &[RecentSnapshotSlot])
+        -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -971,6 +977,15 @@ mod tests {
     impl FinalizedServingStore for TestFinalizedStore {
         fn serving_identity(&self) -> RecentSnapshotIdentity {
             self.identity
+        }
+
+        #[cfg(feature = "corpus-zaino")]
+        fn prepare_recent_snapshot(
+            &mut self,
+            _recent: &[RecentSnapshotSlot],
+        ) -> Result<(), Self::Error> {
+            // This fixture contains only padding, so there are no records to annotate.
+            Ok(())
         }
     }
 
