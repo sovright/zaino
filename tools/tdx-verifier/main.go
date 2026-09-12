@@ -351,7 +351,21 @@ func enforceCurrentStatuses(tdx, qe pcs.TcbComponentStatus) error {
 	return nil
 }
 
+type runDependencies struct {
+	getter trust.HTTPSGetter
+	now    func() time.Time
+	stdout io.Writer
+}
+
 func run(args []string) error {
+	return runWith(args, runDependencies{
+		getter: newGetter(),
+		now:    time.Now,
+		stdout: os.Stdout,
+	})
+}
+
+func runWith(args []string, dependencies runDependencies) error {
 	fs := flag.NewFlagSet("tdx-verifier", flag.ContinueOnError)
 	mode := fs.String("mode", "quote", "verification mode: quote or ccel-diagnostic")
 	quotePath := fs.String("quote", "", "raw QuoteV4 file")
@@ -401,7 +415,7 @@ func run(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), totalNetworkTime)
 	defer cancel()
-	if err := verifyEvidence(ctx, quoteBytes, policy, newGetter(), time.Now()); err != nil {
+	if err := verifyEvidence(ctx, quoteBytes, policy, dependencies.getter, dependencies.now()); err != nil {
 		return err
 	}
 	if *mode == "ccel-diagnostic" {
@@ -409,12 +423,12 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("strict CCEL digest replay: %w", err)
 		}
-		if err := writeCCELDiagnosticReceipt(os.Stdout, quoteBytes, policyData, policy.Validate.TdQuoteBodyOptions.ReportData, ccelTableBytes, ccelLogBytes, replay); err != nil {
+		if err := writeCCELDiagnosticReceipt(dependencies.stdout, quoteBytes, policyData, policy.Validate.TdQuoteBodyOptions.ReportData, ccelTableBytes, ccelLogBytes, replay); err != nil {
 			return fmt.Errorf("write CCEL diagnostic receipt: %w", err)
 		}
 		return nil
 	}
-	if err := writeReceipt(os.Stdout, quoteBytes, policyData, policy.Validate.TdQuoteBodyOptions.ReportData); err != nil {
+	if err := writeReceipt(dependencies.stdout, quoteBytes, policyData, policy.Validate.TdQuoteBodyOptions.ReportData); err != nil {
 		return fmt.Errorf("write receipt: %w", err)
 	}
 	return nil
