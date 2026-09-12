@@ -165,6 +165,77 @@ fn local_verifier_correlates_exact_inputs() {
 }
 
 #[test]
+fn local_ccel_verifier_correlates_every_exact_input_and_scope() {
+    let quote = b"quote";
+    let policy = b"policy";
+    let table = b"table";
+    let log = b"log";
+    let report_data = [9; 64];
+    let receipt = serde_json::json!({
+        "schema_version": 1,
+        "quote_sha256": hex::encode(Sha256::digest(quote)),
+        "policy_sha256": hex::encode(Sha256::digest(policy)),
+        "report_data": hex::encode(report_data),
+        "ccel_table_sha256": hex::encode(Sha256::digest(table)),
+        "ccel_log_sha256": hex::encode(Sha256::digest(log)),
+        "measured_events": [1, 2, 3, 0],
+        "rt_mrs_matched": [true, true, true, true],
+        "scope": "tdx_quote_ccel_digest_replay_diagnostic_v1",
+    })
+    .to_string();
+    let dir = executable_with_receipt(&receipt);
+    let valid_verifier = verifier(&dir.path().join("verifier"), HELPER_TEST_BUDGET);
+    valid_verifier
+        .verify_ccel_diagnostic(quote, policy, report_data, table, log)
+        .expect("all exact diagnostic inputs correlate");
+
+    for bad in [
+        receipt.replace(
+            "tdx_quote_ccel_digest_replay_diagnostic_v1",
+            "quote_signature_current_collateral_and_supplied_field_policy_only",
+        ),
+        receipt.replacen(&hex::encode(Sha256::digest(quote)), &"00".repeat(32), 1),
+        receipt.replacen(&hex::encode(Sha256::digest(policy)), &"00".repeat(32), 1),
+        receipt.replacen(&hex::encode(report_data), &"00".repeat(64), 1),
+        receipt.replacen(&hex::encode(Sha256::digest(table)), &"00".repeat(32), 1),
+        receipt.replacen(&hex::encode(Sha256::digest(log)), &"00".repeat(32), 1),
+        receipt.replace("[true,true,true,true]", "[true,true,true,false]"),
+        receipt.replacen("{", "{\"unknown\":1,", 1),
+        receipt.replacen("{", "{\"scope\":\"duplicate\",", 1),
+    ] {
+        let dir = executable_with_receipt(&bad);
+        assert!(verifier(&dir.path().join("verifier"), HELPER_TEST_BUDGET)
+            .verify_ccel_diagnostic(quote, policy, report_data, table, log)
+            .is_err());
+    }
+}
+
+#[test]
+fn expired_absolute_ccel_deadline_never_starts_the_helper() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("verifier");
+    let marker = dir.path().join("started");
+    fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+    )
+    .expect("script");
+    let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions).expect("permissions");
+    let verifier = verifier(&path, HELPER_TEST_BUDGET);
+    let deadline = std::time::Instant::now() + Duration::from_millis(10);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        verifier.verify_ccel_diagnostic_before(
+            b"quote", b"policy", [1; 64], b"table", b"log", deadline,
+        ),
+        Err(ClientEvidenceError::VerifierTimeout)
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
 fn public_entrypoint_uses_canonical_wire_type() {
     let e = parsed();
     let p = policy();
