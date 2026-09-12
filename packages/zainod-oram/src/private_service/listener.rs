@@ -6,7 +6,7 @@
 //! detail to be relaxed later. Serving two rounds concurrently would let the
 //! observable completion order depend on which address was queried.
 //!
-//! This surface answers two routes. `QueryPage` is the private method the
+//! This surface answers three routes. `QueryPage` is the private method the
 //! mutex above guards. `BootstrapSession` is the deliberate exemption: it hands
 //! a wallet the current key epoch and its two releasable keys, it takes no
 //! client input, and it is answered from material prepared at construction --
@@ -14,10 +14,11 @@
 //! whether a query round is in flight would time the surface against the
 //! runtime's occupancy, which is exactly what the fixed schedule hides.
 //!
-//! Every *other* route answers with the same status as a failed query, so
-//! probing beyond these two reveals no more than calling them. Bootstrap is the
-//! one intended departure from that uniformity: its response is identical for
-//! every caller and reveals nothing about any query.
+//! `GetEvidence` binds a public challenge to the live ephemeral TLS identity
+//! without acquiring the query mutex. It is raw, unverified platform evidence,
+//! with one bounded quote worker and a public timeout. Like bootstrap it is
+//! outside the query release schedule. Every other route answers with the same
+//! status as a failed query.
 
 use std::{
     convert::Infallible,
@@ -44,9 +45,10 @@ use tonic::{
 use zaino_oram::{FixedEnvelopeRuntime, SessionBootstrap};
 
 use super::{
+    attestation::{AttestationWorkloadBinding, RawEvidenceIssuer},
     release_schedule::ReleaseSchedule,
     tls::PrivateTlsIdentity,
-    tonic_body::{PrivateSessionBootstrap, PrivateTonicBodyAdapter},
+    tonic_body::{PrivateEvidence, PrivateSessionBootstrap, PrivateTonicBodyAdapter},
 };
 use crate::private_proto;
 
@@ -54,8 +56,26 @@ use crate::private_proto;
 const QUERY_PAGE_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/QueryPage";
 /// The key-establishment method, answered without it.
 const BOOTSTRAP_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/BootstrapSession";
+const EVIDENCE_ROUTE: &str = "/zaino.private.v1.PrivateCompactTxStreamer/GetEvidence";
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 1;
+
+#[derive(Debug)]
+pub(crate) enum PrivateListenerError {
+    Tls(super::tls::PrivateTlsError),
+    Transport(tonic::transport::Error),
+}
+
+impl fmt::Display for PrivateListenerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tls(error) => write!(formatter, "private listener TLS: {error}"),
+            Self::Transport(error) => write!(formatter, "private listener transport: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PrivateListenerError {}
 
 /// One private-query endpoint bound to a local address.
 ///
@@ -65,7 +85,12 @@ const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 1;
 pub(crate) struct PrivateQueryListener {
     listener: TcpListener,
     local_addr: SocketAddr,
+    #[cfg(test)]
+    test_quote: Option<TestListenerQuote>,
 }
+
+#[cfg(test)]
+type TestListenerQuote = Arc<dyn Fn([u8; 64]) -> Result<Vec<u8>, ()> + Send + Sync>;
 
 impl PrivateQueryListener {
     pub(crate) async fn bind(address: SocketAddr) -> std::io::Result<Self> {
@@ -74,6 +99,8 @@ impl PrivateQueryListener {
         Ok(Self {
             listener,
             local_addr,
+            #[cfg(test)]
+            test_quote: None,
         })
     }
 
@@ -104,14 +131,32 @@ impl PrivateQueryListener {
         session_bootstrap: SessionBootstrap,
         release_schedule: ReleaseSchedule,
         tls: &PrivateTlsIdentity,
+        evidence_binding: Option<AttestationWorkloadBinding>,
         shutdown: impl Future<Output = ()>,
-    ) -> Result<(), tonic::transport::Error>
+    ) -> Result<(), PrivateListenerError>
     where
         H: FixedEnvelopeRuntime<N> + Send + 'static,
         H::PendingResponse: Send + 'static,
     {
-        let service =
+        let mut service =
             PrivateQueryService::<H, N>::new(handler, session_bootstrap, release_schedule);
+        // The issuer is constructed from exactly the identity installed in the
+        // TLS acceptor below. Persisted identities cannot issue raw evidence.
+        service.evidence = evidence_binding
+            .map(|binding| {
+                RawEvidenceIssuer::new(tls, binding).map(|issuer| {
+                    #[cfg(test)]
+                    if let Some(quote) = &self.test_quote {
+                        return Arc::new(PrivateEvidence::with_test_quote(
+                            issuer,
+                            Arc::clone(quote),
+                        ));
+                    }
+                    Arc::new(PrivateEvidence::new(issuer))
+                })
+            })
+            .transpose()
+            .map_err(PrivateListenerError::Tls)?;
         // Building the TLS acceptor requires a process-level rustls
         // CryptoProvider (zingolabs/zaino#1360), exactly as the public gRPC
         // server needs one.
@@ -120,7 +165,8 @@ impl PrivateQueryListener {
         // below, the per-connection request limit, and the uniform refusal all
         // sit where they did, on the same accepted-connection stream.
         Server::builder()
-            .tls_config(tls.server_tls_config())?
+            .tls_config(tls.server_tls_config())
+            .map_err(PrivateListenerError::Transport)?
             .concurrency_limit_per_connection(MAX_CONCURRENT_REQUESTS_PER_CONNECTION)
             .add_service(service)
             .serve_with_incoming_shutdown(
@@ -128,6 +174,7 @@ impl PrivateQueryListener {
                 shutdown,
             )
             .await
+            .map_err(PrivateListenerError::Transport)
     }
 }
 
@@ -223,6 +270,7 @@ struct PrivateQueryService<H, const N: usize> {
     /// cheap unauthenticated route's latency an occupancy probe against the
     /// query round the lock is guarding.
     bootstrap: Arc<PrivateSessionBootstrap>,
+    evidence: Option<Arc<PrivateEvidence>>,
 }
 
 impl<H, const N: usize> PrivateQueryService<H, N>
@@ -243,6 +291,7 @@ where
                 Arc::clone(&release_schedule),
             ))),
             bootstrap: Arc::new(PrivateSessionBootstrap::from_session(&session_bootstrap, N)),
+            evidence: None,
             release_schedule,
         }
     }
@@ -255,6 +304,7 @@ impl<H, const N: usize> Clone for PrivateQueryService<H, N> {
         Self {
             adapter: Arc::clone(&self.adapter),
             bootstrap: Arc::clone(&self.bootstrap),
+            evidence: self.evidence.clone(),
             release_schedule: Arc::clone(&self.release_schedule),
         }
     }
@@ -285,6 +335,7 @@ where
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         let adapter = Arc::clone(&self.adapter);
         let bootstrap = Arc::clone(&self.bootstrap);
+        let evidence = self.evidence.clone();
         let release_schedule = Arc::clone(&self.release_schedule);
         Box::pin(async move {
             match request.uri().path() {
@@ -296,6 +347,10 @@ where
                 // is not on the release schedule: see this module's header and
                 // `PrivateSessionBootstrap`.
                 BOOTSTRAP_ROUTE => Ok(bootstrap.answer(request).await),
+                EVIDENCE_ROUTE if evidence.is_some() => match evidence {
+                    Some(evidence) => Ok(evidence.answer(request).await),
+                    None => Ok(unavailable_response()),
+                },
                 // An unknown route answers exactly as a refused query does --
                 // the same bytes, and now on the same schedule, so route
                 // probing cannot distinguish them by shape or by latency.
@@ -411,6 +466,170 @@ mod tests {
         }
     }
 
+    fn evidence_fixture() -> AttestationWorkloadBinding {
+        AttestationWorkloadBinding::new(
+            [1; 32],
+            [2; 32],
+            FIXTURE_PROFILE_ID,
+            1,
+            FIXTURE_KEY_EPOCH,
+            23,
+            [4; 32],
+        )
+    }
+
+    // Extraction only, not X.509 validation. TLS validates this controlled
+    // self-signed fixture using its certificate as the trust anchor.
+    fn der_element<'a>(
+        input: &mut &'a [u8],
+        tag: u8,
+    ) -> Result<(&'a [u8], &'a [u8]), &'static str> {
+        let original = *input;
+        if original.first() != Some(&tag) {
+            return Err("unexpected DER tag");
+        }
+        let first = *original.get(1).ok_or("missing DER length")?;
+        let (header, length) = if first < 128 {
+            (2, usize::from(first))
+        } else {
+            let width = usize::from(first & 0x7f);
+            if width == 0 || width > std::mem::size_of::<usize>() {
+                return Err("invalid DER length width");
+            }
+            let bytes = original.get(2..2 + width).ok_or("truncated DER length")?;
+            if bytes.first() == Some(&0) {
+                return Err("nonminimal DER length");
+            }
+            let mut length = 0usize;
+            for byte in bytes {
+                length = length
+                    .checked_mul(256)
+                    .and_then(|n| n.checked_add(usize::from(*byte)))
+                    .ok_or("DER length overflow")?;
+            }
+            if length < 128 {
+                return Err("nonminimal DER long length");
+            }
+            (2 + width, length)
+        };
+        let end = header.checked_add(length).ok_or("DER length overflow")?;
+        let full = original.get(..end).ok_or("truncated DER element")?;
+        *input = original.get(end..).ok_or("truncated DER remainder")?;
+        Ok((full, &full[header..]))
+    }
+
+    fn certificate_spki_digest(pem: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+        use base64::Engine;
+        use sha2::Digest;
+        let encoded: String = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let der = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        let mut input = der.as_slice();
+        let (_, mut certificate) = der_element(&mut input, 0x30)?;
+        if !input.is_empty() {
+            return Err("trailing certificate DER".into());
+        }
+        let (_, mut tbs) = der_element(&mut certificate, 0x30)?;
+        if tbs.first() == Some(&0xa0) {
+            der_element(&mut tbs, 0xa0)?;
+        }
+        for tag in [0x02, 0x30, 0x30, 0x30, 0x30] {
+            der_element(&mut tbs, tag)?;
+        }
+        let (spki, mut fields) = der_element(&mut tbs, 0x30)?;
+        der_element(&mut fields, 0x30)?;
+        der_element(&mut fields, 0x03)?;
+        if !fields.is_empty() {
+            return Err("trailing SPKI DER".into());
+        }
+        Ok(sha2::Sha256::digest(spki).into())
+    }
+
+    #[tokio::test]
+    async fn raw_evidence_matches_the_certificate_used_by_the_tls_connection(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sha2::Digest;
+        let mut listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+        listener.test_quote = Some(Arc::new(|report_data| Ok(report_data.to_vec())));
+        let address = listener.local_addr();
+        let tls = PrivateTlsIdentity::generate_ephemeral()?;
+        let certificate = tls.certificate_pem().to_owned();
+        let expected_spki = certificate_spki_digest(&certificate)?;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            listener
+                .serve::<_, ENVELOPE_BYTES>(
+                    handler(),
+                    session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+                    ReleaseSchedule::from_timeout_bucket_millis(TEST_RELEASE_BUCKET_MILLIS),
+                    &tls,
+                    Some(evidence_fixture()),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+        });
+        let result = async {
+            let mut client = connected_private_client(address, &certificate).await?;
+            client.ready().await?;
+            let response: tonic::Response<private_proto::EvidenceResponse> = client
+                .unary(
+                    tonic::Request::new(private_proto::EvidenceRequest {
+                        challenge: vec![9; 64],
+                    }),
+                    http::uri::PathAndQuery::from_static(EVIDENCE_ROUTE),
+                    tonic_prost::ProstCodec::default(),
+                )
+                .await?;
+            let evidence = response.into_inner();
+            assert_eq!(evidence.tls_spki_sha256, expected_spki);
+            assert_eq!(evidence.challenge, vec![9; 64]);
+            assert_eq!(evidence.key_epoch, FIXTURE_KEY_EPOCH);
+            let mut preimage = Vec::new();
+            preimage.extend_from_slice(b"zaino-tdx-report-data-v1\0\0\0\0\0\0\0\0");
+            preimage.extend_from_slice(&1u16.to_be_bytes());
+            preimage.extend_from_slice(&evidence.challenge);
+            preimage.extend_from_slice(&expected_spki);
+            preimage.extend_from_slice(&evidence.binary_sha256);
+            preimage.extend_from_slice(&evidence.effective_config_sha256);
+            preimage.extend_from_slice(&evidence.profile_id);
+            preimage.extend_from_slice(&evidence.schema_version.to_be_bytes());
+            preimage.extend_from_slice(&evidence.key_epoch.to_be_bytes());
+            preimage.extend_from_slice(&evidence.checkpoint_height.to_be_bytes());
+            preimage.extend_from_slice(&evidence.checkpoint_block_hash);
+            assert_eq!(preimage.len(), 258);
+            assert_eq!(evidence.raw_quote, sha2::Sha512::digest(&preimage).to_vec());
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+        let _ = stop.send(());
+        served.await??;
+        result
+    }
+
+    #[tokio::test]
+    async fn persisted_identity_cannot_start_an_evidence_listener(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+        let directory = tempfile::TempDir::new()?;
+        let tls = PrivateTlsIdentity::load_or_generate(directory.path())?;
+        let result = listener
+            .serve::<_, ENVELOPE_BYTES>(
+                handler(),
+                session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+                ReleaseSchedule::from_timeout_bucket_millis(TEST_RELEASE_BUCKET_MILLIS),
+                &tls,
+                Some(evidence_fixture()),
+                std::future::ready(()),
+            )
+            .await;
+        assert!(matches!(result, Err(PrivateListenerError::Tls(_))));
+        Ok(())
+    }
+
     /// One private surface bound to an ephemeral port and served on a task,
     /// with the public half of its identity kept back for the client.
     ///
@@ -426,7 +645,7 @@ mod tests {
         /// loop rather than being reaped mid-test.
         _deployment: Option<tempfile::TempDir>,
         stop: tokio::sync::oneshot::Sender<()>,
-        served: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        served: tokio::task::JoinHandle<Result<(), PrivateListenerError>>,
     }
 
     impl ServedSurface {
@@ -513,6 +732,7 @@ mod tests {
                         session_bootstrap,
                         ReleaseSchedule::from_timeout_bucket_millis(release_bucket_millis),
                         &tls,
+                        None,
                         async {
                             let _ = stopped.await;
                         },

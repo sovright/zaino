@@ -469,10 +469,16 @@ pub struct FinalizedProjection {
 impl FinalizedProjection {
     /// Height of the finalized checkpoint this generation committed to.
     ///
-    /// The only observation offered, and it is already public chain data: a
+    /// Already public chain data: a
     /// server needs it to report what it is serving.
     pub const fn committed_height(&self) -> u32 {
         self.checkpoint.height()
+    }
+
+    /// Public canonical block identity in internal byte order. This is not an
+    /// authenticated projection-state root and provides no rollback protection.
+    pub const fn committed_block_hash(&self) -> [u8; 32] {
+        self.checkpoint.block_hash().0
     }
 }
 

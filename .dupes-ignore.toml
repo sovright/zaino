@@ -1,8 +1,8 @@
 # Duplicate-code lint exemptions.
 #
 # The `lint-code-duplication` guard arrived with the upstream sync (upstream
-# commit c1eafd9d). Every group below predates it: this is inherited ORAM code
-# that the lint had never run against, not duplication introduced by the sync.
+# commit c1eafd9d). The original groups below predate it; later extensions
+# for unrelated constructors are identified in their individual reasons.
 #
 # Two kinds of entry live here, and they are NOT the same thing:
 #
@@ -90,10 +90,11 @@ members = [
 ]
 
 [[ignore]]
-fingerprint = "8bcde84a194f0dc6"
-reason = "PERMANENT. Structural coincidence, not shared logic. Two unrelated 7-field constructors in different crates and domains (chain block header vs ORAM continuation state). Nothing to share."
+fingerprint = "5bd4d1b4aa03e88d"
+reason = "PERMANENT. Structural coincidence, not shared logic. The existing unrelated seven-field constructor group (chain block header and ORAM continuation state) now includes the attestation workload binding. These distinct types only assign their arguments to fields; a shared function cannot construct all three without coupling unrelated domains."
 members = [
     "BlockData::new (method) at packages/zaino-state/src/chain_index/types/db/legacy.rs:803-821",
+    "AttestationWorkloadBinding::new (method) at packages/zainod-oram/src/private_service/attestation.rs:75-93",
     "ContinuationState::new (method) at packages/zaino-oram/src/continuation_token.rs:84-102",
 ]
 

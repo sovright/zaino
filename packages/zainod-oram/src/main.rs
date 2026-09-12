@@ -107,6 +107,8 @@ mod private_proto;
 #[cfg(feature = "private-service")]
 mod private_service;
 #[cfg(feature = "private-service")]
+use crate::private_service::attestation::AttestationWorkloadBinding;
+#[cfg(feature = "private-service")]
 use crate::private_service::{
     require_no_stranded_identity, PrivateQueryListener, PrivateTlsIdentity, ReleaseSchedule,
 };
@@ -1664,6 +1666,7 @@ async fn serve_private_surface(
     )
     .await?;
     let committed_height = projection.committed_height();
+    let checkpoint_block_hash = projection.committed_block_hash();
 
     let deployment = PrivateRuntimeDeployment {
         // The capture digest is already this deployment's public identity;
@@ -1686,6 +1689,21 @@ async fn serve_private_surface(
         .await
         .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
     let session_bootstrap = runtime.session_bootstrap();
+    // Refresh has accepted the exact finalized generation identified above.
+    // This function performs no subsequent refresh while the listener serves.
+    let evidence_binding = if tls.ephemeral_spki_sha256().is_ok() {
+        Some(AttestationWorkloadBinding::new(
+            running_executable_sha256()?,
+            private_evidence_config_sha256(source_backend, &session_bootstrap.profile_id),
+            session_bootstrap.profile_id,
+            PRIVATE_SCHEMA_VERSION,
+            session_bootstrap.key_epoch,
+            committed_height,
+            checkpoint_block_hash,
+        ))
+    } else {
+        None
+    };
     // The release schedule is the compiled profile's own timeout bucket, read
     // back from the profile rather than restated here, so it cannot drift from
     // the budget bound into the profile identifier a wallet pins.
@@ -1701,6 +1719,7 @@ async fn serve_private_surface(
             session_bootstrap,
             ReleaseSchedule::from_timeout_bucket_millis(release_bucket_millis),
             tls,
+            evidence_binding,
             async {
                 // A failed signal registration must stop the server rather than
                 // leave it serving with no way to be asked to stop.
@@ -1711,6 +1730,46 @@ async fn serve_private_surface(
         )
         .await?;
     Ok(())
+}
+
+/// Hashes the executing file, never an operator-supplied receipt or path.
+/// Quote acceptance still requires a verifier-owned measured-image policy:
+/// self-reporting this digest alone does not measure the loaded process.
+#[cfg(feature = "private-service")]
+fn running_executable_sha256() -> RunnerResult<[u8; 32]> {
+    use std::io::Read;
+    #[cfg(target_os = "linux")]
+    let path = PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let path = std::env::current_exe()?;
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        Digest::update(&mut digest, &buffer[..count]);
+    }
+    Ok(Digest::finalize(digest).into())
+}
+
+/// Canonical v1 allowlist for this fixed research serving mode. Never hashes
+/// RPC credentials, file paths, or the full serialized operator configuration.
+/// Guest image/admin/boot trust is separately evaluated by the client policy.
+#[cfg(feature = "private-service")]
+fn private_evidence_config_sha256(source_backend: BackendKind, profile_id: &[u8; 16]) -> [u8; 32] {
+    let mut digest = sha2::Sha256::new();
+    Digest::update(&mut digest, b"zaino-private-evidence-config-v1\0mainnet\0ephemeral-tls\0loopback\0unaudited-research\0single-worker\0frozen-finalized-generation\0");
+    let backend: &[u8] = match source_backend {
+        BackendKind::Direct => b"direct\0",
+        BackendKind::Rpc => b"rpc-external-authority\0",
+    };
+    Digest::update(&mut digest, backend);
+    Digest::update(&mut digest, PRIVATE_SCHEMA_VERSION.to_be_bytes());
+    Digest::update(&mut digest, profile_id);
+    Digest::finalize(digest).into()
 }
 
 /// Binds the replay journal's namespace to the capture this service serves.
@@ -4162,5 +4221,24 @@ mod tests {
             Err(RunnerError::SnapshotStillSyncing)
         ));
         Ok(())
+    }
+
+    #[cfg(feature = "private-service")]
+    #[test]
+    fn evidence_policy_digest_has_a_stable_public_encoding() {
+        let profile = [7; 16];
+        let digest = private_evidence_config_sha256(BackendKind::Direct, &profile);
+        assert_eq!(
+            hex::encode(digest),
+            "ace5fcdaa6b588e962d44df2fd8ae2d56e36c59eaffbb335d8e3f30231f8c82a"
+        );
+        assert_ne!(
+            digest,
+            private_evidence_config_sha256(BackendKind::Rpc, &profile)
+        );
+        assert_ne!(
+            digest,
+            private_evidence_config_sha256(BackendKind::Direct, &[8; 16])
+        );
     }
 }

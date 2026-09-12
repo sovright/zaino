@@ -76,7 +76,7 @@ use std::{
 use base64::Engine as _;
 use rcgen::{
     string::Ia5String, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, SanType,
+    KeyPair, PublicKeyData, SanType,
 };
 use sha2::{Digest, Sha256};
 use tonic::transport::{Identity, ServerTlsConfig};
@@ -121,6 +121,13 @@ pub(crate) struct PrivateTlsIdentity {
     certificate_pem: String,
     private_key_pem: String,
     fingerprint: String,
+    spki_sha256: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy)]
+enum IdentityOrigin {
+    Ephemeral,
+    Persisted,
 }
 
 impl PrivateTlsIdentity {
@@ -136,7 +143,7 @@ impl PrivateTlsIdentity {
     /// This constructor supplies key custody only. It does not attest the
     /// identity or authorize a privacy claim by itself.
     pub(crate) fn generate_ephemeral() -> Result<Self, PrivateTlsError> {
-        Self::generate()
+        Self::generate(IdentityOrigin::Ephemeral)
     }
 
     /// Loads this deployment's identity, minting it on first start.
@@ -182,12 +189,13 @@ impl PrivateTlsIdentity {
             fingerprint: hex::encode(Sha256::digest(&certificate_der)),
             certificate_pem,
             private_key_pem,
+            spki_sha256: None,
         })
     }
 
     /// Mints this deployment's identity and persists it.
     fn generate_into(certificate_path: &Path, key_path: &Path) -> Result<Self, PrivateTlsError> {
-        let identity = Self::generate()?;
+        let identity = Self::generate(IdentityOrigin::Persisted)?;
         // The key first, and with `create_new`, so a racing second start
         // fails rather than overwriting an identity the winner is about to
         // publish. The certificate follows, leaving the pair either absent or
@@ -208,8 +216,14 @@ impl PrivateTlsIdentity {
     /// upgraded under a stable deployment directory, and `profile_label` is
     /// documented in the proto as diagnostic and explicitly not for pinning.
     /// A name that can go stale is worse than no name.
-    fn generate() -> Result<Self, PrivateTlsError> {
+    fn generate(origin: IdentityOrigin) -> Result<Self, PrivateTlsError> {
         let signing_key = KeyPair::generate().map_err(|_| PrivateTlsError::Generate)?;
+        let spki_sha256 = match origin {
+            IdentityOrigin::Ephemeral => {
+                Some(Sha256::digest(signing_key.subject_public_key_info()).into())
+            }
+            IdentityOrigin::Persisted => None,
+        };
 
         let mut params = CertificateParams::default();
         let mut distinguished_name = DistinguishedName::new();
@@ -231,7 +245,17 @@ impl PrivateTlsIdentity {
             fingerprint: hex::encode(Sha256::digest(certificate_der.as_ref())),
             certificate_pem: pem_block("CERTIFICATE", certificate_der.as_ref()),
             private_key_pem: pem_block("PRIVATE KEY", &signing_key.serialize_der()),
+            spki_sha256,
         })
+    }
+
+    /// Returns the live ephemeral listener key's SubjectPublicKeyInfo digest.
+    ///
+    /// Persisted identities are deliberately ineligible for operator-private
+    /// evidence, including the freshly generated value before it is written.
+    pub(crate) fn ephemeral_spki_sha256(&self) -> Result<[u8; 32], PrivateTlsError> {
+        self.spki_sha256
+            .ok_or(PrivateTlsError::AttestationRequiresEphemeralIdentity)
     }
 
     /// SHA-256 over the served certificate's DER, lowercase hex.
@@ -547,6 +571,8 @@ fn pem_block(label: &str, der: &[u8]) -> String {
 pub(crate) enum PrivateTlsError {
     /// No identity could be minted for this deployment.
     Generate,
+    /// Attestation tried to bind an operator-readable persisted identity.
+    AttestationRequiresEphemeralIdentity,
     /// A persisted file exists but could not be read.
     Unreadable {
         /// The file that could not be read.
@@ -611,6 +637,9 @@ impl fmt::Display for PrivateTlsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Generate => f.write_str("private surface TLS identity could not be generated"),
+            Self::AttestationRequiresEphemeralIdentity => f.write_str(
+                "operator-private attestation requires the live ephemeral TLS identity",
+            ),
             Self::Unreadable { path } => write!(
                 f,
                 "private surface TLS file {} exists but could not be read; refusing to regenerate, because a new certificate would break every pinned wallet without warning",
@@ -678,6 +707,24 @@ mod tests {
         assert_ne!(first.fingerprint(), second.fingerprint());
         assert_ne!(first.certificate_pem(), second.certificate_pem());
         assert_ne!(first.private_key_pem, second.private_key_pem);
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_identities_are_never_attestation_eligible(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deployment = tempfile::TempDir::new()?;
+        let freshly_persisted = persisted(deployment.path())?;
+        assert!(matches!(
+            freshly_persisted.ephemeral_spki_sha256(),
+            Err(PrivateTlsError::AttestationRequiresEphemeralIdentity)
+        ));
+
+        let reloaded = persisted(deployment.path())?;
+        assert!(matches!(
+            reloaded.ephemeral_spki_sha256(),
+            Err(PrivateTlsError::AttestationRequiresEphemeralIdentity)
+        ));
         Ok(())
     }
 

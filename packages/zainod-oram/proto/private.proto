@@ -37,9 +37,8 @@ message BootstrapResponse {
   string profile_label = 4;
   // Exact envelope size class, so a wallet pads correctly without guessing.
   uint32 envelope_bytes = 5;
-  // Reserved for a TDX quote binding the TLS identity to the measured binary.
-  // Present and empty in this release; ADR 0010 defers verification, and
-  // keeping the field means adding it later is not a breaking wire change.
+  // Legacy reserved field, always empty. Fresh raw evidence is obtained from
+  // GetEvidence before bootstrap; an empty field is never attestation success.
   bytes attestation = 6;
   // Authoritative identifier of the compiled privacy profile: a digest over
   // every logical budget dimension the runtime compiles in.
@@ -55,8 +54,33 @@ message BootstrapResponse {
   bytes profile_id = 7;
 }
 
+// The verifier contributes only a fresh, exactly 64-byte challenge.
+message EvidenceRequest {
+  bytes challenge = 1;
+}
+
+// Unverified raw evidence. The client must validate the quote and its policy,
+// recompute REPORT_DATA, and match the actual TLS peer's SPKI before bootstrap.
+// These public claims are not trusted merely because the server returned them.
+message EvidenceResponse {
+  uint32 transcript_version = 1;
+  bytes challenge = 2;
+  bytes tls_spki_sha256 = 3;
+  bytes binary_sha256 = 4;
+  bytes effective_config_sha256 = 5;
+  bytes profile_id = 6;
+  uint32 schema_version = 7;
+  uint64 key_epoch = 8;
+  uint32 checkpoint_height = 9;
+  // Internal canonical block-hash bytes, not reversed display-order hex.
+  // This identifies the public chain checkpoint, not an authenticated ORAM root.
+  bytes checkpoint_block_hash = 10;
+  bytes raw_quote = 11;
+}
+
 // Independent private-query surface. This is not the legacy lightwallet API.
 service PrivateCompactTxStreamer {
   rpc QueryPage(FixedEnvelope) returns (FixedEnvelope);
   rpc BootstrapSession(BootstrapRequest) returns (BootstrapResponse);
+  rpc GetEvidence(EvidenceRequest) returns (EvidenceResponse);
 }
