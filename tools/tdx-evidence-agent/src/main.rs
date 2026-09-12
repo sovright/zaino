@@ -670,7 +670,7 @@ mod tests {
         // SA_SIGINFO handler, and the signal mask is initialized empty.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = record_sigsys as usize;
+            action.sa_sigaction = record_sigsys as *const () as usize;
             action.sa_flags = libc::SA_SIGINFO;
             libc::sigemptyset(&mut action.sa_mask);
             assert_eq!(
@@ -769,10 +769,12 @@ mod tests {
         unsafe { libc::_exit(0) }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn confinement_filter_traps_perf_event_open() {
-        for mode in ["control", "filtered-control", "filtered"] {
+        let directory = tempfile::tempdir().expect("diagnostic directory");
+        let diagnostic = directory.path().join("perf-sigsys");
+        for mode in ["control", "filtered-control", "filtered", "diagnostic"] {
             let status =
                 std::process::Command::new(std::env::current_exe().expect("test executable"))
                     .args([
@@ -781,9 +783,22 @@ mod tests {
                         "--nocapture",
                     ])
                     .env("ZAINO_PERF_PROBE", mode)
+                    .env("ZAINO_SIGSYS_DIAGNOSTIC", &diagnostic)
                     .status()
                     .expect("perf probe starts");
-            if mode != "filtered" {
+            if mode == "diagnostic" {
+                assert_eq!(status.code(), Some(159), "diagnostic handler exits 159");
+                let bytes = read_bounded(&diagnostic, std::mem::size_of::<libc::greg_t>())
+                    .expect("fixed SIGSYS diagnostic record");
+                let value: [u8; std::mem::size_of::<libc::greg_t>()] = bytes
+                    .try_into()
+                    .expect("SIGSYS diagnostic record has exact width");
+                assert_eq!(
+                    libc::greg_t::from_ne_bytes(value),
+                    libc::SYS_perf_event_open,
+                    "x86_64 REG_RAX identifies the trapped syscall"
+                );
+            } else if mode != "filtered" {
                 assert!(status.success(), "non-target syscall control must survive");
             } else {
                 assert_eq!(
@@ -795,7 +810,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn confinement_perf_event_probe_child() {
         let Some(mode) = std::env::var_os("ZAINO_PERF_PROBE") else {
@@ -820,6 +835,12 @@ mod tests {
                 let _runtime = runtime.enter();
                 shutdown_signals().expect("signal streams initialize")
             };
+            if mode == "diagnostic" {
+                install_sigsys_diagnostic(Path::new(
+                    &std::env::var_os("ZAINO_SIGSYS_DIAGNOSTIC")
+                        .expect("diagnostic path is present"),
+                ));
+            }
             confinement::install_seccomp().expect("install synchronized filter");
             Some((runtime, _provider, _signals))
         } else {
@@ -901,7 +922,7 @@ mod tests {
             Ok::<_, zaino_private_client::RetainedClientError>(response)
         });
         let response = rpc_result.unwrap_or_else(|error| {
-            let syscall = fs::read(&sigsys)
+            let syscall = read_bounded(&sigsys, std::mem::size_of::<libc::greg_t>())
                 .ok()
                 .filter(|bytes| bytes.len() == std::mem::size_of::<libc::greg_t>())
                 .map(|bytes| {
