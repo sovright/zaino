@@ -109,6 +109,7 @@ running the workload:
 
 ```console
 test -r /sys/firmware/acpi/tables/data/CCEL
+test -r /sys/firmware/acpi/tables/CCEL
 test -d /sys/kernel/config/tsm/report
 dmesg | grep -i 'tdx\|confidential'
 uname -a
@@ -139,6 +140,14 @@ The helper validates the input width, transfers only the report data and fixed
 collector, creates a new guest evidence directory, retrieves the quote, CCEL,
 public guest facts and checksums, and verifies those checksums locally. It does
 not construct the transcript, run a verifier, or decide acceptance.
+
+Collection retains both `ccel-table.bin` (the ACPI table) and `ccel.bin` (the
+event-log area). Stream reads refuse empty or oversized artifacts: 16 KiB for
+the quote, 4 KiB for the table, and 1 MiB for the log. The collector writes the
+checksum manifest only after all reads succeed. These bounds do not validate
+format, table checksum, declared log length, replay, or boot semantics; those
+remain verifier checks. Earlier diagnostic bundles containing only `ccel.bin`
+cannot satisfy the strict two-input CCEL verification mode.
 
 Use pinned `gceprovenance` only to cross-check Google host and instance
 provenance and basic quote signature/challenge handling. It does not perform a
