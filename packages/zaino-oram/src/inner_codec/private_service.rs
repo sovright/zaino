@@ -994,6 +994,15 @@ mod tests {
         target_os = "linux",
         target_arch = "x86_64"
     ))]
+    fn diagnose_phase<T, E>(result: Result<T, E>, phase: &'static str) -> FixtureResult<T> {
+        result.map_err(|_| std::io::Error::other(phase).into())
+    }
+
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
     fn client_address(
         address: &zaino_state::AddrScript,
     ) -> FixtureResult<crate::MainnetStandardAddress> {
@@ -1313,7 +1322,10 @@ mod tests {
                 .refresh(fixture.subscriber(), projection_from_fixture(fixture)?)
                 .await
                 .map_err(|_| "the initial live subscriber refresh succeeds")?;
-            let first_bootstrap = runtime.client_session_bootstrap()?;
+            let first_bootstrap = diagnose_phase(
+                runtime.client_session_bootstrap(),
+                "initial bootstrap unavailable",
+            )?;
             let first_session =
                 MainnetClientSession::try_from_authenticated_bootstrap(&first_bootstrap)?;
             let ordinary_cases = fixture.ordinary_utxo_cases().await?;
@@ -1326,8 +1338,14 @@ mod tests {
             let expected = present.ordinary_utxos();
             let present_request = first_session
                 .seal_standard_address_query(client_address(present.address_script())?, 0)?;
-            let present_pending = runtime.query_page(present_request)?;
-            let present_response = *present_pending.try_release_bytes()?;
+            let present_pending = diagnose_phase(
+                runtime.query_page(present_request),
+                "initial present query refused",
+            )?;
+            let present_response = *diagnose_phase(
+                present_pending.try_release_bytes(),
+                "initial present response release refused",
+            )?;
             drop(present_pending);
             let present_page = first_session.open_single_page_response(present_response)?;
             assert_eq!(present_page.outcome, MainnetClientOutcome::Complete);
@@ -1344,8 +1362,14 @@ mod tests {
                 first_session.seal_standard_address_query(client_address(&absent)?, 0)?;
             let stale_request =
                 first_session.seal_standard_address_query(client_address(&absent)?, 0)?;
-            let first_pending = runtime.query_page(first_request)?;
-            let first_response = *first_pending.try_release_bytes()?;
+            let first_pending = diagnose_phase(
+                runtime.query_page(first_request),
+                "initial absent query refused",
+            )?;
+            let first_response = *diagnose_phase(
+                first_pending.try_release_bytes(),
+                "initial absent response release refused",
+            )?;
             drop(first_pending);
             let first_page = first_session.open_single_page_response(first_response)?;
             assert_eq!(first_page.outcome, MainnetClientOutcome::Complete);
@@ -1363,6 +1387,15 @@ mod tests {
                 .refresh(fixture.subscriber(), projection_from_fixture(fixture)?)
                 .await
                 .map_err(|_| "the advanced live subscriber refresh succeeds")?;
+            let advanced_bootstrap = diagnose_phase(
+                runtime.client_session_bootstrap(),
+                "advanced bootstrap unavailable",
+            )?;
+            assert!(
+                advanced_bootstrap.serving_finalized_checkpoint_height()
+                    > first_bootstrap.serving_finalized_checkpoint_height(),
+                "the cross-crate fixture must enable fast-test-seam to retire a checkpoint"
+            );
             match runtime.query_page(stale_request) {
                 Err(_) => {}
                 Ok(pending) => match pending.try_release_bytes() {
@@ -1372,11 +1405,6 @@ mod tests {
                     }
                 },
             }
-            let advanced_bootstrap = runtime.client_session_bootstrap()?;
-            assert_ne!(
-                advanced_bootstrap.serving_finalized_checkpoint_height(),
-                first_bootstrap.serving_finalized_checkpoint_height()
-            );
             let advanced_session =
                 MainnetClientSession::try_from_authenticated_bootstrap(&advanced_bootstrap)?;
             let advanced_ordinary_cases = fixture.ordinary_utxo_cases().await?;
@@ -1387,8 +1415,14 @@ mod tests {
                 .ordinary_utxos();
             let present_request = advanced_session
                 .seal_standard_address_query(client_address(present.address_script())?, 0)?;
-            let present_pending = runtime.query_page(present_request)?;
-            let present_response = *present_pending.try_release_bytes()?;
+            let present_pending = diagnose_phase(
+                runtime.query_page(present_request),
+                "advanced present query refused",
+            )?;
+            let present_response = *diagnose_phase(
+                present_pending.try_release_bytes(),
+                "advanced present response release refused",
+            )?;
             drop(present_pending);
             let present_page = advanced_session.open_single_page_response(present_response)?;
             assert_eq!(present_page.outcome, MainnetClientOutcome::Complete);
@@ -1402,8 +1436,14 @@ mod tests {
             }
             let fresh_request =
                 advanced_session.seal_standard_address_query(client_address(&absent)?, 0)?;
-            let fresh_pending = runtime.query_page(fresh_request)?;
-            let fresh_response = *fresh_pending.try_release_bytes()?;
+            let fresh_pending = diagnose_phase(
+                runtime.query_page(fresh_request),
+                "advanced absent query refused",
+            )?;
+            let fresh_response = *diagnose_phase(
+                fresh_pending.try_release_bytes(),
+                "advanced absent response release refused",
+            )?;
             drop(fresh_pending);
             let fresh_page = advanced_session.open_single_page_response(fresh_response)?;
             assert_eq!(fresh_page.outcome, MainnetClientOutcome::Complete);
@@ -1411,7 +1451,10 @@ mod tests {
 
             let terminal_request =
                 advanced_session.seal_standard_address_query(client_address(&absent)?, 0)?;
-            let terminal_pending = runtime.query_page(terminal_request)?;
+            let terminal_pending = diagnose_phase(
+                runtime.query_page(terminal_request),
+                "terminal query refused before subscriber advance",
+            )?;
             fixture.mine_blocks(1).await?;
             assert!(terminal_pending.try_release_bytes().is_err());
             drop(terminal_pending);

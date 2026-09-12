@@ -351,15 +351,41 @@ func enforceCurrentStatuses(tdx, qe pcs.TcbComponentStatus) error {
 	return nil
 }
 
+type runDependencies struct {
+	getter trust.HTTPSGetter
+	now    func() time.Time
+	stdout io.Writer
+}
+
 func run(args []string) error {
+	return runWith(args, runDependencies{
+		getter: newGetter(),
+		now:    time.Now,
+		stdout: os.Stdout,
+	})
+}
+
+func runWith(args []string, dependencies runDependencies) error {
 	fs := flag.NewFlagSet("tdx-verifier", flag.ContinueOnError)
+	mode := fs.String("mode", "quote", "verification mode: quote or ccel-diagnostic")
 	quotePath := fs.String("quote", "", "raw QuoteV4 file")
 	policyPath := fs.String("policy", "", "verifier-owned closed policy JSON")
+	ccelTablePath := fs.String("ccel-table", "", "CCEL ACPI table file (ccel-diagnostic mode)")
+	ccelLogPath := fs.String("ccel-log", "", "raw CCEL event-log area (ccel-diagnostic mode)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *quotePath == "" || *policyPath == "" || fs.NArg() != 0 {
-		return errors.New("usage: tdx-verifier -quote FILE -policy FILE")
+		return errors.New("usage: tdx-verifier [-mode quote|ccel-diagnostic] -quote FILE -policy FILE [-ccel-table FILE -ccel-log FILE]")
+	}
+	if *mode != "quote" && *mode != "ccel-diagnostic" {
+		return fmt.Errorf("unknown verification mode %q", *mode)
+	}
+	if *mode == "quote" && (*ccelTablePath != "" || *ccelLogPath != "") {
+		return errors.New("CCEL inputs require explicit ccel-diagnostic mode")
+	}
+	if *mode == "ccel-diagnostic" && (*ccelTablePath == "" || *ccelLogPath == "") {
+		return errors.New("ccel-diagnostic mode requires both -ccel-table and -ccel-log")
 	}
 	policyData, err := readBounded(*policyPath, maxPolicyBytes)
 	if err != nil {
@@ -376,12 +402,33 @@ func run(args []string) error {
 	if len(quoteBytes) < 2 || binary.LittleEndian.Uint16(quoteBytes[:2]) != 4 {
 		return errors.New("only QuoteV4 is accepted")
 	}
+	var ccelTableBytes, ccelLogBytes []byte
+	if *mode == "ccel-diagnostic" {
+		ccelTableBytes, err = readBounded(*ccelTablePath, maxCCELTableBytes)
+		if err != nil {
+			return fmt.Errorf("read CCEL table: %w", err)
+		}
+		ccelLogBytes, err = readBounded(*ccelLogPath, maxCCELLogBytes)
+		if err != nil {
+			return fmt.Errorf("read CCEL log: %w", err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), totalNetworkTime)
 	defer cancel()
-	if err := verifyEvidence(ctx, quoteBytes, policy, newGetter(), time.Now()); err != nil {
+	if err := verifyEvidence(ctx, quoteBytes, policy, dependencies.getter, dependencies.now()); err != nil {
 		return err
 	}
-	if err := writeReceipt(os.Stdout, quoteBytes, policyData, policy.Validate.TdQuoteBodyOptions.ReportData); err != nil {
+	if *mode == "ccel-diagnostic" {
+		replay, err := replayVerifiedQuoteCCEL(quoteBytes, ccelTableBytes, ccelLogBytes)
+		if err != nil {
+			return fmt.Errorf("strict CCEL digest replay: %w", err)
+		}
+		if err := writeCCELDiagnosticReceipt(dependencies.stdout, quoteBytes, policyData, policy.Validate.TdQuoteBodyOptions.ReportData, ccelTableBytes, ccelLogBytes, replay); err != nil {
+			return fmt.Errorf("write CCEL diagnostic receipt: %w", err)
+		}
+		return nil
+	}
+	if err := writeReceipt(dependencies.stdout, quoteBytes, policyData, policy.Validate.TdQuoteBodyOptions.ReportData); err != nil {
 		return fmt.Errorf("write receipt: %w", err)
 	}
 	return nil

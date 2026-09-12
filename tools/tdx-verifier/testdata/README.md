@@ -16,3 +16,12 @@ time. Refresh is a deliberate manual test operation.
 
 The fixtures contain public attestation evidence and public Intel collateral;
 they contain no credentials or private application data.
+
+`gcp-diagnostic-digest-only-ccel.bin` was reconstructed from the retained GCP
+diagnostic event log by retaining only the standardized Spec ID framing and
+each event's measurement-register index, event type, SHA-384 digest, and order.
+All descriptive event payloads were removed. It contains 114 framed records,
+of which 112 extend quoted RTMRs in lane counts `[18, 8, 86, 0]`. This fixture
+tests cryptographic quote verification followed by strict digest replay. It
+does not identify measured components, approve the diagnostic Ubuntu image, or
+establish a semantic workload policy.
