@@ -56,6 +56,23 @@ and OS Login IAM grants; these scripts grant no IAM roles and copy no
 credentials. `gcloud compute ssh` can publish the caller's OS Login SSH key and
 must only be run as part of an authorized experiment.
 
+The native ORAM workflow retains an `oram-native-build-<run>-<attempt>` artifact
+only after the native job's tests and release code-generation checks succeed;
+the parallel private-client matrix jobs remain separate checks. It contains
+the exact checked Linux x86_64 `zainod-oram`, lockfile, tool version reports,
+ELF interpreter/dynamic-linkage report, `build.json`, and `SHA256SUMS`. The
+packager refuses the listed ambient compiler, target, and release-profile
+overrides in its source. The version reports identify available tools, not a
+complete hermetic compiler/dependency closure. Verify all hashes after download and record the
+artifact/run identities in the experiment manifest before transfer. The source
+commit is the actual checked-out commit (which may be a PR merge commit), not an
+assumed PR head. The artifact expires after 30 days; retain the selected bundle
+in the dedicated project's private evidence bucket for a recorded experiment.
+Check the ELF interpreter and required libraries against the destination image;
+the executable is not asserted to be self-contained. This is unsigned CI build
+identity, not reproducibility, accepted-image policy,
+hardware attestation, or evidence that the executable ran inside TDX.
+
 The guest cannot download packages or source. Transfer only the reviewed
 release artifact, verifier challenge, and collection script through
 `gcloud compute scp --tunnel-through-iap`; record their SHA-256 digests before
