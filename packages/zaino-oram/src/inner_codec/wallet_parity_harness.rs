@@ -1227,9 +1227,9 @@ mod parity_tests {
         )?;
         let bootstrap = harness.session_bootstrap()?;
         let session = harness.wallet_session()?;
-        assert_eq!(bootstrap.key_epoch, session.checkpoint.key_epoch);
+        assert_eq!(bootstrap.key_epoch(), session.checkpoint.key_epoch);
         assert_eq!(
-            bootstrap.profile_id,
+            *bootstrap.profile_id(),
             *mainnet_utxo_history_profile()?.profile_id()
         );
 
