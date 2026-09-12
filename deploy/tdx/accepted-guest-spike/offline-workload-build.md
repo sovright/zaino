@@ -1,7 +1,7 @@
 # Offline workload build boundary
 
 The first stage builds the GNU `tdx-evidence-agent` from the explicitly frozen
-guest-confinement source commit `314b80ac1be55f0fb763587427f817d96c6803a1`,
+guest-confinement source commit `ef4d81b9bc7c68ef03a73730caf42781b3f1cd21`,
 which intentionally differs from the builder workflow commit, and records its complete
 interpreter and shared-library closure on two independent Linux runners. The
 selected Ubuntu OCI image executes with container networking disabled. Exact

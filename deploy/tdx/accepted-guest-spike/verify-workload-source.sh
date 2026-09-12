@@ -9,8 +9,8 @@ for file in source.json config.toml source-files.tsv vendor-files.tsv; do [[ -f 
 for directory in repository vendor; do [[ -d "$root/$directory" && ! -L "$root/$directory" ]] || fail "missing $directory"; done
 entries=$(find "$root" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' '); [[ "$entries" == 6 ]] || fail 'unexpected source-input root entry'
 jq -e '.schema=="zaino-workload-source-v1" and .scope=="reviewed-git-export-and-prefetched-cargo-source;compiler-and-build-unexecuted" and (.repository_revision|test("^[0-9a-f]{40}$")) and (.source_tree|test("^[0-9a-f]{40}$")) and (.cargo_lock_sha256|test("^[0-9a-f]{64}$")) and (.source_file_manifest_sha256|test("^[0-9a-f]{64}$")) and (.vendor_file_manifest_sha256|test("^[0-9a-f]{64}$")) and (.cargo_config_sha256|test("^[0-9a-f]{64}$"))' "$root/source.json" >/dev/null || fail 'source receipt rejected'
-[[ $(jq -r .repository_revision "$root/source.json") == 314b80ac1be55f0fb763587427f817d96c6803a1 && $(jq -r .source_tree "$root/source.json") == 2b4b61857e009232dbcb37413f24f6b7ff68e6f8 ]] || fail 'reviewed source identity mismatch'
-[[ $(git -C "$repository_root" rev-parse '314b80ac1be55f0fb763587427f817d96c6803a1^{tree}') == 2b4b61857e009232dbcb37413f24f6b7ff68e6f8 ]] || fail 'reviewed Git object unavailable'
+[[ $(jq -r .repository_revision "$root/source.json") == ef4d81b9bc7c68ef03a73730caf42781b3f1cd21 && $(jq -r .source_tree "$root/source.json") == 725be84be56cb6b51074ba81c8860523a91dbffd ]] || fail 'reviewed source identity mismatch'
+[[ $(git -C "$repository_root" rev-parse 'ef4d81b9bc7c68ef03a73730caf42781b3f1cd21^{tree}') == 725be84be56cb6b51074ba81c8860523a91dbffd ]] || fail 'reviewed Git object unavailable'
 hash() { local x; x=$(openssl dgst -sha256 -r "$1"); printf '%s\n' "${x%% *}"; }
 cmp "$root/config.toml" "$script_root/workload-cargo-config.toml" >/dev/null || fail 'Cargo config differs from reviewed config'
 [[ $(hash "$root/config.toml") == "$(jq -r .cargo_config_sha256 "$root/source.json")" ]] || fail 'config digest mismatch'
@@ -48,8 +48,8 @@ LC_ALL=C sort -t $'\t' -k2,2 -o "$vendor_classes" "$vendor_classes"
 [[ $(hash "$vendor_classes") == 32aaeb811dc98b5c6da4e46379fc41c9cf37eb31946710b444a743efbc10dd0a ]] || fail 'reviewed vendor modes differ'
 rm -f "$vendor_modes" "$vendor_classes"; trap - RETURN
 canonical_parent=$(mktemp -d); canonical="$canonical_parent/repository"; mkdir "$canonical"; trap 'rm -rf -- "$canonical_parent"' EXIT
-git -C "$repository_root" archive 314b80ac1be55f0fb763587427f817d96c6803a1 | tar -xf - -C "$canonical"
-git -C "$repository_root" show 314b80ac1be55f0fb763587427f817d96c6803a1:Cargo.lock > "$canonical/Cargo.lock"
+git -C "$repository_root" archive ef4d81b9bc7c68ef03a73730caf42781b3f1cd21 | tar -xf - -C "$canonical"
+git -C "$repository_root" show ef4d81b9bc7c68ef03a73730caf42781b3f1cd21:Cargo.lock > "$canonical/Cargo.lock"
 materialize() { local link=$1 target=$2; [[ -L "$canonical/$link" && $(readlink "$canonical/$link") == "$target" ]] || fail 'reviewed canonical link changed'; cp -L "$canonical/$link" "$canonical/$link.materialized"; rm "$canonical/$link"; mv "$canonical/$link.materialized" "$canonical/$link"; }
 materialize AGENTS.md CLAUDE.md
 materialize packages/zaino-proto/proto/compact_formats.proto ../lightwallet-protocol/walletrpc/compact_formats.proto

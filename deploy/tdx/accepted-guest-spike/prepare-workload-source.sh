@@ -9,8 +9,8 @@ out=$1; [[ ! -e "$out" ]] || fail 'output already exists'
 parent=$(cd -- "$(dirname -- "$out")" && pwd -P); name=$(basename -- "$out")
 stage=$(mktemp -d "$parent/.${name}.partial.XXXXXX"); moved=false
 cleanup() { local s=$?; trap - EXIT; [[ $moved == true ]] || rm -rf -- "$stage"; exit "$s"; }; trap cleanup EXIT
-revision=314b80ac1be55f0fb763587427f817d96c6803a1
-tree=2b4b61857e009232dbcb37413f24f6b7ff68e6f8
+revision=ef4d81b9bc7c68ef03a73730caf42781b3f1cd21
+tree=725be84be56cb6b51074ba81c8860523a91dbffd
 [[ $(git rev-parse "$revision^{tree}") == "$tree" ]] || fail 'reviewed source commit is unavailable or changed'
 mkdir "$stage/repository" "$stage/vendor"
 git archive --format=tar "$revision" | tar -xf - -C "$stage/repository"
