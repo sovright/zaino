@@ -259,6 +259,28 @@ mod tests {
 
     #[test]
     fn schema_and_generated_query_route_are_golden() {
+        assert_eq!(
+            private_proto::FixedEnvelope {
+                envelope: vec![1],
+                key_epoch: 2
+            }
+            .encode_to_vec(),
+            [10, 1, 1, 16, 2]
+        );
+        assert!(private_proto::BootstrapRequest {}.encode_to_vec().is_empty());
+        let bootstrap = private_proto::BootstrapResponse {
+            key_epoch: 1,
+            request_key: vec![2],
+            response_key: vec![3],
+            profile_label: "p".to_owned(),
+            envelope_bytes: 5,
+            attestation: vec![6],
+            profile_id: vec![7],
+        };
+        assert_eq!(
+            bootstrap.encode_to_vec(),
+            [8, 1, 18, 1, 2, 26, 1, 3, 34, 1, b'p', 40, 5, 50, 1, 6, 58, 1, 7]
+        );
         let request = private_proto::EvidenceRequest {
             challenge: vec![0xaa; 64],
         };
@@ -290,8 +312,11 @@ mod tests {
             private_proto::private_compact_tx_streamer_server::SERVICE_NAME,
             "zaino.private.v1.PrivateCompactTxStreamer"
         );
-        assert!(include_str!("private_proto.rs")
-            .contains("\"/zaino.private.v1.PrivateCompactTxStreamer/GetEvidence\""));
+        for route in ["QueryPage", "BootstrapSession", "GetEvidence"] {
+            assert!(include_str!("private_proto.rs").contains(&format!(
+                "\"/zaino.private.v1.PrivateCompactTxStreamer/{route}\""
+            )));
+        }
     }
 
     #[test]
