@@ -8,7 +8,19 @@ sources=$1 closure=$2 local_repo=$3 expected_packages=$4 fragment=$5 output=$6 r
 [[ "$run_label" =~ ^run-[12]$ ]] || fail 'invalid run label'
 for path in "$sources" "$closure" "$local_repo" "$expected_packages" "$fragment"; do [[ -e "$path" && ! -L "$path" ]] || fail 'missing regular build input'; done
 [[ ! -e "$output" ]] || fail 'output already exists'
+output_owner=$(stat -c '%u:%g' "$(dirname -- "$output")")
+[[ "$output_owner" =~ ^[0-9]+:[0-9]+$ ]] || fail 'invalid output owner'
 mkdir -m 700 -- "$output"
+# The disposable container runs as root to install the offline tool closure.
+# Hand its bounded output mount back to the unprivileged runner on every
+# controlled exit so failure evidence and cleanup remain possible.
+handoff_output() {
+  local status=$?
+  trap - EXIT
+  chown -R -h -- "$output_owner" "$output" 2>/dev/null || true
+  exit "$status"
+}
+trap handoff_output EXIT
 
 # The host authenticated every deb before constructing this local repository.
 # A private APT configuration permits only the readonly file source, preserving
