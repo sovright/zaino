@@ -19,6 +19,7 @@ members = [
     "tools/tdx-boot-spike-protocol",
     "tools/tdx-evidence-agent",
     "tools/tdx-boot-spike-client",
+    "tools/tdx-guest-init",
 ]
 # `container-test` runs a bare `cargo nextest run`, which operates on
 # default-members — so the heavy live-test crates are built and tested only
