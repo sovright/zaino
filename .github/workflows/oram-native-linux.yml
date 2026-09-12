@@ -81,6 +81,8 @@ jobs:
     name: zaino-oram (Linux x86_64)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      ORAM_LIVE_REFRESH_TEST: inner_codec::private_service::tests::mainnet_runtime_refreshes_from_a_live_nonempty_recent_snapshot
 
     steps:
       - name: Checkout repository
@@ -111,9 +113,27 @@ jobs:
           --locked --
           -D warnings -D clippy::unwrap_used
 
-      - name: Run all-feature tests natively
+      - name: Verify exactly one live-refresh regression is selected
+        run: |
+          cargo nextest list -p zaino-oram --all-features --locked \
+            -E "test(=$ORAM_LIVE_REFRESH_TEST)" --message-format json \
+            > target/oram-live-refresh-tests.json
+          jq -e --arg expected "$ORAM_LIVE_REFRESH_TEST" '
+            [."rust-suites"[].testcases | to_entries[] |
+              select(.value."filter-match".status == "matches" and .value.ignored == false) |
+              .key] == [$expected]
+          ' target/oram-live-refresh-tests.json
+
+      - name: Run live-refresh regression before the remaining suite
         run: >-
           cargo nextest run -p zaino-oram --all-features --locked
+          -E "test(=$ORAM_LIVE_REFRESH_TEST)"
+          --no-tests fail --status-level fail
+
+      - name: Run remaining all-feature tests natively
+        run: >-
+          cargo nextest run -p zaino-oram --all-features --locked
+          -E "not test(=$ORAM_LIVE_REFRESH_TEST)"
           --no-tests fail --status-level fail
 
       - name: Run strict typed-qualification runner Clippy
