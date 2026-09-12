@@ -3,9 +3,9 @@
 set -euo pipefail
 export LC_ALL=C
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-roots="$root/package-roots.json"
+roots="${2:-$root/package-roots.json}"
 fail() { echo "package closure refused: $*" >&2; exit 1; }
-[[ $# == 1 ]] || fail 'usage: resolve-package-closure.sh NEW_OUTPUT_DIRECTORY'
+[[ $# -ge 1 && $# -le 2 ]] || fail 'usage: resolve-package-closure.sh NEW_OUTPUT_DIRECTORY [PACKAGE_ROOTS_JSON]'
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'requires Linux x86_64'
 for tool in apt-get awk curl cut dpkg-deb gpgv head jq paste sha256sum sort stat timeout xz; do command -v "$tool" >/dev/null || fail "missing tool: $tool"; done
 if [[ ${ZAINO_PACKAGE_CLOSURE_DEADLINE_GUARD:-} != 1 ]]; then
