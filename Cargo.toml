@@ -3,6 +3,7 @@
 members = [
     "packages/zaino-common",
     "packages/zaino-oram",
+    "packages/zaino-tdx-evidence",
     "packages/zainod",
     "packages/zaino-serve",
     "packages/zaino-state",
@@ -15,6 +16,10 @@ members = [
     "live-tests/clientless",
     "live-tests/e2e",
     "packages/zaino-private-client",
+    "tools/tdx-boot-spike-protocol",
+    "tools/tdx-evidence-agent",
+    "tools/tdx-boot-spike-client",
+    "tools/tdx-guest-init",
 ]
 # `container-test` runs a bare `cargo nextest run`, which operates on
 # default-members — so the heavy live-test crates are built and tested only

@@ -185,6 +185,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d6f9ca11400f14ef046700eb6401c706c587871303453a5e7586efb82340c3d"
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3197,6 +3219,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64",
+ "serde_core",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3900,6 +3932,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "091e7a8e7d86e6feb87a27ce8e2cba29d49eff9507afeebefab7eeb2ca667fb4"
 dependencies = [
  "aws-lc-rs",
+ "pem",
  "rustls-pki-types",
  "time",
  "x509-parser",
@@ -4430,6 +4463,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "secp256k1"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4901,6 +4943,66 @@ checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
 dependencies = [
  "filetime",
  "libc",
+]
+
+[[package]]
+name = "tdx-boot-spike-client"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tdx-boot-spike-protocol",
+ "tokio",
+ "tonic",
+ "zaino-private-client",
+]
+
+[[package]]
+name = "tdx-boot-spike-protocol"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "protoc-bin-vendored",
+ "sha2 0.10.9",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "tdx-evidence-agent"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "clap",
+ "libc",
+ "rcgen",
+ "rustls",
+ "seccompiler",
+ "sha2 0.10.9",
+ "tdx-boot-spike-protocol",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "zaino-private-client",
+ "zaino-tdx-evidence",
+]
+
+[[package]]
+name = "tdx-guest-init"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "hex",
+ "libc",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -6277,6 +6379,7 @@ dependencies = [
 name = "zaino-private-client"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "hex",
  "http",
  "hyper-util",
@@ -6289,6 +6392,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tdx-boot-spike-protocol",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -6385,6 +6489,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zaino-tdx-evidence"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "zaino-testutils"
 version = "0.2.0"
 dependencies = [
@@ -6457,6 +6568,7 @@ dependencies = [
  "zaino-oram",
  "zaino-private-client",
  "zaino-state",
+ "zaino-tdx-evidence",
  "zainod",
 ]
 

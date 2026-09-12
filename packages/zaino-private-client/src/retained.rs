@@ -115,6 +115,127 @@ impl fmt::Display for RetainedClientError {
 }
 impl std::error::Error for RetainedClientError {}
 
+/// One TLS 1.3 stream whose peer proved possession of its certificate key.
+///
+/// This type performs no attestation or admission. Every RPC failure,
+/// cancellation, or deadline terminally closes the sole underlying socket.
+pub struct UnverifiedRetainedTlsConnection {
+    channel: Option<Channel>,
+    peer_spki_sha256: [u8; 32],
+    socket_control: Arc<std::net::TcpStream>,
+    deadline: Instant,
+}
+
+impl UnverifiedRetainedTlsConnection {
+    /// Connects one non-resuming TLS stream before the caller's absolute deadline.
+    pub async fn connect(
+        endpoint: SocketAddr,
+        deadline: Instant,
+    ) -> Result<Self, RetainedClientError> {
+        ensure_active(deadline)?;
+        let (channel, peer_spki_sha256, socket_control) =
+            tokio::time::timeout_at(deadline, connect_retained_tls_inner(endpoint))
+                .await
+                .map_err(|_| RetainedClientError::Cancelled)??;
+        let connection = Self {
+            channel: Some(channel),
+            peer_spki_sha256,
+            socket_control,
+            deadline,
+        };
+        ensure_active(deadline)?;
+        Ok(connection)
+    }
+
+    pub fn peer_spki_sha256(&self) -> [u8; 32] {
+        self.peer_spki_sha256
+    }
+
+    /// Sends one bounded unary RPC while retaining sole ownership of the stream.
+    pub async fn unary<RequestMessage, ResponseMessage>(
+        &mut self,
+        request: RequestMessage,
+        path: http::uri::PathAndQuery,
+        encoding_cap: usize,
+        decoding_cap: usize,
+        deadline: Instant,
+    ) -> Result<ResponseMessage, RetainedClientError>
+    where
+        RequestMessage: prost::Message + Default + Send + Sync + 'static,
+        ResponseMessage: prost::Message + Default + Send + Sync + 'static,
+    {
+        if deadline > self.deadline || Instant::now() >= deadline {
+            self.terminate();
+            return Err(RetainedClientError::Cancelled);
+        }
+        let channel = self
+            .channel
+            .as_ref()
+            .ok_or(RetainedClientError::Transport)?
+            .clone();
+        let mut guard = UnverifiedFailureGuard::new(self);
+        let rpc = async move {
+            let mut grpc = tonic::client::Grpc::new(channel)
+                .max_encoding_message_size(encoding_cap)
+                .max_decoding_message_size(decoding_cap);
+            grpc.ready().await.map_err(|_| RetainedClientError::Rpc)?;
+            let codec = tonic_prost::ProstCodec::default();
+            grpc.unary(Request::new(request), path, codec)
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|_| RetainedClientError::Rpc)
+        };
+        let response = tokio::time::timeout_at(deadline, rpc)
+            .await
+            .map_err(|_| RetainedClientError::Cancelled)??;
+        ensure_active(deadline)?;
+        guard.disarm();
+        Ok(response)
+    }
+
+    fn terminate(&mut self) {
+        self.channel.take();
+        let _ = self.socket_control.shutdown(Shutdown::Both);
+    }
+}
+
+impl fmt::Debug for UnverifiedRetainedTlsConnection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UnverifiedRetainedTlsConnection { ..REDACTED.. }")
+    }
+}
+
+impl Drop for UnverifiedRetainedTlsConnection {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+struct UnverifiedFailureGuard<'a> {
+    connection: &'a mut UnverifiedRetainedTlsConnection,
+    armed: bool,
+}
+
+impl<'a> UnverifiedFailureGuard<'a> {
+    fn new(connection: &'a mut UnverifiedRetainedTlsConnection) -> Self {
+        Self {
+            connection,
+            armed: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnverifiedFailureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.connection.terminate();
+        }
+    }
+}
+
 /// Admitted first-page client. The channel and codec never leave this owner.
 pub struct RetainedPrivateClient {
     grpc:
@@ -710,9 +831,52 @@ mod tests {
         SignatureAlgorithm,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tdx_boot_spike_protocol::wire::{
+        boot_spike_evidence_server::{BootSpikeEvidence, BootSpikeEvidenceServer},
+        EvidenceRequest, EvidenceResponse,
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio::net::TcpListener;
     use tokio_rustls::client::TlsStream;
     use tokio_rustls::TlsAcceptor;
+    use tonic::{Response, Status};
+
+    struct TestTlsIo(tokio_rustls::server::TlsStream<TcpStream>);
+
+    impl tonic::transport::server::Connected for TestTlsIo {
+        type ConnectInfo = ();
+        fn connect_info(&self) -> Self::ConnectInfo {}
+    }
+
+    impl AsyncRead for TestTlsIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestTlsIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
 
     #[test]
     fn admission_age_and_transport_durations_must_be_nonzero() {
@@ -910,6 +1074,186 @@ mod tests {
         assert!(called.load(Ordering::SeqCst));
         let server_result = tokio::time::timeout(Duration::from_secs(1), server).await??;
         assert!(server_result.is_err());
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct DelayedEvidenceService {
+        delay: Duration,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    struct CancellationMarker(Arc<AtomicBool>);
+
+    struct ServerTask(JoinHandle<Result<(), tonic::transport::Error>>);
+
+    impl Drop for ServerTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    impl Drop for CancellationMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tonic::async_trait]
+    impl BootSpikeEvidence for DelayedEvidenceService {
+        async fn get_evidence(
+            &self,
+            _request: Request<EvidenceRequest>,
+        ) -> Result<Response<EvidenceResponse>, Status> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let _marker = CancellationMarker(Arc::clone(&self.cancelled));
+            tokio::time::sleep(self.delay).await;
+            Ok(Response::new(EvidenceResponse::default()))
+        }
+    }
+
+    async fn delayed_evidence_server(
+        delay: Duration,
+    ) -> Result<
+        (
+            SocketAddr,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<AtomicBool>,
+            ServerTask,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let certified = rcgen::generate_simple_self_signed(vec![PRIVATE_DNS_NAME.to_string()])?;
+        let config = test_server_config(
+            certified.cert.der().clone(),
+            certified.signing_key.serialize_der(),
+            None,
+        )?;
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let incoming = async_stream::stream! {
+            let item = match listener.accept().await {
+                Ok((socket, _)) => acceptor.accept(socket).await.map(TestTlsIo),
+                Err(error) => Err(error),
+            };
+            yield item;
+        };
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let service = DelayedEvidenceService {
+            delay,
+            requests: Arc::clone(&requests),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BootSpikeEvidenceServer::new(service))
+                .serve_with_incoming(incoming),
+        );
+        Ok((address, requests, cancelled, ServerTask(server)))
+    }
+
+    #[tokio::test]
+    async fn cancelling_unverified_unary_terminally_closes_the_owned_stream(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (address, requests, cancelled, mut server) =
+            delayed_evidence_server(Duration::from_secs(5)).await?;
+        let mut connection = UnverifiedRetainedTlsConnection::connect(
+            address,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await?;
+        let path = http::uri::PathAndQuery::from_static(
+            "/zaino.boot_spike.v1.BootSpikeEvidence/GetEvidence",
+        );
+        let mut rpc = Box::pin(connection.unary::<EvidenceRequest, EvidenceResponse>(
+            EvidenceRequest::default(),
+            path.clone(),
+            1024,
+            1024,
+            Instant::now() + Duration::from_secs(1),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.load(Ordering::SeqCst) == 0 {
+                tokio::select! {
+                    result = &mut rpc => return Err(format!("RPC unexpectedly completed: {result:?}")),
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await??;
+        drop(rpc);
+        assert!(matches!(
+            connection
+                .unary::<EvidenceRequest, EvidenceResponse>(
+                    EvidenceRequest::default(),
+                    path,
+                    1024,
+                    1024,
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .await,
+            Err(RetainedClientError::Transport)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(1), &mut server.0).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_unverified_unary_result_is_refused_and_terminal(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (address, requests, cancelled, mut server) =
+            delayed_evidence_server(Duration::from_secs(2)).await?;
+        let mut connection = UnverifiedRetainedTlsConnection::connect(
+            address,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await?;
+        let path = http::uri::PathAndQuery::from_static(
+            "/zaino.boot_spike.v1.BootSpikeEvidence/GetEvidence",
+        );
+        assert!(matches!(
+            connection
+                .unary::<EvidenceRequest, EvidenceResponse>(
+                    EvidenceRequest::default(),
+                    path.clone(),
+                    1024,
+                    1024,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+            Err(RetainedClientError::Cancelled)
+        ));
+        assert!(matches!(
+            connection
+                .unary::<EvidenceRequest, EvidenceResponse>(
+                    EvidenceRequest::default(),
+                    path,
+                    1024,
+                    1024,
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .await,
+            Err(RetainedClientError::Transport)
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(1), &mut server.0).await???;
         Ok(())
     }
 
