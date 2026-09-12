@@ -11,7 +11,8 @@ publish = false
 
 [features]
 default = []
-corpus-zaino = ["dep:zaino-state"]
+client-codec = []
+corpus-zaino = ["client-codec", "dep:zaino-state"]
 shadow-parity = ["corpus-zaino"]
 # Test-support only: see `inner_codec::wallet_parity_harness`. Enabled through
 # dev-dependencies so it is absent from every non-test build.

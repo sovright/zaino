@@ -44,7 +44,7 @@ mod xchacha20;
 // protector, lease, and journal types this module keeps private; hoisting it
 // out would mean widening all of them, which is exactly the hiding the codec
 // is built around. Only the opaque `impl Trait` it returns leaves the crate.
-#[cfg(feature = "corpus-zaino")]
+#[cfg(feature = "client-codec")]
 pub(super) mod client_session;
 #[cfg(feature = "corpus-zaino")]
 pub(super) mod private_service;

@@ -179,15 +179,12 @@ impl ValidatedBootstrap {
         self,
     ) -> Result<zaino_oram::MainnetClientSession, zaino_oram::MainnetClientCodecError> {
         let network = match self.network {
-            BootstrapNetwork::Mainnet => zaino_oram::PrivateNetwork::Mainnet,
-            BootstrapNetwork::Testnet => zaino_oram::PrivateNetwork::Testnet,
-            BootstrapNetwork::Regtest => zaino_oram::PrivateNetwork::Regtest,
+            BootstrapNetwork::Mainnet => zaino_oram::MainnetClientNetwork::Mainnet,
+            BootstrapNetwork::Testnet => zaino_oram::MainnetClientNetwork::Testnet,
+            BootstrapNetwork::Regtest => zaino_oram::MainnetClientNetwork::Regtest,
         };
         zaino_oram::MainnetClientSession::try_from_authenticated_context(
-            zaino_oram::ReleasableSessionKeys {
-                request_key: self.request_key,
-                response_key: self.response_key,
-            },
+            zaino_oram::MainnetClientKeys::new(self.request_key, self.response_key),
             self.session_binding,
             self.profile_id,
             network,

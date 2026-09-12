@@ -31,7 +31,12 @@ with a different checkpoint or a continuation. The caller must keep the exact
 verified evidence immutable; these public parsing helpers do not enforce
 connection ownership or authorize a query.
 
-The codec dependency currently enables `zaino-oram/corpus-zaino` and includes
-the chain-index and native database dependency closure. This is a research
-integration, not yet a minimal wallet dependency. Complete pagination, cover
-rounds, retained-connection admission, and an accepted guest image remain open.
+The codec dependency enables only `zaino-oram/client-codec`. Its production
+normal dependency graph excludes `zaino-state`, Zebra, LMDB, RocksDB, and the
+server's native cryptography. The broader research crate still compiles some
+modules unrelated to wallet operation, so this extraction is a bounded closure
+reduction rather than a claim that the whole crate is a minimal cryptographic
+library. Complete pagination, cover rounds, retained-connection admission, and
+an accepted guest image remain open. A future TLS transport may deliberately
+add a reviewed native cryptography provider without reintroducing state or
+database dependencies.
