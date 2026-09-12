@@ -1,0 +1,35 @@
+{
+  "schema": "zaino-boot-spike-custom-kernel-source-v1",
+  "scope": "source_selection_only",
+  "kernel_build_complete": false,
+  "snapshot": "https://snapshot.ubuntu.com/ubuntu/20260911T000000Z/",
+  "index": {
+    "suite": "noble-updates",
+    "path": "main/source/Sources.xz",
+    "file": "kernel-source/noble-updates-main-Sources.xz",
+    "bytes": 520100,
+    "sha256": "471723345504d735e6c2b2099d0782fdb947298d308c3f166632382e25927422"
+  },
+  "package": {
+    "name": "linux-gcp-6.17",
+    "version": "6.17.0-1022.25",
+    "directory": "pool/main/l/linux-gcp-6.17"
+  },
+  "files": [
+    {
+      "file": "linux-gcp-6.17_6.17.0-1022.25.diff.gz",
+      "bytes": 3661171,
+      "sha256": "ab102e6505a4bfcf4a6393358ba2a562a140860dc9c477f535ee4c61e84a518b"
+    },
+    {
+      "file": "linux-gcp-6.17_6.17.0-1022.25.dsc",
+      "bytes": 6000,
+      "sha256": "2deb9f24fa6c655365edaebc946b80e123af092c3fe8bfbc86b131f13683b2e3"
+    },
+    {
+      "file": "linux-gcp-6.17_6.17.0.orig.tar.gz",
+      "bytes": 248671329,
+      "sha256": "a5623ec5af79da8807e1467e43a1888461c7a445fb1e17533fe45f0fdf4394e3"
+    }
+  ]
+}
