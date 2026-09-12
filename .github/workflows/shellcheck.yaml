@@ -28,3 +28,6 @@ jobs:
 
       - name: Verify boot-spike upstream selection and refusal cases
         run: bash deploy/tdx/accepted-guest-spike/test-upstream-selection.sh
+
+      - name: Verify pinned Rust compiler metadata and refusal cases
+        run: bash deploy/tdx/accepted-guest-spike/test-rust-toolchain-inputs.sh
