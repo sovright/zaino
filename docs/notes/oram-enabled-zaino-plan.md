@@ -625,6 +625,10 @@ advantage for each observation. Separate host-visible measurements from trusted
 diagnostic instrumentation and record instrumentation effects. Review the exact
 release assembly as well. Passing finite experiments is bounded evidence, not
 a proof of obliviousness; independent review remains mandatory.
+The [operator-observation registration protocol](oram-operator-observation-protocol.md)
+defines the required frozen manifest, contrasting cases, observation provenance,
+whole-session controls, and treatment of missing or correlated evidence. Its
+unfilled execution prerequisites are not successful qualifications.
 
 **B. Full-mainnet capacity and recovery feasibility.** Reopen and validate the
 completed capture/sizing lineage at its recorded public checkpoint; rerun capture
@@ -641,8 +645,12 @@ evaluate the full-service RTO before the run. Do not extrapolate the bounded
 `BuilderFoundationV1` result into mainnet qualification.
 
 Start from the [current Track B prerequisite audit](oram-track-b-mainnet-prerequisites-2026-09-12.md),
-which checks the retained insertion/hybrid artifact lineage and records the
-missing original capture and target access. The
+which checks the retained insertion/hybrid artifact lineage. Its original
+capture-availability limitation is superseded by the
+[recovery ledger](oram-mainnet-capture-recovery.md): the exact three-file capture
+is now retained in the dedicated project's private evidence bucket. Current
+typed-reader revalidation and hardware capacity/recovery gates remain separate.
+The
 [recent-state width analysis](recent-snapshot-scan-width.md) records negative
 cost evidence and design alternatives at its named boundaries. Main `753f3fc5`
 already consumes stored annotations in the query path; remeasure that actual
