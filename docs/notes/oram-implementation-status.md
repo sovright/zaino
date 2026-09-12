@@ -23,6 +23,67 @@ This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
 clear any Phase 0 gate.
 
+## 2026-09-12 — evidence, activated bootstrap, and client codec composition
+
+The outside-operator execution stack now includes a bounded raw-evidence route
+bound to the live ephemeral TLS SPKI ([PR144](https://github.com/sovright/zaino/pull/144)),
+a strict client-owned QuoteV4 verifier
+([PR146](https://github.com/sovright/zaino/pull/146)), and activated bootstrap
+and client-codec composition under
+[ADR0904](../adr/0904-activated-private-client-bootstrap-context.md)
+([PR148](https://github.com/sovright/zaino/pull/148)). The quote verifier checks
+signature, current collateral/revocation, TCB status, and supplied measurement
+policy; its result is not an accepted workload or query-admission capability.
+
+After login restoration, the isolated administrator-accessible GCP diagnostic
+produced a signed quote that passed full cryptographic verification against a
+test-only policy. All owned cloud resources were explicitly deleted. The
+[diagnostic ledger](oram-tdx-platform-diagnostic-2026-09-12.md) records exact
+artifacts and teardown. This was a platform diagnostic, not an immutable Zaino
+image, a quote-bound Zaino query, or the 176-GiB mainnet capacity target. The
+original full-mainnet capture was subsequently recovered into the restricted
+research project, hash-checked, and reopened by `validate-sizing`; the
+[recovery ledger](oram-mainnet-capture-recovery.md) records the exact objects
+and hashes. Its historical sizing qualification reproduced. Current semantic
+qualification and the fixed-profile capacity experiment remain pending.
+
+The client reconstructs the canonical REPORT_DATA transcript, correlates the
+local helper receipt with exact quote/policy bytes, and validates the activated
+owner bootstrap before constructing the existing first-page codec. The owner
+refuses new bootstrap contexts when unhealthy, stopped, non-idle, or stale.
+Checkpoint validation prevents an old reader accepting a new generation's
+response. Five portable wallet-parity tests pass at `4fc5e1e0`, including a
+generation swap that checks old-reader refusal and current-reader protected
+empty refusal. Native CI exposed two Linux-only stale field accesses, corrected
+to existing getters; the full native query/refresh result remains pending.
+The smaller live-subscriber refresh fixture at `bba720b0` passed its native
+all-feature ORAM test suite in
+[run 34706914500](https://github.com/sovright/zaino/actions/runs/34706914500);
+that baseline does not include the later client query/bootstrap composition.
+
+[PR149](https://github.com/sovright/zaino/pull/149) separates `client-codec`
+from `corpus-zaino`. At `e501ab83`, the normal client dependency graph excludes
+Zaino state, Zebra, native databases, and the ORAM backend. It keeps the same
+cryptography, profile constants, and domain separation. Its 12 client tests and
+strict package Clippy passed on both Ubuntu and macOS in
+[run 34708009946](https://github.com/sovright/zaino/actions/runs/34708009946).
+Its native ORAM job remains a separate gate. The earlier heavy client build
+showed an unexplained concurrent nextest handle-leak flag on a synchronous
+parser test; the isolated test and complete serial suite passed without that
+flag, and no runner timeout or failure policy was relaxed.
+
+Sol implemented these slices and Astra reviewed their source. The
+[retained-connection design](oram-retained-connection-design.md) now has a
+bounded client implementation that keeps one TLS 1.3/HTTP2 stream through
+fresh evidence, local helper verification, bootstrap, and a production-codec
+first-page query. Local real-listener tests cover a synthetic quote/receipt
+fixture, positive ordinary-source query parity, evidence and bootstrap refusal
+ordering, and fail-closed cancellation. They do not establish hardware quote
+acceptance or an accepted immutable guest. Complete pagination/cover rounds, the remaining
+wallet methods, immutable guest acceptance and measured-boot coverage, state
+freshness/rollback protection, target mainnet capacity, and physical
+access-pattern qualification remain open. Production remains NO-GO.
+
 ## 2026-09-12 — outside-operator goal and ephemeral TLS prerequisite
 
 The execution baseline for this slice is fork main `753f3fc5`, not the earlier
@@ -55,10 +116,10 @@ body and repository duplication guard also passed. These are local transport,
 configuration, and lifecycle checks, not a real-ORAM end-to-end TDX test.
 
 The [Track B audit](oram-track-b-mainnet-prerequisites-2026-09-12.md) checked the
-six retained derivative artifact file hashes and their recorded lineage. It did
-not revalidate the unavailable original capture. After restored GCP login,
-read-only inventory found no current TDX/ORAM builder or discoverable retained
-ORAM volume in the configured project. No cloud resources were changed and no
+six retained derivative artifact file hashes and their recorded lineage. A
+later recovery operation found the original private capture and sizing bundles,
+copied them into the dedicated research project, verified their hashes, and
+reproduced the historical sizing qualification; see the recovery ledger. No
 new capture, target-load experiment, or recovery measurement was run.
 
 ## Earlier implementation slices

@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prost = prost_build::Config::new();
     prost.protoc_executable(protoc);
     tonic_prost_build::configure()
-        .build_client(false)
+        .build_client(true)
         .build_server(false)
         .compile_with_config(prost, &[SCHEMA], &["../zainod-oram/proto"])?;
     Ok(())

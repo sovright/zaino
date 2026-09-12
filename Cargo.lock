@@ -6278,15 +6278,25 @@ name = "zaino-private-client"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "http",
+ "hyper-util",
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+ "rcgen",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tonic-prost",
  "tonic-prost-build",
+ "tower 0.4.13",
+ "x509-parser",
  "zaino-oram",
 ]
 
@@ -6445,6 +6455,7 @@ dependencies = [
  "tonic-prost-build",
  "zaino-common",
  "zaino-oram",
+ "zaino-private-client",
  "zaino-state",
  "zainod",
 ]
