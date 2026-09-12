@@ -18,6 +18,7 @@ on:
       - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
       - 'tools/workbench/**'
+      - 'tools/scripts/package-oram-build.sh'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
@@ -34,6 +35,7 @@ on:
       - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
       - 'tools/workbench/**'
+      - 'tools/scripts/package-oram-build.sh'
 
 permissions:
   contents: read
@@ -79,6 +81,8 @@ jobs:
     name: zaino-oram (Linux x86_64)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      ORAM_LIVE_REFRESH_TEST: inner_codec::private_service::tests::mainnet_runtime_refreshes_from_a_live_nonempty_recent_snapshot
 
     steps:
       - name: Checkout repository
@@ -109,9 +113,27 @@ jobs:
           --locked --
           -D warnings -D clippy::unwrap_used
 
-      - name: Run all-feature tests natively
+      - name: Verify exactly one live-refresh regression is selected
+        run: |
+          cargo nextest list -p zaino-oram --all-features --locked \
+            -E "test(=$ORAM_LIVE_REFRESH_TEST)" --message-format json \
+            > target/oram-live-refresh-tests.json
+          jq -e --arg expected "$ORAM_LIVE_REFRESH_TEST" '
+            [."rust-suites"[].testcases | to_entries[] |
+              select(.value."filter-match".status == "matches" and .value.ignored == false) |
+              .key] == [$expected]
+          ' target/oram-live-refresh-tests.json
+
+      - name: Run live-refresh regression before the remaining suite
         run: >-
           cargo nextest run -p zaino-oram --all-features --locked
+          -E "test(=$ORAM_LIVE_REFRESH_TEST)"
+          --no-tests fail --status-level fail
+
+      - name: Run remaining all-feature tests natively
+        run: >-
+          cargo nextest run -p zaino-oram --all-features --locked
+          -E "not test(=$ORAM_LIVE_REFRESH_TEST)"
           --no-tests fail --status-level fail
 
       - name: Run strict typed-qualification runner Clippy
@@ -136,6 +158,43 @@ jobs:
           nm --version | head -1
           objdump --version | head -1
 
+      # Preserve the exact binary for review even when a later profile rejects
+      # it. This is deliberately not the checked research-runner bundle.
+      - name: Prepare unqualified codegen diagnostic
+        run: |
+          set -euo pipefail
+          umask 077
+          diagnostic=target/oram-codegen-diagnostic
+          mkdir -m 0700 "$diagnostic"
+          install -m 0644 target/release/zainod-oram "$diagnostic/runner.UNQUALIFIED"
+          cp Cargo.lock "$diagnostic/Cargo.lock"
+          rustc --version --verbose > "$diagnostic/rustc-version.txt"
+          nm --defined-only target/release/zainod-oram > "$diagnostic/defined-symbols.txt"
+          nm --demangle --defined-only target/release/zainod-oram > "$diagnostic/demangled-symbols.txt"
+          objdump --version > "$diagnostic/binutils-version.txt"
+          objdump --disassemble --wide target/release/zainod-oram > "$diagnostic/disassembly.txt"
+          readelf --relocs --wide target/release/zainod-oram > "$diagnostic/relocations.txt"
+          jq -n --arg source_commit "$(git rev-parse HEAD)" \
+            --arg source_tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg workflow_commit "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{schema:"zaino-oram-codegen-diagnostic-v1",qualified:false,
+              source_commit:$source_commit,source_tree:$source_tree,
+              workflow_commit:$workflow_commit,run_id:$run_id,run_attempt:$run_attempt,
+              build_command:"cargo build -p zainod-oram --all-features --locked --release",
+              scope:"unqualified-binary-for-static-inspection-only"}' > "$diagnostic/diagnostic.json"
+          (cd "$diagnostic" && sha256sum runner.UNQUALIFIED Cargo.lock \
+            rustc-version.txt defined-symbols.txt demangled-symbols.txt \
+            binutils-version.txt disassembly.txt relocations.txt diagnostic.json > SHA256SUMS)
+
+      - name: Retain unqualified codegen diagnostic
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oram-codegen-UNQUALIFIED-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/oram-codegen-diagnostic/
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Check the ORAM access-path codegen profile
         run: >-
           cargo run --locked --release
@@ -155,3 +214,14 @@ jobs:
           --manifest-path tools/workbench/Cargo.toml
           --bin check-oram-page-codegen --
           target/release/zainod-oram
+
+      - name: Package the checked research runner and build identity
+        run: bash tools/scripts/package-oram-build.sh target/oram-native-build
+
+      - name: Retain the checked native research runner
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oram-native-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/oram-native-build/
+          if-no-files-found: error
+          retention-days: 30

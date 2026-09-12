@@ -78,7 +78,7 @@ where
     async fn refresh_from_capture<Capture, Current, Bind>(
         &mut self,
         committed_finalized: PublicChainCheckpoint,
-        finalized_store: S,
+        mut finalized_store: S,
         capture: Capture,
         current: Current,
         bind_currentness: Bind,
@@ -117,6 +117,7 @@ where
         let captured_boundary = input.boundary().clone();
 
         self.rebuild_candidate(
+            &mut finalized_store,
             identity,
             u32::from(recent_tip.height),
             recent_tip.hash.bytes_in_display_order(),
@@ -162,6 +163,7 @@ where
     /// on failure. The closures keep tests independent of live database setup.
     fn rebuild_candidate<Build, Current>(
         &mut self,
+        finalized_store: &mut S,
         identity: RecentSnapshotIdentity,
         recent_tip_height: u32,
         recent_tip_hash_display: [u8; 32],
@@ -186,6 +188,16 @@ where
             }
         };
 
+        if finalized_store
+            .prepare_recent_snapshot(converted.slots())
+            .is_err()
+        {
+            self.consume_failed_update(ticket)?;
+            return Err(RecentSnapshotRefreshError::PreparationRejected);
+        }
+
+        // Preparation can be long-running. Recheck the source only after every
+        // finalized record is annotated against this exact converted candidate.
         match current() {
             Ok(true) => {}
             Ok(false) => {
@@ -469,6 +481,7 @@ pub(crate) enum RecentSnapshotRefreshError {
     CaptureUnavailable,
     InputRejected,
     BuildRejected,
+    PreparationRejected,
     SourceAdvanced,
     FreshnessUnavailable,
     RebuildRequired,
@@ -488,6 +501,7 @@ impl fmt::Display for RecentSnapshotRefreshError {
             Self::CaptureUnavailable => f.write_str("recent snapshot capture unavailable"),
             Self::InputRejected => f.write_str("recent snapshot input rejected"),
             Self::BuildRejected => f.write_str("recent snapshot build rejected"),
+            Self::PreparationRejected => f.write_str("finalized snapshot preparation rejected"),
             Self::SourceAdvanced => f.write_str("recent snapshot source advanced during build"),
             Self::FreshnessUnavailable => f.write_str("recent snapshot freshness unavailable"),
             Self::RebuildRequired => f.write_str("recent snapshot rebuild required"),
@@ -538,6 +552,8 @@ mod tests {
 
     struct TestFinalizedStore {
         identity: RecentSnapshotIdentity,
+        prepared: std::rc::Rc<std::cell::Cell<bool>>,
+        reject_preparation: bool,
     }
 
     impl ObliviousStore for TestFinalizedStore {
@@ -559,6 +575,18 @@ mod tests {
     impl FinalizedServingStore for TestFinalizedStore {
         fn serving_identity(&self) -> RecentSnapshotIdentity {
             self.identity
+        }
+
+        fn prepare_recent_snapshot(
+            &mut self,
+            _recent: &[RecentSnapshotSlot],
+        ) -> Result<(), Self::Error> {
+            // This fixture contains only padding, so there are no records to annotate.
+            if self.reject_preparation {
+                return Err(());
+            }
+            self.prepared.set(true);
+            Ok(())
         }
     }
 
@@ -612,6 +640,8 @@ mod tests {
     fn finalized_store() -> TestFinalizedStore {
         TestFinalizedStore {
             identity: identity(100, FINALIZED_HASH),
+            prepared: Default::default(),
+            reject_preparation: false,
         }
     }
 
@@ -620,6 +650,7 @@ mod tests {
         finalized: RecentSnapshotIdentity,
     ) -> Result<(), RecentSnapshotRefreshError> {
         controller.rebuild_candidate(
+            &mut finalized_store(),
             finalized,
             102,
             TIP_HASH_A,
@@ -688,7 +719,10 @@ mod tests {
                 .refresh(
                     fixture.subscriber(),
                     committed,
-                    TestFinalizedStore { identity },
+                    TestFinalizedStore {
+                        identity,
+                        ..finalized_store()
+                    },
                 )
                 .await?;
             Ok::<_, Box<dyn std::error::Error>>(())
@@ -746,7 +780,10 @@ mod tests {
                     .refresh(
                         fixture.subscriber(),
                         committed,
-                        TestFinalizedStore { identity },
+                        TestFinalizedStore {
+                            identity,
+                            ..finalized_store()
+                        },
                     )
                     .await,
                 Err(RecentSnapshotRefreshError::BuildRejected)
@@ -755,7 +792,10 @@ mod tests {
             wide.refresh(
                 fixture.subscriber(),
                 committed,
-                TestFinalizedStore { identity },
+                TestFinalizedStore {
+                    identity,
+                    ..finalized_store()
+                },
             )
             .await?;
             Ok::<_, Box<dyn std::error::Error>>(())
@@ -790,12 +830,138 @@ mod tests {
     }
 
     #[test]
+    fn prepares_real_finalized_records_against_each_candidate(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            layout::{
+                derive_standard_address_key, LayoutNetwork, StandardAddress, StandardScriptKind,
+            },
+            projection_owner::{
+                finalized_serving_store_for_runtime_tests, FinalizedProjectionServingStore,
+            },
+            records::RecordAnnotation,
+        };
+
+        let address = derive_standard_address_key(
+            LayoutNetwork::Regtest,
+            1,
+            StandardAddress::new(StandardScriptKind::PayToPublicKeyHash, [0xa1; 20]),
+        );
+        let mut controller = RecentSnapshotRefreshController::<
+            SLOT_COUNT,
+            FinalizedProjectionServingStore,
+            TestCurrentness,
+        >::new(CanonicalNetwork::Regtest, 1, 11, 7)?;
+
+        for spend_first in [true, false] {
+            let mut store = finalized_serving_store_for_runtime_tests()?;
+            let first = store.read_slot(&address, 0)?;
+            let second = store.read_slot(&address, 1)?;
+            assert!(first.is_occupied() && second.is_occupied());
+            assert_eq!(first.annotation(), RecordAnnotation::Unannotated);
+            assert_eq!(second.annotation(), RecordAnnotation::Unannotated);
+            let finalized = store.serving_identity();
+            let tip_height = store.committed_checkpoint().height() + 1;
+            let slots = [
+                if spend_first {
+                    RecentSnapshotSlot::spent(address, *first.record())
+                } else {
+                    RecentSnapshotSlot::dummy()
+                },
+                RecentSnapshotSlot::dummy(),
+            ];
+            controller.rebuild_candidate(
+                &mut store,
+                finalized,
+                tip_height,
+                TIP_HASH_A,
+                || {
+                    Ok(ConvertedRecentSnapshot::from_parts_for_tests(
+                        finalized, tip_height, TIP_HASH_A, slots,
+                    ))
+                },
+                || Ok(true),
+            )?;
+            assert!(controller.owner.pin().is_some());
+            for (ordinal, survives) in [(0, !spend_first), (1, true)] {
+                assert_eq!(
+                    store.read_slot(&address, ordinal)?.annotation(),
+                    RecordAnnotation::Annotated {
+                        survives,
+                        valid: true
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_failure_and_post_preparation_source_drift_discard_candidates(
+    ) -> Result<(), RecentSnapshotRefreshError> {
+        for (reject_preparation, freshness, expected) in [
+            (
+                true,
+                Ok(true),
+                RecentSnapshotRefreshError::PreparationRejected,
+            ),
+            (false, Ok(false), RecentSnapshotRefreshError::SourceAdvanced),
+            (
+                false,
+                Err(()),
+                RecentSnapshotRefreshError::FreshnessUnavailable,
+            ),
+        ] {
+            let mut controller = controller()?;
+            let finalized = identity(100, FINALIZED_HASH);
+            rebuild(&mut controller, finalized)?;
+            let prior = controller
+                .owner
+                .pin()
+                .expect("initial candidate is published");
+            let mut store = finalized_store();
+            store.reject_preparation = reject_preparation;
+            let prepared = store.prepared.clone();
+            let checked = std::cell::Cell::new(false);
+            let result = controller.rebuild_candidate(
+                &mut store,
+                finalized,
+                102,
+                TIP_HASH_A,
+                || Ok(candidate(finalized, 102, TIP_HASH_A)),
+                || {
+                    assert!(
+                        prepared.get(),
+                        "freshness must follow completed preparation"
+                    );
+                    checked.set(true);
+                    freshness
+                },
+            );
+            assert_eq!(result, Err(expected));
+            assert_eq!(checked.get(), !reject_preparation);
+            assert!(!prior.is_current());
+            assert!(controller.owner.pin().is_none());
+            assert!(controller.pin_serving_epoch().is_none());
+            assert!(controller.owner.outstanding.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn failed_build_consumes_generation() -> Result<(), RecentSnapshotRefreshError> {
         let finalized = identity(100, FINALIZED_HASH);
         let mut controller = controller()?;
 
         assert_eq!(
-            controller.rebuild_candidate(finalized, 102, TIP_HASH_A, || Err(()), || Ok(true)),
+            controller.rebuild_candidate(
+                &mut finalized_store(),
+                finalized,
+                102,
+                TIP_HASH_A,
+                || Err(()),
+                || Ok(true)
+            ),
             Err(RecentSnapshotRefreshError::BuildRejected)
         );
         assert!(controller.owner.pin().is_none());
@@ -814,6 +980,7 @@ mod tests {
 
         assert_eq!(
             controller.rebuild_candidate(
+                &mut finalized_store(),
                 finalized,
                 102,
                 TIP_HASH_A,
@@ -824,6 +991,7 @@ mod tests {
         );
         assert_eq!(
             controller.rebuild_candidate(
+                &mut finalized_store(),
                 finalized,
                 102,
                 TIP_HASH_A,
@@ -886,6 +1054,7 @@ mod tests {
 
         assert_eq!(
             controller.rebuild_candidate(
+                &mut finalized_store(),
                 identity(99, ADVANCED_FINALIZED_HASH),
                 101,
                 TIP_HASH_B,

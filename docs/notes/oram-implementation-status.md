@@ -23,6 +23,61 @@ This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
 clear any Phase 0 gate.
 
+## 2026-09-12 — rejected exact-upsert identities and diagnostic retention
+
+Native [run 34719266410](https://github.com/sovright/zaino/actions/runs/34719266410)
+at integration head `b648a3b0` passed the live-refresh regression (1/1),
+remaining selected ORAM tests (725/725, three skipped), and runner tests
+(246/246, one skipped). The release binary built and passed the access-path
+profile. The exact-upsert profile then rejected missing raw identities for
+`random_range`, `CircuitORAM::read`, and `CircuitORAM::write_or_insert`;
+different instantiations were present. This proves identity drift, not
+equivalent machine code. Fixed-page checking and checked-runner packaging
+were skipped, and that failed binary was not retained.
+
+The workflow now retains a separately named unqualified diagnostic before
+profile checks: the exact non-executable ELF copy, raw and demangled symbols,
+full disassembly, relocations, compiler/binutils identities, source/tree/run
+identities, Cargo.lock, and file hashes. Its distinct manifest sets
+`qualified:false` and supplies no native build receipt. Profile checks and
+checked-runner packaging remain unchanged. A fresh retained ELF must undergo
+the complete call/instantiation and instruction audit before any reviewed pin
+update; diagnostic retention itself establishes no codegen qualification.
+
+## 2026-09-12 — finalized-record preparation at coherent publication
+
+At integration head `47bb6de2`, native Linux
+[run 34717151138](https://github.com/sovright/zaino/actions/runs/34717151138)
+passed the exact live-refresh regression (1/1) and the remaining selected
+all-feature ORAM tests (725/725, three skipped). Runner Clippy then failed
+because a Linux-only historical-geometry test named `ArtifactError` without
+an import. The test now uses the fully qualified error type; runner tests,
+codegen checks, release packaging, and real-capture execution still require
+their own successful native evidence.
+
+The native live-refresh regression at integration head `2cca5a82` reached the
+advanced present query, then refused response release with
+`projection_not_ready=true`, `store_failure=false`, and
+`recent_scan_failed=false`
+([run 34715423716](https://github.com/sovright/zaino/actions/runs/34715423716)).
+Source inspection found that the live controller never invoked the existing
+finalized-record annotation pass. An occupied unannotated record deliberately
+fails closed under ADR-0902; initial recent-only queries did not exercise that
+path. The failed run skipped the remaining native suite and runner packaging.
+
+Publication now requires the finalized store to prepare every live record
+against the exact converted recent snapshot before the final source-currentness
+check. A failed pass consumes the candidate ticket and publishes no generation.
+Preparation uses the existing deterministic annotation function and stays on
+the owner side of publication, outside query handling. Portable regressions use
+the actual serving-store fixture to distinguish spent and surviving records,
+and inject preparation failure and post-preparation source drift. These tests
+and the existing controller fixtures passed (13/13) on macOS; strict
+all-feature/all-target Clippy and formatting also passed. They cover candidate
+preparation; the typed Linux live-refresh test remains the
+integration gate. This correction does not establish an accepted guest,
+physical obliviousness, mainnet capacity, or a private wallet workflow.
+
 ## 2026-09-12 — evidence, activated bootstrap, and client codec composition
 
 The outside-operator execution stack now includes a bounded raw-evidence route

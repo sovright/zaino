@@ -68,7 +68,8 @@ use crate::corpus_artifact::{
 };
 #[cfg(feature = "typed-qualification")]
 use crate::execution_identity::{
-    create_release_receipt, verify_release_receipt, ReleaseReceiptInputs,
+    create_release_receipt, verify_native_build_identity, verify_release_receipt,
+    ReleaseReceiptInputs,
 };
 #[cfg(feature = "typed-qualification")]
 use crate::full_map_saturation_artifact::publish_full_map_saturation;
@@ -80,6 +81,8 @@ use crate::gate2::{
     TimingAttemptSealInputs, TimingAttemptSummary, TimingAttemptTerminalState,
     TimingManifestCreateInputs, TimingManifestInspectInputs, TimingManifestVerifyInputs,
 };
+#[cfg(feature = "typed-qualification")]
+use crate::historical_geometry_artifact::publish_historical_geometry;
 #[cfg(feature = "typed-qualification")]
 use crate::hybrid_sizing_artifact::load_hybrid_sizing;
 use crate::hybrid_sizing_artifact::publish_hybrid_sizing;
@@ -100,6 +103,8 @@ mod execution_identity;
 mod full_map_saturation_artifact;
 #[cfg(feature = "typed-qualification")]
 mod gate2;
+#[cfg(feature = "typed-qualification")]
+mod historical_geometry_artifact;
 mod hybrid_sizing_artifact;
 mod insertion_bound_artifact;
 #[cfg(feature = "private-service")]
@@ -303,6 +308,9 @@ enum QualificationSubcommand {
     /// Derive a pinned-Rostl retained-memory floor from an admitted hybrid bundle.
     #[cfg(feature = "typed-qualification")]
     FixedPageCapacity(QualificationFixedPageCapacityArgs),
+    /// Publish a preallocation NO-GO for the recovered historical two-table model.
+    #[cfg(feature = "typed-qualification")]
+    HistoricalGeometry(QualificationHistoricalGeometryArgs),
     /// Create, inspect, and verify a Gate 2 timing matrix manifest.
     #[cfg(feature = "typed-qualification")]
     Timing(QualificationTimingCommand),
@@ -592,6 +600,26 @@ struct QualificationFixedPageCapacityArgs {
 }
 
 #[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationHistoricalGeometryArgs {
+    /// Packaged unsigned native build.json for this exact running executable.
+    #[arg(long, value_name = "FILE")]
+    native_build_manifest: PathBuf,
+
+    /// Exact recovered three-file Mainnet capture directory.
+    #[arg(long, value_name = "DIR")]
+    capture_dir: PathBuf,
+
+    /// Exact recovered 176-GiB historical sizing directory.
+    #[arg(long, value_name = "DIR")]
+    sizing_dir: PathBuf,
+
+    /// New directory that will receive the valid negative evidence artifact.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StressQualificationProfileArg {
     /// Fixed smoke-level stress qualification profile.
@@ -833,6 +861,8 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::FixedPageCapacity(args) => run_fixed_page_capacity(args),
             #[cfg(feature = "typed-qualification")]
+            QualificationSubcommand::HistoricalGeometry(args) => run_historical_geometry(args),
+            #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::Timing(command) => match command.command {
                 QualificationTimingSubcommand::Create(args) => run_timing_create_manifest(args),
                 QualificationTimingSubcommand::Inspect(args) => run_timing_inspect_manifest(args),
@@ -868,6 +898,25 @@ fn run_fixed_page_capacity(args: QualificationFixedPageCapacityArgs) -> RunnerRe
         lower_bound
     );
     Ok(())
+}
+
+#[cfg(feature = "typed-qualification")]
+fn run_historical_geometry(args: QualificationHistoricalGeometryArgs) -> RunnerResult<()> {
+    let identity = verify_native_build_identity(&args.native_build_manifest)?;
+    let capture = load_capture(&args.capture_dir)?;
+    let sizing = load_sizing(&args.sizing_dir, &capture)?;
+    let report = publish_historical_geometry(
+        &args.output_dir,
+        &capture,
+        &sizing,
+        identity.source_revision(),
+        identity.binary_sha256(),
+        identity.build_manifest_sha256(),
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    println!("historical_geometry_artifact={}", args.output_dir.display());
+    println!("{report}");
+    Err(zaino_oram::HistoricalGeometryError::PreallocationNoGo.into())
 }
 
 #[cfg(feature = "typed-qualification")]
@@ -2772,6 +2821,23 @@ mod tests {
     }
 
     #[cfg(feature = "typed-qualification")]
+    fn valid_historical_geometry_args() -> [&'static str; 11] {
+        [
+            "zainod-oram",
+            "qualification",
+            "historical-geometry",
+            "--native-build-manifest",
+            "/tmp/native-build/build.json",
+            "--capture-dir",
+            "/tmp/oram-capture",
+            "--sizing-dir",
+            "/tmp/oram-sizing",
+            "--output-dir",
+            "/tmp/oram-historical-geometry",
+        ]
+    }
+
+    #[cfg(feature = "typed-qualification")]
     fn valid_timing_manifest_create_args() -> [&'static str; 10] {
         [
             "zainod-oram",
@@ -2943,6 +3009,7 @@ mod tests {
                 | QualificationSubcommand::TargetLoad(_)
                 | QualificationSubcommand::ColdRebuild(_)
                 | QualificationSubcommand::FixedPageCapacity(_)
+                | QualificationSubcommand::HistoricalGeometry(_)
                 | QualificationSubcommand::Timing(_) => {
                     panic!("insertion-bound arguments parsed as another qualification command")
                 }
@@ -2968,6 +3035,7 @@ mod tests {
                 | QualificationSubcommand::TargetLoad(_)
                 | QualificationSubcommand::ColdRebuild(_)
                 | QualificationSubcommand::FixedPageCapacity(_)
+                | QualificationSubcommand::HistoricalGeometry(_)
                 | QualificationSubcommand::Timing(_)
                 | QualificationSubcommand::InsertionBound(_) => {
                     panic!("hybrid-sizing arguments parsed as another qualification command")
@@ -3011,6 +3079,9 @@ mod tests {
                 QualificationSubcommand::FixedPageCapacity(_) => {
                     panic!("fixed-page-capacity arguments parsed as stress")
                 }
+                QualificationSubcommand::HistoricalGeometry(_) => {
+                    panic!("historical-geometry arguments parsed as stress")
+                }
             },
             Command::Corpus(_) => panic!("stress arguments parsed as corpus"),
             Command::Release(_) => panic!("stress arguments parsed as release"),
@@ -3046,6 +3117,9 @@ mod tests {
                 }
                 QualificationSubcommand::FixedPageCapacity(_) => {
                     panic!("fixed-page-capacity arguments parsed as fixed qualification")
+                }
+                QualificationSubcommand::HistoricalGeometry(_) => {
+                    panic!("historical-geometry arguments parsed as fixed qualification")
                 }
             },
             Command::Corpus(_) => panic!("qualification arguments parsed as corpus"),
@@ -3397,7 +3471,8 @@ mod tests {
                 | QualificationSubcommand::Timing(_)
                 | QualificationSubcommand::InsertionBound(_)
                 | QualificationSubcommand::HybridSizing(_)
-                | QualificationSubcommand::FixedPageCapacity(_) => {
+                | QualificationSubcommand::FixedPageCapacity(_)
+                | QualificationSubcommand::HistoricalGeometry(_) => {
                     panic!("target-load arguments parsed as another qualification command")
                 }
             },
@@ -3429,6 +3504,72 @@ mod tests {
 
     #[cfg(feature = "typed-qualification")]
     #[test]
+    fn historical_geometry_cli_has_no_allocation_or_capacity_knobs() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(valid_historical_geometry_args())?;
+        let args = match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::HistoricalGeometry(args) => args,
+                _ => panic!("historical geometry arguments parsed as another command"),
+            },
+            _ => panic!("historical geometry arguments parsed outside qualification"),
+        };
+        assert_eq!(
+            args.native_build_manifest,
+            PathBuf::from("/tmp/native-build/build.json")
+        );
+        assert_eq!(args.capture_dir, PathBuf::from("/tmp/oram-capture"));
+        assert_eq!(args.sizing_dir, PathBuf::from("/tmp/oram-sizing"));
+        assert_eq!(
+            args.output_dir,
+            PathBuf::from("/tmp/oram-historical-geometry")
+        );
+
+        for (flag, value) in [
+            ("--directory-capacity", "8"),
+            ("--event-capacity", "16"),
+            ("--allocation-deadline-seconds", "3600"),
+            ("--allow-allocation", "true"),
+        ] {
+            let mut command = valid_historical_geometry_args().to_vec();
+            command.extend([flag, value]);
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "typed-qualification",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn historical_geometry_rejects_other_valid_sizing_before_publication() -> RunnerResult<()> {
+        let parent = tempfile::tempdir()?;
+        let (capture_dir, sizing_dir) = publish_target_load_inputs(parent.path())?;
+        let capture = load_capture(&capture_dir)?;
+        let sizing = load_sizing(&sizing_dir, &capture)?;
+        let output = parent.path().join("historical-geometry");
+        let result = publish_historical_geometry(
+            &output,
+            &capture,
+            &sizing,
+            &"1".repeat(40),
+            &"2".repeat(64),
+            &"3".repeat(64),
+            "test-runner",
+        );
+        assert!(matches!(
+            result,
+            Err(crate::corpus_artifact::ArtifactError::InvalidArtifact {
+                reason: "historical geometry input or checked native arithmetic was rejected"
+            })
+        ));
+        assert!(!output.exists());
+        Ok(())
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
     fn cold_rebuild_cli_requires_source_config_lineage_budget_output_and_progress(
     ) -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(valid_cold_rebuild_args())?;
@@ -3441,7 +3582,8 @@ mod tests {
                 | QualificationSubcommand::Timing(_)
                 | QualificationSubcommand::InsertionBound(_)
                 | QualificationSubcommand::HybridSizing(_)
-                | QualificationSubcommand::FixedPageCapacity(_) => {
+                | QualificationSubcommand::FixedPageCapacity(_)
+                | QualificationSubcommand::HistoricalGeometry(_) => {
                     panic!("cold-rebuild arguments parsed as another qualification command")
                 }
             },

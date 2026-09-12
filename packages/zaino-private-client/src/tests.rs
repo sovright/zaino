@@ -190,6 +190,17 @@ fn local_verifier_rejects_duplicate_unknown_and_mismatch_receipts() {
 }
 
 #[test]
+fn trusted_client_rejects_ccel_diagnostic_receipt_scope() {
+    let e = parsed();
+    let p = policy();
+    let diagnostic = expected_receipt(&e, &p)
+        .replace(RECEIPT_SCOPE, "tdx_quote_ccel_digest_replay_diagnostic_v1");
+    let dir = executable_with_receipt(&diagnostic);
+    let verifier = verifier(&dir.path().join("verifier"), HELPER_TEST_BUDGET);
+    assert!(verifier.verify(&e).is_err());
+}
+
+#[test]
 fn local_verifier_kills_and_reaps_on_deadline() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("verifier");

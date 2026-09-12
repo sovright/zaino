@@ -4,6 +4,15 @@ Status: design and negative-gate specification only. It does not approve an
 image, derive an allowlist from a received quote, or authorize a cloud build or
 deployment.
 
+The selected C3 platform's suspend, migration, cloning, entropy, and trusted-time
+boundaries are reviewed separately in
+[`oram-c3-tdx-lifecycle-freshness-review.md`](oram-c3-tdx-lifecycle-freshness-review.md).
+That review is part of this design: cloud lifecycle assertions are not quote
+measurements, and boot-local keys still require external authorization freshness.
+The smallest implementation sequence is the
+[`oram-c3-no-secrets-boot-spike-plan.md`](oram-c3-no-secrets-boot-spike-plan.md),
+whose evidence-only scope must pass before adding Zaino or private inputs.
+
 ## What the retained diagnostic established
 
 The run-3 guest booted the pinned public Ubuntu image

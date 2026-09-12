@@ -18,10 +18,13 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck gnupg jq openssl
 
       - name: Lint shell scripts
         run: ./tools/scripts/lint-shell.sh
 
       - name: Test bounded TDX evidence collection without hardware
         run: bash deploy/tdx/tests/collect-quote-guest.sh
+
+      - name: Verify boot-spike upstream selection and refusal cases
+        run: bash deploy/tdx/accepted-guest-spike/test-upstream-selection.sh
