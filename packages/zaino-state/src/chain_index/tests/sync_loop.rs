@@ -2,8 +2,8 @@ use super::{
     load_test_vectors_and_sync_chain_index, load_test_vectors_and_sync_chain_index_with_timings,
     MockchainMode,
 };
-use crate::chain_index::{ChainIndex, SyncTimings};
-use std::time::Instant;
+use crate::chain_index::{ChainIndex, ChainIndexSnapshot, SyncTimings};
+use std::{sync::Arc, time::Instant};
 use tokio::time::{sleep, Duration};
 use zaino_common::status::{Status as _, StatusType};
 
@@ -139,4 +139,61 @@ async fn tip_converges_after_burst_mine() {
         .height
         .0;
     assert_eq!(indexer_tip, expected_tip);
+}
+
+// Multi-thread required: the persistent-v1 fixture uses block_in_place while its sync worker runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_op_poll_preserves_snapshot_identity_until_chain_advances() {
+    let (_blocks, _indexer, index_reader, mockchain) =
+        load_test_vectors_and_sync_chain_index(MockchainMode::Active).await;
+
+    let initial = match index_reader.snapshot_nonfinalized_state().await.unwrap() {
+        ChainIndexSnapshot::NonFinalizedStateExists {
+            non_finalized_snapshot,
+        } => non_finalized_snapshot,
+        ChainIndexSnapshot::StillSyncingFinalizedState { .. } => {
+            panic!("harness must publish non-finalized state")
+        }
+    };
+
+    // Exercise multiple production polling intervals before checking that an
+    // unchanged poll did not replace the captured snapshot.
+    sleep(SyncTimings::default().interval * 3).await;
+    super::poll::poll_until(
+        "chain index to return to Ready after an unchanged poll",
+        Duration::from_secs(5),
+        Duration::from_millis(10),
+        || async { (index_reader.status() == StatusType::Ready).then_some(()) },
+    )
+    .await;
+
+    let unchanged = match index_reader.snapshot_nonfinalized_state().await.unwrap() {
+        ChainIndexSnapshot::NonFinalizedStateExists {
+            non_finalized_snapshot,
+        } => non_finalized_snapshot,
+        ChainIndexSnapshot::StillSyncingFinalizedState { .. } => {
+            panic!("unchanged poll must retain non-finalized state")
+        }
+    };
+    assert!(
+        Arc::ptr_eq(&initial, &unchanged),
+        "an unchanged production poll must preserve the serving snapshot identity"
+    );
+
+    mockchain.mine_blocks(1);
+    super::poll::poll_until(
+        "chain advance to publish a distinct snapshot",
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || async {
+            let snapshot = index_reader.snapshot_nonfinalized_state().await.ok()?;
+            match snapshot {
+                ChainIndexSnapshot::NonFinalizedStateExists {
+                    non_finalized_snapshot,
+                } => (!Arc::ptr_eq(&initial, &non_finalized_snapshot)).then_some(()),
+                ChainIndexSnapshot::StillSyncingFinalizedState { .. } => None,
+            }
+        },
+    )
+    .await;
 }
