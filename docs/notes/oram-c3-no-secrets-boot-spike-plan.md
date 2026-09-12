@@ -34,9 +34,14 @@ instance pins:
 | workload | fixed public evidence-only binary digest; no Zaino keys, wallet data, credentials, operator shell, updater, or workload downloader |
 | machine | `c3-standard-4` for feasibility only, one 20-GiB balanced NVMe boot disk, exact supported zone selected at execution review |
 
-The Ubuntu snapshot URL, builder digest, package list, and signing certificate
-fingerprints are deliberately unset today. Selecting and reviewing their exact
-values is implementation step zero. The build must not silently resolve
+The first [upstream selection](../../deploy/tdx/accepted-guest-spike/README.md)
+now pins a dated root filesystem, signed snapshot release metadata, and the
+amd64 builder base manifest. Its verifier checks retained signatures and
+digests, with optional downloaded-rootfs verification. It is not a complete
+build input manifest: the exact kernel/package closure, final builder recipe
+and digest, workload binaries, and signing certificate fingerprints remain
+unresolved. Completing and reviewing those values is implementation step zero.
+The build must not silently resolve
 “latest,” an image family, a package mirror head, or an unversioned Git branch.
 
 Reproducibility inputs also pin `SOURCE_DATE_EPOCH`, GPT and filesystem UUIDs,
