@@ -1,0 +1,44 @@
+name: TDX verifier
+
+on:
+  pull_request:
+    paths:
+      - tools/tdx-verifier/**
+      - .github/workflows/tdx-verifier.yml
+  push:
+    branches: [main]
+    paths:
+      - tools/tdx-verifier/**
+      - .github/workflows/tdx-verifier.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verifier:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: tools/tdx-verifier
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: amd64
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.27.1
+          cache: false
+      - name: Enforce toolchain
+        run: test "$(go env GOVERSION)" = go1.27.1
+      - name: Verify modules
+        run: go mod verify
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build static Linux verifier
+        run: go build -trimpath -o /tmp/zaino-tdx-verifier ./
