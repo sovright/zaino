@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+umask 077
 
 readonly INPUT="${1:-report-data.bin}"
 readonly OUTPUT_DIR="${2:-evidence}"
@@ -27,14 +28,28 @@ cleanup_report() {
 }
 trap cleanup_report EXIT
 
+collect_bounded() {
+  local source="$1" destination="$2" limit="$3" bytes
+  # Sysfs/ConfigFS nodes may advertise a size unrelated to their stream length.
+  # Read one byte beyond the verifier's cap, then refuse incomplete evidence.
+  # The caller owns destination; only the privileged stream read needs sudo.
+  # shellcheck disable=SC2024
+  sudo head -c "$((limit + 1))" -- "${source}" > "${destination}"
+  bytes="$(wc -c < "${destination}")"
+  if (( bytes == 0 || bytes > limit )); then
+    echo "evidence stream is empty or exceeds its bound: ${source}" >&2
+    return 1
+  fi
+}
+
 sudo cp -- "${INPUT}" /sys/kernel/config/tsm/report/zaino0/inblob
 # Read the virtual ConfigFS attribute as a stream. The caller owns OUTPUT_DIR;
 # sudo is needed only to read the node, not to create the local artifact.
-# shellcheck disable=SC2024
-sudo cat /sys/kernel/config/tsm/report/zaino0/outblob > "${OUTPUT_DIR}/quote.bin"
+collect_bounded /sys/kernel/config/tsm/report/zaino0/outblob "${OUTPUT_DIR}/quote.bin" 16384
 cp -- "${INPUT}" "${OUTPUT_DIR}/report-data.bin"
-sudo cp -- /sys/firmware/acpi/tables/data/CCEL "${OUTPUT_DIR}/ccel.bin"
-sudo chown "$(id -u):$(id -g)" "${OUTPUT_DIR}/ccel.bin"
+# These are distinct artifacts: the ACPI table declares the event-log area.
+collect_bounded /sys/firmware/acpi/tables/CCEL "${OUTPUT_DIR}/ccel-table.bin" 4096
+collect_bounded /sys/firmware/acpi/tables/data/CCEL "${OUTPUT_DIR}/ccel.bin" 1048576
 
 {
   uname -a
@@ -48,4 +63,4 @@ sudo chown "$(id -u):$(id -g)" "${OUTPUT_DIR}/ccel.bin"
 } > "${OUTPUT_DIR}/guest-environment.txt"
 
 (cd -- "${OUTPUT_DIR}" && \
-  sha256sum quote.bin report-data.bin ccel.bin guest-environment.txt > SHA256SUMS)
+  sha256sum quote.bin report-data.bin ccel-table.bin ccel.bin guest-environment.txt > SHA256SUMS)
