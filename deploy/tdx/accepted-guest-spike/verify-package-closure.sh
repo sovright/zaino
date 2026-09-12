@@ -4,20 +4,21 @@ set -euo pipefail
 export LC_ALL=C
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 fail() { echo "package closure refused: $*" >&2; exit 1; }
-[[ $# == 1 ]] || fail 'usage: verify-package-closure.sh CLOSURE_DIRECTORY'
+[[ $# -ge 1 && $# -le 2 ]] || fail 'usage: verify-package-closure.sh CLOSURE_DIRECTORY [PACKAGE_ROOTS_JSON]'
+roots="${2:-$root/package-roots.json}"
 closure=$(cd -- "$1" && pwd -P) || fail 'missing closure directory'
 lock="$closure/package-lock.json"
 packages="$closure/packages"
 indexes="$closure/indexes"
 [[ -f "$lock" && ! -L "$lock" && -d "$packages" && ! -L "$packages" && -d "$indexes" && ! -L "$indexes" ]] || fail 'invalid closure layout'
 for tool in awk basename cmp dpkg-deb find gpgv jq sha256sum sort stat xz; do command -v "$tool" >/dev/null || fail "missing tool: $tool"; done
-bash "$root/verify-package-roots.sh" >/dev/null
+bash "$root/verify-package-roots.sh" "$roots" >/dev/null
 lock_bytes=$(stat -c %s "$lock")
 [[ "$lock_bytes" -gt 0 && "$lock_bytes" -le 65536 ]] || fail 'lock byte budget'
 root_entries=$(find "$closure" -mindepth 1 -maxdepth 1 -print | sort)
 [[ "$root_entries" == "$(printf '%s\n' "$indexes" "$lock" "$packages" | sort)" ]] || fail 'unexpected closure root entry'
-roots_sha=$(sha256sum -- "$root/package-roots.json" | awk '{print $1}')
-jq -e --arg builder "$(jq -r '.selected_builder_base_image' "$root/package-roots.json")" --arg snapshot "$(jq -r '.snapshot' "$root/package-roots.json")" --arg apt "$(jq -r '.resolver_apt_version' "$root/package-roots.json")" --arg roots "$roots_sha" '
+roots_sha=$(sha256sum -- "$roots" | awk '{print $1}')
+jq -e --arg builder "$(jq -r '.selected_builder_base_image' "$roots")" --arg snapshot "$(jq -r '.snapshot' "$roots")" --arg apt "$(jq -r '.resolver_apt_version' "$roots")" --arg roots "$roots_sha" '
   .schema == "zaino-boot-spike-package-closure-v1" and
   .selected_builder_base_image == $builder and .snapshot == $snapshot and .architecture == "amd64" and
   .apt_version == $apt and .package_roots_sha256 == $roots and
@@ -38,7 +39,7 @@ while IFS= read -r requested; do
   version=${requested#*=}
   count=$(jq --arg name "$name" --arg version "$version" '[.packages[] | select(.name == $name and .version == $version)] | length' "$lock")
   [[ "$count" == 1 ]] || fail "missing or duplicate requested root: $requested"
-done < <(jq -r '.guest_roots[], .builder_tool_roots[]' "$root/package-roots.json")
+done < <(jq -r '.guest_roots[], .builder_tool_roots[]' "$roots")
 
 release_value() {
   local release=$1 wanted=$2
