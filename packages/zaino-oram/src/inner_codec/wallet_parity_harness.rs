@@ -2,26 +2,11 @@
 //!
 //! # This is not, and cannot become, a production API
 //!
-//! A real wallet cannot do what this module does, and the reason is not that
-//! the client code has not been written yet. Two values a request must carry
-//! are never published by the protocol:
-//!
-//! 1. **`session_binding`** — 32 bytes minted per security lease from OS
-//!    entropy ([`super::security_owner::SecurityLeaseIdentity::mint`]). It is
-//!    bound into the AEAD protection context *and* written into the request
-//!    body, where [`super::PrivateQueryCodec::decode_request_with_nonce`]
-//!    validates it. It appears in no `.proto` file and in no wire message.
-//! 2. **The serving checkpoint** — network, height, block hash, schema
-//!    version, projection epoch, and key epoch. A request whose checkpoint
-//!    differs from the runtime's serving checkpoint is answered
-//!    `ProjectionNotReady`. `BootstrapResponse` publishes only `key_epoch`.
-//!
-//! This module hands both out *from the composed runtime's own internals*.
-//! Publishing them on the wire is a real option, but it is a security decision
-//! that needs its own ADR; until that decision is made there is no
-//! client-constructible request, and therefore no way to check that the private
-//! query path returns correct answers. This harness closes that correctness gap
-//! without making the security decision.
+//! This module constructs both the serving runtime and its wallet-side reader
+//! inside one process. ADR0904 now publishes the security lease's session
+//! binding and exact serving checkpoint through activated bootstrap, enabling
+//! a separate production codec. This harness still bypasses the transport and
+//! attestation boundary; successful parity here cannot authorize a connection.
 //!
 //! Because a value obtained this way can only come from inside the server
 //! process, nothing here can be mistaken for something a deployed wallet could
@@ -979,12 +964,10 @@ mod parity_tests {
             .collect()
     }
 
-    /// Seals one query, drives it through the runtime, and opens the answer.
-    fn round<H>(
+    fn release_round<H>(
         harness: &mut H,
         request: [u8; PARITY_ENVELOPE_BYTES],
-        session: &WalletSession,
-    ) -> ParityResult<WalletPage>
+    ) -> ParityResult<[u8; PARITY_ENVELOPE_BYTES]>
     where
         H: WalletParityRuntime,
     {
@@ -995,8 +978,43 @@ mod parity_tests {
             .try_release_bytes()
             .map_err(|_| ParityHarnessError::Refused)?;
         assert_eq!(response.len(), PARITY_ENVELOPE_BYTES);
-        let bytes = *response;
+        Ok(*response)
+    }
+
+    /// Drives a sealed query through the runtime and opens the fixed answer.
+    fn round<H>(
+        harness: &mut H,
+        request: [u8; PARITY_ENVELOPE_BYTES],
+        session: &WalletSession,
+    ) -> ParityResult<WalletPage>
+    where
+        H: WalletParityRuntime,
+    {
+        let bytes = release_round(harness, request)?;
         Ok(session.open_response(&bytes)?)
+    }
+
+    fn assert_retired_round_refused<H>(
+        harness: &mut H,
+        request: [u8; PARITY_ENVELOPE_BYTES],
+        retired: &WalletSession,
+    ) -> ParityResult<()>
+    where
+        H: WalletParityRuntime,
+    {
+        let bytes = release_round(harness, request)?;
+        assert!(matches!(
+            retired.open_response(&bytes),
+            Err(ParityHarnessError::Open)
+        ));
+        // The response is protected under the current checkpoint. Only the
+        // current reader can decode its empty, uniform refusal.
+        let current = harness.wallet_session()?;
+        let refusal = current.open_response(&bytes)?;
+        assert_eq!(refusal.outcome, WalletOutcome::ProjectionNotReady);
+        assert!(refusal.utxos.is_empty());
+        assert!(!refusal.has_more);
+        Ok(())
     }
 
     /// The number of transparent outputs the fixture chain spends.
@@ -1183,11 +1201,7 @@ mod parity_tests {
 
         harness.republish(blocks)?;
 
-        // The retired checkpoint is still a well-formed, authentic envelope --
-        // it opens -- and is answered as having no ready projection.
-        let stale = round(&mut harness, stale_request, &stale_session)?;
-        assert_eq!(stale.outcome, WalletOutcome::ProjectionNotReady);
-        assert!(stale.utxos.is_empty());
+        assert_retired_round_refused(&mut harness, stale_request, &stale_session)?;
 
         let session = harness.wallet_session()?;
         for case in fixture.cases() {
@@ -1269,10 +1283,7 @@ mod parity_tests {
             )
             .ok_or("fixture chain has a proper prefix")?;
         harness.republish(prefix)?;
-        assert_eq!(
-            round(&mut harness, stale, &session)?.outcome,
-            WalletOutcome::ProjectionNotReady
-        );
+        assert_retired_round_refused(&mut harness, stale, &session)?;
         let current = harness.wallet_session()?;
         let current_request = current.seal_query(case.address_script(), 0, None)?;
         assert_eq!(
