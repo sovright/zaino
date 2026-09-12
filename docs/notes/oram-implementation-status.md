@@ -44,8 +44,10 @@ image, a quote-bound Zaino query, or the 176-GiB mainnet capacity target. The
 original full-mainnet capture was subsequently recovered into the restricted
 research project, hash-checked, and reopened by `validate-sizing`; the
 [recovery ledger](oram-mainnet-capture-recovery.md) records the exact objects
-and hashes. Its historical sizing qualification reproduced. Current semantic
-qualification and the fixed-profile capacity experiment remain pending.
+and hashes. The [current-reader rerun](oram-mainnet-revalidation-2026-09-12.md)
+completed typed semantic validation and reproduced the exact historical logical
+sizing digest. Growth, backend calibration, measured capacity, and full-service
+recovery remain pending.
 
 The client reconstructs the canonical REPORT_DATA transcript, correlates the
 local helper receipt with exact quote/policy bytes, and validates the activated
@@ -71,6 +73,14 @@ Its native ORAM job remains a separate gate. The earlier heavy client build
 showed an unexplained concurrent nextest handle-leak flag on a synchronous
 parser test; the isolated test and complete serial suite passed without that
 flag, and no runner timeout or failure policy was relaxed.
+
+The subsequent native query/refresh failure was traced to unchanged source
+polls publishing a new snapshot identity. The reviewed no-op publication fix
+preserves identity only for complete normalized snapshot equality, retains the
+stale-writer compare-and-swap check, and changes identity for real content
+updates. Its three publication tests and one live-poll/forward-advance test
+passed locally. Ready/Syncing admission checks remain intact; native execution
+and the combined retained-client CI run remain separate verification gates.
 
 Sol implemented these slices and Astra reviewed their source. The
 [retained-connection design](oram-retained-connection-design.md) now has a
