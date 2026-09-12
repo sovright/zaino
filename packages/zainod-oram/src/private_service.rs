@@ -267,7 +267,9 @@ mod tests {
             .encode_to_vec(),
             [10, 1, 1, 16, 2]
         );
-        assert!(private_proto::BootstrapRequest {}.encode_to_vec().is_empty());
+        assert!(private_proto::BootstrapRequest {}
+            .encode_to_vec()
+            .is_empty());
         let bootstrap = private_proto::BootstrapResponse {
             key_epoch: 1,
             request_key: vec![2],

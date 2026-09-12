@@ -27,7 +27,7 @@ jq -n --argjson network "${network_json}" --argjson subnet "${subnet_json}" --ar
 chmod 0600 "${snapshot_dir}/disk-config-sanitized.json" "${snapshot_dir}/network-config-sanitized.json"
 jq -e --arg id "${instance_id}" --arg owner "${owner}" --arg machine "${MACHINE_TYPE}" --arg network "${network}" --arg subnet "${subnet}" --arg tag "${instance_tag}" '
 (.id==$id) and (.description==$owner) and (.machineType|endswith("/"+$machine)) and
-(.confidentialInstanceConfig.enableConfidentialCompute==true) and (.confidentialInstanceConfig.confidentialInstanceType=="TDX") and
+(.confidentialInstanceConfig.confidentialInstanceType=="TDX") and
 (.scheduling.automaticRestart==false) and (.scheduling.onHostMaintenance=="TERMINATE") and (.scheduling.provisioningModel=="STANDARD") and (.scheduling.instanceTerminationAction=="DELETE") and ((.scheduling.maxRunDuration.seconds|tonumber)==21600) and
 ((.networkInterfaces|length)==1) and (((.networkInterfaces[0].accessConfigs//[])|length)==0) and (.networkInterfaces[0].network|endswith("/"+$network)) and (.networkInterfaces[0].subnetwork|endswith("/"+$subnet)) and
 ((.disks|length)==1) and (.disks[0].boot==true) and (.disks[0].autoDelete==true) and (.disks[0].interface=="NVME") and (.tags.items==[$tag]) and (((.serviceAccounts//[])|length)==0) and
