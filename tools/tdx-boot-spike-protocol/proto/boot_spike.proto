@@ -1,0 +1,11 @@
+syntax = "proto3";
+package zaino.boot_spike.v1;
+service BootSpikeEvidence { rpc GetEvidence(EvidenceRequest) returns (EvidenceResponse); }
+message EvidenceRequest { bytes challenge = 1; }
+message EvidenceResponse {
+  uint32 transcript_version = 1;
+  bytes boot_lease_id = 2;
+  bytes quote_v4 = 3;
+  bytes ccel_table = 4;
+  bytes ccel_log = 5;
+}

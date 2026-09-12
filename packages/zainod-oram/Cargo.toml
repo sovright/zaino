@@ -52,6 +52,7 @@ tonic-prost = { version = "0.14", optional = true }
 zaino-common = { version = "0.2.0", path = "../zaino-common" }
 zaino-oram = { version = "0.1.0", path = "../zaino-oram", features = ["corpus-zaino"] }
 zaino-state = { version = "0.3.1", path = "../zaino-state", default-features = false }
+zaino-tdx-evidence = { version = "0.1.0", path = "../zaino-tdx-evidence" }
 zainod = { version = "0.4.3-ironwood.1", path = "../zainod" }
 
 [dev-dependencies]

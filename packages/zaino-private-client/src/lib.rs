@@ -6,7 +6,10 @@
 mod bootstrap;
 mod retained;
 pub use bootstrap::{BootstrapNetwork, BootstrapWireError, ValidatedBootstrap};
-pub use retained::{RetainedClientConfig, RetainedClientError, RetainedPrivateClient};
+pub use retained::{
+    RetainedClientConfig, RetainedClientError, RetainedPrivateClient,
+    UnverifiedRetainedTlsConnection,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
@@ -287,6 +290,16 @@ pub struct LocalQuotePolicyReceipt {
     report_data: [u8; 64],
 }
 
+/// Successful strict quote and four-lane CCEL digest replay only.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LocalCcelDiagnosticReceipt {
+    quote_sha256: [u8; 32],
+    policy_sha256: [u8; 32],
+    report_data: [u8; 64],
+    ccel_table_sha256: [u8; 32],
+    ccel_log_sha256: [u8; 32],
+}
+
 #[derive(Clone)]
 pub struct LocalQuoteVerifier {
     executable: PathBuf,
@@ -323,48 +336,154 @@ impl LocalQuoteVerifier {
         self.timeout
     }
 
-    fn verify(
+    pub fn verify_ccel_diagnostic(
         &self,
-        evidence: &ParsedEvidenceV1,
-    ) -> Result<LocalQuotePolicyReceipt, ClientEvidenceError> {
-        let policy = &evidence.policy;
-        policy.check_evidence(evidence)?;
-        // The client host and immutable installation are trusted. This check catches
-        // accidental replacement; it is not atomic against a hostile local OS.
+        quote: &[u8],
+        policy: &[u8],
+        report_data: [u8; 64],
+        ccel_table: &[u8],
+        ccel_log: &[u8],
+    ) -> Result<LocalCcelDiagnosticReceipt, ClientEvidenceError> {
+        self.verify_ccel_diagnostic_inner(quote, policy, report_data, ccel_table, ccel_log, None)
+    }
+
+    /// Runs the diagnostic without allowing queueing or hashing to extend the
+    /// caller-owned absolute transaction deadline.
+    pub fn verify_ccel_diagnostic_before(
+        &self,
+        quote: &[u8],
+        policy: &[u8],
+        report_data: [u8; 64],
+        ccel_table: &[u8],
+        ccel_log: &[u8],
+        deadline: Instant,
+    ) -> Result<LocalCcelDiagnosticReceipt, ClientEvidenceError> {
+        self.verify_ccel_diagnostic_inner(
+            quote,
+            policy,
+            report_data,
+            ccel_table,
+            ccel_log,
+            Some(deadline),
+        )
+    }
+
+    fn verify_ccel_diagnostic_inner(
+        &self,
+        quote: &[u8],
+        policy: &[u8],
+        report_data: [u8; 64],
+        ccel_table: &[u8],
+        ccel_log: &[u8],
+        absolute_deadline: Option<Instant>,
+    ) -> Result<LocalCcelDiagnosticReceipt, ClientEvidenceError> {
+        if quote.is_empty()
+            || quote.len() > MAX_QUOTE_BYTES
+            || policy.is_empty()
+            || policy.len() > MAX_POLICY_BYTES
+            || ccel_table.is_empty()
+            || ccel_table.len() > 4 * 1024
+            || ccel_log.is_empty()
+            || ccel_log.len() > 1024 * 1024
+        {
+            return Err(ClientEvidenceError::VerifierOutput);
+        }
+        let dir = verifier_directory()?;
+        let quote_path = dir.path().join("quote.bin");
+        let policy_path = dir.path().join("policy.json");
+        let table_path = dir.path().join("ccel-table.bin");
+        let log_path = dir.path().join("ccel-log.bin");
+        write_new(&quote_path, quote)?;
+        write_new(&policy_path, policy)?;
+        write_new(&table_path, ccel_table)?;
+        write_new(&log_path, ccel_log)?;
+        let stdout = self.invoke(&dir, absolute_deadline, |command| {
+            command
+                .arg("-mode")
+                .arg("ccel-diagnostic")
+                .arg("-quote")
+                .arg(&quote_path)
+                .arg("-policy")
+                .arg(&policy_path)
+                .arg("-ccel-table")
+                .arg(&table_path)
+                .arg("-ccel-log")
+                .arg(&log_path);
+        })?;
+        let receipt: CcelReceiptJson = parse_one_json(&stdout)?;
+        let expected_quote = Sha256::digest(quote).into();
+        let expected_policy = Sha256::digest(policy).into();
+        let expected_table = Sha256::digest(ccel_table).into();
+        let expected_log = Sha256::digest(ccel_log).into();
+        correlate(
+            "quote_sha256",
+            decode_hex(&receipt.quote_sha256)?,
+            expected_quote,
+        )?;
+        correlate(
+            "policy_sha256",
+            decode_hex(&receipt.policy_sha256)?,
+            expected_policy,
+        )?;
+        correlate(
+            "report_data",
+            decode_hex(&receipt.report_data)?,
+            report_data,
+        )?;
+        correlate(
+            "ccel_table_sha256",
+            decode_hex(&receipt.ccel_table_sha256)?,
+            expected_table,
+        )?;
+        correlate(
+            "ccel_log_sha256",
+            decode_hex(&receipt.ccel_log_sha256)?,
+            expected_log,
+        )?;
+        if receipt.schema_version != 1
+            || receipt.scope != "tdx_quote_ccel_digest_replay_diagnostic_v1"
+            || receipt.rt_mrs_matched != [true; 4]
+        {
+            return Err(ClientEvidenceError::VerifierCorrelation("ccel_scope"));
+        }
+        Ok(LocalCcelDiagnosticReceipt {
+            quote_sha256: expected_quote,
+            policy_sha256: expected_policy,
+            report_data,
+            ccel_table_sha256: expected_table,
+            ccel_log_sha256: expected_log,
+        })
+    }
+
+    fn invoke(
+        &self,
+        dir: &tempfile::TempDir,
+        absolute_deadline: Option<Instant>,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<Vec<u8>, ClientEvidenceError> {
+        let now = Instant::now();
+        let configured_deadline = now
+            .checked_add(self.timeout)
+            .ok_or(ClientEvidenceError::VerifierTimeout)?;
+        let deadline = absolute_deadline.map_or(configured_deadline, |absolute| {
+            configured_deadline.min(absolute)
+        });
+        if now >= deadline {
+            return Err(ClientEvidenceError::VerifierTimeout);
+        }
         if hash_regular_file(&self.executable, MAX_HELPER_BYTES)? != self.executable_sha256 {
             return Err(ClientEvidenceError::VerifierPath);
         }
-        let report_data = evidence.report_data();
-        let policy_bytes = serde_json::to_vec(&InvocationPolicy {
-            report_data: hex::encode(report_data),
-            template: &policy.quote,
-        })
-        .map_err(|_| ClientEvidenceError::PolicyEncoding)?;
-        let quote_sha256 = Sha256::digest(&evidence.raw_quote).into();
-        let policy_sha256 = Sha256::digest(&policy_bytes).into();
-        let dir = tempfile::Builder::new()
-            .prefix("zaino-quote-verifier-")
-            .tempdir()
-            .map_err(|_| ClientEvidenceError::VerifierIo)?;
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| ClientEvidenceError::VerifierIo)?;
-        let quote_path = dir.path().join("quote.bin");
-        let policy_path = dir.path().join("policy.json");
         let stdout_path = dir.path().join("stdout");
         let stderr_path = dir.path().join("stderr");
-        write_new(&quote_path, &evidence.raw_quote)?;
-        write_new(&policy_path, &policy_bytes)?;
         let stdout_file = create_new(&stdout_path)?;
         let stderr_file = create_new(&stderr_path)?;
-        let deadline = Instant::now()
-            .checked_add(self.timeout)
-            .ok_or(ClientEvidenceError::VerifierTimeout)?;
+        if Instant::now() >= deadline {
+            return Err(ClientEvidenceError::VerifierTimeout);
+        }
         let mut command = Command::new(&self.executable);
+        configure(&mut command);
         command
-            .arg("-quote")
-            .arg(&quote_path)
-            .arg("-policy")
-            .arg(&policy_path)
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout_file))
@@ -397,6 +516,35 @@ impl LocalQuoteVerifier {
         if !status.success() {
             return Err(ClientEvidenceError::VerifierRefused);
         }
+        Ok(stdout)
+    }
+
+    fn verify(
+        &self,
+        evidence: &ParsedEvidenceV1,
+    ) -> Result<LocalQuotePolicyReceipt, ClientEvidenceError> {
+        let policy = &evidence.policy;
+        policy.check_evidence(evidence)?;
+        let report_data = evidence.report_data();
+        let policy_bytes = serde_json::to_vec(&InvocationPolicy {
+            report_data: hex::encode(report_data),
+            template: &policy.quote,
+        })
+        .map_err(|_| ClientEvidenceError::PolicyEncoding)?;
+        let quote_sha256 = Sha256::digest(&evidence.raw_quote).into();
+        let policy_sha256 = Sha256::digest(&policy_bytes).into();
+        let dir = verifier_directory()?;
+        let quote_path = dir.path().join("quote.bin");
+        let policy_path = dir.path().join("policy.json");
+        write_new(&quote_path, &evidence.raw_quote)?;
+        write_new(&policy_path, &policy_bytes)?;
+        let stdout = self.invoke(&dir, None, |command| {
+            command
+                .arg("-quote")
+                .arg(&quote_path)
+                .arg("-policy")
+                .arg(&policy_path);
+        })?;
         let receipt = parse_receipt(&stdout)?;
         correlate("quote_sha256", receipt.quote_sha256, quote_sha256)?;
         correlate("policy_sha256", receipt.policy_sha256, policy_sha256)?;
@@ -490,6 +638,43 @@ struct ReceiptJson {
     policy_sha256: String,
     report_data: String,
     scope: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CcelReceiptJson {
+    schema_version: u32,
+    quote_sha256: String,
+    policy_sha256: String,
+    report_data: String,
+    ccel_table_sha256: String,
+    ccel_log_sha256: String,
+    #[serde(rename = "measured_events")]
+    _measured_events: [u32; 4],
+    rt_mrs_matched: [bool; 4],
+    scope: String,
+}
+
+fn verifier_directory() -> Result<tempfile::TempDir, ClientEvidenceError> {
+    let dir = tempfile::Builder::new()
+        .prefix("zaino-quote-verifier-")
+        .tempdir()
+        .map_err(|_| ClientEvidenceError::VerifierIo)?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| ClientEvidenceError::VerifierIo)?;
+    Ok(dir)
+}
+
+fn parse_one_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ClientEvidenceError> {
+    let mut stream = serde_json::Deserializer::from_slice(bytes).into_iter::<T>();
+    let value = stream
+        .next()
+        .ok_or(ClientEvidenceError::VerifierOutput)?
+        .map_err(|_| ClientEvidenceError::VerifierOutput)?;
+    if stream.next().is_some() {
+        return Err(ClientEvidenceError::VerifierOutput);
+    }
+    Ok(value)
 }
 fn parse_receipt(bytes: &[u8]) -> Result<ReceiptWire, ClientEvidenceError> {
     let mut stream = serde_json::Deserializer::from_slice(bytes).into_iter::<ReceiptJson>();
