@@ -8,6 +8,7 @@
     "CONFIG_GVE": ["y", "m"],
     "CONFIG_INTEL_TDX_GUEST": ["y"],
     "CONFIG_PCI_MSI": ["y"],
+    "CONFIG_PERF_EVENTS": ["y"],
     "CONFIG_SWIOTLB": ["y"],
     "CONFIG_TDX_GUEST_DRIVER": ["y", "m"],
     "CONFIG_TSM_REPORTS": ["y"]

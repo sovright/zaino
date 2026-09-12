@@ -84,6 +84,7 @@ container_id=$(docker create --cidfile "$cidfile" --network none --pull never --
   --mount "type=bind,src=$fragment,dst=/inputs/custom-kernel.config,readonly" \
   --mount "type=bind,src=$root/build-custom-kernel-inner.sh,dst=/builder/build.sh,readonly" \
   --mount "type=bind,src=$root/verify-custom-kernel-effective-config.sh,dst=/builder/verify-effective-config.sh,readonly" \
+  --mount "type=bind,src=$root/kernel-config-common.sh,dst=/builder/kernel-config-common.sh,readonly" \
   --mount "type=bind,src=$partial/output,dst=/output" \
   "$image" bash /builder/build.sh /inputs/sources /inputs/closure /inputs/repo /inputs/expected-packages.tsv /inputs/custom-kernel.config /output/result "$run_label")
 [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || fail 'builder container creation failed'
@@ -95,7 +96,7 @@ bash "$root/verify-custom-kernel-effective-config.sh" "$partial/output/result/ar
 source_lock_sha=$(openssl dgst -sha256 -r "$root/custom-kernel-source.json"); source_lock_sha=${source_lock_sha%% *}
 tool_lock_sha=$(openssl dgst -sha256 -r "$closure/package-lock.json"); tool_lock_sha=${tool_lock_sha%% *}
 config_sha=$(openssl dgst -sha256 -r "$fragment"); config_sha=${config_sha%% *}
-scripts_sha=$(for file in build-custom-kernel-inner.sh build-custom-kernel-once.sh verify-custom-kernel-effective-config.sh verify-kernel-config.sh kernel-config-policy.json; do openssl dgst -sha256 -r "$root/$file" | awk '{print $1}'; done | LC_ALL=C sort | openssl dgst -sha256 -r); scripts_sha=${scripts_sha%% *}
+scripts_sha=$(for file in build-custom-kernel-inner.sh build-custom-kernel-once.sh kernel-config-common.sh verify-custom-kernel-effective-config.sh verify-kernel-config.sh kernel-config-policy.json; do openssl dgst -sha256 -r "$root/$file" | awk '{print $1}'; done | LC_ALL=C sort | openssl dgst -sha256 -r); scripts_sha=${scripts_sha%% *}
 revision=$(git -C "$root" rev-parse HEAD)
 artifact_manifest_sha=$(openssl dgst -sha256 -r "$partial/output/result/artifacts/SHA256SUMS"); artifact_manifest_sha=${artifact_manifest_sha%% *}
 tool_versions_sha=$(openssl dgst -sha256 -r "$partial/output/result/tool-versions.txt"); tool_versions_sha=${tool_versions_sha%% *}
