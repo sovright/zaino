@@ -44,9 +44,10 @@ prevention enforced. It contains aggregate measurements and public provenance;
 no wallet inputs, daemon configurations, or credentials were copied. Downloads
 must verify the file hashes above before use.
 
-This establishes artifact availability and byte/canonical identity. Current
-Rust-reader semantic revalidation and reproduction of the historical sizing
-result remain separate checks. Recovery does not establish current chain
+This establishes artifact availability and byte/canonical identity. Subsequent
+[current-reader revalidation](oram-mainnet-revalidation-2026-09-12.md) accepted
+the capture and reproduced the exact historical logical sizing digest.
+Recovery and logical sizing do not establish current chain
 coverage, physical ORAM capacity, TDX performance, or accepted-image privacy.
 
 All new ORAM cloud work uses the new project explicitly. Historical manifests
