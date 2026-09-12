@@ -13,6 +13,10 @@ on:
       - 'packages/zaino-fetch/**'
       - 'packages/zaino-oram/**'
       - 'packages/zaino-private-client/**'
+      - 'packages/zaino-tdx-evidence/**'
+      - 'tools/tdx-boot-spike-client/**'
+      - 'tools/tdx-boot-spike-protocol/**'
+      - 'tools/tdx-evidence-agent/**'
       - 'packages/zaino-proto/**'
       - 'packages/zaino-state/**'
       - 'packages/zainod-oram/**'
@@ -30,6 +34,10 @@ on:
       - 'packages/zaino-fetch/**'
       - 'packages/zaino-oram/**'
       - 'packages/zaino-private-client/**'
+      - 'packages/zaino-tdx-evidence/**'
+      - 'tools/tdx-boot-spike-client/**'
+      - 'tools/tdx-boot-spike-protocol/**'
+      - 'tools/tdx-evidence-agent/**'
       - 'packages/zaino-proto/**'
       - 'packages/zaino-state/**'
       - 'packages/zainod-oram/**'
@@ -68,13 +76,16 @@ jobs:
         with:
           tool: nextest@0.9.140
           fallback: none
-      - name: Check client
+      - name: Check client and boot diagnostic components
         run: >-
-          cargo clippy -p zaino-private-client --all-targets --no-deps --locked --
+          cargo clippy -p zaino-private-client -p zaino-tdx-evidence
+          -p tdx-boot-spike-protocol -p tdx-evidence-agent -p tdx-boot-spike-client
+          --all-targets --no-deps --locked --
           -D warnings -D clippy::unwrap_used
-      - name: Test client
+      - name: Test client and boot diagnostic components
         run: >-
-          cargo nextest run -p zaino-private-client --locked
+          cargo nextest run -p zaino-private-client -p zaino-tdx-evidence
+          -p tdx-boot-spike-protocol -p tdx-evidence-agent -p tdx-boot-spike-client --locked
           --no-tests fail --status-level fail
 
   zaino-oram:
