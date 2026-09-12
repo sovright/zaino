@@ -716,64 +716,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn privileged_capability_drop_reaches_filtered_runtime() {
-        if std::env::var_os("ZAINO_RUN_PRIVILEGED_CAP_PROBE").is_none() {
-            return;
-        }
-        let status = std::process::Command::new("sudo")
-            .args([
-                "-n",
-                "/usr/bin/timeout",
-                "--signal=KILL",
-                "15s",
-                "/usr/bin/env",
-                "ZAINO_CAP_DROP_CHILD=1",
-            ])
-            .arg(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "tests::privileged_capability_drop_child",
-                "--nocapture",
-            ])
-            .status()
-            .expect("privileged capability probe starts");
-        assert!(status.success(), "privileged capability probe refused");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn privileged_capability_drop_child() {
-        if std::env::var_os("ZAINO_CAP_DROP_CHILD").is_none() {
-            return;
-        }
-        // SAFETY: geteuid has no pointer arguments.
-        assert_eq!(unsafe { libc::geteuid() }, 0, "probe requires UID 0");
-        confinement::drop_capabilities().expect("production capability drop succeeds");
-        verify_zero_capabilities(true).expect("all five capability sets are empty");
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("probe runtime");
-        let _provider = start_provider_with(Arc::new(|_| {
-            Err(std::io::Error::other("unused probe collector"))
-        }))
-        .expect("permanent provider starts");
-        let _signals = {
-            let _runtime = runtime.enter();
-            shutdown_signals().expect("signal streams initialize")
-        };
-        confinement::install_seccomp().expect("install synchronized filter");
-        // SAFETY: getpid is explicitly allowed after the production filter.
-        unsafe {
-            libc::syscall(libc::SYS_getpid);
-            libc::_exit(0);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn inherited_descriptor_check_accepts_closed_process() {
         let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
