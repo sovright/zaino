@@ -287,6 +287,7 @@ pub struct LocalQuotePolicyReceipt {
     report_data: [u8; 64],
 }
 
+#[derive(Clone)]
 pub struct LocalQuoteVerifier {
     executable: PathBuf,
     executable_sha256: [u8; DIGEST_BYTES],

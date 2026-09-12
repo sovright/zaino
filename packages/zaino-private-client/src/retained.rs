@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{net::TcpStream, task::JoinHandle};
+use tokio::{net::TcpStream, task::JoinHandle, time::Instant};
 use tokio_rustls::TlsConnector;
 use tonic::{
     transport::{Channel, Endpoint},
@@ -46,6 +46,7 @@ pub struct RetainedClientConfig {
     verifier: LocalQuoteVerifier,
     connect_timeout: Duration,
     rpc_timeout: Duration,
+    maximum_admission_age: Duration,
 }
 
 impl RetainedClientConfig {
@@ -56,10 +57,9 @@ impl RetainedClientConfig {
         verifier: LocalQuoteVerifier,
         connect_timeout: Duration,
         rpc_timeout: Duration,
+        maximum_admission_age: Duration,
     ) -> Result<Self, RetainedClientError> {
-        if connect_timeout.is_zero() || rpc_timeout.is_zero() {
-            return Err(RetainedClientError::Configuration);
-        }
+        validate_durations(connect_timeout, rpc_timeout, maximum_admission_age)?;
         Ok(Self {
             endpoint,
             expected_network,
@@ -67,7 +67,20 @@ impl RetainedClientConfig {
             verifier,
             connect_timeout,
             rpc_timeout,
+            maximum_admission_age,
         })
+    }
+}
+
+fn validate_durations(
+    connect_timeout: Duration,
+    rpc_timeout: Duration,
+    maximum_admission_age: Duration,
+) -> Result<(), RetainedClientError> {
+    if connect_timeout.is_zero() || rpc_timeout.is_zero() || maximum_admission_age.is_zero() {
+        Err(RetainedClientError::Configuration)
+    } else {
+        Ok(())
     }
 }
 
@@ -92,6 +105,7 @@ pub enum RetainedClientError {
     Codec,
     Rpc,
     Cancelled,
+    AdmissionExpired,
 }
 
 impl fmt::Display for RetainedClientError {
@@ -108,8 +122,10 @@ pub struct RetainedPrivateClient {
     codec: Option<MainnetClientSession>,
     socket_control: Arc<std::net::TcpStream>,
     rpc_timeout: Duration,
+    admission_deadline: Instant,
     key_epoch: u64,
-    _evidence: private_proto::EvidenceResponse,
+    evidence: ParsedEvidenceV1,
+    verifier: LocalQuoteVerifier,
     _receipt: crate::LocalQuotePolicyReceipt,
 }
 
@@ -122,15 +138,20 @@ impl fmt::Debug for RetainedPrivateClient {
 impl RetainedPrivateClient {
     /// Performs TLS, evidence verification, and bootstrap on exactly one stream.
     pub async fn connect(config: RetainedClientConfig) -> Result<Self, RetainedClientError> {
+        let admission_deadline = Instant::now()
+            .checked_add(config.maximum_admission_age)
+            .ok_or(RetainedClientError::Configuration)?;
         let (channel, spki, socket_control) =
-            connect_retained_tls(config.endpoint, config.connect_timeout).await?;
+            connect_retained_tls_until(config.endpoint, admission_deadline, config.connect_timeout)
+                .await?;
         let pending = PendingConnection {
             channel,
             spki,
             socket_control: Some(socket_control),
         };
         let challenge = fresh_challenge()?;
-        let evidence = timeout_rpc(
+        let evidence = timeout_rpc_until(
+            admission_deadline,
             config.rpc_timeout,
             pending
                 .client(MAX_EVIDENCE_MESSAGE_BYTES)
@@ -143,24 +164,17 @@ impl RetainedPrivateClient {
         let parsed =
             ParsedEvidenceV1::try_from_wire(&evidence, challenge, pending.spki, &config.policy)
                 .map_err(RetainedClientError::Evidence)?;
-        let verifier_budget = config
-            .verifier
-            .timeout()
-            .checked_add(Duration::from_secs(2))
-            .ok_or(RetainedClientError::Configuration)?;
-        let verifier_task = AbortOnDrop::new(tokio::task::spawn_blocking(move || {
-            config.verifier.verify(&parsed)
-        }));
-        let receipt = tokio::time::timeout(verifier_budget, verifier_task.join())
-            .await
-            .map_err(|_| RetainedClientError::Cancelled)??
-            .map_err(RetainedClientError::Evidence)?;
+        ensure_active(admission_deadline)?;
+        let receipt =
+            verify_until(config.verifier.clone(), parsed.clone(), admission_deadline).await?;
+        ensure_active(admission_deadline)?;
         let mut verified = VerifiedConnection {
             pending,
             evidence,
             receipt,
         };
-        let bootstrap = timeout_rpc(
+        let bootstrap = timeout_rpc_until(
+            admission_deadline,
             config.rpc_timeout,
             verified
                 .client(MAX_BOOTSTRAP_MESSAGE_BYTES)
@@ -168,6 +182,7 @@ impl RetainedPrivateClient {
         )
         .await?
         .into_inner();
+        ensure_active(admission_deadline)?;
         let validated = ValidatedBootstrap::try_from_wire(
             &bootstrap,
             &verified.evidence,
@@ -178,6 +193,7 @@ impl RetainedPrivateClient {
         let codec = validated
             .into_mainnet_client_session()
             .map_err(|_| RetainedClientError::Codec)?;
+        ensure_active(admission_deadline)?;
         Ok(Self {
             grpc: verified.client(MAX_QUERY_MESSAGE_BYTES),
             codec: Some(codec),
@@ -187,8 +203,10 @@ impl RetainedPrivateClient {
                 .take()
                 .ok_or(RetainedClientError::Transport)?,
             rpc_timeout: config.rpc_timeout,
+            admission_deadline,
             key_epoch,
-            _evidence: verified.evidence,
+            evidence: parsed,
+            verifier: config.verifier,
             _receipt: verified.receipt,
         })
     }
@@ -200,6 +218,17 @@ impl RetainedPrivateClient {
         minimum_height: u32,
     ) -> Result<MainnetClientPage, RetainedClientError> {
         let mut guard = QueryFailureGuard::new(self);
+        if guard.client.codec.is_none() {
+            return Err(RetainedClientError::Rpc);
+        }
+        ensure_active(guard.client.admission_deadline)?;
+        verify_until(
+            guard.client.verifier.clone(),
+            guard.client.evidence.clone(),
+            guard.client.admission_deadline,
+        )
+        .await?;
+        ensure_active(guard.client.admission_deadline)?;
         let codec = guard
             .client
             .codec
@@ -208,7 +237,8 @@ impl RetainedPrivateClient {
         let envelope = codec
             .seal_standard_address_query(address, minimum_height)
             .map_err(|_| RetainedClientError::Codec)?;
-        let response = timeout_rpc(
+        let response = timeout_rpc_until(
+            guard.client.admission_deadline,
             guard.client.rpc_timeout,
             guard
                 .client
@@ -220,6 +250,7 @@ impl RetainedPrivateClient {
         )
         .await?
         .into_inner();
+        ensure_active(guard.client.admission_deadline)?;
         if response.key_epoch != guard.client.key_epoch {
             return Err(RetainedClientError::Rpc);
         }
@@ -230,6 +261,7 @@ impl RetainedPrivateClient {
         let page = codec
             .open_single_page_response(response)
             .map_err(|_| RetainedClientError::Codec)?;
+        ensure_active(guard.client.admission_deadline)?;
         guard.disarm();
         Ok(page)
     }
@@ -347,14 +379,70 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-async fn timeout_rpc<T>(
-    duration: Duration,
+async fn verify_until(
+    verifier: LocalQuoteVerifier,
+    evidence: ParsedEvidenceV1,
+    admission_deadline: Instant,
+) -> Result<crate::LocalQuotePolicyReceipt, RetainedClientError> {
+    ensure_active(admission_deadline)?;
+    let helper_wait = verifier
+        .timeout()
+        .checked_add(Duration::from_secs(2))
+        .ok_or(RetainedClientError::Configuration)?;
+    let helper_deadline = Instant::now()
+        .checked_add(helper_wait)
+        .ok_or(RetainedClientError::Configuration)?
+        .min(admission_deadline);
+    let verifier_task = AbortOnDrop::new(tokio::task::spawn_blocking(move || {
+        verifier.verify(&evidence)
+    }));
+    tokio::time::timeout_at(helper_deadline, verifier_task.join())
+        .await
+        .map_err(|_| {
+            if Instant::now() >= admission_deadline {
+                RetainedClientError::AdmissionExpired
+            } else {
+                RetainedClientError::Cancelled
+            }
+        })??
+        .map_err(RetainedClientError::Evidence)
+}
+
+async fn timeout_rpc_until<T>(
+    deadline: Instant,
+    maximum_duration: Duration,
     rpc: impl Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 ) -> Result<tonic::Response<T>, RetainedClientError> {
-    tokio::time::timeout(duration, rpc)
+    let rpc_deadline = bounded_deadline(deadline, maximum_duration)?;
+    tokio::time::timeout_at(rpc_deadline, rpc)
         .await
-        .map_err(|_| RetainedClientError::Rpc)?
+        .map_err(|_| {
+            if Instant::now() >= deadline {
+                RetainedClientError::AdmissionExpired
+            } else {
+                RetainedClientError::Rpc
+            }
+        })?
         .map_err(|_| RetainedClientError::Rpc)
+}
+
+fn bounded_deadline(
+    admission_deadline: Instant,
+    maximum_duration: Duration,
+) -> Result<Instant, RetainedClientError> {
+    ensure_active(admission_deadline)?;
+    let rpc_deadline = Instant::now()
+        .checked_add(maximum_duration)
+        .ok_or(RetainedClientError::Configuration)?;
+    Ok(rpc_deadline.min(admission_deadline))
+}
+
+fn ensure_active(deadline: Instant) -> Result<(), RetainedClientError> {
+    if Instant::now() >= deadline {
+        Err(RetainedClientError::AdmissionExpired)
+    } else {
+        Ok(())
+    }
 }
 
 fn fresh_challenge() -> Result<[u8; 64], RetainedClientError> {
@@ -367,6 +455,7 @@ fn fresh_challenge() -> Result<[u8; 64], RetainedClientError> {
     Ok(challenge)
 }
 
+#[cfg(test)]
 async fn connect_retained_tls(
     endpoint: SocketAddr,
     timeout: Duration,
@@ -374,6 +463,23 @@ async fn connect_retained_tls(
     tokio::time::timeout(timeout, connect_retained_tls_inner(endpoint))
         .await
         .map_err(|_| RetainedClientError::Connect)?
+}
+
+async fn connect_retained_tls_until(
+    endpoint: SocketAddr,
+    admission_deadline: Instant,
+    maximum_duration: Duration,
+) -> Result<(Channel, [u8; 32], Arc<std::net::TcpStream>), RetainedClientError> {
+    let connect_deadline = bounded_deadline(admission_deadline, maximum_duration)?;
+    tokio::time::timeout_at(connect_deadline, connect_retained_tls_inner(endpoint))
+        .await
+        .map_err(|_| {
+            if Instant::now() >= admission_deadline {
+                RetainedClientError::AdmissionExpired
+            } else {
+                RetainedClientError::Connect
+            }
+        })?
 }
 
 async fn connect_retained_tls_inner(
@@ -607,6 +713,37 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_rustls::client::TlsStream;
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn admission_age_and_transport_durations_must_be_nonzero() {
+        let one = Duration::from_secs(1);
+        assert!(validate_durations(one, one, one).is_ok());
+        assert!(matches!(
+            validate_durations(one, one, Duration::ZERO),
+            Err(RetainedClientError::Configuration)
+        ));
+        assert!(matches!(
+            validate_durations(Duration::ZERO, one, one),
+            Err(RetainedClientError::Configuration)
+        ));
+        assert!(matches!(
+            validate_durations(one, Duration::ZERO, one),
+            Err(RetainedClientError::Configuration)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_admission_refuses_before_polling_an_rpc() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&polled);
+        let rpc = std::future::poll_fn(move |_| {
+            observed.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(tonic::Response::new(())))
+        });
+        let result = timeout_rpc_until(Instant::now(), Duration::from_secs(1), rpc).await;
+        assert!(matches!(result, Err(RetainedClientError::AdmissionExpired)));
+        assert!(!polled.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn complete_der_parser_hashes_only_the_subject_public_key_info(

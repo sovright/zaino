@@ -433,7 +433,7 @@ mod tests {
     use sha2::Digest as _;
     use zaino_oram::{
         MainnetPrivateQueryRuntime, PendingFixedEnvelope, PrivateQueryUnavailable,
-        ReleasableSessionKeys,
+        ReleasableSessionKeys, WalletParityRuntime,
     };
 
     use super::{super::tls::PRIVATE_SURFACE_DNS_NAME, *};
@@ -564,18 +564,51 @@ mod tests {
         (tempfile::TempDir, zaino_private_client::LocalQuoteVerifier),
         Box<dyn std::error::Error>,
     > {
+        let (directory, verifier, _) = counting_test_verifier(None, None)?;
+        Ok((directory, verifier))
+    }
+
+    fn counting_test_verifier(
+        successful_invocations: Option<u32>,
+        sleep_on_invocation: Option<u32>,
+    ) -> Result<
+        (
+            tempfile::TempDir,
+            zaino_private_client::LocalQuoteVerifier,
+            std::path::PathBuf,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
         let directory = tempfile::TempDir::new()?;
         let path = directory.path().join("verifier");
+        let marker = directory.path().join("invocations");
+        let refusal = successful_invocations.map_or_else(String::new, |limit| {
+            format!("if [ \"$count\" -gt {limit} ]; then exit 1; fi\n")
+        });
+        let delay = sleep_on_invocation.map_or_else(String::new, |invocation| {
+            format!("if [ \"$count\" -eq {invocation} ]; then exec /bin/sleep 10; fi\n")
+        });
         fs::write(
             &path,
-            concat!(
+            format!(
+                concat!(
                 "#!/bin/sh\n",
-                "q=$(/usr/bin/openssl dgst -sha256 \"$2\"); q=${q##* }\n",
-                "p=$(/usr/bin/openssl dgst -sha256 \"$4\"); p=${p##* }\n",
+                "count=0\n",
+                "if [ -f '{marker}' ]; then count=$(/bin/cat '{marker}'); fi\n",
+                "count=$((count + 1))\n",
+                "printf '%s' \"$count\" > '{marker}'\n",
+                "{delay}",
+                "{refusal}",
+                "q=$(/usr/bin/openssl dgst -sha256 \"$2\"); q=${{q##* }}\n",
+                "p=$(/usr/bin/openssl dgst -sha256 \"$4\"); p=${{p##* }}\n",
                 "body=$(/bin/cat \"$4\")\n",
-                "tail=${body#*\\\"report_data\\\":\\\"}; r=${tail%%\\\"*}\n",
-                "printf '{\"schema_version\":1,\"quote_sha256\":\"%s\",\"policy_sha256\":\"%s\",\"report_data\":\"%s\",\"scope\":\"quote_signature_current_collateral_and_supplied_field_policy_only\"}' \"$q\" \"$p\" \"$r\"\n"
+                "tail=${{body#*\\\"report_data\\\":\\\"}}; r=${{tail%%\\\"*}}\n",
+                "printf '{{\"schema_version\":1,\"quote_sha256\":\"%s\",\"policy_sha256\":\"%s\",\"report_data\":\"%s\",\"scope\":\"quote_signature_current_collateral_and_supplied_field_policy_only\"}}' \"$q\" \"$p\" \"$r\"\n"
+                ),
+                marker = marker.display(),
+                delay = delay,
+                refusal = refusal,
             ),
         )?;
         let mut permissions = fs::metadata(&path)?.permissions();
@@ -586,7 +619,62 @@ mod tests {
             sha2::Sha256::digest(fs::read(path)?).into(),
             Duration::from_secs(5),
         )?;
-        Ok((directory, verifier))
+        Ok((directory, verifier, marker))
+    }
+
+    async fn retained_test_surface(
+        verifier: zaino_private_client::LocalQuoteVerifier,
+        maximum_admission_age: std::time::Duration,
+        release_bucket_millis: u64,
+    ) -> Result<
+        (
+            tempfile::TempDir,
+            ServedSurface,
+            zaino_private_client::RetainedClientConfig,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use std::time::Duration;
+        use zaino_oram::{wallet_parity_harness, PARITY_ENVELOPE_BYTES};
+        use zaino_private_client::{
+            BootstrapNetwork, RetainedClientConfig, VerifierOwnedEvidencePolicy,
+        };
+
+        let fixture = zaino_state::test_dependencies::load_ordinary_utxo_shadow_fixture().await?;
+        let journal = tempfile::TempDir::new()?;
+        let harness = wallet_parity_harness(
+            &parity_shape()?,
+            fixture.indexed_blocks(),
+            journal.path().join("replay"),
+            [0x6a; 16],
+            1,
+        )?;
+        let bootstrap = harness.session_bootstrap()?;
+        let evidence = evidence_for_bootstrap(&bootstrap);
+        let policy = VerifierOwnedEvidencePolicy::new(
+            [1; 32],
+            [2; 32],
+            *bootstrap.profile_id(),
+            bootstrap.schema_version(),
+            &zero_quote_policy_json()?,
+        )?;
+        let surface = ServedSurface::start_attested_with_bucket::<_, PARITY_ENVELOPE_BYTES>(
+            harness,
+            bootstrap,
+            evidence,
+            release_bucket_millis,
+        )
+        .await?;
+        let config = RetainedClientConfig::new(
+            surface.address,
+            BootstrapNetwork::Regtest,
+            policy,
+            verifier,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            maximum_admission_age,
+        )?;
+        Ok((journal, surface, config))
     }
 
     // Extraction only, not X.509 validation. TLS validates this controlled
@@ -830,6 +918,20 @@ mod tests {
             H: FixedEnvelopeRuntime<N> + Send + 'static,
             H::PendingResponse: Send + 'static,
         {
+            Self::start_attested_with_bucket(handler, session_bootstrap, evidence_binding, 100)
+                .await
+        }
+
+        async fn start_attested_with_bucket<H, const N: usize>(
+            handler: H,
+            session_bootstrap: ClientSessionBootstrap,
+            evidence_binding: AttestationWorkloadBinding,
+            release_bucket_millis: u64,
+        ) -> Result<Self, Box<dyn std::error::Error>>
+        where
+            H: FixedEnvelopeRuntime<N> + Send + 'static,
+            H::PendingResponse: Send + 'static,
+        {
             let mut listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
             listener.test_quote = Some(Arc::new(|report_data| Ok(report_data.to_vec())));
             let tls = PrivateTlsIdentity::generate_ephemeral()?;
@@ -843,7 +945,7 @@ mod tests {
                     .serve::<_, N>(
                         handler,
                         session_bootstrap,
-                        ReleaseSchedule::from_timeout_bucket_millis(100),
+                        ReleaseSchedule::from_timeout_bucket_millis(release_bucket_millis),
                         &tls,
                         Some(evidence_binding),
                         async {
@@ -1516,7 +1618,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn retained_client_accepts_synthetic_quote_then_executes_one_real_private_query(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use std::time::Duration;
+        use std::{fs, time::Duration};
         use zaino_oram::{
             wallet_parity_harness, MainnetClientOutcome, WalletParityRuntime, PARITY_ENVELOPE_BYTES,
         };
@@ -1550,7 +1652,7 @@ mod tests {
             schema_version,
             &quote_policy,
         )?;
-        let (_helper_dir, verifier) = correlated_test_verifier()?;
+        let (_helper_dir, verifier, invocations) = counting_test_verifier(None, None)?;
         let config = RetainedClientConfig::new(
             surface.address,
             BootstrapNetwork::Regtest,
@@ -1558,6 +1660,7 @@ mod tests {
             verifier,
             Duration::from_secs(5),
             Duration::from_secs(30),
+            Duration::from_secs(60),
         )?;
         let result = async {
             let mut client = RetainedPrivateClient::connect(config)
@@ -1573,6 +1676,7 @@ mod tests {
             assert_eq!(surface.routes.evidence.load(Ordering::SeqCst), 1);
             assert_eq!(surface.routes.bootstrap.load(Ordering::SeqCst), 1);
             assert_eq!(surface.routes.query.load(Ordering::SeqCst), 0);
+            assert_eq!(fs::read_to_string(&invocations)?, "1");
             let case = fixture
                 .cases()
                 .iter()
@@ -1596,6 +1700,7 @@ mod tests {
                 )
             })?;
             assert_eq!(surface.routes.query.load(Ordering::SeqCst), 1);
+            assert_eq!(fs::read_to_string(&invocations)?, "2");
             assert_eq!(page.outcome, MainnetClientOutcome::Complete);
             assert!(!page.has_more);
             assert_eq!(page.utxos.len(), case.ordinary_utxos().len());
@@ -1620,11 +1725,13 @@ mod tests {
                 result = &mut pending => panic!("scheduled query completed before cancellation: {result:?}"),
             }
             drop(pending);
+            assert_eq!(fs::read_to_string(&invocations)?, "3");
             assert!(matches!(
                 client.query_first_page(address, 0).await,
                 Err(RetainedClientError::Rpc)
             ));
             assert_eq!(surface.routes.query.load(Ordering::SeqCst), 2);
+            assert_eq!(fs::read_to_string(invocations)?, "3");
             Ok::<(), Box<dyn std::error::Error>>(())
         }
         .await;
@@ -1678,6 +1785,7 @@ mod tests {
             verifier,
             Duration::from_secs(5),
             Duration::from_secs(5),
+            Duration::from_secs(30),
         )?;
         assert!(matches!(
             RetainedPrivateClient::connect(config).await,
@@ -1686,6 +1794,148 @@ mod tests {
         assert_eq!(surface.routes.evidence.load(Ordering::SeqCst), 1);
         assert_eq!(surface.routes.bootstrap.load(Ordering::SeqCst), 0);
         assert_eq!(surface.routes.query.load(Ordering::SeqCst), 0);
+        surface.shutdown().await
+    }
+
+    // multi_thread required: the persistent-v1 fixture uses block_in_place while serving TLS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retained_client_revalidates_before_query_and_helper_refusal_sends_nothing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, time::Duration};
+        use zaino_oram::{wallet_parity_harness, MainnetStandardAddress, PARITY_ENVELOPE_BYTES};
+        use zaino_private_client::{
+            BootstrapNetwork, RetainedClientConfig, RetainedClientError, RetainedPrivateClient,
+            VerifierOwnedEvidencePolicy,
+        };
+
+        let fixture = zaino_state::test_dependencies::load_ordinary_utxo_shadow_fixture().await?;
+        let journal = tempfile::TempDir::new()?;
+        let harness = wallet_parity_harness(
+            &parity_shape()?,
+            fixture.indexed_blocks(),
+            journal.path().join("replay"),
+            [0x6a; 16],
+            1,
+        )?;
+        let bootstrap = harness.session_bootstrap()?;
+        let evidence = evidence_for_bootstrap(&bootstrap);
+        let policy = VerifierOwnedEvidencePolicy::new(
+            [1; 32],
+            [2; 32],
+            *bootstrap.profile_id(),
+            bootstrap.schema_version(),
+            &zero_quote_policy_json()?,
+        )?;
+        let surface =
+            ServedSurface::start_attested::<_, PARITY_ENVELOPE_BYTES>(harness, bootstrap, evidence)
+                .await?;
+        let (_helper_dir, verifier, invocations) = counting_test_verifier(Some(1), None)?;
+        let config = RetainedClientConfig::new(
+            surface.address,
+            BootstrapNetwork::Regtest,
+            policy,
+            verifier,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )?;
+        let mut client = RetainedPrivateClient::connect(config).await?;
+        assert_eq!(fs::read_to_string(&invocations)?, "1");
+        let result = client
+            .query_first_page(MainnetStandardAddress::pay_to_public_key_hash([0; 20]), 0)
+            .await;
+        assert!(matches!(result, Err(RetainedClientError::Evidence(_))));
+        assert_eq!(fs::read_to_string(&invocations)?, "2");
+        assert_eq!(surface.routes.evidence.load(Ordering::SeqCst), 1);
+        assert_eq!(surface.routes.bootstrap.load(Ordering::SeqCst), 1);
+        assert_eq!(surface.routes.query.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            client
+                .query_first_page(MainnetStandardAddress::pay_to_public_key_hash([0; 20]), 0)
+                .await,
+            Err(RetainedClientError::Rpc)
+        ));
+        assert_eq!(fs::read_to_string(&invocations)?, "2");
+        surface.shutdown().await
+    }
+
+    // multi_thread required: the persistent-v1 fixture uses block_in_place while serving TLS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_expiry_inside_initial_helper_sends_no_bootstrap_or_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, sync::atomic::Ordering, time::Duration};
+        use zaino_private_client::{RetainedClientError, RetainedPrivateClient};
+
+        let (_helper_dir, verifier, invocations) = counting_test_verifier(None, Some(1))?;
+        let (_journal, surface, config) =
+            retained_test_surface(verifier, Duration::from_secs(3), 100).await?;
+        let result = RetainedPrivateClient::connect(config).await;
+        assert!(matches!(result, Err(RetainedClientError::AdmissionExpired)));
+        assert_eq!(fs::read_to_string(invocations)?, "1");
+        assert_eq!(surface.routes.evidence.load(Ordering::SeqCst), 1);
+        assert_eq!(surface.routes.bootstrap.load(Ordering::SeqCst), 0);
+        assert_eq!(surface.routes.query.load(Ordering::SeqCst), 0);
+        surface.shutdown().await
+    }
+
+    // multi_thread required: the persistent-v1 fixture uses block_in_place while serving TLS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_expiry_inside_query_helper_is_terminal_before_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, sync::atomic::Ordering, time::Duration};
+        use zaino_oram::MainnetStandardAddress;
+        use zaino_private_client::{RetainedClientError, RetainedPrivateClient};
+
+        let (_helper_dir, verifier, invocations) = counting_test_verifier(None, Some(2))?;
+        let (_journal, surface, config) =
+            retained_test_surface(verifier, Duration::from_secs(3), 100).await?;
+        let mut client = RetainedPrivateClient::connect(config).await?;
+        assert_eq!(fs::read_to_string(&invocations)?, "1");
+        assert!(matches!(
+            client
+                .query_first_page(MainnetStandardAddress::pay_to_public_key_hash([0; 20]), 0)
+                .await,
+            Err(RetainedClientError::AdmissionExpired)
+        ));
+        assert_eq!(fs::read_to_string(&invocations)?, "2");
+        assert_eq!(surface.routes.query.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            client
+                .query_first_page(MainnetStandardAddress::pay_to_public_key_hash([0; 20]), 0)
+                .await,
+            Err(RetainedClientError::Rpc)
+        ));
+        assert_eq!(fs::read_to_string(invocations)?, "2");
+        surface.shutdown().await
+    }
+
+    // multi_thread required: the persistent-v1 fixture uses block_in_place while serving TLS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn response_after_admission_expiry_is_not_returned_and_client_is_terminal(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, sync::atomic::Ordering, time::Duration};
+        use zaino_oram::MainnetStandardAddress;
+        use zaino_private_client::{RetainedClientError, RetainedPrivateClient};
+
+        let (_helper_dir, verifier, invocations) = counting_test_verifier(None, None)?;
+        let (_journal, surface, config) =
+            retained_test_surface(verifier, Duration::from_secs(3), 5_000).await?;
+        let mut client = RetainedPrivateClient::connect(config).await?;
+        assert!(matches!(
+            client
+                .query_first_page(MainnetStandardAddress::pay_to_public_key_hash([0; 20]), 0)
+                .await,
+            Err(RetainedClientError::AdmissionExpired)
+        ));
+        assert_eq!(surface.routes.query.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read_to_string(&invocations)?, "2");
+        assert!(matches!(
+            client
+                .query_first_page(MainnetStandardAddress::pay_to_public_key_hash([0; 20]), 0)
+                .await,
+            Err(RetainedClientError::Rpc)
+        ));
+        assert_eq!(fs::read_to_string(invocations)?, "2");
         surface.shutdown().await
     }
 
@@ -1745,6 +1995,7 @@ mod tests {
             verifier,
             Duration::from_secs(5),
             Duration::from_secs(5),
+            Duration::from_secs(30),
         )?;
         assert!(matches!(
             RetainedPrivateClient::connect(config).await,
