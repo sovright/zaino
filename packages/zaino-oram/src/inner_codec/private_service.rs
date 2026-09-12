@@ -29,10 +29,11 @@
 //! erasing them behind a `Box<dyn ..>` would add a vtable hop to the one
 //! fixed-schedule code path this crate exists to keep uniform.
 //!
-//! What this module does *not* establish: obliviousness. The projection below
-//! is built on the qualification memory backend, which provides none — see
-//! [`crate::projection_owner`]. This is a research composition and makes no
-//! production privacy claim.
+//! The projection builder selects the typed ORAM backend and fails closed if
+//! its platform or feature is unavailable; it never falls back to qualification
+//! memory. That backend selection does not establish obliviousness or a
+//! production privacy claim: backend audit, physical trace qualification and
+//! the complete attested deployment remain separate gates.
 
 use std::{future::Future, path::PathBuf};
 
