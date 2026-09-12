@@ -40,3 +40,72 @@ form downloads, extracts, executes, or builds the selected software. GnuPG uses
 a temporary isolated public keyring. The second builder, Rust/vendor closure,
 kernel/package pins, evidence agent, diagnostic client, offline signing inputs,
 and deterministic filesystem/image settings remain explicit prerequisites.
+
+`package-roots.json` freezes candidate guest-kernel roots separately from
+builder tools. `resolve-package-closure.sh NEW_DIRECTORY` runs only on Linux
+amd64 with the pinned APT version and an empty private APT state. It admits
+indexes and packages only when their lengths and SHA-256 digests match the
+retained signed snapshot metadata, downloads without installing, and emits a
+canonical lock. `verify-package-closure.sh DIRECTORY` rechecks that closure
+offline. The offline verifier authenticates package membership and bytes
+against the retained signed indexes and requires every requested root; it does
+not recompute the dependency graph. The pinned APT solve produces that graph,
+and equal locks from two fresh runs show resolver determinism for those inputs.
+Neither result establishes kernel suitability or image acceptance.
+The current CI invokes APT 2.8.3 directly on GitHub's `ubuntu-24.04` runner;
+it does not execute inside the selected OCI builder base and is not a hermetic
+builder-identity claim.
+
+The selected stock Linux 6.17 GCP kernel is a deliberate negative candidate.
+Its package config contains the required TDX guest, ConfigFS TSM, GVE, NVMe,
+SWIOTLB, EFI-stub, and dm-verity settings, but it also enables policy-prohibited
+debug-kernel, kexec, hibernation, and sleep settings. The static
+`verify-kernel-config.sh` gate therefore refuses it. `CONFIG_DEBUG_KERNEL` is
+separate from the TDX DEBUG guest attribute. An acceptable custom kernel,
+source/config/package digests, and review of the required TDX halt fixes remain
+prerequisites.
+
+`custom-kernel-tool-roots.json` is a separate builder-only request for the
+compiler, binutils, Kbuild utilities, source extractor, and development
+libraries. Its OpenSSL command and development packages are confined to the
+network-disabled disposable kernel builder; they are not Zaino Rust/runtime or
+guest-image dependencies. This scoped builder use does not relax the repository
+ban on OpenSSL crates or OpenSSL packages in shipped runtime images.
+
+`download-custom-kernel-source.sh` downloads only the three archives bound by
+the retained signed source index. `build-custom-kernel-once.sh` then accepts
+that directory, an offline closure resolved from `custom-kernel-tool-roots.json`,
+the reviewed `custom-kernel.config`, a `run-1` or `run-2` label, and a new
+output directory. It executes the selected OCI digest with networking disabled,
+checks the installed package and compiler versions, extracts the authenticated
+source, verifies the effective Kconfig, and builds `bzImage` and `vmlinux`.
+The CI workflow runs this front door on two separate clean runners and compares
+their artifact hashes. Matching builds establish this build-input experiment;
+they do not establish boot, TDX, image-admission, or runtime suitability.
+The builder marks its private `file:` APT repository as trusted only because
+the outer gate has already authenticated every retained package against the
+signed snapshot indexes. That adapter is not a new package-signature claim and
+does not permit another source or network download.
+
+The effective-config verifier accepts an omitted disabled symbol only from a
+closed list reviewed against the selected 6.17 source. These symbols are hidden
+when their controlling dependency is disabled, so Kconfig represents `n` by
+absence. Unknown omissions, duplicate settings, and any enabled value remain
+refusals. `CONFIG_TSM_REPORTS` is checked by the static policy after the enabled
+TDX guest driver selects it; it is not asserted as an independent hidden input.
+`CONFIG_DEVKMEM` does not exist in the selected 6.17 Kconfig and is therefore
+not represented as a disabled or hidden setting. x86 selects
+`CONFIG_PERF_EVENTS=y` unconditionally. That enabled framework is accepted only
+with the separately tested guest boundary: the production process drops and
+verifies all five capability sets, refuses inherited descriptors, and its
+synchronized seccomp filter traps `perf_event_open`. Host PMU and side-channel
+closure and the real C3 guest remain qualification gates.
+
+`CONFIG_EXPERT=y` is required to disable standard kernel facilities and itself
+selects the `DEBUG_KERNEL` meta-symbol. The fragment therefore records that
+forced value while continuing to prohibit the concrete debugger, tracing,
+console, core-export, and alternate-execution facilities. Enabling EXPERT also
+exposes defaults that `allnoconfig` otherwise clears: the guest explicitly
+enables SHMEM for its required tmpfs mounts and PROC_SYSCTL for the production
+capability-bound lookup. PROC_SYSCTL selects the hidden SYSCTL symbol. No tmpfs
+ACL or extended-attribute option is enabled without a guest consumer.
