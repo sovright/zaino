@@ -27,5 +27,14 @@ a pageable or complete wallet codec. It is currently compiled with
 client's trusted code; a later feature split is required before calling that
 dependency surface minimal.
 
+The native fixture previously started at active height 150. Its initial recent
+projection contains more than the production profile's 256 query slots, so the
+first refresh correctly failed capacity validation before it could test the
+refresh lifecycle. The default fixture now starts at height 100, which fits the
+unchanged production 256-slot profile. `start_at_height(150)` remains available
+to prove that the production-width controller refuses that larger capture while
+a deliberately 512-slot test controller accepts it. This changes test input
+only; the production profile and capacity bound are unchanged.
+
 The fixture's source is a fixed linear chain with monotonic advancement, so it
 does not provide or claim deterministic reorg coverage.
