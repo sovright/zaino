@@ -567,6 +567,16 @@ small, isolated, expiring platform test. Neither raw quote acquisition nor this
 administrator-accessible diagnostic image closes Track A. Client verification,
 accepted image policy, and the complete typed query path remain required.
 
+The [client verifier experiment](../../tools/tdx-verifier/README.md) now
+implements bounded local QuoteV4 signature, current collateral/revocation,
+strict TCB-status, and complete supplied-field-policy checks. A signed hardware
+diagnostic fixture exercises the full pipeline, including refusal mutations.
+The [candidate review](oram-client-verifier-candidate.md) records its pinned
+dependency closure and remaining integration requirements. This file-based
+result does not authorize bootstrap or queries: fresh challenge reconstruction,
+the same live TLS peer, independently approved launch policy, provenance, and
+state-freshness policy remain separate gates.
+
 The experiment must compose actual attestation verification and quote-bound
 TLS, production-grade envelope cryptography with explicit nonce/key ownership,
 the real typed ORAM backend, bounded recent-state scan/merge, continuation and
