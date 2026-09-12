@@ -4,6 +4,11 @@
 
 proposed
 
+Superseded for the outside-TEE operator goal by
+[ADR-0903](0903-operator-privacy-scope-and-tdx-experiment.md). This document
+records the earlier interim posture and does not authorize deferred attestation
+or operator-accessible keys for that goal.
+
 Narrows the *deployment posture* for the first private-query release. It does
 not amend, weaken, or supersede the adversary model in
 [0007](0007-private-query-service-and-leakage-model.md), which remains the

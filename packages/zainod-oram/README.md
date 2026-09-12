@@ -15,6 +15,14 @@ compile-time profile:
 cargo check -p zainod-oram --features private-service
 ```
 
+The private serve command keeps its persisted TLS identity mode as the
+default. An isolated local experiment may select
+`--ephemeral-tls-identity`; this generates a fresh certificate and key only in
+process, permits loopback listeners only, and rotates the certificate pin at
+every restart. It remains gated by `--allow-unaudited-oram`. The option does
+not provide attestation, prove TDX residency, or authorize a deployment privacy
+claim.
+
 When `protoc` is available, the build script regenerates and formats a temporary
 copy, then fails if it differs from the committed Rust source. Refreshing after
 an intentional schema change requires the pinned toolchain's `rustfmt` and the

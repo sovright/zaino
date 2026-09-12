@@ -1,16 +1,17 @@
 # ORAM-enabled Zaino fork: architecture and delivery plan
 
 - Status: Phase 0/1 research foundation implemented; current gate is **NO-GO
-  for server integration** pending the measured blockers in
+  for production server integration** pending the measured blockers in
   [the feasibility report](oram-phase0-1-feasibility-report.md).
 - Prepared: 2026-07-12.
-- Updated: 2026-07-26.
+- Updated: 2026-09-12 (outside-operator privacy and execution sequence).
+- Decision update: [ADR-0903](../adr/0903-operator-privacy-scope-and-tdx-experiment.md).
 - Target fork point: [`zingolabs/zaino@c94ae247`](https://github.com/zingolabs/zaino/commit/c94ae247de7286fd3337e313559bb3d62bdcbd5d), the live `origin/dev` head inspected for this plan.
 - Design seed: [TEE-backed lightwalletd / Zaino with `rostl` and `oblivious_node`](https://gist.github.com/zmanian/61f6b2b1afad08729356d5f226fdfbb3).
 
 ## Current Phase 0 decision
 
-Phase 0 remains a stop gate and is **NO-GO for server integration** until the
+Phase 0 remains a stop gate and is **NO-GO for production server integration** until the
 measured blockers in the concise
 [kill-gate report](oram-phase0-kill-gates-2026-07-23.md) and complete
 [feasibility report](oram-phase0-1-feasibility-report.md) clear.
@@ -20,6 +21,21 @@ insertion/failure bounds, and measured target-TDX RSS/no-swap headroom.
 Implementation chronology belongs in the
 [separate status log](oram-implementation-status.md), not in this normative
 architecture and delivery plan.
+
+The 2026-09-12 planning revision uses fork main `753f3fc5` as its implementation
+baseline. Historical report paragraphs describe their named source heads, not
+necessarily today's code. Main now includes XChaCha protectors, TLS/bootstrap,
+runtime/recent-state work, and later annotation/codegen changes; do not rebuild
+those foundations or repeat the completed corpus capture merely because an
+older evidence paragraph calls them missing. Revalidate their composition and
+remaining gates at the exact experiment head.
+
+[ADR-0903](../adr/0903-operator-privacy-scope-and-tdx-experiment.md) permits the
+isolated experiment below under the production NO-GO. It supersedes the proposed
+ADR-0010 posture for this outside-operator goal: operator-trusted deployment and
+deferred attestation are not an acceptable completion milestone. Current
+persisted TLS identity files and runtime-wide bootstrap keys require an explicit
+trust/key-custody transition before that goal can be claimed.
 
 ## Executive decision
 
@@ -54,6 +70,67 @@ All links in this section are pinned to `c94ae247`.
 Language-server workspace symbols and references on the target commit confirmed the trait definitions, the sole production `NodeBackedIndexerServiceSubscriber` implementation, and the address-query call chain into `ChainIndex`. Source reads were then used to inspect behavior inside those resolved symbols.
 
 ## Privacy claim and threat model
+
+### Product goal and complete wallet scope
+
+The goal is a Zaino workload inside an attested TEE whose outside operator
+cannot infer a client's queried addresses or results beyond the accepted public
+leakage budget. This is query privacy, not anonymous network usage: client IPs,
+arrival times, connection duration, and aggregate traffic remain observable.
+The stronger active-host protections below also cover replay, rollback, and
+tampering; they do not guarantee availability or protection against every CPU
+side channel.
+
+The first UTXO query is a feasibility milestone, not completion of this product
+goal. Before a wallet integration claim, freeze an inventory of every RPC and
+client decision in the supported workflow, including follow-up requests and
+failure behavior:
+
+| Wallet activity | Required treatment before claiming that workflow private |
+| --- | --- |
+| Transparent UTXO discovery, balance, and history | Protect each used method's complete lookup, fold, recent-state merge, response, and continuation path |
+| Fetching transactions selected by a private result | Protected txid lookup and padded payload retrieval; no legacy or external query-derived fetch |
+| Mempool reads and transaction submission, if used | Separate accepted policy and implementation for membership, payload size, timing, and broadcast correlation; unsupported until qualified |
+| Compact-block sync and rescans | Declare whether requested range, wallet birthday, and progress are public; add protected block batches if the workflow promises to hide them |
+| Retries, pagination, profile selection, and failures | Fixed client cover-round/retry contract; no secret-driven weaker profile or silent legacy fallback |
+
+The reference client must refuse unsupported private operations. A workflow
+cannot inherit privacy from one protected RPC while another discloses its
+selected addresses or transactions. Capture its entire network session,
+including third-party destinations, for the final claim gate. Phase 7 methods
+required by the selected workflow move ahead of that workflow's Phase 6 claim;
+they are optional only for workflows that do not use them.
+
+Use [ADR-0900](../adr/0900-minimal-private-api-set.md) as the starting inventory:
+address-to-UTXOs, address-to-txids, and txid-to-transaction. Derive balance on the
+client. Retain its public height/range leakage only when the selected workflow
+explicitly accepts it; its operator-trusted posture does not override ADR-0903.
+
+### Concrete deployment trust boundary
+
+For the first candidate, put the authoritative validator/consensus validation,
+projection ingest, NFS snapshot, private engine, envelope/session/token keys,
+and TLS termination inside the measured TDX guest. Pin the guest OS and boot
+configuration as part of the accepted image policy. Outside peers may supply
+public blocks, but the trusted workload validates them and applies an explicit
+chain-freshness policy; peer authentication alone does not establish consensus
+correctness or freshness. The outside host may still censor connectivity.
+
+An external validator is an alternative requiring a separate reviewed trust
+decision: identify its owner, authenticate its channel, specify which consensus
+and freshness checks remain inside the TEE, and disclose any trusted external
+authority. The host-controlled validator must not silently become a trusted
+oracle. In either layout, external ingest follows public chain progress and
+never carries query-selected address or txid requests.
+
+The operator may provision, stop, and replace a guest, but must not have a guest
+root shell, debug console, debugger, memory/core dump export, key export, or
+administrative query-inspection capability in an accepted image. Host-mounted
+configuration cannot replace code, trust roots, or security policy without
+client-detectable measurement/configuration changes. Administrative operations
+are allowlisted lifecycle actions with public aggregate output; loopback or
+vsock placement alone is not authorization. Production key and freshness-witness
+ownership must survive the host's ability to replace or roll back storage.
 
 ### Protected adversary
 
@@ -459,6 +536,118 @@ Existing finalised readiness may route reads through an ephemeral source while p
 
 ## Delivery phases
 
+### Next milestone — operator-observation experiment and mainnet feasibility
+
+Prioritize two evidence tracks before further correctness-only qualification
+slices, except changes needed to make these experiments possible. Neither track
+is currently complete.
+
+**A. One complete query path on isolated TDX hardware.** Move a bounded subset
+of Phase 4/5 research forward under ADR-0903. Use a disposable, default-off test
+application and controlled reference client, synthetic query identities, and
+fixtures or public chain data. No public listener, real wallets, production
+credentials, or claim of private-service readiness is permitted. Restrict the
+test network to the harness; this exception does not authorize deployment now.
+
+Reuse the existing XChaCha, runtime, recent-state, and TLS/transport foundations
+where they satisfy this profile. Replace the operator-readable persisted TLS
+key path with an in-guest ephemeral identity or reviewed TEE sealing. Current
+runtime-wide bootstrap keys rely on TLS for cross-client confidentiality; any
+claim of envelope-level client isolation requires a separately reviewed session
+derivation design. The controlled client must verify evidence and bind the TLS
+peer before bootstrap trust or query transmission. Empty attestation bytes and
+operator-supplied pin replacement are not substitutes.
+
+The experiment must compose actual attestation verification and quote-bound
+TLS, production-grade envelope cryptography with explicit nonce/key ownership,
+the real typed ORAM backend, bounded recent-state scan/merge, continuation and
+replay handling, and actual transport framing. A model or deterministic test
+protector cannot stand in for any measured portion. Use a complete fixed test
+profile; it is not an approved mainnet profile.
+
+The research lifecycle uses fresh in-guest keys and a fresh session epoch on
+each boot or rebuild, rejects all prior tokens, and never resumes sealed
+session/nonce state. Disable guest snapshot restore, cloning, and live migration
+for the experiment and record how that restriction is enforced. If the chosen
+platform cannot enforce it against the outside operator, require a reviewed
+external session-freshness/nonce-ownership mechanism before encrypted queries.
+A fresh startup path alone does not protect a resumed memory snapshot. No
+trusted clock, entropy, or replay-persistence property may be assumed from a
+host-provided interface without documenting its trust and failure behavior.
+
+Record exact source/lockfile, compiler and release flags, binary/image digests,
+CPU/microcode/TDX/TCB identity, effective configuration, profile, and DOIT state.
+Preserve verifier evidence and bind measurement artifacts to the executed build.
+Exercise wrong image/key/profile, stale evidence, debug configuration, and
+untrusted administration rejection before sending test queries.
+
+Pre-register contrasting secret cases and the allowed public observations:
+hit/miss, empty/full/cap-hit, early/late matches, different address histories,
+valid/invalid/expired/replayed continuation, and final versus cover pages. Hold
+public profiles and chain snapshots constant. Observe physical ORAM accesses,
+memory/page behavior, allocation, timing, packet sizes/completion, source calls,
+logs, and administrative output. Include controlled concurrency, ingest
+contention, scheduling perturbations, and failure paths. Instrument the backend
+where necessary; `backend-unobservable` leaves a gate open.
+
+Before collection, specify sample counts, repetitions, held-out secret cases,
+classifier baselines, confidence intervals, and acceptable distinguishing
+advantage for each observation. Separate host-visible measurements from trusted
+diagnostic instrumentation and record instrumentation effects. Review the exact
+release assembly as well. Passing finite experiments is bounded evidence, not
+a proof of obliviousness; independent review remains mandatory.
+
+**B. Full-mainnet capacity and recovery feasibility.** Reopen and validate the
+completed capture/sizing lineage at its recorded public checkpoint; rerun capture
+only when a newer checkpoint or changed measurement schema requires it. Recover
+the original large capture bundle before treating a dated log as revalidated
+input. Select a growth horizon,
+and calibrate actual backend allocation including position maps, stash, and
+temporary memory. Measure the chosen TDX instance with the selected validator
+layout, NFS work, concurrent ingest/query load, no swapping, and at least 30%
+RSS headroom. Measure cold restart through client-serviceable readiness,
+including source startup, verification, replay, key/witness initialization, and
+attestation; keep worker-only replay timings separately labeled. Declare and
+evaluate the full-service RTO before the run. Do not extrapolate the bounded
+`BuilderFoundationV1` result into mainnet qualification.
+
+Start from the [current Track B prerequisite audit](oram-track-b-mainnet-prerequisites-2026-09-12.md),
+which checks the retained insertion/hybrid artifact lineage and records the
+missing original capture and target access. The
+[recent-state width analysis](recent-snapshot-scan-width.md) records negative
+cost evidence and design alternatives at its named boundaries. Main `753f3fc5`
+already consumes stored annotations in the query path; remeasure that actual
+implementation and its publication cost rather than repeating the superseded
+nested-join implementation task or assuming the new code makes mainnet fit.
+
+**Decision artifact.** Publish a source-bound report for each track with missing
+observations and negative results intact, then update the feasibility scorecard.
+If leakage, NFS cost, memory, or recovery fails its gate, revise the algorithm,
+backend, or profile and rerun; a weaker leakage budget requires a new ADR.
+Proceed to production integration only after all existing Phase 0 gates pass.
+The isolated experiment does not waive the later multi-CPU, soak, live parity,
+recovery, audit, or complete-wallet gates.
+
+Execute this milestone in the following dependency order; tracks A and B may
+proceed independently once their inputs are frozen:
+
+1. Commit the supported workflow/RPC inventory, research profile and workload,
+   target CPU/TDX configuration, verifier/crypto dependency and license choices,
+   session-reset policy, and pre-registered observation protocol. Record absent
+   hardware or source access as blockers, not successful qualifications.
+2. Compose the local controlled-client query harness with the real backend and
+   cryptography. Test full-path correctness, padding, rejection, and reset
+   behavior; label local/mock attestation evidence as such.
+3. On the selected isolated TDX target, bind the execution artifacts and pass
+   negative attestation/admin/session checks before test-query admission.
+4. Capture the pre-registered host observations and trusted diagnostic traces;
+   publish results and unobservable dimensions with their source/build binding.
+5. Independently validate the full-mainnet capture and publish calibrated sizing, target-load,
+   and full-service cold-recovery artifacts against the frozen track-B inputs.
+6. Review both tracks, update the gate scorecard, and decide whether to retain
+   the backend, revise the design, or open production integration. Missing
+   hardware measurements cannot be replaced by additional unit-test totals.
+
 ### Phase 0 — fork baseline, threat model, and feasibility gate
 
 Deliverables:
@@ -475,7 +664,8 @@ Deliverables:
 - baseline memory/latency/stash/queue experiments on random full-map workloads, not repeated key-zero microbenchmarks;
 - assembly/trace experiment covering the upstream compiler-preservation concern.
 
-Authorization to resume the frozen later research slices requires:
+Outside the isolated ADR-0903 experiment, authorization to resume frozen later
+research slices requires:
 
 - a reproducible full-mainnet corpus and hot-tail result, approved growth and
   backend-calibration inputs, and a measured target-TDX fit with at least 30%
@@ -492,14 +682,17 @@ kill gate: preserve the exact dependency inventory, pursue authoritative
 license and notice texts for the distribution closure, and review any AGPL
 verifier boundary as part of external-release due diligence.
 
-Server integration remains a separate, stricter go/no-go. It additionally
+Production server integration remains a separate, stricter go/no-go. It additionally
 requires:
 
 - there is a credible recovery/persistence plan and declared RTO;
 - capacity, hot-address, stash, and insertion-queue failure are typed/fail-safe rather than panics or leaky fallback;
 - the team accepts the precise leakage budget and client contract.
 
-If these fail, stop before server integration. Possible next moves are a different ORAM construction, a sharded/public-bucket design with a revised leakage budget, or upstream `rostl` work.
+If these fail, stop before production server integration. ADR-0903 permits only
+the isolated research experiment above. Possible next moves are a different
+ORAM construction, a sharded/public-bucket design with a revised leakage budget,
+or upstream `rostl` work.
 
 ### Phase 1 — private contract and deterministic trace model
 
@@ -603,6 +796,10 @@ Acceptance:
 
 ### Phase 4 — private service integration
 
+The earlier isolated experiment supplies bounded evidence only. This phase
+completes approved service lifecycle and production integration after its gate
+opens; existing interim service code is not proof that the gate passed.
+
 Deliverables:
 
 - a production monotonic freshness witness and security-state owner built on
@@ -650,6 +847,9 @@ Acceptance:
 
 ### Phase 5 — TDX deployment and remote attestation
 
+Early experimental attestation moves into the next milestone. This phase
+completes production operations and the full supported hardware matrix.
+
 Deliverables:
 
 - separate deterministic `deploy/tdx/` image/manifests rather than overloading normal Docker deployment;
@@ -683,7 +883,12 @@ Acceptance:
 - target capacity retains at least 30% RSS headroom;
 - no pre-registered classifier distinguishes secret cases within the same public profile above the accepted threshold;
 - every audit blocker is resolved;
-- operators and client teams approve the final published leakage budget.
+- operators and client teams approve the final published leakage budget;
+- the selected complete wallet workflow passes whole-session capture review,
+  with no query-derived legacy/third-party fallback and only the accepted
+  profile-selection, retry, and termination leakage;
+- client verification binds the TLS identity before sensitive traffic, and the
+  measured guest excludes operator key export, debugging, and query inspection.
 
 Until this phase passes, label the fork experimental and do not call it mainnet-ready or host-oblivious.
 
@@ -771,9 +976,9 @@ Reviewed at [`d00718df`](https://github.com/obliviouslabs/oblivious_node/commit/
 
 Published reference memory guidance also shows why the sizing gate is first-order: a 16,777,216-node configuration accounts for roughly 9.4 GB of raw node values before ORAM tree, keys, buckets, recursive position maps, and runtime overhead. Zaino must measure its own fixed record and real address-event distribution on intended TDX hardware.
 
-## First implementation slice
+## Original foundation slice (historical scope)
 
-The first mergeable slice should stop before real wallet serving:
+The original foundation was scoped to stop before real wallet serving:
 
 1. ADR and leakage table.
 2. `zaino-oram` crate with fixed UTXO event/page business and persistent types.
@@ -783,4 +988,7 @@ The first mergeable slice should stop before real wallet serving:
 6. Shadow parity at one finalized snapshot.
 7. A written Phase 0/1 go/no-go report.
 
-That slice answers the expensive unknowns—capacity, API fit, compiler behavior, throughput, and recovery—without prematurely exposing a privacy service or forcing the alpha ORAM dependency into Zaino's ordinary production path.
+That slice established tools for investigating capacity, API fit, compiler
+behavior, throughput, and recovery. The dated evidence records which questions
+were answered; it does not establish an outside-operator privacy claim. Continue
+with the next milestone above using current-main evidence.

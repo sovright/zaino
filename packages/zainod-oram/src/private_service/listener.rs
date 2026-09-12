@@ -424,7 +424,7 @@ mod tests {
         fingerprint: String,
         /// The persisted identity lives here; held so it outlives the serve
         /// loop rather than being reaped mid-test.
-        _deployment: tempfile::TempDir,
+        _deployment: Option<tempfile::TempDir>,
         stop: tokio::sync::oneshot::Sender<()>,
         served: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     }
@@ -456,9 +456,53 @@ mod tests {
             H::PendingResponse: Send + 'static,
         {
             let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
-            let address = listener.local_addr();
             let deployment = tempfile::TempDir::new()?;
             let tls = PrivateTlsIdentity::load_or_generate(deployment.path())?;
+            Self::start_with_identity(
+                listener,
+                handler,
+                session_bootstrap,
+                release_bucket_millis,
+                tls,
+                Some(deployment),
+            )
+            .await
+        }
+
+        async fn start_ephemeral<H, const N: usize>(
+            handler: H,
+            session_bootstrap: SessionBootstrap,
+        ) -> Result<Self, Box<dyn std::error::Error>>
+        where
+            H: FixedEnvelopeRuntime<N> + Send + 'static,
+            H::PendingResponse: Send + 'static,
+        {
+            let listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+            let tls = PrivateTlsIdentity::generate_ephemeral()?;
+            Self::start_with_identity(
+                listener,
+                handler,
+                session_bootstrap,
+                TEST_RELEASE_BUCKET_MILLIS,
+                tls,
+                None,
+            )
+            .await
+        }
+
+        async fn start_with_identity<H, const N: usize>(
+            listener: PrivateQueryListener,
+            handler: H,
+            session_bootstrap: SessionBootstrap,
+            release_bucket_millis: u64,
+            tls: PrivateTlsIdentity,
+            deployment: Option<tempfile::TempDir>,
+        ) -> Result<Self, Box<dyn std::error::Error>>
+        where
+            H: FixedEnvelopeRuntime<N> + Send + 'static,
+            H::PendingResponse: Send + 'static,
+        {
+            let address = listener.local_addr();
             let certificate_pem = tls.certificate_pem().to_owned();
             let fingerprint = tls.fingerprint().to_owned();
             let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -612,6 +656,27 @@ mod tests {
         )
         .await?;
 
+        assert_eq!(response.envelope, RESPONSE);
+
+        surface.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn an_ephemeral_identity_completes_a_real_tls_handshake(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let surface = ServedSurface::start_ephemeral::<_, ENVELOPE_BYTES>(
+            handler(),
+            session_bootstrap_fixture(FIXTURE_KEY_EPOCH),
+        )
+        .await?;
+
+        let response = query_page_over_the_wire(
+            surface.address,
+            &surface.certificate_pem,
+            vec![1, 2, 3, 4],
+            FIXTURE_KEY_EPOCH,
+        )
+        .await?;
         assert_eq!(response.envelope, RESPONSE);
 
         surface.shutdown().await

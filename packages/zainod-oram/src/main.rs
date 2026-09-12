@@ -202,6 +202,13 @@ struct PrivateServeArgs {
     #[arg(long, value_name = "DIR")]
     tls_identity_dir: Option<PathBuf>,
 
+    /// Generate a fresh TLS identity in memory for one isolated experiment.
+    ///
+    /// This mode is restricted to a loopback listener, never reads or writes
+    /// TLS identity files, and does not provide attestation by itself.
+    #[arg(long, conflicts_with = "tls_identity_dir")]
+    ephemeral_tls_identity: bool,
+
     /// Address the private gRPC surface binds to.
     #[arg(long, value_name = "ADDR")]
     listen_address: SocketAddr,
@@ -1403,12 +1410,23 @@ const PRIVATE_SCHEMA_VERSION: u32 = 1;
 #[cfg(feature = "private-service")]
 async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
     require_private_listener_opt_in(args.allow_unaudited_oram)?;
-    eprintln!(
-        "WARNING: the ORAM backend is an unaudited alpha revision of rostl, and this \
-         deployment assumes an honest-but-curious operator inside an attested TEE \
-         (docs/adr/0010). It does not withstand a host that modifies the workload, \
-         induces page faults, or rolls back state."
-    );
+    if args.ephemeral_tls_identity {
+        require_ephemeral_tls_loopback(args.listen_address)?;
+    }
+    if args.ephemeral_tls_identity {
+        eprintln!(
+            "WARNING: isolated loopback experiment with an unaudited alpha ORAM \
+             backend and no attestation verification. This mode does not prove TEE \
+             residency or authorize a deployment privacy claim."
+        );
+    } else {
+        eprintln!(
+            "WARNING: the ORAM backend is an unaudited alpha revision of rostl, and \
+             this deployment follows the honest-but-curious interim posture in \
+             docs/adr/0010. It does not withstand a host that modifies the workload, \
+             induces page faults, or rolls back state."
+        );
+    }
     let capture = load_capture(&args.capture_dir)?;
     let sizing = load_sizing(&args.sizing_dir, &capture)?;
     let config = load_config(&args.config)?;
@@ -1426,30 +1444,39 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
         EphemeralKeyGeneration::draw().map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
     let shape = private_projection_shape(&capture, &sizing, key_generation.key_epoch)?;
 
-    // Loaded here -- before the bind and long before the chain replay -- so a
-    // deployment whose identity is missing, damaged, or half-present fails
-    // immediately rather than after paying for a full replay. Unlike the
-    // symmetric keys drawn above, this identity is *not* rotated by a restart:
-    // a broken pin is an opaque handshake failure a wallet cannot recover
-    // from, where stale keys earn it a StaleKeyEpoch and a re-bootstrap.
-    let tls_identity_dir = match args.tls_identity_dir {
-        Some(directory) => directory,
-        None => default_tls_identity_dir(&args.replay_journal_dir)?,
-    };
-    require_tls_identity_outside_journal(&tls_identity_dir, &args.replay_journal_dir)?;
-    // Earlier builds kept the identity in the journal directory. Upgrading in
-    // place must not look at an empty new location and mint over a pin that is
-    // still perfectly good one directory away.
-    require_no_stranded_identity(&tls_identity_dir, &args.replay_journal_dir)?;
-    let tls = PrivateTlsIdentity::load_or_generate(&tls_identity_dir)?;
-    let fingerprint_path = tls.publish_fingerprint(&tls_identity_dir)?;
-    print!("{}", tls.fingerprint_record());
-    println!(
-        "private_tls_fingerprint_file={}",
-        fingerprint_path.display()
-    );
-    eprintln!(
-        "NOTE: this certificate persists across restarts, so a wallet's pin stays \
+    // Selected here before the bind and long before the chain replay.
+    let tls = if args.ephemeral_tls_identity {
+        let tls = PrivateTlsIdentity::generate_ephemeral()?;
+        print!("{}", tls.fingerprint_record());
+        eprintln!(
+            "NOTE: this isolated-experiment TLS identity exists only in this process \
+             and rotates at restart. It avoids persisting the identity key, but does \
+             not provide attestation or prove TEE residency."
+        );
+        tls
+    } else {
+        // A persisted identity that is missing, damaged, or half-present fails
+        // immediately. Unlike the symmetric keys drawn above, it is not
+        // rotated by restart: stale symmetric keys have a protocol recovery
+        // path, while an implicitly broken certificate pin does not.
+        let tls_identity_dir = match args.tls_identity_dir {
+            Some(directory) => directory,
+            None => default_tls_identity_dir(&args.replay_journal_dir)?,
+        };
+        require_tls_identity_outside_journal(&tls_identity_dir, &args.replay_journal_dir)?;
+        // Earlier builds kept the identity in the journal directory. Upgrading in
+        // place must not look at an empty new location and mint over a pin that is
+        // still perfectly good one directory away.
+        require_no_stranded_identity(&tls_identity_dir, &args.replay_journal_dir)?;
+        let tls = PrivateTlsIdentity::load_or_generate(&tls_identity_dir)?;
+        let fingerprint_path = tls.publish_fingerprint(&tls_identity_dir)?;
+        print!("{}", tls.fingerprint_record());
+        println!(
+            "private_tls_fingerprint_file={}",
+            fingerprint_path.display()
+        );
+        eprintln!(
+            "NOTE: this certificate persists across restarts, so a wallet's pin stays \
          valid until an operator rotates it deliberately by deleting the certificate \
          and key in {} -- which invalidates every pin. That directory is deliberately \
          a sibling of the replay journal, never inside it, so wiping the journal to \
@@ -1459,8 +1486,10 @@ async fn run_private_serve(args: PrivateServeArgs) -> RunnerResult<()> {
          must be revisited as the posture tightens toward docs/adr/0007. A pin proves \
          only that a wallet is talking to the same surface as before; it attests \
          nothing about which binary is running. Attestation supersedes pinning.",
-        tls_identity_dir.display()
-    );
+            tls_identity_dir.display()
+        );
+        tls
+    };
 
     let listener = PrivateQueryListener::bind(args.listen_address).await?;
     let listening_on = listener.local_addr();
@@ -1503,6 +1532,15 @@ fn default_tls_identity_dir(replay_journal_dir: &Path) -> RunnerResult<PathBuf> 
     let mut sibling = name.to_os_string();
     sibling.push("-tls-identity");
     Ok(replay_journal_dir.with_file_name(sibling))
+}
+
+#[cfg(feature = "private-service")]
+fn require_ephemeral_tls_loopback(listen_address: SocketAddr) -> RunnerResult<()> {
+    if listen_address.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(RunnerError::EphemeralTlsRequiresLoopback { listen_address }.into())
+    }
 }
 
 /// Refuses an identity directory that a journal wipe would destroy.
@@ -2063,6 +2101,10 @@ enum RunnerError {
         identity: PathBuf,
         journal: PathBuf,
     },
+    #[cfg(feature = "private-service")]
+    EphemeralTlsRequiresLoopback {
+        listen_address: SocketAddr,
+    },
     IncompleteCheckpoint,
     InvalidCheckpointHash,
     TargetAboveServiceable {
@@ -2146,6 +2188,11 @@ impl fmt::Display for RunnerError {
                 "--tls-identity-dir {} is inside --replay-journal-dir {}; wiping the journal to reset replay state would delete the TLS identity and break every wallet's pinned certificate. Choose a directory outside the journal",
                 identity.display(),
                 journal.display()
+            ),
+            #[cfg(feature = "private-service")]
+            Self::EphemeralTlsRequiresLoopback { listen_address } => write!(
+                f,
+                "--ephemeral-tls-identity is restricted to a loopback listener; {listen_address} is not loopback"
             ),
             #[cfg(feature = "private-service")]
             Self::PrivateListenerOptInRequired => f.write_str(
@@ -2280,6 +2327,86 @@ mod tests {
         };
         let PrivateSubcommand::Serve(serve) = private.command;
         assert_eq!(serve.tls_identity_dir, None);
+        assert!(!serve.ephemeral_tls_identity);
+    }
+
+    #[cfg(feature = "private-service")]
+    #[test]
+    fn ephemeral_tls_mode_is_explicit_exclusive_and_loopback_only() {
+        let base = [
+            "zainod-oram",
+            "private",
+            "serve",
+            "--allow-unaudited-oram",
+            "--config",
+            "/tmp/zainod.toml",
+            "--capture-dir",
+            "/tmp/capture",
+            "--sizing-dir",
+            "/tmp/sizing",
+            "--replay-journal-dir",
+            "/tmp/replay",
+            "--listen-address",
+            "127.0.0.1:0",
+            "--progress-interval",
+            "1000",
+            "--ephemeral-tls-identity",
+        ];
+        let parsed = Cli::try_parse_from(base).expect("explicit ephemeral mode parses");
+        let Command::Private(private) = parsed.command else {
+            panic!("the parsed command is the private one");
+        };
+        let PrivateSubcommand::Serve(serve) = private.command;
+        assert!(serve.ephemeral_tls_identity);
+        assert!(require_ephemeral_tls_loopback(serve.listen_address).is_ok());
+        assert!(require_ephemeral_tls_loopback(
+            "[::1]:0"
+                .parse()
+                .expect("fixture IPv6 loopback address is valid")
+        )
+        .is_ok());
+
+        let mut conflicting = base.to_vec();
+        conflicting.extend(["--tls-identity-dir", "/tmp/tls"]);
+        assert!(Cli::try_parse_from(conflicting).is_err());
+
+        let public: SocketAddr = "0.0.0.0:9137"
+            .parse()
+            .expect("fixture socket address is valid");
+        let error = require_ephemeral_tls_loopback(public)
+            .expect_err("ephemeral identity must not reach a public listener");
+        assert!(error
+            .to_string()
+            .contains("restricted to a loopback listener"));
+        let public_v6: SocketAddr = "[::]:9137"
+            .parse()
+            .expect("fixture IPv6 unspecified address is valid");
+        assert!(require_ephemeral_tls_loopback(public_v6).is_err());
+    }
+
+    #[cfg(feature = "private-service")]
+    #[tokio::test]
+    async fn ephemeral_public_bind_is_rejected_before_input_files_are_read() {
+        let args = PrivateServeArgs {
+            allow_unaudited_oram: true,
+            config: PathBuf::from("/does-not-exist/config.toml"),
+            capture_dir: PathBuf::from("/does-not-exist/capture"),
+            sizing_dir: PathBuf::from("/does-not-exist/sizing"),
+            replay_journal_dir: PathBuf::from("/does-not-exist/replay"),
+            tls_identity_dir: None,
+            ephemeral_tls_identity: true,
+            listen_address: "0.0.0.0:9137"
+                .parse()
+                .expect("fixture socket address is valid"),
+            progress_interval: NonZeroU32::new(1).expect("one is nonzero"),
+        };
+
+        let error = run_private_serve(args)
+            .await
+            .expect_err("public ephemeral bind must be rejected first");
+        assert!(error
+            .to_string()
+            .contains("restricted to a loopback listener"));
     }
 
     #[derive(Debug, PartialEq, Eq, serde::Serialize)]

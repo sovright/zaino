@@ -1,5 +1,12 @@
 # ORAM Phase 0 kill-gate report — 2026-07-23
 
+2026-09-12 sequencing amendment:
+[ADR-0903](../adr/0903-operator-privacy-scope-and-tdx-experiment.md) permits a
+narrow isolated TDX experiment under the production NO-GO. The freeze below
+continues outside that exception. These results apply to the named historical
+binaries; revalidate current-main codegen and physical behavior at the experiment
+head rather than treating subsequent implementation changes as a gate pass.
+
 - Evidence baseline: `3a84280c3b727b434f26b424c4abad90f192d909`.
 - Completed mainnet-capture source:
   `d35d158a9826c75a4ec1c31932c29b43cf4c7163`.
