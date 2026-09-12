@@ -1,8 +1,12 @@
-//! Client-owned validation of raw TDX evidence and local verifier results.
-//! No type in this crate grants bootstrap or query authority yet.
+//! Client-owned validation of raw TDX evidence and a retained-stream research client.
+//!
+//! Admission accepts the caller's reviewed policy. It does not establish a
+//! generally accepted guest-image policy, rollback protection, or wallet readiness.
 
 mod bootstrap;
+mod retained;
 pub use bootstrap::{BootstrapNetwork, BootstrapWireError, ValidatedBootstrap};
+pub use retained::{RetainedClientConfig, RetainedClientError, RetainedPrivateClient};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
@@ -312,6 +316,10 @@ impl LocalQuoteVerifier {
             executable_sha256,
             timeout,
         })
+    }
+
+    const fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     fn verify(

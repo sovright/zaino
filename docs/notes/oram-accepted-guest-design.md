@@ -172,12 +172,17 @@ The spike must also prove that the production quote path still works after PID
 1 applies the final capability, device, mount, and syscall restrictions. Define
 before boot a bounded evidence RPC that accepts only one fresh 64-byte
 challenge, reads ConfigFS through the least-privileged fixed quote worker,
-returns only the capped quote, fixed public CCEL artifact, and public evidence
+returns only the capped quote, fixed public CCEL ACPI table and event-log
+artifacts, and public evidence
 fields, and has no shell,
 arbitrary path, command, upload, or debug operation. The diagnostic IAP
 collector is not an acceptable production collection path.
-The CCEL response has a fixed method, bounded byte length, validated table
-format, and no caller-supplied path so a verifier can replay it independently.
+The CCEL response has a fixed method, separate bounded byte lengths, validated
+table format/checksum and declared log length, and no caller-supplied path so a
+verifier can replay it independently. Both the ACPI table and event-log area
+are required: the diagnostic retained only the latter. Register replay matches
+event digests to quote RTMRs; an additional verifier-owned, type-aware event
+policy must establish the accepted boot-component semantics.
 
 ## Required artifacts before approval
 

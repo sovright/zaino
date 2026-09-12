@@ -22,3 +22,6 @@ jobs:
 
       - name: Lint shell scripts
         run: ./tools/scripts/lint-shell.sh
+
+      - name: Test bounded TDX evidence collection without hardware
+        run: bash deploy/tdx/tests/collect-quote-guest.sh

@@ -44,6 +44,9 @@ use tonic::{
 
 use zaino_oram::{ClientSessionBootstrap, FixedEnvelopeRuntime};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::{
     attestation::{AttestationWorkloadBinding, RawEvidenceIssuer},
     release_schedule::ReleaseSchedule,
@@ -87,10 +90,20 @@ pub(crate) struct PrivateQueryListener {
     local_addr: SocketAddr,
     #[cfg(test)]
     test_quote: Option<TestListenerQuote>,
+    #[cfg(test)]
+    test_routes: Arc<TestRouteCounts>,
 }
 
 #[cfg(test)]
 type TestListenerQuote = Arc<dyn Fn([u8; 64]) -> Result<Vec<u8>, ()> + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRouteCounts {
+    evidence: AtomicUsize,
+    bootstrap: AtomicUsize,
+    query: AtomicUsize,
+}
 
 impl PrivateQueryListener {
     pub(crate) async fn bind(address: SocketAddr) -> std::io::Result<Self> {
@@ -101,6 +114,8 @@ impl PrivateQueryListener {
             local_addr,
             #[cfg(test)]
             test_quote: None,
+            #[cfg(test)]
+            test_routes: Arc::new(TestRouteCounts::default()),
         })
     }
 
@@ -140,6 +155,10 @@ impl PrivateQueryListener {
     {
         let mut service =
             PrivateQueryService::<H, N>::new(handler, session_bootstrap, release_schedule);
+        #[cfg(test)]
+        {
+            service.test_routes = Some(Arc::clone(&self.test_routes));
+        }
         // The issuer is constructed from exactly the identity installed in the
         // TLS acceptor below. Persisted identities cannot issue raw evidence.
         service.evidence = evidence_binding
@@ -271,6 +290,8 @@ struct PrivateQueryService<H, const N: usize> {
     /// query round the lock is guarding.
     bootstrap: Arc<PrivateSessionBootstrap>,
     evidence: Option<Arc<PrivateEvidence>>,
+    #[cfg(test)]
+    test_routes: Option<Arc<TestRouteCounts>>,
 }
 
 impl<H, const N: usize> PrivateQueryService<H, N>
@@ -292,6 +313,8 @@ where
             ))),
             bootstrap: Arc::new(PrivateSessionBootstrap::from_session(&session_bootstrap, N)),
             evidence: None,
+            #[cfg(test)]
+            test_routes: None,
             release_schedule,
         }
     }
@@ -305,6 +328,8 @@ impl<H, const N: usize> Clone for PrivateQueryService<H, N> {
             adapter: Arc::clone(&self.adapter),
             bootstrap: Arc::clone(&self.bootstrap),
             evidence: self.evidence.clone(),
+            #[cfg(test)]
+            test_routes: self.test_routes.clone(),
             release_schedule: Arc::clone(&self.release_schedule),
         }
     }
@@ -337,18 +362,36 @@ where
         let bootstrap = Arc::clone(&self.bootstrap);
         let evidence = self.evidence.clone();
         let release_schedule = Arc::clone(&self.release_schedule);
+        #[cfg(test)]
+        let test_routes = self.test_routes.clone();
         Box::pin(async move {
             match request.uri().path() {
                 QUERY_PAGE_ROUTE => {
+                    #[cfg(test)]
+                    if let Some(counts) = &test_routes {
+                        counts.query.fetch_add(1, Ordering::SeqCst);
+                    }
                     let mut adapter = adapter.lock().await;
                     Ok(adapter.query_page(request).await)
                 }
                 // Deliberately does not take the handler lock, and deliberately
                 // is not on the release schedule: see this module's header and
                 // `PrivateSessionBootstrap`.
-                BOOTSTRAP_ROUTE => Ok(bootstrap.answer(request).await),
+                BOOTSTRAP_ROUTE => {
+                    #[cfg(test)]
+                    if let Some(counts) = &test_routes {
+                        counts.bootstrap.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(bootstrap.answer(request).await)
+                }
                 EVIDENCE_ROUTE if evidence.is_some() => match evidence {
-                    Some(evidence) => Ok(evidence.answer(request).await),
+                    Some(evidence) => {
+                        #[cfg(test)]
+                        if let Some(counts) = &test_routes {
+                            counts.evidence.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(evidence.answer(request).await)
+                    }
                     None => Ok(unavailable_response()),
                 },
                 // An unknown route answers exactly as a refused query does --
@@ -482,6 +525,68 @@ mod tests {
             23,
             [4; 32],
         )
+    }
+
+    fn evidence_for_bootstrap(bootstrap: &ClientSessionBootstrap) -> AttestationWorkloadBinding {
+        let mut checkpoint_hash = *bootstrap.serving_finalized_checkpoint_block_hash_display();
+        checkpoint_hash.reverse();
+        AttestationWorkloadBinding::new(
+            [1; 32],
+            [2; 32],
+            *bootstrap.profile_id(),
+            bootstrap.schema_version(),
+            bootstrap.key_epoch(),
+            bootstrap.serving_finalized_checkpoint_height(),
+            checkpoint_hash,
+        )
+    }
+
+    fn zero_quote_policy_json() -> Result<Vec<u8>, serde_json::Error> {
+        let hex = |bytes| "00".repeat(bytes);
+        serde_json::to_vec(&serde_json::json!({
+            "minimum_qe_svn": 0,
+            "minimum_pce_svn": 0,
+            "minimum_tee_tcb_svn": hex(16),
+            "mr_seam": hex(48),
+            "mr_signer_seam": hex(48),
+            "seam_attributes": hex(8),
+            "td_attributes": hex(8),
+            "xfam": hex(8),
+            "mr_td": hex(48),
+            "mr_config_id": hex(48),
+            "mr_owner": hex(48),
+            "mr_owner_config": hex(48),
+            "rt_mrs": [hex(48), hex(48), hex(48), hex(48)]
+        }))
+    }
+
+    fn correlated_test_verifier() -> Result<
+        (tempfile::TempDir, zaino_private_client::LocalQuoteVerifier),
+        Box<dyn std::error::Error>,
+    > {
+        use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+        let directory = tempfile::TempDir::new()?;
+        let path = directory.path().join("verifier");
+        fs::write(
+            &path,
+            concat!(
+                "#!/bin/sh\n",
+                "q=$(/usr/bin/openssl dgst -sha256 \"$2\"); q=${q##* }\n",
+                "p=$(/usr/bin/openssl dgst -sha256 \"$4\"); p=${p##* }\n",
+                "body=$(/bin/cat \"$4\")\n",
+                "tail=${body#*\\\"report_data\\\":\\\"}; r=${tail%%\\\"*}\n",
+                "printf '{\"schema_version\":1,\"quote_sha256\":\"%s\",\"policy_sha256\":\"%s\",\"report_data\":\"%s\",\"scope\":\"quote_signature_current_collateral_and_supplied_field_policy_only\"}' \"$q\" \"$p\" \"$r\"\n"
+            ),
+        )?;
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions)?;
+        let verifier = zaino_private_client::LocalQuoteVerifier::new(
+            path.clone(),
+            sha2::Sha256::digest(fs::read(path)?).into(),
+            Duration::from_secs(5),
+        )?;
+        Ok((directory, verifier))
     }
 
     // Extraction only, not X.509 validation. TLS validates this controlled
@@ -647,6 +752,7 @@ mod tests {
         /// What a wallet pins. The private half stayed in the served task.
         certificate_pem: String,
         fingerprint: String,
+        routes: Arc<TestRouteCounts>,
         /// The persisted identity lives here; held so it outlives the serve
         /// loop rather than being reaped mid-test.
         _deployment: Option<tempfile::TempDir>,
@@ -715,6 +821,48 @@ mod tests {
             .await
         }
 
+        async fn start_attested<H, const N: usize>(
+            handler: H,
+            session_bootstrap: ClientSessionBootstrap,
+            evidence_binding: AttestationWorkloadBinding,
+        ) -> Result<Self, Box<dyn std::error::Error>>
+        where
+            H: FixedEnvelopeRuntime<N> + Send + 'static,
+            H::PendingResponse: Send + 'static,
+        {
+            let mut listener = PrivateQueryListener::bind("127.0.0.1:0".parse()?).await?;
+            listener.test_quote = Some(Arc::new(|report_data| Ok(report_data.to_vec())));
+            let tls = PrivateTlsIdentity::generate_ephemeral()?;
+            let address = listener.local_addr();
+            let routes = Arc::clone(&listener.test_routes);
+            let certificate_pem = tls.certificate_pem().to_owned();
+            let fingerprint = tls.fingerprint().to_owned();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let served = tokio::spawn(async move {
+                listener
+                    .serve::<_, N>(
+                        handler,
+                        session_bootstrap,
+                        ReleaseSchedule::from_timeout_bucket_millis(100),
+                        &tls,
+                        Some(evidence_binding),
+                        async {
+                            let _ = stopped.await;
+                        },
+                    )
+                    .await
+            });
+            Ok(Self {
+                address,
+                certificate_pem,
+                fingerprint,
+                routes,
+                _deployment: None,
+                stop,
+                served,
+            })
+        }
+
         async fn start_with_identity<H, const N: usize>(
             listener: PrivateQueryListener,
             handler: H,
@@ -728,6 +876,7 @@ mod tests {
             H::PendingResponse: Send + 'static,
         {
             let address = listener.local_addr();
+            let routes = Arc::clone(&listener.test_routes);
             let certificate_pem = tls.certificate_pem().to_owned();
             let fingerprint = tls.fingerprint().to_owned();
             let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -749,6 +898,7 @@ mod tests {
                 address,
                 certificate_pem,
                 fingerprint,
+                routes,
                 _deployment: deployment,
                 stop,
                 served,
@@ -1358,6 +1508,251 @@ mod tests {
             "a parity run that only ever compared empty sets proves nothing"
         );
 
+        surface.shutdown().await
+    }
+
+    // multi_thread required: the retained client executes its bounded local
+    // verifier in spawn_blocking while the listener serves the same TLS stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retained_client_accepts_synthetic_quote_then_executes_one_real_private_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+        use zaino_oram::{
+            wallet_parity_harness, MainnetClientOutcome, WalletParityRuntime, PARITY_ENVELOPE_BYTES,
+        };
+        use zaino_private_client::{
+            BootstrapNetwork, RetainedClientConfig, RetainedClientError, RetainedPrivateClient,
+            VerifierOwnedEvidencePolicy,
+        };
+
+        let fixture = zaino_state::test_dependencies::load_ordinary_utxo_shadow_fixture().await?;
+        let journal = tempfile::TempDir::new()?;
+        let harness = wallet_parity_harness(
+            &parity_shape()?,
+            fixture.indexed_blocks(),
+            journal.path().join("replay"),
+            [0x6a; 16],
+            1,
+        )?;
+        let bootstrap = harness.session_bootstrap()?;
+        let profile_id = *bootstrap.profile_id();
+        let schema_version = bootstrap.schema_version();
+        let evidence = evidence_for_bootstrap(&bootstrap);
+        let surface =
+            ServedSurface::start_attested::<_, PARITY_ENVELOPE_BYTES>(harness, bootstrap, evidence)
+                .await?;
+
+        let quote_policy = zero_quote_policy_json()?;
+        let policy = VerifierOwnedEvidencePolicy::new(
+            [1; 32],
+            [2; 32],
+            profile_id,
+            schema_version,
+            &quote_policy,
+        )?;
+        let (_helper_dir, verifier) = correlated_test_verifier()?;
+        let config = RetainedClientConfig::new(
+            surface.address,
+            BootstrapNetwork::Regtest,
+            policy,
+            verifier,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )?;
+        let result = async {
+            let mut client = RetainedPrivateClient::connect(config)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "retained connect {error:?}; routes evidence={} bootstrap={} query={}",
+                        surface.routes.evidence.load(Ordering::SeqCst),
+                        surface.routes.bootstrap.load(Ordering::SeqCst),
+                        surface.routes.query.load(Ordering::SeqCst)
+                    )
+                })?;
+            assert_eq!(surface.routes.evidence.load(Ordering::SeqCst), 1);
+            assert_eq!(surface.routes.bootstrap.load(Ordering::SeqCst), 1);
+            assert_eq!(surface.routes.query.load(Ordering::SeqCst), 0);
+            let case = fixture
+                .cases()
+                .iter()
+                .find(|case| !case.ordinary_utxos().is_empty())
+                .ok_or("ordinary fixture has no positive UTXO case")?;
+            let address = match case.address_script().script_type() {
+                0 => zaino_oram::MainnetStandardAddress::pay_to_public_key_hash(
+                    *case.address_script().hash(),
+                ),
+                1 => zaino_oram::MainnetStandardAddress::pay_to_script_hash(
+                    *case.address_script().hash(),
+                ),
+                _ => return Err("fixture address is not standard".into()),
+            };
+            let page = client.query_first_page(address, 0).await.map_err(|error| {
+                format!(
+                    "retained query {error:?}; routes evidence={} bootstrap={} query={}",
+                    surface.routes.evidence.load(Ordering::SeqCst),
+                    surface.routes.bootstrap.load(Ordering::SeqCst),
+                    surface.routes.query.load(Ordering::SeqCst)
+                )
+            })?;
+            assert_eq!(surface.routes.query.load(Ordering::SeqCst), 1);
+            assert_eq!(page.outcome, MainnetClientOutcome::Complete);
+            assert!(!page.has_more);
+            assert_eq!(page.utxos.len(), case.ordinary_utxos().len());
+            for (actual, expected) in page.utxos.iter().zip(case.ordinary_utxos()) {
+                assert_eq!(actual.txid, *expected.txid());
+                assert_eq!(actual.output_index, expected.output_index());
+                assert_eq!(actual.value_zat, expected.value_zat());
+                assert_eq!(actual.height, expected.height());
+                assert_eq!(actual.script, expected.script());
+            }
+            let mut pending = Box::pin(client.query_first_page(address, 0));
+            let route_observed = async {
+                while surface.routes.query.load(Ordering::SeqCst) != 2 {
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::select! {
+                biased;
+                observed = tokio::time::timeout(Duration::from_secs(5), route_observed) => {
+                    observed.map_err(|_| "second query did not reach the server before cancellation")?;
+                }
+                result = &mut pending => panic!("scheduled query completed before cancellation: {result:?}"),
+            }
+            drop(pending);
+            assert!(matches!(
+                client.query_first_page(address, 0).await,
+                Err(RetainedClientError::Rpc)
+            ));
+            assert_eq!(surface.routes.query.load(Ordering::SeqCst), 2);
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+        surface.shutdown().await?;
+        result
+    }
+
+    // multi_thread required: the retained connection owns a spawned HTTP/2
+    // driver while the listener answers the evidence request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retained_client_evidence_refusal_never_reaches_bootstrap_or_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, time::Duration};
+        use zaino_oram::{wallet_parity_harness, WalletParityRuntime, PARITY_ENVELOPE_BYTES};
+        use zaino_private_client::{
+            BootstrapNetwork, LocalQuoteVerifier, RetainedClientConfig, RetainedClientError,
+            RetainedPrivateClient, VerifierOwnedEvidencePolicy,
+        };
+
+        let fixture = zaino_state::test_dependencies::load_ordinary_utxo_shadow_fixture().await?;
+        let journal = tempfile::TempDir::new()?;
+        let harness = wallet_parity_harness(
+            &parity_shape()?,
+            fixture.indexed_blocks(),
+            journal.path().join("replay"),
+            [0x6a; 16],
+            1,
+        )?;
+        let bootstrap = harness.session_bootstrap()?;
+        let policy = VerifierOwnedEvidencePolicy::new(
+            [9; 32],
+            [2; 32],
+            *bootstrap.profile_id(),
+            bootstrap.schema_version(),
+            &zero_quote_policy_json()?,
+        )?;
+        let evidence = evidence_for_bootstrap(&bootstrap);
+        let surface =
+            ServedSurface::start_attested::<_, PARITY_ENVELOPE_BYTES>(harness, bootstrap, evidence)
+                .await?;
+        let helper = std::path::PathBuf::from("/usr/bin/true");
+        let verifier = LocalQuoteVerifier::new(
+            helper.clone(),
+            sha2::Sha256::digest(fs::read(&helper)?).into(),
+            Duration::from_secs(1),
+        )?;
+        let config = RetainedClientConfig::new(
+            surface.address,
+            BootstrapNetwork::Regtest,
+            policy,
+            verifier,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )?;
+        assert!(matches!(
+            RetainedPrivateClient::connect(config).await,
+            Err(RetainedClientError::Evidence(_))
+        ));
+        assert_eq!(surface.routes.evidence.load(Ordering::SeqCst), 1);
+        assert_eq!(surface.routes.bootstrap.load(Ordering::SeqCst), 0);
+        assert_eq!(surface.routes.query.load(Ordering::SeqCst), 0);
+        surface.shutdown().await
+    }
+
+    // multi_thread required: evidence verification uses spawn_blocking while
+    // the live listener serves the same retained HTTP/2 connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retained_client_malformed_bootstrap_never_reaches_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+        use zaino_oram::{wallet_parity_harness, PARITY_ENVELOPE_BYTES};
+        use zaino_private_client::{
+            BootstrapNetwork, LocalQuoteVerifier, RetainedClientConfig, RetainedClientError,
+            RetainedPrivateClient, VerifierOwnedEvidencePolicy,
+        };
+
+        let fixture = zaino_state::test_dependencies::load_ordinary_utxo_shadow_fixture().await?;
+        let journal = tempfile::TempDir::new()?;
+        let harness = wallet_parity_harness(
+            &parity_shape()?,
+            fixture.indexed_blocks(),
+            journal.path().join("replay"),
+            [0x6a; 16],
+            1,
+        )?;
+        let bootstrap = ClientSessionBootstrap::for_test(
+            ReleasableSessionKeys {
+                request_key: [0x11; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+                response_key: [0x22; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
+            },
+            [0x33; 32],
+            FIXTURE_PROFILE_ID,
+            "malformed-bootstrap-fixture",
+            zaino_oram::PrivateNetwork::Regtest,
+            1,
+            [0x44; 32],
+            1,
+            1,
+            0,
+        );
+        let evidence = evidence_for_bootstrap(&bootstrap);
+        let policy = VerifierOwnedEvidencePolicy::new(
+            [1; 32],
+            [2; 32],
+            FIXTURE_PROFILE_ID,
+            1,
+            &zero_quote_policy_json()?,
+        )?;
+        let surface =
+            ServedSurface::start_attested::<_, PARITY_ENVELOPE_BYTES>(harness, bootstrap, evidence)
+                .await?;
+        let (_helper_dir, verifier): (tempfile::TempDir, LocalQuoteVerifier) =
+            correlated_test_verifier()?;
+        let config = RetainedClientConfig::new(
+            surface.address,
+            BootstrapNetwork::Regtest,
+            policy,
+            verifier,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )?;
+        assert!(matches!(
+            RetainedPrivateClient::connect(config).await,
+            Err(RetainedClientError::Bootstrap(_))
+        ));
+        assert_eq!(surface.routes.evidence.load(Ordering::SeqCst), 1);
+        assert_eq!(surface.routes.bootstrap.load(Ordering::SeqCst), 1);
+        assert_eq!(surface.routes.query.load(Ordering::SeqCst), 0);
         surface.shutdown().await
     }
 
