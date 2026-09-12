@@ -1387,6 +1387,15 @@ mod tests {
                 .refresh(fixture.subscriber(), projection_from_fixture(fixture)?)
                 .await
                 .map_err(|_| "the advanced live subscriber refresh succeeds")?;
+            let advanced_bootstrap = diagnose_phase(
+                runtime.client_session_bootstrap(),
+                "advanced bootstrap unavailable",
+            )?;
+            assert!(
+                advanced_bootstrap.serving_finalized_checkpoint_height()
+                    > first_bootstrap.serving_finalized_checkpoint_height(),
+                "the cross-crate fixture must enable fast-test-seam to retire a checkpoint"
+            );
             match runtime.query_page(stale_request) {
                 Err(_) => {}
                 Ok(pending) => match pending.try_release_bytes() {
@@ -1396,14 +1405,6 @@ mod tests {
                     }
                 },
             }
-            let advanced_bootstrap = diagnose_phase(
-                runtime.client_session_bootstrap(),
-                "advanced bootstrap unavailable",
-            )?;
-            assert_ne!(
-                advanced_bootstrap.serving_finalized_checkpoint_height(),
-                first_bootstrap.serving_finalized_checkpoint_height()
-            );
             let advanced_session =
                 MainnetClientSession::try_from_authenticated_bootstrap(&advanced_bootstrap)?;
             let advanced_ordinary_cases = fixture.ordinary_utxo_cases().await?;
