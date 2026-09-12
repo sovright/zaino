@@ -40,3 +40,27 @@ form downloads, extracts, executes, or builds the selected software. GnuPG uses
 a temporary isolated public keyring. The second builder, Rust/vendor closure,
 kernel/package pins, evidence agent, diagnostic client, offline signing inputs,
 and deterministic filesystem/image settings remain explicit prerequisites.
+
+`package-roots.json` freezes candidate guest-kernel roots separately from
+builder tools. `resolve-package-closure.sh NEW_DIRECTORY` runs only on Linux
+amd64 with the pinned APT version and an empty private APT state. It admits
+indexes and packages only when their lengths and SHA-256 digests match the
+retained signed snapshot metadata, downloads without installing, and emits a
+canonical lock. `verify-package-closure.sh DIRECTORY` rechecks that closure
+offline. The offline verifier authenticates package membership and bytes
+against the retained signed indexes and requires every requested root; it does
+not recompute the dependency graph. The pinned APT solve produces that graph,
+and equal locks from two fresh runs show resolver determinism for those inputs.
+Neither result establishes kernel suitability or image acceptance.
+The current CI invokes APT 2.8.3 directly on GitHub's `ubuntu-24.04` runner;
+it does not execute inside the selected OCI builder base and is not a hermetic
+builder-identity claim.
+
+The selected stock Linux 6.17 GCP kernel is a deliberate negative candidate.
+Its package config contains the required TDX guest, ConfigFS TSM, GVE, NVMe,
+SWIOTLB, EFI-stub, and dm-verity settings, but it also enables policy-prohibited
+debug-kernel, kexec, hibernation, and sleep settings. The static
+`verify-kernel-config.sh` gate therefore refuses it. `CONFIG_DEBUG_KERNEL` is
+separate from the TDX DEBUG guest attribute. An acceptable custom kernel,
+source/config/package digests, and review of the required TDX halt fixes remain
+prerequisites.

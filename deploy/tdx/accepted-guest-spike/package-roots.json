@@ -1,0 +1,21 @@
+{
+  "schema": "zaino-boot-spike-package-roots-v1",
+  "selected_builder_base_image": "docker.io/library/ubuntu@sha256:a61567bd31828687156d735ea8eb01ba4e37636e225dd6a48ba94136a70d9d61",
+  "snapshot": "https://snapshot.ubuntu.com/ubuntu/20260911T000000Z/",
+  "architecture": "amd64",
+  "resolver_apt_version": "2.8.3",
+  "guest_roots": [
+    "linux-image-6.17.0-1012-gcp=6.17.0-1012.12~24.04.1",
+    "linux-modules-6.17.0-1012-gcp=6.17.0-1012.12~24.04.1"
+  ],
+  "builder_tool_roots": [
+    "cryptsetup-bin=2:2.7.0-1ubuntu4.2",
+    "dosfstools=4.2-1.1build1",
+    "e2fsprogs=1.47.0-2.4~exp1ubuntu4.1",
+    "initramfs-tools-core=0.142ubuntu25.8",
+    "sbsigntool=0.9.4-3.1ubuntu7",
+    "systemd-boot-efi=255.4-1ubuntu8.17",
+    "systemd-ukify=255.4-1ubuntu8.17"
+  ],
+  "scope": "resolver_roots_only;kernel_suitability_and_image_admission_unverified"
+}
