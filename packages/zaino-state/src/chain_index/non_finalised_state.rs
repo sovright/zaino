@@ -312,7 +312,7 @@ impl ChainIndexSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// A snapshot of the nonfinalized state as it existed when this was created.
 pub(crate) struct NonfinalizedBlockCacheSnapshot {
     /// the set of all known blocks less than `OPERATIONAL_NFS_DEPTH` blocks old
@@ -328,6 +328,20 @@ pub(crate) struct NonfinalizedBlockCacheSnapshot {
     // best_tip is a BestTip, which contains
     // a Height, and a BlockHash as named fields.
     pub best_tip: BlockIndex,
+}
+
+fn publish_snapshot(
+    current: &ArcSwap<NonfinalizedBlockCacheSnapshot>,
+    initial: &Arc<NonfinalizedBlockCacheSnapshot>,
+    candidate: NonfinalizedBlockCacheSnapshot,
+) -> bool {
+    let replacement = if initial.as_ref() == &candidate {
+        Arc::clone(initial)
+    } else {
+        Arc::new(candidate)
+    };
+    let stored = current.compare_and_swap(initial, replacement);
+    Arc::ptr_eq(&stored, initial)
 }
 
 #[derive(Debug)]
@@ -935,14 +949,11 @@ impl<Source: BlockchainSource> NonFinalizedState<Source> {
             .await
             .map_err(|_e| UpdateError::DatabaseHole)?;
 
-        // Need to get best hash at some point in this process
-        let stored = self
-            .current
-            .compare_and_swap(&initial_state, Arc::new(new_snapshot));
+        let new_best_tip = new_snapshot.best_tip;
+        let published = publish_snapshot(&self.current, &initial_state, new_snapshot);
 
-        if Arc::ptr_eq(&stored, &initial_state) {
+        if published {
             let stale_best_tip = initial_state.best_tip;
-            let new_best_tip = stored.best_tip;
 
             // Log chain tip change
             if new_best_tip != stale_best_tip {
@@ -1198,5 +1209,129 @@ impl Block for zebra_chain::block::Block {
         nfs: &NonFinalizedState<Source>,
     ) -> Result<IndexedBlock, SyncError> {
         nfs.block_to_chainblock(prev_block, self).await
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::{publish_snapshot, NonfinalizedBlockCacheSnapshot};
+    use crate::{
+        chain_index::{
+            tests::vectors::{indexed_block_chain, load_test_vectors},
+            BlockIndex,
+        },
+        BlockHash,
+    };
+    use arc_swap::ArcSwap;
+    use std::{error::Error, io, sync::Arc};
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    fn fixture() -> Result<NonfinalizedBlockCacheSnapshot, Box<dyn Error>> {
+        let vectors = load_test_vectors()?;
+        let raw_blocks = vectors
+            .blocks
+            .get(..3)
+            .ok_or_else(|| io::Error::other("test vectors must contain three blocks"))?;
+        let blocks = indexed_block_chain(raw_blocks).collect::<Vec<_>>();
+        let tip = blocks
+            .last()
+            .ok_or_else(|| io::Error::other("snapshot fixture must contain a tip"))?;
+        Ok(NonfinalizedBlockCacheSnapshot {
+            blocks: blocks
+                .iter()
+                .map(|block| (*block.hash(), block.clone()))
+                .collect(),
+            heights_to_hashes: blocks
+                .iter()
+                .map(|block| (block.height(), *block.hash()))
+                .collect(),
+            best_tip: BlockIndex {
+                height: tip.height(),
+                hash: *tip.hash(),
+            },
+        })
+    }
+
+    #[test]
+    fn no_op_publication_preserves_snapshot_identity() -> TestResult {
+        let initial = Arc::new(fixture()?);
+        let current = ArcSwap::from(Arc::clone(&initial));
+
+        assert!(publish_snapshot(
+            &current,
+            &initial,
+            initial.as_ref().clone()
+        ));
+        assert!(Arc::ptr_eq(&current.load_full(), &initial));
+        Ok(())
+    }
+
+    #[test]
+    fn every_snapshot_field_change_publishes_new_identity() -> TestResult {
+        let original = fixture()?;
+        let mut blocks = original.blocks.values().cloned().collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.height());
+
+        let mut side_branch = original.clone();
+        let side_hash = BlockHash([0xa5; 32]);
+        let mut side_block = blocks[1].clone();
+        side_block.context.index.hash = side_hash;
+        side_branch.blocks.insert(side_hash, side_block);
+
+        let mut block_contents = original.clone();
+        let same_hash = *blocks[1].hash();
+        let changed_block = block_contents
+            .blocks
+            .get_mut(&same_hash)
+            .ok_or_else(|| io::Error::other("fixture block missing from snapshot"))?;
+        changed_block.context.parent_hash = BlockHash([0xb6; 32]);
+
+        let mut canonical_tip = original.clone();
+        let earlier = &blocks[1];
+        canonical_tip.best_tip = BlockIndex {
+            height: earlier.height(),
+            hash: *earlier.hash(),
+        };
+
+        let mut height_map = original.clone();
+        height_map
+            .heights_to_hashes
+            .insert(blocks[1].height(), *blocks[0].hash());
+
+        let mut trimmed = original.clone();
+        trimmed.blocks.remove(blocks[0].hash());
+        trimmed.heights_to_hashes.remove(&blocks[0].height());
+
+        for candidate in [
+            side_branch,
+            block_contents,
+            canonical_tip,
+            height_map,
+            trimmed,
+        ] {
+            let initial = Arc::new(original.clone());
+            let current = ArcSwap::from(Arc::clone(&initial));
+            assert!(publish_snapshot(&current, &initial, candidate));
+            assert!(!Arc::ptr_eq(&current.load_full(), &initial));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_expected_snapshot_loses_even_when_competing_value_is_equal() -> TestResult {
+        let initial = Arc::new(fixture()?);
+        let current = ArcSwap::from(Arc::clone(&initial));
+        let competing = Arc::new(initial.as_ref().clone());
+        assert!(!Arc::ptr_eq(&initial, &competing));
+        current.store(Arc::clone(&competing));
+
+        assert!(!publish_snapshot(
+            &current,
+            &initial,
+            initial.as_ref().clone()
+        ));
+        assert!(Arc::ptr_eq(&current.load_full(), &competing));
+        Ok(())
     }
 }
