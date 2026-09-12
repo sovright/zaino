@@ -1,0 +1,90 @@
+{
+  "schema": "zaino-boot-spike-upstream-selection-v1",
+  "scope": "partial_upstream_selection_only",
+  "build_inputs_complete": false,
+  "rootfs": {
+    "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260826/ubuntu-24.04-server-cloudimg-amd64-root.tar.xz",
+    "bytes": 228994404,
+    "sha256": "df1146e4f2bc372b193c966b709f1b5e22a5facb27721ad80c5bae254040c380",
+    "checksum_manifest_url": "https://cloud-images.ubuntu.com/releases/noble/release-20260826/SHA256SUMS",
+    "signing_fingerprint": "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
+    "signing_key_authority": "https://ubuntu.com/docs/public-images/public-images-how-to/verify-image-checksum/",
+    "verification": "downloaded_bytes_match_signed_manifest; GnuPG VALIDSIG matches documented fingerprint"
+  },
+  "builder_base": {
+    "discovery_tag": "docker.io/library/ubuntu:24.04",
+    "index_digest": "sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254",
+    "image": "docker.io/library/ubuntu@sha256:a61567bd31828687156d735ea8eb01ba4e37636e225dd6a48ba94136a70d9d61",
+    "platform": "linux/amd64",
+    "manifest_bytes": 424,
+    "config_digest": "sha256:b2b7ea366714195a1e1c5b2b578ece85c0b3920381a8654d038d9684f009613c",
+    "source_authentication": "public registry HTTPS; content digests verified; no publisher signature verified"
+  },
+  "package_snapshot": {
+    "base_url": "https://snapshot.ubuntu.com/ubuntu/20260911T000000Z/",
+    "suites": [
+      "noble",
+      "noble-updates",
+      "noble-security"
+    ],
+    "metadata_signature_verified": true,
+    "package_closure_resolved": false,
+    "signing_fingerprint": "F6ECB3762474EDA9D21B7022871920D1991BC93C",
+    "keyring_provenance": "usr/share/keyrings/ubuntu-archive-keyring.gpg extracted from the verified rootfs"
+  },
+  "incomplete": [
+    "exact kernel and package closure",
+    "builder recipe and final builder digest",
+    "Rust components and vendored Cargo closure",
+    "evidence agent and diagnostic client binaries",
+    "offline signing certificates and deterministic signing",
+    "reproducibility inputs and complete build manifest"
+  ],
+  "retained_evidence": [
+    {
+      "file": "upstream/SHA256SUMS",
+      "bytes": 7843,
+      "sha256": "ee5d4762c360593bc480ad345cbb78eee0e70dbf6bd2301c8bfc8b2007d4c7b3"
+    },
+    {
+      "file": "upstream/SHA256SUMS.gpg",
+      "bytes": 833,
+      "sha256": "303cceab0ff0aa69faa03df5c657c91d84e0e24ceac71b1f1f0b1fb860040242"
+    },
+    {
+      "file": "upstream/cloud-image-signing-key.asc",
+      "bytes": 3325,
+      "sha256": "927138de292fac4d861105a052cf56e9c5921987da385c844d88f34d19b39ab0"
+    },
+    {
+      "file": "upstream/builder-index.json",
+      "bytes": 6688,
+      "sha256": "224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254"
+    },
+    {
+      "file": "upstream/builder-amd64-manifest.json",
+      "bytes": 424,
+      "sha256": "a61567bd31828687156d735ea8eb01ba4e37636e225dd6a48ba94136a70d9d61"
+    },
+    {
+      "file": "upstream/noble.InRelease",
+      "bytes": 255850,
+      "sha256": "cdb2f31d809f589719a53c6ad15f255b27569c4059542ada282aaa21b8e164b0"
+    },
+    {
+      "file": "upstream/noble-updates.InRelease",
+      "bytes": 126125,
+      "sha256": "2fb2c5418c54004245ca902a4446dee50c444c0d8afa2a1cac6550a770b003e4"
+    },
+    {
+      "file": "upstream/noble-security.InRelease",
+      "bytes": 126127,
+      "sha256": "1f35bbac35092dcc85517806c3fbecead38cc215cd985f89bea5abdcdab5798d"
+    },
+    {
+      "file": "upstream/ubuntu-archive-keyring.gpg",
+      "bytes": 3607,
+      "sha256": "80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31"
+    }
+  ]
+}

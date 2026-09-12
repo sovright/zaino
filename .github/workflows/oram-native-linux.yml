@@ -18,6 +18,7 @@ on:
       - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
       - 'tools/workbench/**'
+      - 'tools/scripts/package-oram-build.sh'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
@@ -34,6 +35,7 @@ on:
       - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
       - 'tools/workbench/**'
+      - 'tools/scripts/package-oram-build.sh'
 
 permissions:
   contents: read
@@ -155,3 +157,14 @@ jobs:
           --manifest-path tools/workbench/Cargo.toml
           --bin check-oram-page-codegen --
           target/release/zainod-oram
+
+      - name: Package the checked research runner and build identity
+        run: bash tools/scripts/package-oram-build.sh target/oram-native-build
+
+      - name: Retain the checked native research runner
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oram-native-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/oram-native-build/
+          if-no-files-found: error
+          retention-days: 30
