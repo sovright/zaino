@@ -226,6 +226,7 @@ pub(super) enum FileRole {
     ReproducibleBinary,
     Receipt,
     RunningExecutable,
+    NativeBuildManifest,
 }
 
 impl FileRole {
@@ -239,6 +240,7 @@ impl FileRole {
             Self::ReproducibleBinary => "second no-cache build artifact",
             Self::Receipt => "release receipt",
             Self::RunningExecutable => "running executable",
+            Self::NativeBuildManifest => "native build manifest",
         }
     }
 
@@ -249,7 +251,7 @@ impl FileRole {
             Self::RustToolchain => MAX_RUST_TOOLCHAIN_BYTES,
             Self::Dockerfile => MAX_DOCKERFILE_BYTES,
             Self::Binary | Self::ReproducibleBinary | Self::RunningExecutable => MAX_BINARY_BYTES,
-            Self::Receipt => MAX_RECEIPT_BYTES,
+            Self::Receipt | Self::NativeBuildManifest => MAX_RECEIPT_BYTES,
         }
     }
 }
@@ -265,6 +267,109 @@ struct OpenedDigest {
 struct OpenedBytes {
     digest: OpenedDigest,
     bytes: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeBuildManifestV1 {
+    schema: String,
+    source_commit: String,
+    source_tree: String,
+    source_dirty: bool,
+    binary_sha256: String,
+    cargo_lock_sha256: String,
+    repository: String,
+    workflow_commit: String,
+    run_id: String,
+    run_attempt: String,
+    build_command: String,
+    environment_policy: String,
+    target_os: String,
+    target_arch: String,
+    profile: String,
+    scope: String,
+}
+
+/// Verified unsigned identity of the packaged native diagnostic executable.
+pub(super) struct NativeBuildIdentity {
+    source_revision: String,
+    binary_sha256: String,
+    build_manifest_sha256: String,
+}
+
+impl NativeBuildIdentity {
+    pub(super) fn source_revision(&self) -> &str {
+        &self.source_revision
+    }
+
+    pub(super) fn binary_sha256(&self) -> &str {
+        &self.binary_sha256
+    }
+
+    pub(super) fn build_manifest_sha256(&self) -> &str {
+        &self.build_manifest_sha256
+    }
+}
+
+/// Validates packaged native build metadata against the opened running executable.
+pub(super) fn verify_native_build_identity(
+    build_manifest: &Path,
+) -> Result<NativeBuildIdentity, ReleaseReceiptError> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) || cfg!(debug_assertions) {
+        return Err(ReleaseReceiptError::UnsupportedExecutableIdentityBuild);
+    }
+    let opened = read_path(build_manifest, FileRole::NativeBuildManifest)?;
+    let manifest: NativeBuildManifestV1 =
+        serde_json::from_slice(&opened.bytes).map_err(ReleaseReceiptError::Json)?;
+    validate_native_build_manifest(&manifest)?;
+    let executable = hash_opened_file(open_running_executable()?, FileRole::RunningExecutable)?;
+    if executable.sha256 != manifest.binary_sha256 {
+        return Err(ReleaseReceiptError::RunningExecutableMismatch);
+    }
+    Ok(NativeBuildIdentity {
+        source_revision: manifest.source_commit,
+        binary_sha256: manifest.binary_sha256,
+        build_manifest_sha256: opened.digest.sha256,
+    })
+}
+
+fn validate_native_build_manifest(
+    manifest: &NativeBuildManifestV1,
+) -> Result<(), ReleaseReceiptError> {
+    validate_lower_hex(
+        &manifest.source_commit,
+        SOURCE_REVISION_HEX_BYTES,
+        ReleaseReceiptError::InvalidSourceRevision,
+    )?;
+    validate_lower_hex(
+        &manifest.source_tree,
+        SOURCE_REVISION_HEX_BYTES,
+        ReleaseReceiptError::InvalidSourceRevision,
+    )?;
+    for digest in [&manifest.binary_sha256, &manifest.cargo_lock_sha256] {
+        validate_lower_hex(digest, SHA256_HEX_BYTES, ReleaseReceiptError::InvalidDigest)?;
+    }
+    if manifest.schema != "zaino-oram-native-build-v1"
+        || manifest.source_dirty
+        || manifest.repository != "sovright/zaino"
+        || manifest.workflow_commit != manifest.source_commit
+        || manifest.run_id.is_empty()
+        || manifest.run_attempt.is_empty()
+        || !manifest.run_id.bytes().all(|byte| byte.is_ascii_digit())
+        || !manifest
+            .run_attempt
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        || manifest.build_command != "cargo build -p zainod-oram --all-features --locked --release"
+        || manifest.environment_policy != "listed_compiler_target_and_release_overrides_absent"
+        || manifest.target_os != "linux"
+        || manifest.target_arch != "x86_64"
+        || manifest.profile != "release"
+        || manifest.scope != "unsigned_ci_build_identity_only"
+    {
+        return Err(ReleaseReceiptError::InvalidFixedBuildIdentity);
+    }
+    Ok(())
 }
 
 struct ArchiveInputs<'a> {
@@ -1945,5 +2050,26 @@ mod tests {
                 role: FileRole::CargoLock
             })
         ));
+    }
+
+    #[test]
+    fn packaged_native_build_schema_accepts_git_object_widths() -> TestResult {
+        let manifest: NativeBuildManifestV1 = serde_json::from_str(&format!(
+            r#"{{"schema":"zaino-oram-native-build-v1","source_commit":"{}","source_tree":"{}","source_dirty":false,"binary_sha256":"{}","cargo_lock_sha256":"{}","repository":"sovright/zaino","workflow_commit":"{}","run_id":"347","run_attempt":"1","build_command":"cargo build -p zainod-oram --all-features --locked --release","environment_policy":"listed_compiler_target_and_release_overrides_absent","target_os":"linux","target_arch":"x86_64","profile":"release","scope":"unsigned_ci_build_identity_only"}}"#,
+            "1".repeat(SOURCE_REVISION_HEX_BYTES),
+            "2".repeat(SOURCE_REVISION_HEX_BYTES),
+            "3".repeat(SHA256_HEX_BYTES),
+            "4".repeat(SHA256_HEX_BYTES),
+            "1".repeat(SOURCE_REVISION_HEX_BYTES),
+        ))?;
+        validate_native_build_manifest(&manifest)?;
+
+        let mut wrong_tree = manifest;
+        wrong_tree.source_tree.push('0');
+        assert!(matches!(
+            validate_native_build_manifest(&wrong_tree),
+            Err(ReleaseReceiptError::InvalidSourceRevision)
+        ));
+        Ok(())
     }
 }

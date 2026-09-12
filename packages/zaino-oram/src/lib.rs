@@ -35,6 +35,8 @@ mod envelope;
 mod fixed_page_capacity;
 #[cfg(feature = "corpus-zaino")]
 mod full_map_saturation;
+#[cfg(feature = "rostl-experimental")]
+mod historical_geometry;
 #[cfg(feature = "corpus-zaino")]
 mod hybrid_sizing;
 mod inner_codec;
@@ -85,6 +87,8 @@ pub use full_map_saturation::{
     run_typed_worker_full_map_saturation, TypedWorkerFullMapSaturationError,
     TypedWorkerFullMapSaturationProfile, TypedWorkerFullMapSaturationReport,
 };
+#[cfg(feature = "rostl-experimental")]
+pub use historical_geometry::{HistoricalGeometryError, HistoricalTwoTableGeometry};
 #[cfg(feature = "corpus-zaino")]
 pub use hybrid_sizing::{
     SourceBoundHybridSizingError, SourceBoundHybridSizingProfile, SourceBoundHybridSizingReport,
