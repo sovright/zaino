@@ -108,8 +108,19 @@
 
 ## Current Phase 0 decision
 
-**Current decision: NO-GO for private-server integration, deployment, or any
+**Current decision: NO-GO for production private-server integration, deployment, or any
 mainnet/host-oblivious privacy claim.**
+
+Planning amendment, 2026-09-12: [ADR-0903](../adr/0903-operator-privacy-scope-and-tdx-experiment.md)
+permits a default-off isolated TDX experiment with a controlled synthetic client
+and no public listener or production credentials. Prioritize its complete-path
+operator observations alongside calibration of the existing mainnet evidence.
+This is a research sequencing exception, not new measurement evidence. The
+historical implementation paragraphs below remain scoped to their recorded
+heads; main `753f3fc5` includes later crypto, TLS/bootstrap, runtime and codegen
+work. Reconcile exact-head evidence before assigning missing implementation or
+changing a gate; neither an old failure nor a later code change alone determines
+the current binary's physical qualification.
 
 Technical Gate 1 now has a deterministic sampled NO-GO for the exact current
 1x-capacity, four-probe profile, but remains incomplete on a remediated design
@@ -178,7 +189,7 @@ reclamation, or bounded retention; capacity remains lifetime cumulative and
 the ten-phase schedule is unchanged.
 
 This is a technical gate decision, not a conclusion that ORAM is infeasible.
-Private-server integration, deployment, and host-oblivious privacy claims must
+Production private-server integration, deployment, and host-oblivious privacy claims must
 remain closed until the technical Phase 0 blockers in this report have
 measured, reviewable results and the decision is revisited.
 
@@ -1251,13 +1262,17 @@ open. No production rollback resistance follows from the local binding.
 
 `catch_unwind` plus a public manifest is not a durable ORAM recovery protocol.
 Until one of the persistence options in the delivery plan is implemented and
-tested—or a measured cold rebuild meets the accepted RTO—the private endpoint
-must not exist, or must remain unready in a later offline prototype.
+tested—or a measured cold rebuild meets the accepted RTO—the production private
+endpoint must not exist or must remain unready. ADR-0903 permits the isolated
+synthetic-client experiment before that gate closes, with no real wallets or
+recovery qualification claim.
 
 ## Work under the technical NO-GO
 
 Work that answers or remediates a technical Phase 0 gate may continue under
-accurate experimental labeling. The priorities are:
+accurate experimental labeling. ADR-0903 additionally permits the isolated TDX
+experiment in the delivery plan and gives its ordered execution sequence.
+The existing technical remediation obligations remain:
 
 1. replace or broaden the current-profile eight-schedule NO-GO with a
    remediated insertion design or explicit alternative-profile evidence, apply
@@ -1279,7 +1294,8 @@ technical slice freeze.
 
 ## Conditions to change the decision
 
-Authorization to resume the frozen later research slices requires all of the
+Beyond the narrow ADR-0903 experiment, authorization to resume frozen later
+research slices requires all of the
 following, not a subset:
 
 - a reproducible full-mainnet aggregate report at a public checkpoint, an
@@ -1298,7 +1314,7 @@ required before redistribution. They are not conditions for technical-gate
 remediation, backend-fork work, or changing this technical feasibility
 decision.
 
-Private-server integration is a separate, stricter decision. It additionally
+Production private-server integration is a separate, stricter decision. It additionally
 requires target-load latency/stash/queue/failure results with typed fail-closed
 behavior, a credible authenticated persistence/recovery design and measured
 RTO, an accepted leakage matrix and client cover-round contract, completion of
@@ -1306,4 +1322,6 @@ the fixed-work/wire/source/legacy parity evidence, and a written review that
 explicitly authorizes integration.
 
 Until then, the accurate description is: **experimental offline ORAM research
-for a possible Zaino private-query subsystem**.
+for a possible Zaino private-query subsystem** for the evidence recorded here.
+An executed ADR-0903 experiment may be labeled isolated TDX research with its
+measured scope and open gates; planning it supplies no TDX evidence.

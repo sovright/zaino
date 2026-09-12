@@ -23,6 +23,46 @@ This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
 clear any Phase 0 gate.
 
+## 2026-09-12 — outside-operator goal and ephemeral TLS prerequisite
+
+The execution baseline for this slice is fork main `753f3fc5`, not the earlier
+`feat/oram-mainnet-corpus-evidence` checkout. Existing XChaCha, TLS/bootstrap,
+recent-state and annotation implementations were retained. Historical entries
+below describe their named slice boundaries, including features that have since
+landed; they are not a current missing-feature inventory.
+
+[ADR-0903](../adr/0903-operator-privacy-scope-and-tdx-experiment.md) makes the
+outside-TEE operator goal explicit, supersedes the proposed operator-trusted
+interim posture for that goal, and permits only an isolated research experiment
+under the production NO-GO. The delivery plan now puts complete wallet scope,
+client-verified key binding, physical observations, calibrated mainnet capacity,
+and full-service recovery ahead of further correctness-only slices.
+
+The default-off private service gains `--ephemeral-tls-identity` for a controlled
+local experiment. It rejects a simultaneous identity-directory option and
+non-loopback binding, generates a fresh in-process identity, and bypasses TLS
+identity-file loading and publication. Existing persisted mode remains the
+default. Fresh TLS identity custody is only a prerequisite: this slice provides
+no TDX residency proof, quote verifier, attested client bootstrap, production
+nonce/freshness ownership, or physical-obliviousness evidence.
+
+Local validation passed the four focused ephemeral-mode tests and the complete
+`zainod-oram --features private-service` nextest suite (102 passed, one skipped),
+including a current-thread real TLS handshake against the test handler. Strict
+all-target Clippy with `private-service` and separately with default features
+disabled passed, as did formatting. The boundary-conversion task
+body and repository duplication guard also passed. These are local transport,
+configuration, and lifecycle checks, not a real-ORAM end-to-end TDX test.
+
+The [Track B audit](oram-track-b-mainnet-prerequisites-2026-09-12.md) checked the
+six retained derivative artifact file hashes and their recorded lineage. It did
+not revalidate the unavailable original capture. After restored GCP login,
+read-only inventory found no current TDX/ORAM builder or discoverable retained
+ORAM volume in the configured project. No cloud resources were changed and no
+new capture, target-load experiment, or recovery measurement was run.
+
+## Earlier implementation slices
+
 Implementation began on `feat/oram-private-foundation` after fast-forwarding the
 local `dev` branch to the recorded target fork point. The initial implemented
 scope establishes the ADR, fixed business/persistence/envelope and continuation

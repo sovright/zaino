@@ -9,9 +9,11 @@
 //! wallet reading another's traffic, and the only thing that stops a network
 //! observer reading both. See `docs/notes/private-query-client-key-establishment.md`.
 //!
-//! The identity is generated here, in-process, on first start (ADR 0007): the
-//! private key is drawn inside the workload rather than handed in by an
-//! operator.
+//! The identity is generated here, in-process, rather than handed in by an
+//! operator. The interim deployment mode persists it across starts. The
+//! isolated experiment mode keeps it only in memory and rotates at restart;
+//! that avoids an operator-readable identity file but does not prove that the
+//! process is inside a TEE. Attestation must establish that separately.
 //!
 //! # Why it persists, when the symmetric keys do not
 //!
@@ -122,6 +124,21 @@ pub(crate) struct PrivateTlsIdentity {
 }
 
 impl PrivateTlsIdentity {
+    /// Mints a fresh identity that exists only in this process.
+    ///
+    /// This mode is reserved for an isolated TEE experiment whose measured
+    /// workload must be the only owner of the private key. It deliberately
+    /// accepts no path and performs no filesystem operation, so it cannot
+    /// silently load an operator-readable key or persist a newly generated
+    /// one. Every call rotates the identity; a caller that needs restart-stable
+    /// pinning must use [`Self::load_or_generate`] instead.
+    ///
+    /// This constructor supplies key custody only. It does not attest the
+    /// identity or authorize a privacy claim by itself.
+    pub(crate) fn generate_ephemeral() -> Result<Self, PrivateTlsError> {
+        Self::generate()
+    }
+
     /// Loads this deployment's identity, minting it on first start.
     ///
     /// Never silently regenerates. A certificate that exists but cannot be
@@ -651,6 +668,17 @@ mod tests {
     /// Mints and persists one identity in a fresh directory.
     fn persisted(deployment_dir: &Path) -> Result<PrivateTlsIdentity, PrivateTlsError> {
         PrivateTlsIdentity::load_or_generate(deployment_dir)
+    }
+
+    #[test]
+    fn each_ephemeral_lifecycle_rotates_the_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let first = PrivateTlsIdentity::generate_ephemeral()?;
+        let second = PrivateTlsIdentity::generate_ephemeral()?;
+
+        assert_ne!(first.fingerprint(), second.fingerprint());
+        assert_ne!(first.certificate_pem(), second.certificate_pem());
+        assert_ne!(first.private_key_pem, second.private_key_pem);
+        Ok(())
     }
 
     #[test]

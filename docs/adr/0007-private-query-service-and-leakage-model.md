@@ -5,6 +5,10 @@
 accepted for the ORAM research fork; this decision does not authorize a
 mainnet privacy claim until the gates below pass.
 
+Amended by [ADR-0903](0903-operator-privacy-scope-and-tdx-experiment.md) for the
+complete wallet scope, concrete deployment boundary, and isolated TDX research
+exception. Production integration and claim gates remain in force.
+
 ## Context and decision
 
 The existing `CompactTxStreamer` contract exposes exact protobuf collections,
@@ -96,7 +100,7 @@ establish semantic obliviousness or remove CPU side channels.
 
 ## Advancement gates
 
-**Phase 0 — feasibility.** Stop before service integration unless a measured
+**Phase 0 — feasibility.** Stop before production service integration unless a measured
 mainnet corpus plus growth horizon fits the intended TDX instance with at least
 30% RSS headroom and no host swapping; capacity, hot-address, stash, and queue
 failures are typed and fail closed; a credible authenticated recovery or
