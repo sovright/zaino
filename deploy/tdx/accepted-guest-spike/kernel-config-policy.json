@@ -1,0 +1,24 @@
+{
+  "schema": "zaino-boot-spike-kernel-config-policy-v1",
+  "required": {
+    "CONFIG_BLK_DEV_NVME": ["y"],
+    "CONFIG_CONFIGFS_FS": ["y"],
+    "CONFIG_DM_VERITY": ["y", "m"],
+    "CONFIG_EFI_STUB": ["y"],
+    "CONFIG_GVE": ["y", "m"],
+    "CONFIG_INTEL_TDX_GUEST": ["y"],
+    "CONFIG_PCI_MSI": ["y"],
+    "CONFIG_SWIOTLB": ["y"],
+    "CONFIG_TDX_GUEST_DRIVER": ["y", "m"],
+    "CONFIG_TSM_REPORTS": ["y"]
+  },
+  "prohibited": [
+    "CONFIG_DEBUG_KERNEL",
+    "CONFIG_HIBERNATION",
+    "CONFIG_KEXEC",
+    "CONFIG_KEXEC_CORE",
+    "CONFIG_KEXEC_FILE",
+    "CONFIG_PM_SLEEP"
+  ],
+  "scope": "static-config-policy-only;halt-fixes-runtime-device-and-image-admission-unverified"
+}
