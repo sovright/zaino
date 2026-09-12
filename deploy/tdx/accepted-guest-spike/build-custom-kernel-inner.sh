@@ -17,7 +17,10 @@ mkdir -m 700 -- "$output"
 handoff_output() {
   local status=$?
   trap - EXIT
-  chown -R -h -- "$output_owner" "$output" 2>/dev/null || true
+  if ! chown -R -h -- "$output_owner" "$output"; then
+    echo 'custom kernel build refused: output ownership handoff failed' >&2
+    [[ $status != 0 ]] || status=1
+  fi
   exit "$status"
 }
 trap handoff_output EXIT
