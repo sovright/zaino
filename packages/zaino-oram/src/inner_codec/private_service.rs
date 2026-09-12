@@ -49,6 +49,7 @@ use super::{
 };
 use crate::{
     canonical_chain::{CanonicalNetwork, PublicChainCheckpoint},
+    client_context::{PRIVATE_CLIENT_CONTEXT_VERSION, PRIVATE_MAINNET_ENVELOPE_BYTES},
     continuation_token::{ContinuationReplayGuard, ContinuationTokenProtector},
     layout::{
         DirectoryTableConfiguration, EventTableConfiguration, FixedProbeLayout, LayoutIdentity,
@@ -77,9 +78,6 @@ const QUEUE_CAPACITY: usize = 1;
 
 const LAYOUT_SEED_DOMAIN: &[u8] = b"zaino-oram/private-service-layout-seed/v1\0";
 
-/// Exact application-envelope width every request and response must carry.
-pub const PRIVATE_MAINNET_ENVELOPE_BYTES: usize = MAINNET_ENVELOPE_BYTES;
-
 /// Length of each long-lived runtime key.
 pub const PRIVATE_RUNTIME_KEY_BYTES: usize = KEY_BYTES;
 
@@ -89,8 +87,6 @@ pub const PRIVATE_RUNTIME_KEY_BYTES: usize = KEY_BYTES;
 /// protection context; it is republished here so a consumer never has to name
 /// the crate-internal profile module.
 pub const PRIVATE_PROFILE_ID_BYTES: usize = PROFILE_ID_BYTES;
-/// Version of the complete client codec context published after refresh.
-pub const PRIVATE_CLIENT_CONTEXT_VERSION: u32 = 1;
 
 /// Chain a private deployment projects and serves.
 ///
@@ -993,6 +989,25 @@ mod tests {
         })
     }
 
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    fn client_address(
+        address: &zaino_state::AddrScript,
+    ) -> FixtureResult<crate::MainnetStandardAddress> {
+        match address.script_type() {
+            0x00 => Ok(crate::MainnetStandardAddress::pay_to_public_key_hash(
+                *address.hash(),
+            )),
+            0x01 => Ok(crate::MainnetStandardAddress::pay_to_script_hash(
+                *address.hash(),
+            )),
+            _ => Err("fixture address is outside the client codec's standard domains".into()),
+        }
+    }
+
     /// A regtest shape wide enough for one compiled mainnet query.
     ///
     /// `max_events_per_address` is the profile's store-read count, the
@@ -1309,7 +1324,8 @@ mod tests {
                 .min_by_key(|case| case.ordinary_utxos().len())
                 .ok_or("fixture has no bounded present-address UTXO case")?;
             let expected = present.ordinary_utxos();
-            let present_request = first_session.seal_query(present.address_script(), 0)?;
+            let present_request = first_session
+                .seal_standard_address_query(client_address(present.address_script())?, 0)?;
             let present_pending = runtime.query_page(present_request)?;
             let present_response = *present_pending.try_release_bytes()?;
             drop(present_pending);
@@ -1324,8 +1340,10 @@ mod tests {
                 assert_eq!(actual.script, expected.script());
             }
             let absent = AddrScript::new([0x5a; 20], ScriptType::P2PKH as u8);
-            let first_request = first_session.seal_query(&absent, 0)?;
-            let stale_request = first_session.seal_query(&absent, 0)?;
+            let first_request =
+                first_session.seal_standard_address_query(client_address(&absent)?, 0)?;
+            let stale_request =
+                first_session.seal_standard_address_query(client_address(&absent)?, 0)?;
             let first_pending = runtime.query_page(first_request)?;
             let first_response = *first_pending.try_release_bytes()?;
             drop(first_pending);
@@ -1367,7 +1385,8 @@ mod tests {
                 .find(|case| case.address_script() == present.address_script())
                 .ok_or("present-address ordinary oracle disappeared after advance")?
                 .ordinary_utxos();
-            let present_request = advanced_session.seal_query(present.address_script(), 0)?;
+            let present_request = advanced_session
+                .seal_standard_address_query(client_address(present.address_script())?, 0)?;
             let present_pending = runtime.query_page(present_request)?;
             let present_response = *present_pending.try_release_bytes()?;
             drop(present_pending);
@@ -1381,7 +1400,8 @@ mod tests {
                 assert_eq!(actual.height, expected.height());
                 assert_eq!(actual.script, expected.script());
             }
-            let fresh_request = advanced_session.seal_query(&absent, 0)?;
+            let fresh_request =
+                advanced_session.seal_standard_address_query(client_address(&absent)?, 0)?;
             let fresh_pending = runtime.query_page(fresh_request)?;
             let fresh_response = *fresh_pending.try_release_bytes()?;
             drop(fresh_pending);
@@ -1389,7 +1409,8 @@ mod tests {
             assert_eq!(fresh_page.outcome, MainnetClientOutcome::Complete);
             assert!(fresh_page.utxos.is_empty());
 
-            let terminal_request = advanced_session.seal_query(&absent, 0)?;
+            let terminal_request =
+                advanced_session.seal_standard_address_query(client_address(&absent)?, 0)?;
             let terminal_pending = runtime.query_page(terminal_request)?;
             fixture.mine_blocks(1).await?;
             assert!(terminal_pending.try_release_bytes().is_err());

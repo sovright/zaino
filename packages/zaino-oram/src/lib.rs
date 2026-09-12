@@ -24,6 +24,8 @@
 mod canonical_chain;
 #[cfg(feature = "corpus-zaino")]
 mod checkpoint;
+#[cfg(feature = "client-codec")]
+mod client_context;
 mod continuation_token;
 mod corpus;
 mod cost_model;
@@ -71,6 +73,8 @@ mod zaino_corpus;
 #[cfg(all(test, feature = "corpus-zaino"))]
 mod zaino_fixtures;
 
+#[cfg(feature = "client-codec")]
+pub use client_context::{PRIVATE_CLIENT_CONTEXT_VERSION, PRIVATE_MAINNET_ENVELOPE_BYTES};
 #[cfg(all(feature = "corpus-zaino", feature = "rostl-experimental"))]
 pub use fixed_page_capacity::{
     derive_fixed_page_capacity_lower_bound, FixedPageCapacityError, FixedPageCapacityLowerBound,
@@ -86,10 +90,10 @@ pub use hybrid_sizing::{
     SourceBoundHybridSizingError, SourceBoundHybridSizingProfile, SourceBoundHybridSizingReport,
     SourceBoundHybridSizingSession,
 };
-#[cfg(feature = "corpus-zaino")]
+#[cfg(feature = "client-codec")]
 pub use inner_codec::client_session::{
-    MainnetClientCodecError, MainnetClientOutcome, MainnetClientPage, MainnetClientSession,
-    MainnetClientUtxo,
+    MainnetClientCodecError, MainnetClientKeys, MainnetClientNetwork, MainnetClientOutcome,
+    MainnetClientPage, MainnetClientSession, MainnetClientUtxo, MainnetStandardAddress,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use inner_codec::private_service::{
@@ -97,8 +101,7 @@ pub use inner_codec::private_service::{
     private_mainnet_timeout_bucket_millis, ClientSessionBootstrap, EphemeralKeyGeneration,
     FinalizedProjection, FinalizedProjectionBuilder, MainnetPrivateQueryRuntime, PrivateNetwork,
     PrivateProjectionShape, PrivateRuntimeDeployment, PrivateRuntimeKeys, ReleasableSessionKeys,
-    SessionBootstrap, PRIVATE_CLIENT_CONTEXT_VERSION, PRIVATE_MAINNET_ENVELOPE_BYTES,
-    PRIVATE_PROFILE_ID_BYTES, PRIVATE_RUNTIME_KEY_BYTES,
+    SessionBootstrap, PRIVATE_PROFILE_ID_BYTES, PRIVATE_RUNTIME_KEY_BYTES,
 };
 #[cfg(feature = "wallet-parity-harness")]
 pub use inner_codec::wallet_parity_harness::{
