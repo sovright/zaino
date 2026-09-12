@@ -28,8 +28,10 @@ cleanup_report() {
 trap cleanup_report EXIT
 
 sudo cp -- "${INPUT}" /sys/kernel/config/tsm/report/zaino0/inblob
-sudo cp -- /sys/kernel/config/tsm/report/zaino0/outblob "${OUTPUT_DIR}/quote.bin"
-sudo chown "$(id -u):$(id -g)" "${OUTPUT_DIR}/quote.bin"
+# Read the virtual ConfigFS attribute as a stream. The caller owns OUTPUT_DIR;
+# sudo is needed only to read the node, not to create the local artifact.
+# shellcheck disable=SC2024
+sudo cat /sys/kernel/config/tsm/report/zaino0/outblob > "${OUTPUT_DIR}/quote.bin"
 cp -- "${INPUT}" "${OUTPUT_DIR}/report-data.bin"
 sudo cp -- /sys/firmware/acpi/tables/data/CCEL "${OUTPUT_DIR}/ccel.bin"
 sudo chown "$(id -u):$(id -g)" "${OUTPUT_DIR}/ccel.bin"

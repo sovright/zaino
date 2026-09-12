@@ -79,7 +79,7 @@ The script generates unique per-run names, records successful creates and
 immutable resource IDs in a local manifest, creates the isolated resources,
 then makes `verify-cloud-config.sh` assert the intended policy.
 
-- `confidentialInstanceType: TDX` and confidential compute enabled;
+- `confidentialInstanceType: TDX`;
 - `c3-standard-4`, maintenance `TERMINATE`, no automatic restart, and the
   six-hour delete deadline;
 - no access configuration/external IP and no service account;
