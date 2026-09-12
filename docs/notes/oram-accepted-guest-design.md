@@ -100,11 +100,11 @@ administrator path.
    root filesystem, its dm-verity hash tree, and no mutable boot/config
    partition. Put the kernel, initramfs, fixed command line, OS release, and the
    dm-verity root hash in one Unified Kernel Image so these inputs cannot be
-   independently substituted. `systemd-stub` defines the UKI sections and
-   systemd's verity generator supports a root hash supplied from authenticated
-   boot material.
+   independently substituted. `systemd-stub` defines the UKI sections. The
+   current spike uses a static native init to validate the authenticated
+   command line and dm-verity mapping and fully sweep the root before
+   switch-root; it does not include a runtime systemd verity generator.
    [systemd-stub](https://www.freedesktop.org/software/systemd/man/latest/systemd-stub.html),
-   [systemd-veritysetup-generator](https://www.freedesktop.org/software/systemd/man/latest/systemd-veritysetup-generator.html),
    [dm-verity](https://docs.kernel.org/admin-guide/device-mapper/verity.html)
    Configure exactly one UKI profile. The ESP contains no companion credential,
    system-extension, configuration-extension, addon EFI, alternate profile, or
