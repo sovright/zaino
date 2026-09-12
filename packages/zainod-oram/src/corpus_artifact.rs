@@ -371,6 +371,7 @@ pub(super) struct ValidatedSizing {
     directory: ArtifactDirectory,
     qualification: MainnetSizingQualification,
     measurement_blake2s256: String,
+    sizing_model_blake2s256: String,
     qualification_blake2s256: String,
 }
 
@@ -388,6 +389,11 @@ impl ValidatedSizing {
     /// Returns the digest of the canonical typed sizing artifact.
     pub(super) fn qualification_blake2s256(&self) -> &str {
         &self.qualification_blake2s256
+    }
+
+    /// Returns the digest of the canonical sizing model bound by provenance.
+    pub(super) fn sizing_model_blake2s256(&self) -> &str {
+        &self.sizing_model_blake2s256
     }
 }
 
@@ -417,12 +423,13 @@ pub(super) fn load_sizing(
         source,
     })?;
     let directory = open_artifact_directory(&source_directory)?;
-    let (artifact, _) = read_validated_sizing_directory(&directory, capture)?;
+    let (artifact, provenance) = read_validated_sizing_directory(&directory, capture)?;
     let qualification_blake2s256 = artifact.digest()?;
     Ok(ValidatedSizing {
         directory,
         qualification: artifact.qualification,
         measurement_blake2s256: artifact.measurement_blake2s256,
+        sizing_model_blake2s256: provenance.sizing_model_blake2s256,
         qualification_blake2s256,
     })
 }
