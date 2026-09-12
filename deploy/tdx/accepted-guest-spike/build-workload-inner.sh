@@ -12,6 +12,11 @@ trap handoff EXIT
 bash /builder/install-packages.sh "$local_repo" "$expected" /tmp/zaino-workload-apt
 [[ $(gcc-13 -dumpfullversion) == 13.3.0 ]] || fail 'unexpected gcc version'
 [[ $(musl-gcc -dumpmachine) == x86_64-linux-gnu ]] || fail 'unexpected musl compiler target'
+awk '$5 == "/tmp" { options="," $6 ","; for (i=7; i<=NF && $i!="-"; i++) options=options "," $i ","; if ($(i+1)=="tmpfs" && options ~ /,rw,/ && options ~ /,nosuid,/ && options ~ /,nodev,/ && options !~ /,noexec,/) accepted=1 } END {exit accepted ? 0 : 1}' /proc/self/mountinfo || fail 'builder scratch mount policy mismatch'
+printf 'int main(void) { return 0; }\n' > /tmp/compiler-execution-probe.c
+gcc-13 /tmp/compiler-execution-probe.c -o /tmp/compiler-execution-probe
+/tmp/compiler-execution-probe || fail 'builder scratch does not permit compiler output execution'
+rm -f /tmp/compiler-execution-probe.c /tmp/compiler-execution-probe
 
 mkdir -m 755 /opt/rust
 for archive in "$rust_archives"/*.tar.xz; do

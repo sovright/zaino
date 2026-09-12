@@ -25,7 +25,7 @@ image=$(jq -r .selected_builder_base_image "$root/workload-tool-roots.json"); do
 image_id=$(docker image inspect --format '{{.Id}}' "$image"); image_os=$(docker image inspect --format '{{.Os}}' "$image"); image_arch=$(docker image inspect --format '{{.Architecture}}' "$image")
 [[ "$image_os" == linux && "$image_arch" == amd64 && "$image_id" == "$(jq -r .config.digest "$root/upstream/builder-amd64-manifest.json")" ]] || fail 'executed OCI identity mismatch'
 owner=$(stat -c '%u:%g' "$partial/output")
-container_id=$(docker create --cidfile "$cidfile" --network none --pull never --tmpfs /tmp:rw,nosuid,nodev,size=12g \
+container_id=$(docker create --cidfile "$cidfile" --network none --pull never --tmpfs /tmp:rw,exec,nosuid,nodev,size=12g \
   --mount "type=bind,src=$source_input,dst=/inputs/source,readonly" \
   --mount "type=bind,src=$source_input/vendor,dst=/inputs/vendor,readonly" \
   --mount "type=bind,src=$partial/repo,dst=/inputs/repo,readonly" \
