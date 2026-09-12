@@ -76,6 +76,12 @@ jobs:
         run: >-
           cargo nextest run -p tdx-evidence-agent --locked
           --no-tests fail --status-level fail
+      - name: Verify privileged capability bounding-set drop
+        env:
+          ZAINO_RUN_PRIVILEGED_CAP_PROBE: '1'
+        run: >-
+          cargo test -p tdx-evidence-agent --locked
+          tests::privileged_capability_drop_reaches_filtered_runtime -- --exact
       - name: Check native init
         run: >-
           cargo clippy -p tdx-guest-init --features linux-init --all-targets
