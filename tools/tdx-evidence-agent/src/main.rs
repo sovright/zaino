@@ -631,7 +631,54 @@ fn private_listener(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd as _;
+    #[cfg(target_os = "linux")]
     use std::os::unix::process::ExitStatusExt as _;
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    static SIGSYS_DIAGNOSTIC_FD: AtomicI32 = AtomicI32::new(-1);
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    extern "C" fn record_sigsys(
+        _signal: libc::c_int,
+        _info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
+        // SAFETY: SA_SIGINFO supplies a live ucontext for this synchronous
+        // x86_64 seccomp trap. write and _exit are async-signal-safe.
+        unsafe {
+            let syscall =
+                (*(context.cast::<libc::ucontext_t>())).uc_mcontext.gregs[libc::REG_RAX as usize];
+            let fd = SIGSYS_DIAGNOSTIC_FD.load(Ordering::Relaxed);
+            libc::write(
+                fd,
+                std::ptr::from_ref(&syscall).cast(),
+                std::mem::size_of_val(&syscall),
+            );
+            libc::_exit(159);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn install_sigsys_diagnostic(path: &Path) {
+        let file = fs::File::create(path).expect("SIGSYS diagnostic opens");
+        SIGSYS_DIAGNOSTIC_FD.store(file.as_raw_fd(), Ordering::Relaxed);
+        std::mem::forget(file);
+        // SAFETY: action is fully initialized before registering a test-only
+        // SA_SIGINFO handler, and the signal mask is initialized empty.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_sigsys as usize;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
 
     #[cfg(target_os = "linux")]
     struct ChildGuard(Option<std::process::Child>);
@@ -808,6 +855,7 @@ mod tests {
     fn confinement_filter_supports_precreated_runtime_and_fixed_worker() {
         let directory = tempfile::tempdir().expect("probe directory");
         let marker = directory.path().join("listener");
+        let sigsys = directory.path().join("sigsys");
         let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -815,6 +863,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("ZAINO_SECCOMP_PROBE", directory.path())
+            .env("ZAINO_SIGSYS_DIAGNOSTIC", &sigsys)
             .spawn()
             .expect("start isolated confinement probe");
         let mut child = ChildGuard(Some(child));
@@ -829,13 +878,12 @@ mod tests {
             .enable_time()
             .build()
             .expect("probe client runtime");
-        runtime.block_on(async {
+        let rpc_result = runtime.block_on(async {
             let mut connection = zaino_private_client::UnverifiedRetainedTlsConnection::connect(
                 address,
                 tokio::time::Instant::from_std(deadline),
             )
-            .await
-            .expect("real TLS 1.3 handshake through filtered server");
+            .await?;
             let response: EvidenceResponse = connection
                 .unary(
                     EvidenceRequest {
@@ -848,13 +896,24 @@ mod tests {
                     MAX_RESPONSE_BYTES,
                     tokio::time::Instant::from_std(deadline),
                 )
-                .await
-                .expect("quote job crosses the filtered permanent worker");
-            assert_eq!(response.quote_v4, [1]);
-            assert_eq!(response.ccel_table, [2]);
-            assert_eq!(response.ccel_log, [3]);
+                .await?;
             drop(connection);
+            Ok::<_, zaino_private_client::RetainedClientError>(response)
         });
+        let response = rpc_result.unwrap_or_else(|error| {
+            let syscall = fs::read(&sigsys)
+                .ok()
+                .filter(|bytes| bytes.len() == std::mem::size_of::<libc::greg_t>())
+                .map(|bytes| {
+                    let mut value = [0_u8; std::mem::size_of::<libc::greg_t>()];
+                    value.copy_from_slice(&bytes);
+                    libc::greg_t::from_ne_bytes(value)
+                });
+            panic!("filtered evidence RPC failed: {error:?}; trapped syscall: {syscall:?}")
+        });
+        assert_eq!(response.quote_v4, [1]);
+        assert_eq!(response.ccel_table, [2]);
+        assert_eq!(response.ccel_log, [3]);
         let child_id = child.0.as_ref().expect("child guard retains process").id();
         // SAFETY: child_id belongs to the guarded probe process.
         assert_eq!(unsafe { libc::kill(child_id as i32, libc::SIGTERM) }, 0);
@@ -901,6 +960,10 @@ mod tests {
             let _runtime = runtime.enter();
             shutdown_signals().expect("signal streams initialize before filter")
         };
+        #[cfg(target_arch = "x86_64")]
+        install_sigsys_diagnostic(Path::new(
+            &std::env::var_os("ZAINO_SIGSYS_DIAGNOSTIC").expect("diagnostic path"),
+        ));
         confinement::install_seccomp().expect("install synchronized filter");
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0")
