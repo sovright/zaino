@@ -11,11 +11,19 @@ publish = false
 [dependencies]
 async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls = { version = "0.23.41", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum"] }
 sha2 = "0.10"
 tdx-boot-spike-protocol = { version = "0.1.0", path = "../tdx-boot-spike-protocol" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "sync", "net", "signal"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs"] }
 tonic = { version = "0.14.6", features = ["tls-aws-lc", "transport"] }
 zaino-tdx-evidence = { version = "0.1.0", path = "../../packages/zaino-tdx-evidence" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+
+[dev-dependencies]
+tempfile.workspace = true
+zaino-private-client = { path = "../../packages/zaino-private-client" }

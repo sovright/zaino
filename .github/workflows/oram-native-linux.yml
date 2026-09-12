@@ -22,6 +22,8 @@ on:
       - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
       - 'tools/workbench/**'
+      - 'tools/tdx-evidence-agent/**'
+      - 'tools/tdx-guest-init/**'
       - 'tools/scripts/package-oram-build.sh'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -43,6 +45,8 @@ on:
       - 'packages/zainod-oram/**'
       - 'rust-toolchain.toml'
       - 'tools/workbench/**'
+      - 'tools/tdx-evidence-agent/**'
+      - 'tools/tdx-guest-init/**'
       - 'tools/scripts/package-oram-build.sh'
 
 permissions:
@@ -52,6 +56,69 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  guest-confinement:
+    name: TDX guest confinement (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Verify native architecture and pinned toolchain
+        run: |
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+          rustup show active-toolchain
+          rustc --version --verbose
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: nextest@0.9.140
+          fallback: none
+      - name: Check evidence-agent confinement
+        run: >-
+          cargo clippy -p tdx-evidence-agent --all-targets --no-deps --locked --
+          -D warnings -D clippy::unwrap_used
+      - name: Exercise evidence-agent confinement
+        run: >-
+          cargo nextest run -p tdx-evidence-agent --locked
+          --no-tests fail --status-level fail
+      - name: Verify privileged candidate reaches its filtered listener
+        shell: bash
+        run: |
+          cargo build -p tdx-evidence-agent --locked
+          agent_path="$PWD/target/debug/tdx-evidence-agent"
+          test -z "$(sudo -n /usr/bin/ss -H -ltnp 'sport = :39091')"
+          set +e
+          sudo -n /usr/bin/timeout --kill-after=1s 3s \
+            "$agent_path" --listen 127.0.0.1:39091 &
+          probe_pid=$!
+          listener_ready=0
+          for _ in $(seq 1 40); do
+            listener="$(sudo -n /usr/bin/ss -H -ltnp 'sport = :39091')"
+            if [[ "$listener" =~ pid=([0-9]+) ]] &&
+              test "$(sudo -n /usr/bin/readlink "/proc/${BASH_REMATCH[1]}/exe")" = "$agent_path"
+            then
+              listener_ready=1
+              break
+            fi
+            sleep 0.05
+          done
+          wait "$probe_pid"
+          probe_status=$?
+          set -e
+          test "$listener_ready" -eq 1
+          test "$probe_status" -eq 124
+      - name: Check native init
+        run: >-
+          cargo clippy -p tdx-guest-init --features linux-init --all-targets
+          --no-deps --locked -- -D warnings -D clippy::unwrap_used
+      - name: Exercise native init
+        run: >-
+          cargo nextest run -p tdx-guest-init --features linux-init --locked
+          --no-tests fail --status-level fail
+
   private-client:
     name: Private client (${{ matrix.os }})
     strategy:
