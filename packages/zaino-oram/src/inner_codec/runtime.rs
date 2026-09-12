@@ -300,26 +300,37 @@ where
     fn try_release_bytes(&self) -> Result<&[u8; ENVELOPE_BYTES], UniformExternalFailure> {
         let decision = self.release_decision.get_or_init(|| {
             if !self.release_permit.begin_response_release() {
+                #[cfg(test)]
+                eprintln!("private runtime release refused: release gate already closed");
                 self.fail_closed();
                 return Err(UniformExternalFailure);
             }
-            if self.serving_release_witness.observe_and_match().is_err()
-                || self
-                    .security_release_witness
-                    .observe_and_match(
-                        &self.round.security_round,
-                        &self.round.reservation_authority,
-                        &self.round.replay_commit_authority,
-                        self.round.now_unix_seconds,
-                        &self.round.response_nonce,
-                        &self.round.token_nonce,
-                    )
-                    .is_err()
+            if self.serving_release_witness.observe_and_match().is_err() {
+                #[cfg(test)]
+                eprintln!("private runtime release refused: serving witness");
+                self.fail_closed();
+                return Err(UniformExternalFailure);
+            }
+            if self
+                .security_release_witness
+                .observe_and_match(
+                    &self.round.security_round,
+                    &self.round.reservation_authority,
+                    &self.round.replay_commit_authority,
+                    self.round.now_unix_seconds,
+                    &self.round.response_nonce,
+                    &self.round.token_nonce,
+                )
+                .is_err()
             {
+                #[cfg(test)]
+                eprintln!("private runtime release refused: security witness");
                 self.fail_closed();
                 return Err(UniformExternalFailure);
             }
             if !self.release_permit.authorize_response_release() {
+                #[cfg(test)]
+                eprintln!("private runtime release refused: authorization gate changed");
                 self.fail_closed();
                 return Err(UniformExternalFailure);
             }
@@ -806,6 +817,13 @@ where
             QueryOutcome::StoreFailure | QueryOutcome::ProjectionNotReady
         ) || recent_snapshot_failed
         {
+            #[cfg(test)]
+            eprintln!(
+                "private runtime unhealthy: store_failure={} projection_not_ready={} recent_scan_failed={}",
+                engine_outcome == QueryOutcome::StoreFailure,
+                engine_outcome == QueryOutcome::ProjectionNotReady,
+                recent_snapshot_failed
+            );
             self.healthy = false;
         }
         let protected_outcome = if engine_outcome == QueryOutcome::StoreFailure {
