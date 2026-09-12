@@ -6,6 +6,7 @@ use tempfile::TempDir;
 use zaino_common::{network::ActivationHeights, DatabaseConfig, StorageConfig};
 
 use super::{
+    finalised_state::capability::CapabilityRequest,
     finalized_height_floor,
     shadow_vectors::{
         build_active_mockchain_source, load_test_vectors, try_indexed_block_chain,
@@ -175,18 +176,40 @@ impl CanonicalProjectionTestFixture {
                     "fixture source did not have a finalized checkpoint".to_string(),
                 )
             })?;
+        let ready = || {
+            self.subscriber
+                .current_canonical_transparent_projection_boundary()
+                .is_ok_and(|boundary| {
+                    boundary.tip().height.0 == expected_tip
+                        && boundary.tip().hash.0 == expected_hash.0
+                        && boundary.finalized() == expected_finalized
+                })
+        };
         tokio::time::timeout(READY_BUDGET, async {
             loop {
-                let ready = self
-                    .subscriber
-                    .current_canonical_transparent_projection_boundary()
-                    .is_ok_and(|boundary| {
-                        boundary.tip().height.0 == expected_tip
-                            && boundary.tip().hash.0 == expected_hash.0
-                            && boundary.finalized() == expected_finalized
-                    });
-                if ready {
+                if ready() {
                     break;
+                }
+                tokio::time::sleep(READY_POLL_INTERVAL).await;
+            }
+
+            self.indexer.finalized_db.wait_until_synced().await;
+            if self.indexer.finalized_db.status() == crate::StatusType::CriticalError {
+                return Err(CanonicalProjectionTestFixtureError(
+                    "fixture finalized database entered a critical state".to_string(),
+                ));
+            }
+            loop {
+                if ready() {
+                    self.indexer
+                        .finalized_db
+                        .backend_for_cap(CapabilityRequest::TransparentHistExt)
+                        .map_err(|error| {
+                            CanonicalProjectionTestFixtureError(format!(
+                                "fixture finalized transparent history was unavailable: {error}"
+                            ))
+                        })?;
+                    return Ok(());
                 }
                 tokio::time::sleep(READY_POLL_INTERVAL).await;
             }
@@ -196,7 +219,7 @@ impl CanonicalProjectionTestFixture {
             CanonicalProjectionTestFixtureError(format!(
                 "fixture chain index did not publish tip {expected_tip} within {READY_BUDGET:?}"
             ))
-        })
+        })?
     }
 
     /// Stops the index before its temporary database directory is removed.
@@ -215,6 +238,38 @@ mod tests {
 
     /// multi_thread required: the persistent-v1 fixture transitively uses `block_in_place`.
     #[tokio::test(flavor = "multi_thread")]
+    async fn readiness_waits_for_persistent_background_work(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = CanonicalProjectionTestFixture::start().await?;
+        let result = async {
+            fixture
+                .subscriber()
+                .current_canonical_transparent_projection_boundary()?;
+            let operation = fixture.indexer.finalized_db.hold_background_op_for_test();
+            let pending =
+                tokio::time::timeout(Duration::from_millis(150), fixture.await_active_tip()).await;
+            drop(operation);
+            if pending.is_ok() {
+                return Err(
+                    "synchronous boundary exposed unfinished persistent background work".into(),
+                );
+            }
+            fixture.await_active_tip().await?;
+            fixture
+                .subscriber()
+                .capture_canonical_transparent_projection_input()
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        let shutdown = fixture.shutdown().await;
+        result?;
+        shutdown?;
+        Ok(())
+    }
+
+    /// multi_thread required: the persistent-v1 fixture transitively uses `block_in_place`.
+    #[tokio::test(flavor = "multi_thread")]
     async fn fixture_publishes_a_real_forward_update() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = CanonicalProjectionTestFixture::start().await?;
         let result = async {
@@ -230,7 +285,7 @@ mod tests {
                 .filter(|case| !case.ordinary_utxos().is_empty())
                 .min_by_key(|case| case.ordinary_utxos().len())
                 .ok_or("fixture has no present-address UTXO case at height 100")?;
-            let stable_address = stable_case.address_script().clone();
+            let stable_address = *stable_case.address_script();
 
             fixture.mine_blocks(1).await?;
             let advanced = fixture

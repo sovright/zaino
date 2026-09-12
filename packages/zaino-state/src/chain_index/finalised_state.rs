@@ -1035,6 +1035,12 @@ impl<T: BlockchainSource> FinalisedState<T> {
         }
     }
 
+    /// Holds the background-operation lifecycle open for readiness tests.
+    #[cfg(test)]
+    pub(super) fn hold_background_op_for_test(&self) -> impl Drop + use<T> {
+        self.db.begin_background_op()
+    }
+
     /// Creates a read-only view onto the running database.
     ///
     /// All chain fetches should be performed through [`DbReader`] rather than calling read methods
