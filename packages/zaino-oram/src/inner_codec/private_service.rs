@@ -29,10 +29,11 @@
 //! erasing them behind a `Box<dyn ..>` would add a vtable hop to the one
 //! fixed-schedule code path this crate exists to keep uniform.
 //!
-//! What this module does *not* establish: obliviousness. The projection below
-//! is built on the qualification memory backend, which provides none — see
-//! [`crate::projection_owner`]. This is a research composition and makes no
-//! production privacy claim.
+//! The projection builder selects the typed ORAM backend and fails closed if
+//! its platform or feature is unavailable; it never falls back to qualification
+//! memory. That backend selection does not establish obliviousness or a
+//! production privacy claim: backend audit, physical trace qualification and
+//! the complete attested deployment remain separate gates.
 
 use std::{future::Future, path::PathBuf};
 
@@ -786,6 +787,47 @@ mod tests {
     use crate::zaino_fixtures::projection_chain;
     use crate::zaino_fixtures::FixtureResult;
 
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    fn projection_from_fixture(
+        fixture: &zaino_state::test_dependencies::chain_index::CanonicalProjectionTestFixture,
+    ) -> FixtureResult<FinalizedProjection> {
+        let mut builder = FinalizedProjectionBuilder::start(&live_fixture_shape()?)
+            .map_err(|_| "the typed projection builder starts")?;
+        for block in fixture.finalized_blocks() {
+            builder
+                .push(block)
+                .map_err(|_| "the fixture finalized prefix applies")?;
+        }
+        builder
+            .finish()
+            .map_err(|_| "the fixture projection seals".into())
+    }
+
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    fn live_fixture_shape() -> FixtureResult<PrivateProjectionShape> {
+        Ok(PrivateProjectionShape {
+            network: PrivateNetwork::Regtest,
+            schema_version: 1,
+            key_epoch: 7,
+            projection_epoch: 11,
+            max_seen_outputs: 4_096,
+            max_live_outputs: 4_096,
+            directory_admission: 64,
+            event_admission: 4_096,
+            max_events_per_address: private_mainnet_store_reads()?,
+            directory_capacity: 256,
+            event_capacity: 8_192,
+        })
+    }
+
     /// A regtest shape wide enough for one compiled mainnet query.
     ///
     /// `max_events_per_address` is the profile's store-read count, the
@@ -1045,6 +1087,72 @@ mod tests {
             .map_err(|_| "a wide enough regtest shape builds")?;
 
         assert!(builder.finish().is_err());
+        Ok(())
+    }
+
+    /// multi_thread required: the persistent-v1 chain-index fixture transitively uses
+    /// `block_in_place` while the runtime awaits real subscriber refreshes.
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mainnet_runtime_refreshes_from_a_live_nonempty_recent_snapshot() -> FixtureResult<()> {
+        use zaino_state::test_dependencies::{
+            chain_index::CanonicalProjectionTestFixture, TestChainSource,
+        };
+
+        async fn exercise(fixture: &CanonicalProjectionTestFixture) -> FixtureResult<()> {
+            let first_input = fixture
+                .subscriber()
+                .capture_canonical_transparent_projection_input()
+                .await?;
+            assert!(!first_input.recent().blocks().is_empty());
+            let first_tip = first_input.recent().tip();
+
+            let journal = tempfile::tempdir()?;
+            let deployment = PrivateRuntimeDeployment {
+                service_namespace_id: [0x55; 16],
+                owner_generation: 1,
+                replay_journal_root: journal.path().join("replay"),
+                projection: live_fixture_shape()?,
+            };
+            let mut runtime = mainnet_private_query_runtime::<TestChainSource>(
+                &deployment,
+                EphemeralKeyGeneration::draw()
+                    .map_err(|_| "the OS generator yields four keys")?
+                    .keys,
+            )
+            .map_err(|_| "the mainnet runtime composes")?;
+
+            runtime
+                .refresh(fixture.subscriber(), projection_from_fixture(fixture)?)
+                .await
+                .map_err(|_| "the initial live subscriber refresh succeeds")?;
+
+            fixture.mine_blocks(1).await?;
+            let advanced_input = fixture
+                .subscriber()
+                .capture_canonical_transparent_projection_input()
+                .await?;
+            assert!(!advanced_input.recent().blocks().is_empty());
+            assert_ne!(advanced_input.recent().tip(), first_tip);
+
+            runtime
+                .refresh(fixture.subscriber(), projection_from_fixture(fixture)?)
+                .await
+                .map_err(|_| "the advanced live subscriber refresh succeeds")?;
+            MainnetPrivateQueryRuntime::<TestChainSource>::shutdown(&mut runtime)
+                .map_err(|_| "the refreshed runtime stops cleanly")?;
+            Ok(())
+        }
+
+        let fixture = CanonicalProjectionTestFixture::start().await?;
+        let result = exercise(&fixture).await;
+        let shutdown = fixture.shutdown().await;
+        result?;
+        shutdown?;
         Ok(())
     }
 }

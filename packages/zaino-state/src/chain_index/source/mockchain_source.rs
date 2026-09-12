@@ -142,7 +142,7 @@ fn mockchain_network() -> zebra_chain::parameters::Network {
 /// A test-only mock implementation of BlockchainReader using ordered lists by height.
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
-pub(crate) struct MockchainSource {
+pub struct MockchainSource {
     blocks: Vec<Arc<Block>>,
     roots: Vec<(Option<(sapling::Root, u64)>, Option<(orchard::Root, u64)>)>,
     treestates: Vec<(Vec<u8>, Vec<u8>)>,
@@ -273,7 +273,7 @@ impl MockchainSource {
     /// `max_chain_height`. Returns `true` iff the height changed; on a
     /// no-op advance (already at the cap) returns `false` so callers
     /// can decide whether to fire the change-notify.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_dependencies"))]
     fn advance_active_height(&self, blocks: u32) -> bool {
         // len() returns one-indexed length, height is zero-indexed.
         let max_height = self.max_chain_height();
@@ -289,7 +289,7 @@ impl MockchainSource {
             .is_ok()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_dependencies"))]
     pub(crate) fn mine_blocks(&self, blocks: u32) {
         if self.advance_active_height(blocks) {
             self.blocks_received_broadcaster.send_replace(());

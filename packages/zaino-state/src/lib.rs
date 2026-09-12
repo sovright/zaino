@@ -100,6 +100,8 @@ pub mod test_dependencies {
         pub use crate::chain_index::*;
     }
 
+    pub use crate::chain_index::source::mockchain_source::MockchainSource as TestChainSource;
+
     pub use crate::shadow_parity::{
         load_ordinary_utxo_shadow_fixture, OrdinaryTransparentUtxo, OrdinaryUtxoShadowCase,
         OrdinaryUtxoShadowError, OrdinaryUtxoShadowFixture,
