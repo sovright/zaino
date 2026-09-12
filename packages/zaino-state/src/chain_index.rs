@@ -83,6 +83,12 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "test_dependencies")]
+mod test_fixture;
+
+#[cfg(feature = "test_dependencies")]
+pub use test_fixture::{CanonicalProjectionTestFixture, CanonicalProjectionTestFixtureError};
+
 #[cfg(all(feature = "test_dependencies", not(test)))]
 #[path = "chain_index/tests/vectors.rs"]
 pub(crate) mod shadow_vectors;

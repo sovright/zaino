@@ -4,6 +4,18 @@ Status: retained derivative artifact hashes and recorded lineage checked;
 original capture revalidation, physical calibration, and a current authorized
 execution host remain open.
 
+Later implementation updates supersede this audit's proposed attestation
+implementation: the [raw evidence v1 contract](oram-raw-evidence-v1.md) and
+[client verifier experiment](oram-client-verifier-candidate.md) now exist. The
+selected helper uses the pinned Google full verifier, with strict collateral
+and field checks; Intel's native QVL remains unadopted. V1 binds a public
+finalized chain checkpoint, not an authenticated ORAM root. The
+[small TDX diagnostic](oram-tdx-platform-diagnostic-2026-09-12.md) successfully
+collected a hardware quote after login restoration. That 16-GiB diagnostic
+does not supply the missing mainnet source/capture or qualify the proposed
+176-GiB calibration target. The design discussion below records the earlier
+audit and must be read with these updates.
+
 This note records the read-only prerequisite audit for the full-Mainnet sizing
 and rebuild track. It does not authorize infrastructure changes and does not
 claim target-TDX qualification or a full-service recovery-time objective.

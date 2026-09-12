@@ -42,7 +42,7 @@ use tonic::{
     transport::server::{Connected, Server},
 };
 
-use zaino_oram::{FixedEnvelopeRuntime, SessionBootstrap};
+use zaino_oram::{ClientSessionBootstrap, FixedEnvelopeRuntime};
 
 use super::{
     attestation::{AttestationWorkloadBinding, RawEvidenceIssuer},
@@ -128,7 +128,7 @@ impl PrivateQueryListener {
     pub(crate) async fn serve<H, const N: usize>(
         self,
         handler: H,
-        session_bootstrap: SessionBootstrap,
+        session_bootstrap: ClientSessionBootstrap,
         release_schedule: ReleaseSchedule,
         tls: &PrivateTlsIdentity,
         evidence_binding: Option<AttestationWorkloadBinding>,
@@ -280,14 +280,14 @@ where
 {
     fn new(
         handler: H,
-        session_bootstrap: SessionBootstrap,
+        session_bootstrap: ClientSessionBootstrap,
         release_schedule: ReleaseSchedule,
     ) -> Self {
         let release_schedule = Arc::new(release_schedule);
         Self {
             adapter: Arc::new(Mutex::new(PrivateTonicBodyAdapter::new(
                 handler,
-                session_bootstrap.key_epoch,
+                session_bootstrap.key_epoch(),
                 Arc::clone(&release_schedule),
             ))),
             bootstrap: Arc::new(PrivateSessionBootstrap::from_session(&session_bootstrap, N)),
@@ -407,16 +407,22 @@ mod tests {
     const FIXTURE_PROFILE_ID: [u8; zaino_oram::PRIVATE_PROFILE_ID_BYTES] =
         [0x5a; zaino_oram::PRIVATE_PROFILE_ID_BYTES];
 
-    fn session_bootstrap_fixture(key_epoch: u64) -> SessionBootstrap {
-        SessionBootstrap {
-            key_epoch,
-            keys: ReleasableSessionKeys {
+    fn session_bootstrap_fixture(key_epoch: u64) -> ClientSessionBootstrap {
+        ClientSessionBootstrap::for_test(
+            ReleasableSessionKeys {
                 request_key: [0x11; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
                 response_key: [0x22; zaino_oram::PRIVATE_RUNTIME_KEY_BYTES],
             },
-            profile_label: "test-profile",
-            profile_id: FIXTURE_PROFILE_ID,
-        }
+            [0x33; 32],
+            FIXTURE_PROFILE_ID,
+            "test-profile",
+            zaino_oram::PrivateNetwork::Regtest,
+            1,
+            [0x44; 32],
+            1,
+            1,
+            key_epoch,
+        )
     }
 
     /// One pending response, generic over its width. Shared by every handler
@@ -653,7 +659,7 @@ mod tests {
         /// spawns the serve loop.
         async fn start<H, const N: usize>(
             handler: H,
-            session_bootstrap: SessionBootstrap,
+            session_bootstrap: ClientSessionBootstrap,
         ) -> Result<Self, Box<dyn std::error::Error>>
         where
             H: FixedEnvelopeRuntime<N> + Send + 'static,
@@ -667,7 +673,7 @@ mod tests {
         /// tolerating it.
         async fn start_with_bucket<H, const N: usize>(
             handler: H,
-            session_bootstrap: SessionBootstrap,
+            session_bootstrap: ClientSessionBootstrap,
             release_bucket_millis: u64,
         ) -> Result<Self, Box<dyn std::error::Error>>
         where
@@ -690,7 +696,7 @@ mod tests {
 
         async fn start_ephemeral<H, const N: usize>(
             handler: H,
-            session_bootstrap: SessionBootstrap,
+            session_bootstrap: ClientSessionBootstrap,
         ) -> Result<Self, Box<dyn std::error::Error>>
         where
             H: FixedEnvelopeRuntime<N> + Send + 'static,
@@ -712,7 +718,7 @@ mod tests {
         async fn start_with_identity<H, const N: usize>(
             listener: PrivateQueryListener,
             handler: H,
-            session_bootstrap: SessionBootstrap,
+            session_bootstrap: ClientSessionBootstrap,
             release_bucket_millis: u64,
             tls: PrivateTlsIdentity,
             deployment: Option<tempfile::TempDir>,
@@ -1016,34 +1022,18 @@ mod tests {
                 event_capacity: 8192,
             },
         };
-        let runtime = zaino_oram::mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
-            &deployment,
-            zaino_oram::EphemeralKeyGeneration::draw()
-                .map_err(|_| "the OS generator yields four keys")?
-                .keys,
-        )
-        .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
-        let session_bootstrap = runtime.session_bootstrap();
-        let key_epoch = session_bootstrap.key_epoch;
-
-        let surface = ServedSurface::start::<_, { zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES }>(
-            runtime,
-            session_bootstrap,
-        )
-        .await?;
-
-        let status = query_page_over_the_wire(
-            surface.address,
-            &surface.certificate_pem,
-            vec![0; zaino_oram::PRIVATE_MAINNET_ENVELOPE_BYTES],
-            key_epoch,
-        )
-        .await
-        .expect_err("an unrefreshed runtime has no serving epoch to answer from");
-
-        assert_eq!(status.message(), "private query unavailable");
-
-        surface.shutdown().await
+        let mut runtime =
+            zaino_oram::mainnet_private_query_runtime::<zaino_state::ValidatorConnector>(
+                &deployment,
+                zaino_oram::EphemeralKeyGeneration::draw()
+                    .map_err(|_| "the OS generator yields four keys")?
+                    .keys,
+            )
+            .map_err(|_| "the mainnet runtime composes over a fresh journal")?;
+        assert!(runtime.client_session_bootstrap().is_err());
+        MainnetPrivateQueryRuntime::<zaino_state::ValidatorConnector>::shutdown(&mut runtime)
+            .map_err(|_| "the unrefreshed runtime stops cleanly")?;
+        Ok(())
     }
 
     /// A wrong-length envelope must be refused by the adapter, not by Tonic's
@@ -1227,15 +1217,21 @@ mod tests {
             response_key,
             busy: Arc::new(AtomicBool::new(false)),
         };
-        let session_bootstrap = SessionBootstrap {
-            key_epoch: FIXTURE_KEY_EPOCH,
-            keys: ReleasableSessionKeys {
+        let session_bootstrap = ClientSessionBootstrap::for_test(
+            ReleasableSessionKeys {
                 request_key,
                 response_key,
             },
-            profile_label: "test-profile",
-            profile_id: FIXTURE_PROFILE_ID,
-        };
+            [0x33; 32],
+            FIXTURE_PROFILE_ID,
+            "test-profile",
+            zaino_oram::PrivateNetwork::Regtest,
+            1,
+            [0x44; 32],
+            1,
+            1,
+            FIXTURE_KEY_EPOCH,
+        );
 
         let surface = ServedSurface::start::<_, ENVELOPE_BYTES>(handler, session_bootstrap).await?;
 
@@ -1281,15 +1277,14 @@ mod tests {
     ///
     /// The wallet material comes from `zaino_oram`'s `wallet-parity-harness`,
     /// enabled only through this crate's dev-dependencies. That harness hands
-    /// out the session binding and serving checkpoint the protocol does not
-    /// publish; without them no client-constructible request exists, which is
-    /// why the neighbouring `a_wallet_bootstraps_then_queries` had to fall back
-    /// on an XOR stand-in. This test uses no stand-in of any kind.
+    /// out the session binding and serving checkpoint directly from the
+    /// runtime. ADR0904 also publishes those fields in activated bootstrap,
+    /// but this test does not obtain its codec context through that boundary.
+    /// It uses the actual codec and protector throughout.
     ///
-    /// What it does *not* establish: that a deployable wallet exists. It does
-    /// not, and cannot until those two values are published or replaced. The
-    /// projection underneath is also the non-oblivious in-memory backend, so
-    /// nothing here bears on obliviousness.
+    /// This test does not establish attestation-gated client admission. The
+    /// projection underneath is the non-oblivious in-memory backend, so it
+    /// also makes no obliviousness claim.
     ///
     /// multi_thread required: the serve loop and the client run concurrently on
     /// separate tasks and the client blocks on a response the server must send.
@@ -1312,7 +1307,7 @@ mod tests {
         )?;
         let session = harness.wallet_session()?;
         let bootstrap = harness.session_bootstrap()?;
-        let expected_key_epoch = bootstrap.key_epoch;
+        let expected_key_epoch = bootstrap.key_epoch();
 
         let surface = ServedSurface::start::<_, PARITY_ENVELOPE_BYTES>(harness, bootstrap).await?;
 

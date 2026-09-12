@@ -52,6 +52,24 @@ message BootstrapResponse {
   //
   // Unlike `profile_label`, this field IS authoritative. Pin on it.
   bytes profile_id = 7;
+  // Versioned, complete codec context below. Version zero means absent legacy context.
+  uint32 context_version = 8;
+  // Random per-security-lease binding authenticated inside every envelope.
+  bytes session_binding = 9;
+  PrivateNetwork network = 10;
+  // Exact finalized checkpoint from the pinned recent serving identity.
+  uint32 serving_finalized_checkpoint_height = 11;
+  // Display-order bytes, matching the protected query codec representation.
+  bytes serving_finalized_checkpoint_block_hash_display = 12;
+  uint32 schema_version = 13;
+  uint64 projection_epoch = 14;
+}
+
+enum PrivateNetwork {
+  PRIVATE_NETWORK_UNSPECIFIED = 0;
+  PRIVATE_NETWORK_MAINNET = 1;
+  PRIVATE_NETWORK_TESTNET = 2;
+  PRIVATE_NETWORK_REGTEST = 3;
 }
 
 // The verifier contributes only a fresh, exactly 64-byte challenge.

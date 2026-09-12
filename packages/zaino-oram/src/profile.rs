@@ -600,14 +600,15 @@ pub(super) fn mainnet_utxo_history_profile() -> Result<PrivacyProfile, PrivacyPr
         // which is the wrong marginal for a shared array. Populating
         // `per_address_delta_event_histogram` therefore cannot size this
         // dimension; that distribution sizes `response_slots` instead.
-        // `scan_width::mainnet_recent_snapshot_scan_width` computes this width
-        // from the capture and returns `Unserviceable`: the engine's
-        // recent-snapshot scan is quadratic in the width, so covering that
-        // demand costs roughly 6.0e12 slot pairings per request against a
-        // budget of 1.6e6. No constant fixes this. Until the recent-state
-        // structure changes, this width serves only chains whose generations
-        // stay under it and fails closed on mainnet, which is consistent with
-        // `hybrid_sizing::EvidenceScope` asserting no mainnet readiness.
+        // This 256-slot bound remains insufficient for the captured all-address
+        // demand and overflow fails closed. The historical scan-width report
+        // models pre-hoist per-query pairings; ADR0902 and the current code
+        // compute snapshot liveness and record relations at publication, then
+        // read cached annotations during queries. Publication work, fixed
+        // response selection, real backend cost, and physical leakage at a
+        // mainnet-sized width remain unqualified. Raising this constant would
+        // establish none of them, consistent with `hybrid_sizing::EvidenceScope`
+        // asserting no mainnet readiness.
         // See docs/notes/recent-snapshot-scan-width.md.
         recent_snapshot_scan_slots: MAINNET_QUERY_SLOTS,
         response_slots: MAINNET_QUERY_SLOTS,

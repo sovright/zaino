@@ -2,26 +2,11 @@
 //!
 //! # This is not, and cannot become, a production API
 //!
-//! A real wallet cannot do what this module does, and the reason is not that
-//! the client code has not been written yet. Two values a request must carry
-//! are never published by the protocol:
-//!
-//! 1. **`session_binding`** — 32 bytes minted per security lease from OS
-//!    entropy ([`super::security_owner::SecurityLeaseIdentity::mint`]). It is
-//!    bound into the AEAD protection context *and* written into the request
-//!    body, where [`super::PrivateQueryCodec::decode_request_with_nonce`]
-//!    validates it. It appears in no `.proto` file and in no wire message.
-//! 2. **The serving checkpoint** — network, height, block hash, schema
-//!    version, projection epoch, and key epoch. A request whose checkpoint
-//!    differs from the runtime's serving checkpoint is answered
-//!    `ProjectionNotReady`. `BootstrapResponse` publishes only `key_epoch`.
-//!
-//! This module hands both out *from the composed runtime's own internals*.
-//! Publishing them on the wire is a real option, but it is a security decision
-//! that needs its own ADR; until that decision is made there is no
-//! client-constructible request, and therefore no way to check that the private
-//! query path returns correct answers. This harness closes that correctness gap
-//! without making the security decision.
+//! This module constructs both the serving runtime and its wallet-side reader
+//! inside one process. ADR0904 now publishes the security lease's session
+//! binding and exact serving checkpoint through activated bootstrap, enabling
+//! a separate production codec. This harness still bypasses the transport and
+//! attestation boundary; successful parity here cannot authorize a connection.
 //!
 //! Because a value obtained this way can only come from inside the server
 //! process, nothing here can be mistaken for something a deployed wallet could
@@ -39,13 +24,13 @@
 //!
 //! # What is not real here
 //!
-//! The projection underneath is built on the **in-memory qualification
-//! backend**, not the typed ORAM backend, so this harness establishes *answer
-//! correctness only* and makes no obliviousness claim whatsoever.
-//! [`super::private_service::FinalizedProjectionBuilder`] refuses that backend
-//! on purpose, and this module deliberately does not go through it. The serving
-//! epoch is published directly rather than captured from a live chain
-//! subscriber.
+//! The portable [`wallet_parity_harness`] uses the **in-memory qualification
+//! backend** and makes no obliviousness claim. On supported builds,
+//! `typed_wallet_parity_harness` runs the same path over the volatile typed
+//! ORAM backend. That proves backend integration for the small fixture; it does
+//! not qualify physical traces, mainnet capacity, persistence, or freshness.
+//! Both harnesses publish the serving epoch directly rather than capturing it
+//! from a live chain subscriber.
 
 use std::path::PathBuf;
 
@@ -54,8 +39,8 @@ use zeroize::Zeroizing;
 
 use super::{
     private_service::{
-        PrivateNetwork as ServiceNetwork, PrivateProjectionShape, ReleasableSessionKeys,
-        SessionBootstrap,
+        ClientSessionBootstrap, PrivateNetwork as ServiceNetwork, PrivateProjectionShape,
+        ReleasableSessionKeys,
     },
     runtime::PrivateQueryRuntime,
     security_owner::{
@@ -103,7 +88,7 @@ pub enum ParityHarnessError {
     Profile,
     /// The requested projection shape was rejected before any chain work.
     ProjectionShape,
-    /// A projection worker could not be allocated on the memory backend.
+    /// A projection worker could not be allocated on the selected backend.
     ProjectionBackend,
     /// A canonical block was rejected, or no block was applied at all.
     ProjectionChain,
@@ -273,8 +258,8 @@ pub fn parity_mismatch(returned: &[WalletUtxo], expected: &[WalletUtxo]) -> Opti
 
 /// The wallet half of one harness session.
 ///
-/// Holds exactly what a wallet would hold if the two unpublished values were
-/// published: the two releasable keys (inside a real protector), the session
+/// Holds exactly what a wallet holds from the complete activated bootstrap
+/// publication: the two releasable keys (inside a real protector), the session
 /// binding, and the serving checkpoint. It holds no store, no token key, and no
 /// journal.
 pub struct WalletSession {
@@ -358,7 +343,9 @@ impl WalletSession {
             .codec
             .decode_response(&FixedEnvelope::from_array(*envelope), &self.protector)
             .map_err(|_| ParityHarnessError::Open)?;
-        let (page, has_more, continuation) = response.into_wallet_parts();
+        let (page, has_more, continuation) = response
+            .into_wallet_parts_for_checkpoint(self.checkpoint)
+            .map_err(|_| ParityHarnessError::Open)?;
         let outcome =
             WalletOutcome::from_outcome(page.outcome()).ok_or(ParityHarnessError::Open)?;
         let utxos = page
@@ -394,7 +381,7 @@ impl std::fmt::Debug for ParityPendingResponse {
 }
 
 /// The serving half of one harness, plus the seam that hands out the two
-/// unpublished values.
+/// owner-issued activated bootstrap values.
 pub trait WalletParityRuntime: FixedEnvelopeRuntime<PARITY_ENVELOPE_BYTES> {
     /// Returns the wallet material for the runtime's current serving epoch.
     ///
@@ -405,12 +392,9 @@ pub trait WalletParityRuntime: FixedEnvelopeRuntime<PARITY_ENVELOPE_BYTES> {
 
     /// Returns the bootstrap material a listener publishes for this harness.
     ///
-    /// Exactly the surface a deployed runtime publishes -- key epoch, the two
-    /// releasable keys, and the compiled profile identifier -- and nothing
-    /// more. It is *insufficient* to form a request, which is the whole reason
-    /// this module exists; [`Self::wallet_session`] is where the two
-    /// unpublished values come from.
-    fn session_bootstrap(&self) -> Result<SessionBootstrap, ParityHarnessError>;
+    /// This is the complete activated owner snapshot: releasable keys, profile,
+    /// session binding, network, and exact serving checkpoint.
+    fn session_bootstrap(&self) -> Result<ClientSessionBootstrap, ParityHarnessError>;
 
     /// Replaces the serving generation with one built from `blocks`.
     ///
@@ -486,6 +470,19 @@ struct Harness<E, T, R, N> {
     session_binding: [u8; SESSION_BINDING_BYTES],
     request_key: [u8; KEY_BYTES],
     response_key: [u8; KEY_BYTES],
+    backend: HarnessBackend,
+}
+
+#[derive(Clone, Copy)]
+enum HarnessBackend {
+    QualificationMemory,
+    #[cfg(all(
+        test,
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    TypedRostl,
 }
 
 impl<E, T, R, N> std::fmt::Debug for Harness<E, T, R, N> {
@@ -509,7 +506,7 @@ fn memory_backed_serving_store(
         .map_err(|_| ParityHarnessError::ProjectionShape)?;
     let event_capacity =
         usize::try_from(shape.event_capacity).map_err(|_| ParityHarnessError::ProjectionShape)?;
-    let mut owner = OfflineProjectionOwner::new_on_qualification_memory(
+    let owner = OfflineProjectionOwner::new_on_qualification_memory(
         shape
             .projection_config()
             .map_err(|_| ParityHarnessError::ProjectionShape)?,
@@ -521,7 +518,36 @@ fn memory_backed_serving_store(
         QUEUE_CAPACITY,
     )
     .map_err(|_| ParityHarnessError::ProjectionBackend)?;
+    finish_serving_store(owner, blocks)
+}
 
+#[cfg(all(
+    test,
+    feature = "rostl-experimental",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+fn typed_serving_store(
+    shape: &PrivateProjectionShape,
+    blocks: &[IndexedBlock],
+) -> Result<FinalizedProjectionServingStore, ParityHarnessError> {
+    let owner = OfflineProjectionOwner::new(
+        shape
+            .projection_config()
+            .map_err(|_| ParityHarnessError::ProjectionShape)?,
+        shape
+            .layout()
+            .map_err(|_| ParityHarnessError::ProjectionShape)?,
+        QUEUE_CAPACITY,
+    )
+    .map_err(|_| ParityHarnessError::ProjectionBackend)?;
+    finish_serving_store(owner, blocks)
+}
+
+fn finish_serving_store(
+    mut owner: OfflineProjectionOwner,
+    blocks: &[IndexedBlock],
+) -> Result<FinalizedProjectionServingStore, ParityHarnessError> {
     let mut target = None;
     for block in blocks {
         target = Some(
@@ -541,6 +567,23 @@ fn memory_backed_serving_store(
     owner
         .into_serving_store()
         .map_err(|_| ParityHarnessError::ProjectionSeal)
+}
+
+fn serving_store(
+    backend: HarnessBackend,
+    shape: &PrivateProjectionShape,
+    blocks: &[IndexedBlock],
+) -> Result<FinalizedProjectionServingStore, ParityHarnessError> {
+    match backend {
+        HarnessBackend::QualificationMemory => memory_backed_serving_store(shape, blocks),
+        #[cfg(all(
+            test,
+            feature = "rostl-experimental",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        HarnessBackend::TypedRostl => typed_serving_store(shape, blocks),
+    }
 }
 
 /// Publishes one serving epoch over `store` with an empty recent snapshot.
@@ -620,6 +663,57 @@ pub fn wallet_parity_harness(
     impl WalletParityRuntime<PendingResponse: Send + 'static> + Send + 'static,
     ParityHarnessError,
 > {
+    parity_harness_on_backend(
+        HarnessBackend::QualificationMemory,
+        shape,
+        blocks,
+        replay_journal_root,
+        service_namespace_id,
+        owner_generation,
+    )
+}
+
+/// Composes the parity path over the volatile typed `rostl` backend.
+///
+/// This is available only on the backend's supported build target. It makes no
+/// persistence, mainnet-capacity, trace-qualification, or live-freshness claim.
+#[cfg(all(
+    test,
+    feature = "rostl-experimental",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+fn typed_wallet_parity_harness(
+    shape: &PrivateProjectionShape,
+    blocks: &[IndexedBlock],
+    replay_journal_root: PathBuf,
+    service_namespace_id: [u8; 16],
+    owner_generation: u64,
+) -> Result<
+    impl WalletParityRuntime<PendingResponse: Send + 'static> + Send + 'static,
+    ParityHarnessError,
+> {
+    parity_harness_on_backend(
+        HarnessBackend::TypedRostl,
+        shape,
+        blocks,
+        replay_journal_root,
+        service_namespace_id,
+        owner_generation,
+    )
+}
+
+fn parity_harness_on_backend(
+    backend: HarnessBackend,
+    shape: &PrivateProjectionShape,
+    blocks: &[IndexedBlock],
+    replay_journal_root: PathBuf,
+    service_namespace_id: [u8; 16],
+    owner_generation: u64,
+) -> Result<
+    impl WalletParityRuntime<PendingResponse: Send + 'static> + Send + 'static,
+    ParityHarnessError,
+> {
     let profile = mainnet_utxo_history_profile().map_err(|_| ParityHarnessError::Profile)?;
     let compiled = CompiledQueryShape::<MAINNET_QUERY_SLOTS, MAINNET_ENVELOPE_BYTES>::new(profile)
         .map_err(|_| ParityHarnessError::Profile)?;
@@ -656,7 +750,7 @@ pub fn wallet_parity_harness(
     );
     let session_binding = lease.session_binding();
 
-    let store = memory_backed_serving_store(shape, blocks)?;
+    let store = serving_store(backend, shape, blocks)?;
     let serving_epoch = published_serving_epoch(store)?;
     let runtime = HarnessRuntime::from_finalized_serving_epoch(serving_epoch, compiled, lease)
         .map_err(|_| ParityHarnessError::ServingEpoch)?;
@@ -667,6 +761,7 @@ pub fn wallet_parity_harness(
         session_binding,
         request_key,
         response_key,
+        backend,
     })
 }
 
@@ -722,21 +817,31 @@ where
         })
     }
 
-    fn session_bootstrap(&self) -> Result<SessionBootstrap, ParityHarnessError> {
+    fn session_bootstrap(&self) -> Result<ClientSessionBootstrap, ParityHarnessError> {
         let profile = mainnet_utxo_history_profile().map_err(|_| ParityHarnessError::Profile)?;
-        Ok(SessionBootstrap {
-            key_epoch: self.shape.key_epoch,
-            keys: ReleasableSessionKeys {
+        let checkpoint = self
+            .runtime
+            .serving_checkpoint()
+            .ok_or(ParityHarnessError::ServingEpoch)?;
+        Ok(ClientSessionBootstrap::for_test(
+            ReleasableSessionKeys {
                 request_key: self.request_key,
                 response_key: self.response_key,
             },
-            profile_label: profile.label(),
-            profile_id: *profile.profile_id(),
-        })
+            self.session_binding,
+            *profile.profile_id(),
+            profile.label(),
+            self.shape.network,
+            checkpoint.height,
+            checkpoint.block_hash_display,
+            checkpoint.schema_version,
+            checkpoint.projection_epoch,
+            self.shape.key_epoch,
+        ))
     }
 
     fn republish(&mut self, blocks: &[IndexedBlock]) -> Result<(), ParityHarnessError> {
-        let store = memory_backed_serving_store(&self.shape, blocks)?;
+        let store = serving_store(self.backend, &self.shape, blocks)?;
         let serving_epoch = published_serving_epoch(store)?;
         self.runtime
             .activate_finalized_serving_epoch(serving_epoch)
@@ -859,7 +964,24 @@ mod parity_tests {
             .collect()
     }
 
-    /// Seals one query, drives it through the runtime, and opens the answer.
+    fn release_round<H>(
+        harness: &mut H,
+        request: [u8; PARITY_ENVELOPE_BYTES],
+    ) -> ParityResult<[u8; PARITY_ENVELOPE_BYTES]>
+    where
+        H: WalletParityRuntime,
+    {
+        let pending = harness
+            .query_page(request)
+            .map_err(|_| ParityHarnessError::Refused)?;
+        let response = pending
+            .try_release_bytes()
+            .map_err(|_| ParityHarnessError::Refused)?;
+        assert_eq!(response.len(), PARITY_ENVELOPE_BYTES);
+        Ok(*response)
+    }
+
+    /// Drives a sealed query through the runtime and opens the fixed answer.
     fn round<H>(
         harness: &mut H,
         request: [u8; PARITY_ENVELOPE_BYTES],
@@ -868,13 +990,31 @@ mod parity_tests {
     where
         H: WalletParityRuntime,
     {
-        let pending = harness
-            .query_page(request)
-            .map_err(|_| ParityHarnessError::Refused)?;
-        let bytes = *pending
-            .try_release_bytes()
-            .map_err(|_| ParityHarnessError::Refused)?;
+        let bytes = release_round(harness, request)?;
         Ok(session.open_response(&bytes)?)
+    }
+
+    fn assert_retired_round_refused<H>(
+        harness: &mut H,
+        request: [u8; PARITY_ENVELOPE_BYTES],
+        retired: &WalletSession,
+    ) -> ParityResult<()>
+    where
+        H: WalletParityRuntime,
+    {
+        let bytes = release_round(harness, request)?;
+        assert!(matches!(
+            retired.open_response(&bytes),
+            Err(ParityHarnessError::Open)
+        ));
+        // The response is protected under the current checkpoint. Only the
+        // current reader can decode its empty, uniform refusal.
+        let current = harness.wallet_session()?;
+        let refusal = current.open_response(&bytes)?;
+        assert_eq!(refusal.outcome, WalletOutcome::ProjectionNotReady);
+        assert!(refusal.utxos.is_empty());
+        assert!(!refusal.has_more);
+        Ok(())
     }
 
     /// The number of transparent outputs the fixture chain spends.
@@ -1061,11 +1201,7 @@ mod parity_tests {
 
         harness.republish(blocks)?;
 
-        // The retired checkpoint is still a well-formed, authentic envelope --
-        // it opens -- and is answered as having no ready projection.
-        let stale = round(&mut harness, stale_request, &stale_session)?;
-        assert_eq!(stale.outcome, WalletOutcome::ProjectionNotReady);
-        assert!(stale.utxos.is_empty());
+        assert_retired_round_refused(&mut harness, stale_request, &stale_session)?;
 
         let session = harness.wallet_session()?;
         for case in fixture.cases() {
@@ -1080,6 +1216,80 @@ mod parity_tests {
                 case.name()
             );
         }
+        Ok(())
+    }
+
+    /// Exercises one complete fixed-profile path over the typed volatile
+    /// backend. This does not qualify physical traces or mainnet capacities.
+    #[cfg(all(
+        feature = "rostl-experimental",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[tokio::test]
+    async fn typed_backend_serves_sealed_queries_and_preserves_republish_semantics(
+    ) -> ParityResult<()> {
+        let fixture = load_ordinary_utxo_shadow_fixture().await?;
+        let blocks = fixture.indexed_blocks();
+        let journal = tempfile::TempDir::new()?;
+        let mut harness = typed_wallet_parity_harness(
+            &parity_shape()?,
+            blocks,
+            journal.path().join("replay"),
+            [0x6a; 16],
+            1,
+        )?;
+        let bootstrap = harness.session_bootstrap()?;
+        let session = harness.wallet_session()?;
+        assert_eq!(bootstrap.key_epoch(), session.checkpoint.key_epoch);
+        assert_eq!(
+            *bootstrap.profile_id(),
+            *mainnet_utxo_history_profile()?.profile_id()
+        );
+
+        for case in fixture.cases() {
+            let request = session.seal_query(case.address_script(), 0, None)?;
+            let page = round(&mut harness, request, &session)?;
+            assert_eq!(page.outcome, WalletOutcome::Complete);
+            assert_eq!(
+                parity_mismatch(&page.utxos, &ordinary_expectation(case)),
+                None,
+                "{} differs on the typed backend",
+                case.name()
+            );
+        }
+
+        let case = fixture
+            .cases()
+            .first()
+            .ok_or("the fixture publishes at least one case")?;
+        let replay = session.seal_query(case.address_script(), 0, None)?;
+        assert_eq!(
+            round(&mut harness, replay, &session)?.outcome,
+            WalletOutcome::Complete
+        );
+        assert_eq!(
+            round(&mut harness, replay, &session)?.outcome,
+            WalletOutcome::ProjectionNotReady
+        );
+
+        let stale = session.seal_query(case.address_script(), 0, None)?;
+        let prefix = blocks
+            .get(
+                ..blocks
+                    .len()
+                    .checked_sub(1)
+                    .ok_or("fixture chain is empty")?,
+            )
+            .ok_or("fixture chain has a proper prefix")?;
+        harness.republish(prefix)?;
+        assert_retired_round_refused(&mut harness, stale, &session)?;
+        let current = harness.wallet_session()?;
+        let current_request = current.seal_query(case.address_script(), 0, None)?;
+        assert_eq!(
+            round(&mut harness, current_request, &current)?.outcome,
+            WalletOutcome::Complete
+        );
         Ok(())
     }
 

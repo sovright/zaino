@@ -62,7 +62,7 @@ use crate::{
 use super::{
     security_owner::{ActiveSecurityLease, RoundMaterialSource},
     EnvelopeProtector, InnerCodecError, PrivateQueryCheckpoint, PrivateQueryCodec,
-    PrivateQueryResponse, UniformExternalFailure, ENVELOPE_NONCE_BYTES,
+    PrivateQueryResponse, UniformExternalFailure, ENVELOPE_NONCE_BYTES, SESSION_BINDING_BYTES,
 };
 
 #[cfg(feature = "corpus-zaino")]
@@ -517,12 +517,14 @@ where
 
     /// Returns the checkpoint of the pinned serving epoch, if one is pinned.
     ///
-    /// Not published on any wire: a request must carry this exact value or it
-    /// is answered `ProjectionNotReady`, and the harness is the only thing that
-    /// can hand it to a client.
-    #[cfg(feature = "wallet-parity-harness")]
+    /// A request must carry this exact owner-derived value or it is answered
+    /// `ProjectionNotReady`.
     pub(super) fn serving_checkpoint(&self) -> Option<PrivateQueryCheckpoint> {
         self.epoch.as_ref().map(|epoch| epoch.checkpoint)
+    }
+
+    pub(super) const fn session_binding(&self) -> [u8; SESSION_BINDING_BYTES] {
+        self.security.session_binding()
     }
 
     #[cfg(feature = "corpus-zaino")]
@@ -1399,6 +1401,22 @@ where
             self.controller.invalidate_publication();
         }
         result
+    }
+
+    pub(super) fn client_context(
+        &self,
+    ) -> Option<(PrivateQueryCheckpoint, [u8; SESSION_BINDING_BYTES])> {
+        if self.stopped || !self.runtime.healthy || !self.response_release.is_idle() {
+            return None;
+        }
+        let serving = self.controller.pin_serving_epoch()?;
+        let observation = serving.observe_current().ok()?;
+        if !serving.is_current(&observation) {
+            return None;
+        }
+        self.runtime
+            .serving_checkpoint()
+            .map(|checkpoint| (checkpoint, self.runtime.session_binding()))
     }
 
     fn handle(

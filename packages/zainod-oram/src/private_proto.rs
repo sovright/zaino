@@ -59,6 +59,24 @@ pub struct BootstrapResponse {
     /// Unlike `profile_label`, this field IS authoritative. Pin on it.
     #[prost(bytes = "vec", tag = "7")]
     pub profile_id: ::prost::alloc::vec::Vec<u8>,
+    /// Versioned, complete codec context below. Version zero means absent legacy context.
+    #[prost(uint32, tag = "8")]
+    pub context_version: u32,
+    /// Random per-security-lease binding authenticated inside every envelope.
+    #[prost(bytes = "vec", tag = "9")]
+    pub session_binding: ::prost::alloc::vec::Vec<u8>,
+    #[prost(enumeration = "PrivateNetwork", tag = "10")]
+    pub network: i32,
+    /// Exact finalized checkpoint from the pinned recent serving identity.
+    #[prost(uint32, tag = "11")]
+    pub serving_finalized_checkpoint_height: u32,
+    /// Display-order bytes, matching the protected query codec representation.
+    #[prost(bytes = "vec", tag = "12")]
+    pub serving_finalized_checkpoint_block_hash_display: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "13")]
+    pub schema_version: u32,
+    #[prost(uint64, tag = "14")]
+    pub projection_epoch: u64,
 }
 /// The verifier contributes only a fresh, exactly 64-byte challenge.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -95,6 +113,38 @@ pub struct EvidenceResponse {
     pub checkpoint_block_hash: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "11")]
     pub raw_quote: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PrivateNetwork {
+    Unspecified = 0,
+    Mainnet = 1,
+    Testnet = 2,
+    Regtest = 3,
+}
+impl PrivateNetwork {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PRIVATE_NETWORK_UNSPECIFIED",
+            Self::Mainnet => "PRIVATE_NETWORK_MAINNET",
+            Self::Testnet => "PRIVATE_NETWORK_TESTNET",
+            Self::Regtest => "PRIVATE_NETWORK_REGTEST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PRIVATE_NETWORK_UNSPECIFIED" => Some(Self::Unspecified),
+            "PRIVATE_NETWORK_MAINNET" => Some(Self::Mainnet),
+            "PRIVATE_NETWORK_TESTNET" => Some(Self::Testnet),
+            "PRIVATE_NETWORK_REGTEST" => Some(Self::Regtest),
+            _ => None,
+        }
+    }
 }
 /// Generated server implementations.
 pub mod private_compact_tx_streamer_server {

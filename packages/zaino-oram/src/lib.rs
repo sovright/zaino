@@ -87,12 +87,18 @@ pub use hybrid_sizing::{
     SourceBoundHybridSizingSession,
 };
 #[cfg(feature = "corpus-zaino")]
+pub use inner_codec::client_session::{
+    MainnetClientCodecError, MainnetClientOutcome, MainnetClientPage, MainnetClientSession,
+    MainnetClientUtxo,
+};
+#[cfg(feature = "corpus-zaino")]
 pub use inner_codec::private_service::{
     mainnet_private_query_runtime, private_mainnet_store_reads,
-    private_mainnet_timeout_bucket_millis, EphemeralKeyGeneration, FinalizedProjection,
-    FinalizedProjectionBuilder, MainnetPrivateQueryRuntime, PrivateNetwork, PrivateProjectionShape,
-    PrivateRuntimeDeployment, PrivateRuntimeKeys, ReleasableSessionKeys, SessionBootstrap,
-    PRIVATE_MAINNET_ENVELOPE_BYTES, PRIVATE_PROFILE_ID_BYTES, PRIVATE_RUNTIME_KEY_BYTES,
+    private_mainnet_timeout_bucket_millis, ClientSessionBootstrap, EphemeralKeyGeneration,
+    FinalizedProjection, FinalizedProjectionBuilder, MainnetPrivateQueryRuntime, PrivateNetwork,
+    PrivateProjectionShape, PrivateRuntimeDeployment, PrivateRuntimeKeys, ReleasableSessionKeys,
+    SessionBootstrap, PRIVATE_CLIENT_CONTEXT_VERSION, PRIVATE_MAINNET_ENVELOPE_BYTES,
+    PRIVATE_PROFILE_ID_BYTES, PRIVATE_RUNTIME_KEY_BYTES,
 };
 #[cfg(feature = "wallet-parity-harness")]
 pub use inner_codec::wallet_parity_harness::{
