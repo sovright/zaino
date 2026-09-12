@@ -164,6 +164,20 @@ impl FinalizedServingStore for FinalizedProjectionServingStore {
     fn serving_identity(&self) -> RecentSnapshotIdentity {
         self.identity
     }
+
+    #[cfg(feature = "corpus-zaino")]
+    fn prepare_recent_snapshot(
+        &mut self,
+        recent: &[crate::recent_snapshot::RecentSnapshotSlot],
+    ) -> Result<(), Self::Error> {
+        // A freshly consumed owner has no prepared generation. Every appended
+        // address must be visited, including those absent from the recent tail.
+        let visit = self.appended.clone();
+        self.annotate_generation(&visit, &|address, record| {
+            Some(crate::engine::annotate_record(address, record, recent))
+        })
+        .map_err(|_| FinalizedProjectionServingStoreUnavailable)
+    }
 }
 
 impl fmt::Debug for FinalizedProjectionServingStore {
