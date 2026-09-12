@@ -3,42 +3,51 @@
 set -euo pipefail
 export LC_ALL=C.UTF-8 TZ=UTC
 fail() { echo "custom kernel build refused: $*" >&2; exit 1; }
-[[ $# == 6 ]] || fail 'internal usage: SOURCES CLOSURE EXPECTED_PACKAGES FRAGMENT OUTPUT RUN_LABEL'
-sources=$1 closure=$2 expected_packages=$3 fragment=$4 output=$5 run_label=$6
+[[ $# == 7 ]] || fail 'internal usage: SOURCES CLOSURE LOCAL_REPO EXPECTED_PACKAGES FRAGMENT OUTPUT RUN_LABEL'
+sources=$1 closure=$2 local_repo=$3 expected_packages=$4 fragment=$5 output=$6 run_label=$7
 [[ "$run_label" =~ ^run-[12]$ ]] || fail 'invalid run label'
-for path in "$sources" "$closure" "$expected_packages" "$fragment"; do [[ -e "$path" && ! -L "$path" ]] || fail 'missing regular build input'; done
+for path in "$sources" "$closure" "$local_repo" "$expected_packages" "$fragment"; do [[ -e "$path" && ! -L "$path" ]] || fail 'missing regular build input'; done
 [[ ! -e "$output" ]] || fail 'output already exists'
 mkdir -m 700 -- "$output"
 
-# The closure is authenticated by the host before entry. dpkg consumes only
-# these retained bytes without downloads or network. A failed maintainer script
-# or configuration is fatal.
-mapfile -t debs < <(find "$closure/packages" -mindepth 1 -maxdepth 1 -type f -name '*.deb' -print | LC_ALL=C sort)
-[[ ${#debs[@]} -gt 0 ]] || fail 'empty tool closure'
-# Freeze the observed gawk Pre-Depends edge and satisfy it before the ordinary
-# dpkg transaction. dpkg remains responsible for every other relation and fails
-# normally if the pinned base does not satisfy it.
-prerequisite=''
-gawk_archive=''
-for deb in "${debs[@]}"; do
-  package=$(dpkg-deb -f "$deb" Package)
-  if [[ "$package" == gawk ]]; then
-    [[ -z "$gawk_archive" ]] || fail 'duplicate gawk archive'
-    gawk_archive=$deb
-  elif [[ "$package" == libmpfr6 ]]; then
-    [[ -z "$prerequisite" ]] || fail 'duplicate libmpfr6 prerequisite'
-    prerequisite=$deb
-  fi
-done
-[[ -n "$gawk_archive" ]] || fail 'missing gawk archive'
-[[ $(dpkg-deb -f "$gawk_archive" Version) == 1:5.2.1-2ubuntu0.1 && $(dpkg-deb -f "$gawk_archive" Architecture) == amd64 && $(dpkg-deb -f "$gawk_archive" Pre-Depends) == 'libmpfr6 (>= 3.1.3)' ]] || fail 'unexpected gawk Pre-Depends identity'
-[[ -n "$prerequisite" ]] || fail 'missing libmpfr6 prerequisite'
-[[ $(dpkg-deb -f "$prerequisite" Version) == 4.2.1-1build1.1 && $(dpkg-deb -f "$prerequisite" Architecture) == amd64 ]] || fail 'unexpected libmpfr6 prerequisite identity'
-[[ $(awk -F '\t' '$1=="libmpfr6" && $2=="4.2.1-1build1.1" && $3=="amd64" {n++} END {print n+0}' "$expected_packages") == 1 ]] || fail 'libmpfr6 prerequisite absent from authenticated closure lock'
-DEBIAN_FRONTEND=noninteractive dpkg --unpack "$prerequisite"
-DEBIAN_FRONTEND=noninteractive dpkg --configure libmpfr6:amd64
-DEBIAN_FRONTEND=noninteractive dpkg --unpack "${debs[@]}"
-DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+# The host authenticated every deb before constructing this local repository.
+# A private APT configuration permits only the readonly file source, preserving
+# the complete Pre-Depends transaction without external downloads.
+apt_root=/tmp/zaino-kernel-apt
+mkdir -p "$apt_root/etc/apt.conf.d" "$apt_root/etc/sources.list.d" "$apt_root/etc/preferences.d" "$apt_root/lists/partial" "$apt_root/cache/archives/partial"
+: > "$apt_root/etc/preferences"
+cat > "$apt_root/etc/sources.list" <<EOF
+deb [trusted=yes] file:/inputs/repo ./
+EOF
+cat > "$apt_root/etc/apt.conf" <<EOF
+APT::Architecture "amd64";
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+Acquire::Languages "none";
+Acquire::Retries "0";
+Acquire::http::Proxy "false";
+Acquire::https::Proxy "false";
+Dir::State::status "/var/lib/dpkg/status";
+Dir::State::lists "$apt_root/lists";
+Dir::Cache::archives "$apt_root/cache/archives";
+Dir::Etc "$apt_root/etc";
+Dir::Etc::sourcelist "sources.list";
+Dir::Etc::sourceparts "sources.list.d";
+Dir::Etc::preferences "preferences";
+Dir::Etc::preferencesparts "preferences.d";
+Dir::Etc::main "apt.conf";
+Dir::Etc::parts "apt.conf.d";
+#clear DPkg::Pre-Install-Pkgs;
+#clear DPkg::Post-Invoke;
+#clear APT::Update::Post-Invoke;
+EOF
+export APT_CONFIG="$apt_root/etc/apt.conf"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy no_proxy NO_PROXY
+[[ $(apt-get --version | awk 'NR == 1 { print $2 }') == 2.8.3 ]] || fail 'unexpected apt version'
+apt-get update
+mapfile -t install_requests < <(awk -F '\t' '{print $1 "=" $2}' "$expected_packages")
+[[ ${#install_requests[@]} -gt 0 ]] || fail 'empty tool closure'
+DEBIAN_FRONTEND=noninteractive apt-get --assume-yes --no-remove --no-install-recommends install "${install_requests[@]}"
 [[ -z $(dpkg --audit) ]] || fail 'dpkg audit reports an incomplete installation'
 while IFS=$'\t' read -r package version architecture; do
   [[ $(dpkg-query -W -f='${Version}\t${Architecture}\n' "$package") == "$version"$'\t'"$architecture" ]] || fail "installed package mismatch: $package"

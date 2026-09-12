@@ -92,3 +92,7 @@ source, verifies the effective Kconfig, and builds `bzImage` and `vmlinux`.
 The CI workflow runs this front door on two separate clean runners and compares
 their artifact hashes. Matching builds establish this build-input experiment;
 they do not establish boot, TDX, image-admission, or runtime suitability.
+The builder marks its private `file:` APT repository as trusted only because
+the outer gate has already authenticated every retained package against the
+signed snapshot indexes. That adapter is not a new package-signature claim and
+does not permit another source or network download.
