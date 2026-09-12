@@ -911,7 +911,7 @@ mod tests {
                         challenge: vec![7; CHALLENGE_BYTES],
                     },
                     tonic::codegen::http::uri::PathAndQuery::from_static(
-                        "/zaino.boot.v1.BootSpikeEvidence/GetEvidence",
+                        "/zaino.boot_spike.v1.BootSpikeEvidence/GetEvidence",
                     ),
                     CHALLENGE_BYTES + 16,
                     MAX_RESPONSE_BYTES,
