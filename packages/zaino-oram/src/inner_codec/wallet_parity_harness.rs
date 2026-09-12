@@ -54,8 +54,8 @@ use zeroize::Zeroizing;
 
 use super::{
     private_service::{
-        PrivateNetwork as ServiceNetwork, PrivateProjectionShape, ReleasableSessionKeys,
-        SessionBootstrap,
+        ClientSessionBootstrap, PrivateNetwork as ServiceNetwork, PrivateProjectionShape,
+        ReleasableSessionKeys,
     },
     runtime::PrivateQueryRuntime,
     security_owner::{
@@ -273,8 +273,8 @@ pub fn parity_mismatch(returned: &[WalletUtxo], expected: &[WalletUtxo]) -> Opti
 
 /// The wallet half of one harness session.
 ///
-/// Holds exactly what a wallet would hold if the two unpublished values were
-/// published: the two releasable keys (inside a real protector), the session
+/// Holds exactly what a wallet holds from the complete activated bootstrap
+/// publication: the two releasable keys (inside a real protector), the session
 /// binding, and the serving checkpoint. It holds no store, no token key, and no
 /// journal.
 pub struct WalletSession {
@@ -358,7 +358,9 @@ impl WalletSession {
             .codec
             .decode_response(&FixedEnvelope::from_array(*envelope), &self.protector)
             .map_err(|_| ParityHarnessError::Open)?;
-        let (page, has_more, continuation) = response.into_wallet_parts();
+        let (page, has_more, continuation) = response
+            .into_wallet_parts_for_checkpoint(self.checkpoint)
+            .map_err(|_| ParityHarnessError::Open)?;
         let outcome =
             WalletOutcome::from_outcome(page.outcome()).ok_or(ParityHarnessError::Open)?;
         let utxos = page
@@ -394,7 +396,7 @@ impl std::fmt::Debug for ParityPendingResponse {
 }
 
 /// The serving half of one harness, plus the seam that hands out the two
-/// unpublished values.
+/// owner-issued activated bootstrap values.
 pub trait WalletParityRuntime: FixedEnvelopeRuntime<PARITY_ENVELOPE_BYTES> {
     /// Returns the wallet material for the runtime's current serving epoch.
     ///
@@ -405,12 +407,9 @@ pub trait WalletParityRuntime: FixedEnvelopeRuntime<PARITY_ENVELOPE_BYTES> {
 
     /// Returns the bootstrap material a listener publishes for this harness.
     ///
-    /// Exactly the surface a deployed runtime publishes -- key epoch, the two
-    /// releasable keys, and the compiled profile identifier -- and nothing
-    /// more. It is *insufficient* to form a request, which is the whole reason
-    /// this module exists; [`Self::wallet_session`] is where the two
-    /// unpublished values come from.
-    fn session_bootstrap(&self) -> Result<SessionBootstrap, ParityHarnessError>;
+    /// This is the complete activated owner snapshot: releasable keys, profile,
+    /// session binding, network, and exact serving checkpoint.
+    fn session_bootstrap(&self) -> Result<ClientSessionBootstrap, ParityHarnessError>;
 
     /// Replaces the serving generation with one built from `blocks`.
     ///
@@ -833,17 +832,27 @@ where
         })
     }
 
-    fn session_bootstrap(&self) -> Result<SessionBootstrap, ParityHarnessError> {
+    fn session_bootstrap(&self) -> Result<ClientSessionBootstrap, ParityHarnessError> {
         let profile = mainnet_utxo_history_profile().map_err(|_| ParityHarnessError::Profile)?;
-        Ok(SessionBootstrap {
-            key_epoch: self.shape.key_epoch,
-            keys: ReleasableSessionKeys {
+        let checkpoint = self
+            .runtime
+            .serving_checkpoint()
+            .ok_or(ParityHarnessError::ServingEpoch)?;
+        Ok(ClientSessionBootstrap::for_test(
+            ReleasableSessionKeys {
                 request_key: self.request_key,
                 response_key: self.response_key,
             },
-            profile_label: profile.label(),
-            profile_id: *profile.profile_id(),
-        })
+            self.session_binding,
+            *profile.profile_id(),
+            profile.label(),
+            self.shape.network,
+            checkpoint.height,
+            checkpoint.block_hash_display,
+            checkpoint.schema_version,
+            checkpoint.projection_epoch,
+            self.shape.key_epoch,
+        ))
     }
 
     fn republish(&mut self, blocks: &[IndexedBlock]) -> Result<(), ParityHarnessError> {

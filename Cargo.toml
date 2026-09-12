@@ -14,6 +14,7 @@ members = [
     "live-tests/zaino-testutils",
     "live-tests/clientless",
     "live-tests/e2e",
+    "packages/zaino-private-client",
 ]
 # `container-test` runs a bare `cargo nextest run`, which operates on
 # default-members — so the heavy live-test crates are built and tested only
@@ -70,7 +71,6 @@ tracing-subscriber = { version = "0.3.20", features = [
     "json",
 ] }
 tracing-tree = "0.4"
-nu-ansi-term = "0.50"
 time = { version = "0.3", features = ["macros", "formatting"] }
 
 # Network / RPC
@@ -110,7 +110,6 @@ corez = "0.1"
 
 # Formats
 base64 = "0.22"
-byteorder = "1.5"
 sha2 = "0.10"
 blake2 = "0.10"
 hex = "0.4"

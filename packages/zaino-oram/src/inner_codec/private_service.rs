@@ -45,7 +45,7 @@ use super::{
     composition::{finalized_runtime_owner, RuntimeDeployment, RuntimeKeyMaterial},
     runtime::FinalizedRuntimeOwner,
     security_owner::{OsEntropy, RoundEntropy, RoundMaterialSource},
-    EnvelopeProtector,
+    EnvelopeProtector, SESSION_BINDING_BYTES,
 };
 use crate::{
     canonical_chain::{CanonicalNetwork, PublicChainCheckpoint},
@@ -89,6 +89,8 @@ pub const PRIVATE_RUNTIME_KEY_BYTES: usize = KEY_BYTES;
 /// protection context; it is republished here so a consumer never has to name
 /// the crate-internal profile module.
 pub const PRIVATE_PROFILE_ID_BYTES: usize = PROFILE_ID_BYTES;
+/// Version of the complete client codec context published after refresh.
+pub const PRIVATE_CLIENT_CONTEXT_VERSION: u32 = 1;
 
 /// Chain a private deployment projects and serves.
 ///
@@ -412,7 +414,7 @@ impl std::fmt::Debug for ReleasableSessionKeys {
     }
 }
 
-/// Everything a wallet needs to seal a query, and nothing else.
+/// Process-lifetime keys and profile metadata available before serving readiness.
 ///
 /// A named struct rather than a tuple: `key_epoch` and `keys` are unambiguous
 /// by name where two positional fields would invite a silent swap.
@@ -449,6 +451,141 @@ pub struct SessionBootstrap {
     /// deployment-wide budget parameters, carries no key material, and is
     /// identical for every session served by this runtime.
     pub profile_id: [u8; PRIVATE_PROFILE_ID_BYTES],
+}
+
+/// Owner-derived material for one exact, already-pinned serving epoch.
+pub struct ClientSessionBootstrap {
+    /// Version of this client context schema.
+    context_version: u32,
+    /// Keys a wallet uses for request and response envelopes.
+    keys: ReleasableSessionKeys,
+    /// Random binding held by the same process-lifetime security lease.
+    session_binding: [u8; SESSION_BINDING_BYTES],
+    /// Authoritative compiled privacy profile identifier.
+    profile_id: [u8; PRIVATE_PROFILE_ID_BYTES],
+    /// Human-readable profile label, excluded from authority decisions.
+    profile_label: &'static str,
+    /// Network encoded inside every protected request checkpoint.
+    network: PrivateNetwork,
+    /// Finalized height in the exact pinned serving identity.
+    serving_finalized_checkpoint_height: u32,
+    /// Finalized block hash in the display order encoded by the query codec.
+    serving_finalized_checkpoint_block_hash_display: [u8; 32],
+    /// Record schema encoded inside every protected request checkpoint.
+    schema_version: u32,
+    /// Volatile projection lifecycle encoded inside every request checkpoint.
+    projection_epoch: u64,
+    /// Security key epoch encoded inside every request checkpoint.
+    key_epoch: u64,
+}
+
+impl ClientSessionBootstrap {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_authenticated_parts(
+        keys: ReleasableSessionKeys,
+        session_binding: [u8; SESSION_BINDING_BYTES],
+        profile_id: [u8; PRIVATE_PROFILE_ID_BYTES],
+        profile_label: &'static str,
+        network: PrivateNetwork,
+        serving_finalized_checkpoint_height: u32,
+        serving_finalized_checkpoint_block_hash_display: [u8; 32],
+        schema_version: u32,
+        projection_epoch: u64,
+        key_epoch: u64,
+    ) -> Self {
+        Self {
+            context_version: PRIVATE_CLIENT_CONTEXT_VERSION,
+            keys,
+            session_binding,
+            profile_id,
+            profile_label,
+            network,
+            serving_finalized_checkpoint_height,
+            serving_finalized_checkpoint_block_hash_display,
+            schema_version,
+            projection_epoch,
+            key_epoch,
+        }
+    }
+    /// Returns the codec-context schema version.
+    pub const fn context_version(&self) -> u32 {
+        self.context_version
+    }
+    /// Returns the two releasable envelope keys.
+    pub const fn keys(&self) -> &ReleasableSessionKeys {
+        &self.keys
+    }
+    /// Returns the security lease's random session binding.
+    pub const fn session_binding(&self) -> &[u8; SESSION_BINDING_BYTES] {
+        &self.session_binding
+    }
+    /// Returns the authoritative compiled profile identifier.
+    pub const fn profile_id(&self) -> &[u8; PRIVATE_PROFILE_ID_BYTES] {
+        &self.profile_id
+    }
+    /// Returns the diagnostic profile label.
+    pub const fn profile_label(&self) -> &'static str {
+        self.profile_label
+    }
+    /// Returns the protected checkpoint's network.
+    pub const fn network(&self) -> PrivateNetwork {
+        self.network
+    }
+    /// Returns the finalized height from the pinned serving identity.
+    pub const fn serving_finalized_checkpoint_height(&self) -> u32 {
+        self.serving_finalized_checkpoint_height
+    }
+    /// Returns the codec-order finalized block hash from the pinned serving identity.
+    pub const fn serving_finalized_checkpoint_block_hash_display(&self) -> &[u8; 32] {
+        &self.serving_finalized_checkpoint_block_hash_display
+    }
+    /// Returns the protected record schema version.
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+    /// Returns the volatile projection lifecycle epoch.
+    pub const fn projection_epoch(&self) -> u64 {
+        self.projection_epoch
+    }
+    /// Returns the security key epoch.
+    pub const fn key_epoch(&self) -> u64 {
+        self.key_epoch
+    }
+
+    #[cfg(feature = "wallet-parity-harness")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_test(
+        keys: ReleasableSessionKeys,
+        session_binding: [u8; SESSION_BINDING_BYTES],
+        profile_id: [u8; PRIVATE_PROFILE_ID_BYTES],
+        profile_label: &'static str,
+        network: PrivateNetwork,
+        serving_finalized_checkpoint_height: u32,
+        serving_finalized_checkpoint_block_hash_display: [u8; 32],
+        schema_version: u32,
+        projection_epoch: u64,
+        key_epoch: u64,
+    ) -> Self {
+        Self::from_authenticated_parts(
+            keys,
+            session_binding,
+            profile_id,
+            profile_label,
+            network,
+            serving_finalized_checkpoint_height,
+            serving_finalized_checkpoint_block_hash_display,
+            schema_version,
+            projection_epoch,
+            key_epoch,
+        )
+    }
+}
+
+impl std::fmt::Debug for ClientSessionBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientSessionBootstrap { ..REDACTED.. }")
+    }
 }
 
 impl std::fmt::Debug for SessionBootstrap {
@@ -600,13 +737,15 @@ where
     /// Stops serving once every in-flight response has been released.
     fn shutdown(&mut self) -> Result<(), PrivateQueryUnavailable>;
 
-    /// Returns the material a wallet needs to seal and open envelopes against
-    /// this runtime's live key epoch.
+    /// Returns process-lifetime key and profile material.
     ///
-    /// Available whether or not an epoch has been pinned: the keys and
-    /// profile are fixed at composition time, independent of the serving
-    /// generation `refresh` publishes.
+    /// This is not a complete codec context. Call
+    /// [`Self::client_session_bootstrap`] after refresh for the exact pinned
+    /// serving checkpoint and session binding.
     fn session_bootstrap(&self) -> SessionBootstrap;
+
+    /// Returns a complete client context only after a serving epoch is pinned.
+    fn client_session_bootstrap(&self) -> Result<ClientSessionBootstrap, PrivateQueryUnavailable>;
 }
 
 /// Composes one process-lifetime runtime over the compiled mainnet profile.
@@ -749,6 +888,32 @@ where
             profile_label: self.profile_label,
             profile_id: self.profile_id,
         }
+    }
+
+    fn client_session_bootstrap(&self) -> Result<ClientSessionBootstrap, PrivateQueryUnavailable> {
+        let (checkpoint, session_binding) =
+            self.inner.client_context().ok_or(PrivateQueryUnavailable)?;
+        let network = match checkpoint.network {
+            super::PrivateNetwork::Mainnet => PrivateNetwork::Mainnet,
+            super::PrivateNetwork::Testnet => PrivateNetwork::Testnet,
+            super::PrivateNetwork::Regtest => PrivateNetwork::Regtest,
+        };
+        Ok(ClientSessionBootstrap {
+            context_version: PRIVATE_CLIENT_CONTEXT_VERSION,
+            keys: ReleasableSessionKeys {
+                request_key: self.session_keys.request_key,
+                response_key: self.session_keys.response_key,
+            },
+            session_binding,
+            profile_id: self.profile_id,
+            profile_label: self.profile_label,
+            network,
+            serving_finalized_checkpoint_height: checkpoint.height,
+            serving_finalized_checkpoint_block_hash_display: checkpoint.block_hash_display,
+            schema_version: checkpoint.schema_version,
+            projection_epoch: checkpoint.projection_epoch,
+            key_epoch: checkpoint.key_epoch,
+        })
     }
 
     // Written as an explicit `impl Future` rather than `async fn`: the trait
@@ -930,6 +1095,7 @@ mod tests {
         assert!(runtime
             .query_page([0; PRIVATE_MAINNET_ENVELOPE_BYTES])
             .is_err());
+        assert!(runtime.client_session_bootstrap().is_err());
         MainnetPrivateQueryRuntime::<zaino_state::ValidatorConnector>::shutdown(&mut runtime)
             .map_err(|_| "an idle runtime stops cleanly")?;
         Ok(())
@@ -1099,9 +1265,11 @@ mod tests {
     ))]
     #[tokio::test(flavor = "multi_thread")]
     async fn mainnet_runtime_refreshes_from_a_live_nonempty_recent_snapshot() -> FixtureResult<()> {
+        use crate::{MainnetClientOutcome, MainnetClientSession, PendingFixedEnvelope};
         use zaino_state::test_dependencies::{
             chain_index::CanonicalProjectionTestFixture, TestChainSource,
         };
+        use zaino_state::{AddrScript, ScriptType};
 
         async fn exercise(fixture: &CanonicalProjectionTestFixture) -> FixtureResult<()> {
             let first_input = fixture
@@ -1130,6 +1298,40 @@ mod tests {
                 .refresh(fixture.subscriber(), projection_from_fixture(fixture)?)
                 .await
                 .map_err(|_| "the initial live subscriber refresh succeeds")?;
+            let first_bootstrap = runtime.client_session_bootstrap()?;
+            let first_session =
+                MainnetClientSession::try_from_authenticated_bootstrap(&first_bootstrap)?;
+            let ordinary_cases = fixture.ordinary_utxo_cases().await?;
+            let present = ordinary_cases
+                .iter()
+                .filter(|case| !case.ordinary_utxos().is_empty())
+                .filter(|case| case.ordinary_utxos().len() <= crate::profile::MAINNET_QUERY_SLOTS)
+                .min_by_key(|case| case.ordinary_utxos().len())
+                .ok_or("fixture has no bounded present-address UTXO case")?;
+            let expected = present.ordinary_utxos();
+            let present_request = first_session.seal_query(present.address_script(), 0)?;
+            let present_pending = runtime.query_page(present_request)?;
+            let present_response = *present_pending.try_release_bytes()?;
+            drop(present_pending);
+            let present_page = first_session.open_single_page_response(present_response)?;
+            assert_eq!(present_page.outcome, MainnetClientOutcome::Complete);
+            assert_eq!(present_page.utxos.len(), expected.len());
+            for (actual, expected) in present_page.utxos.iter().zip(expected) {
+                assert_eq!(&actual.txid, expected.txid());
+                assert_eq!(actual.output_index, expected.output_index());
+                assert_eq!(actual.value_zat, expected.value_zat());
+                assert_eq!(actual.height, expected.height());
+                assert_eq!(actual.script, expected.script());
+            }
+            let absent = AddrScript::new([0x5a; 20], ScriptType::P2PKH as u8);
+            let first_request = first_session.seal_query(&absent, 0)?;
+            let stale_request = first_session.seal_query(&absent, 0)?;
+            let first_pending = runtime.query_page(first_request)?;
+            let first_response = *first_pending.try_release_bytes()?;
+            drop(first_pending);
+            let first_page = first_session.open_single_page_response(first_response)?;
+            assert_eq!(first_page.outcome, MainnetClientOutcome::Complete);
+            assert!(first_page.utxos.is_empty());
 
             fixture.mine_blocks(1).await?;
             let advanced_input = fixture
@@ -1143,6 +1345,56 @@ mod tests {
                 .refresh(fixture.subscriber(), projection_from_fixture(fixture)?)
                 .await
                 .map_err(|_| "the advanced live subscriber refresh succeeds")?;
+            match runtime.query_page(stale_request) {
+                Err(_) => {}
+                Ok(pending) => match pending.try_release_bytes() {
+                    Err(_) => {}
+                    Ok(response) => {
+                        assert!(first_session.open_single_page_response(*response).is_err());
+                    }
+                },
+            }
+            let advanced_bootstrap = runtime.client_session_bootstrap()?;
+            assert_ne!(
+                advanced_bootstrap.serving_finalized_checkpoint_height(),
+                first_bootstrap.serving_finalized_checkpoint_height()
+            );
+            let advanced_session =
+                MainnetClientSession::try_from_authenticated_bootstrap(&advanced_bootstrap)?;
+            let advanced_ordinary_cases = fixture.ordinary_utxo_cases().await?;
+            let advanced_expected = advanced_ordinary_cases
+                .iter()
+                .find(|case| case.address_script() == present.address_script())
+                .ok_or("present-address ordinary oracle disappeared after advance")?
+                .ordinary_utxos();
+            let present_request = advanced_session.seal_query(present.address_script(), 0)?;
+            let present_pending = runtime.query_page(present_request)?;
+            let present_response = *present_pending.try_release_bytes()?;
+            drop(present_pending);
+            let present_page = advanced_session.open_single_page_response(present_response)?;
+            assert_eq!(present_page.outcome, MainnetClientOutcome::Complete);
+            assert_eq!(present_page.utxos.len(), advanced_expected.len());
+            for (actual, expected) in present_page.utxos.iter().zip(advanced_expected) {
+                assert_eq!(&actual.txid, expected.txid());
+                assert_eq!(actual.output_index, expected.output_index());
+                assert_eq!(actual.value_zat, expected.value_zat());
+                assert_eq!(actual.height, expected.height());
+                assert_eq!(actual.script, expected.script());
+            }
+            let fresh_request = advanced_session.seal_query(&absent, 0)?;
+            let fresh_pending = runtime.query_page(fresh_request)?;
+            let fresh_response = *fresh_pending.try_release_bytes()?;
+            drop(fresh_pending);
+            let fresh_page = advanced_session.open_single_page_response(fresh_response)?;
+            assert_eq!(fresh_page.outcome, MainnetClientOutcome::Complete);
+            assert!(fresh_page.utxos.is_empty());
+
+            let terminal_request = advanced_session.seal_query(&absent, 0)?;
+            let terminal_pending = runtime.query_page(terminal_request)?;
+            fixture.mine_blocks(1).await?;
+            assert!(terminal_pending.try_release_bytes().is_err());
+            drop(terminal_pending);
+            assert!(runtime.client_session_bootstrap().is_err());
             MainnetPrivateQueryRuntime::<TestChainSource>::shutdown(&mut runtime)
                 .map_err(|_| "the refreshed runtime stops cleanly")?;
             Ok(())

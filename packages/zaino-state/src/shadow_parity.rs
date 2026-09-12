@@ -269,7 +269,7 @@ pub async fn load_ordinary_utxo_shadow_fixture(
     })
 }
 
-async fn observed_standard_cases(
+pub(super) async fn observed_standard_cases(
     blocks: &[TestVectorBlockData],
     source: &MockchainSource,
 ) -> Result<Vec<OrdinaryUtxoShadowCase>, OrdinaryUtxoShadowError> {

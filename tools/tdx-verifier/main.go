@@ -381,9 +381,29 @@ func run(args []string) error {
 	if err := verifyEvidence(ctx, quoteBytes, policy, newGetter(), time.Now()); err != nil {
 		return err
 	}
-	digest := sha256.Sum256(quoteBytes)
-	fmt.Printf("verified quote_sha256=%x scope=quote_signature_current_collateral_and_supplied_field_policy_only\n", digest)
+	if err := writeReceipt(os.Stdout, quoteBytes, policyData, policy.Validate.TdQuoteBodyOptions.ReportData); err != nil {
+		return fmt.Errorf("write receipt: %w", err)
+	}
 	return nil
+}
+
+type verificationReceipt struct {
+	SchemaVersion uint32 `json:"schema_version"`
+	QuoteSHA256   string `json:"quote_sha256"`
+	PolicySHA256  string `json:"policy_sha256"`
+	ReportData    string `json:"report_data"`
+	Scope         string `json:"scope"`
+}
+
+func writeReceipt(w io.Writer, quote, policy, reportData []byte) error {
+	receipt := verificationReceipt{
+		SchemaVersion: 1,
+		QuoteSHA256:   fmt.Sprintf("%x", sha256.Sum256(quote)),
+		PolicySHA256:  fmt.Sprintf("%x", sha256.Sum256(policy)),
+		ReportData:    hex.EncodeToString(reportData),
+		Scope:         "quote_signature_current_collateral_and_supplied_field_policy_only",
+	}
+	return json.NewEncoder(w).Encode(receipt)
 }
 
 func main() {

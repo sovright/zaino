@@ -19,7 +19,7 @@ use tonic::{
 use tonic_prost::{ProstDecoder, ProstEncoder};
 #[cfg(test)]
 use zaino_oram::PrivateQueryUnavailable;
-use zaino_oram::{FixedEnvelopeRuntime, PendingFixedEnvelope, SessionBootstrap};
+use zaino_oram::{ClientSessionBootstrap, FixedEnvelopeRuntime, PendingFixedEnvelope};
 
 use super::attestation::{AttestationChallenge, ConfigFsTsmQuoteProvider, RawEvidenceIssuer};
 use super::{
@@ -267,14 +267,29 @@ impl PrivateSessionBootstrap {
     /// listener's const generic `N`) rather than read off `bootstrap`, since
     /// `SessionBootstrap` deliberately does not carry it: there is exactly one
     /// source of that number and no second copy that could disagree with it.
-    pub(super) fn from_session(bootstrap: &SessionBootstrap, envelope_bytes: usize) -> Self {
+    pub(super) fn from_session(bootstrap: &ClientSessionBootstrap, envelope_bytes: usize) -> Self {
+        let network = match bootstrap.network() {
+            zaino_oram::PrivateNetwork::Mainnet => private_proto::PrivateNetwork::Mainnet,
+            zaino_oram::PrivateNetwork::Testnet => private_proto::PrivateNetwork::Testnet,
+            zaino_oram::PrivateNetwork::Regtest => private_proto::PrivateNetwork::Regtest,
+        };
         Self {
             response: private_proto::BootstrapResponse {
-                key_epoch: bootstrap.key_epoch,
-                request_key: bootstrap.keys.request_key.to_vec(),
-                response_key: bootstrap.keys.response_key.to_vec(),
-                profile_label: bootstrap.profile_label.to_owned(),
-                profile_id: bootstrap.profile_id.to_vec(),
+                key_epoch: bootstrap.key_epoch(),
+                request_key: bootstrap.keys().request_key.to_vec(),
+                response_key: bootstrap.keys().response_key.to_vec(),
+                profile_label: bootstrap.profile_label().to_owned(),
+                profile_id: bootstrap.profile_id().to_vec(),
+                context_version: bootstrap.context_version(),
+                session_binding: bootstrap.session_binding().to_vec(),
+                network: network.into(),
+                serving_finalized_checkpoint_height: bootstrap
+                    .serving_finalized_checkpoint_height(),
+                serving_finalized_checkpoint_block_hash_display: bootstrap
+                    .serving_finalized_checkpoint_block_hash_display()
+                    .to_vec(),
+                schema_version: bootstrap.schema_version(),
+                projection_epoch: bootstrap.projection_epoch(),
                 envelope_bytes: u32::try_from(envelope_bytes).unwrap_or(u32::MAX),
                 // Reserved for a future TDX quote; present and empty in this release.
                 attestation: Vec::new(),
@@ -876,16 +891,22 @@ mod tests {
     /// and the fixture must not let a test pass that assumed otherwise.
     const FIXTURE_PROFILE_ID: [u8; PRIVATE_PROFILE_ID_BYTES] = [0x5a; PRIVATE_PROFILE_ID_BYTES];
 
-    fn session_bootstrap_fixture() -> SessionBootstrap {
-        SessionBootstrap {
-            key_epoch: FIXTURE_KEY_EPOCH,
-            keys: ReleasableSessionKeys {
+    fn session_bootstrap_fixture() -> ClientSessionBootstrap {
+        ClientSessionBootstrap::for_test(
+            ReleasableSessionKeys {
                 request_key: [0x11; PRIVATE_RUNTIME_KEY_BYTES],
                 response_key: [0x22; PRIVATE_RUNTIME_KEY_BYTES],
             },
-            profile_label: "test-profile",
-            profile_id: FIXTURE_PROFILE_ID,
-        }
+            [0x33; 32],
+            FIXTURE_PROFILE_ID,
+            "test-profile",
+            zaino_oram::PrivateNetwork::Regtest,
+            1,
+            [0x44; 32],
+            1,
+            1,
+            FIXTURE_KEY_EPOCH,
+        )
     }
 
     /// The bootstrap half of the surface, built exactly as the listener builds
@@ -1228,6 +1249,13 @@ mod tests {
             envelope_bytes,
             attestation,
             profile_id,
+            context_version,
+            session_binding,
+            network,
+            serving_finalized_checkpoint_height,
+            serving_finalized_checkpoint_block_hash_display,
+            schema_version,
+            projection_epoch,
         } = decoded;
 
         assert_eq!(key_epoch, FIXTURE_KEY_EPOCH);
@@ -1240,6 +1268,13 @@ mod tests {
         );
         // The keys served must be the releasable pair and nothing else.
         assert_ne!(request_key, response_key);
+        assert_eq!(context_version, zaino_oram::PRIVATE_CLIENT_CONTEXT_VERSION);
+        assert_eq!(session_binding.len(), 32);
+        assert_eq!(network, private_proto::PrivateNetwork::Regtest as i32);
+        assert_eq!(serving_finalized_checkpoint_height, 1);
+        assert_eq!(serving_finalized_checkpoint_block_hash_display, [0x44; 32]);
+        assert_eq!(schema_version, 1);
+        assert_eq!(projection_epoch, 1);
 
         // The authoritative identifier is carried at its exact width and is
         // the runtime's own digest, byte for byte.

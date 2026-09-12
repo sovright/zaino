@@ -577,6 +577,16 @@ result does not authorize bootstrap or queries: fresh challenge reconstruction,
 the same live TLS peer, independently approved launch policy, provenance, and
 state-freshness policy remain separate gates.
 
+The [Rust client foundation](../../packages/zaino-private-client/README.md)
+reconstructs the canonical transcript and correlates the pinned verifier's
+bounded result. [ADR-0904](../adr/0904-activated-private-client-bootstrap-context.md)
+defines the activated owner bootstrap and strict production-codec context.
+These components do not yet own a retained TLS stream or grant query admission.
+The [accepted guest design](oram-accepted-guest-design.md) specifies the next
+measured-boot, administration-removal, reproducibility, and negative-test gates;
+the successful administrator-accessible diagnostic quote is not an accepted
+workload image.
+
 The experiment must compose actual attestation verification and quote-bound
 TLS, production-grade envelope cryptography with explicit nonce/key ownership,
 the real typed ORAM backend, bounded recent-state scan/merge, continuation and
@@ -657,6 +667,17 @@ proceed independently once their inputs are frozen:
 2. Compose the local controlled-client query harness with the real backend and
    cryptography. Test full-path correctness, padding, rejection, and reset
    behavior; label local/mock attestation evidence as such.
+   The typed query harness and real subscriber forward-refresh fixture now
+   exist; their [scope note](oram-runtime-refresh-fixture.md) distinguishes
+   refresh coverage from production client-query coverage. Before composing
+   that client, publish an owner-derived bootstrap context from one activated
+   serving epoch, including its exact codec checkpoint and security lease
+   session binding. A finalized attestation checkpoint alone is insufficient
+   to reconstruct the codec context. Accept those additional fields only on
+   the same authenticated TLS stream after workload-policy verification, with
+   explicit policy and generation checks. REPORT_DATA v1 binds a key and
+   challenge; local connection ownership prevents carrying authorization over
+   reconnect, but the quote does not identify a unique TLS transport session.
 3. On the selected isolated TDX target, bind the execution artifacts and pass
    negative attestation/admin/session checks before test-query admission.
 4. Capture the pre-registered host observations and trusted diagnostic traces;

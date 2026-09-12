@@ -45,6 +45,8 @@ mod xchacha20;
 // out would mean widening all of them, which is exactly the hiding the codec
 // is built around. Only the opaque `impl Trait` it returns leaves the crate.
 #[cfg(feature = "corpus-zaino")]
+pub(super) mod client_session;
+#[cfg(feature = "corpus-zaino")]
 pub(super) mod private_service;
 
 // Test-support only. Same reason for living here as `private_service`: it
@@ -209,6 +211,23 @@ struct PrivateQueryResponse<const RESPONSE_SLOTS: usize> {
 }
 
 impl<const RESPONSE_SLOTS: usize> PrivateQueryResponse<RESPONSE_SLOTS> {
+    pub(super) fn into_wallet_parts_for_checkpoint(
+        self,
+        expected: PrivateQueryCheckpoint,
+    ) -> Result<
+        (
+            UtxoResultPage<RESPONSE_SLOTS>,
+            bool,
+            Option<ContinuationToken>,
+        ),
+        InnerCodecError,
+    > {
+        if self.checkpoint != expected {
+            return Err(InnerCodecError::CheckpointMismatch);
+        }
+        Ok((self.page, self.has_more, self.continuation))
+    }
+
     fn new(
         checkpoint: PrivateQueryCheckpoint,
         page: UtxoResultPage<RESPONSE_SLOTS>,
@@ -222,24 +241,6 @@ impl<const RESPONSE_SLOTS: usize> PrivateQueryResponse<RESPONSE_SLOTS> {
             has_more,
             continuation,
         })
-    }
-}
-
-#[cfg(feature = "wallet-parity-harness")]
-impl<const RESPONSE_SLOTS: usize> PrivateQueryResponse<RESPONSE_SLOTS> {
-    /// Decomposes a decoded response for a wallet-side reader.
-    ///
-    /// The checkpoint is deliberately dropped: a wallet already knows which
-    /// checkpoint it sealed under, and re-reading the one the server echoed
-    /// back would invite a caller to trust it.
-    pub(super) fn into_wallet_parts(
-        self,
-    ) -> (
-        UtxoResultPage<RESPONSE_SLOTS>,
-        bool,
-        Option<ContinuationToken>,
-    ) {
-        (self.page, self.has_more, self.continuation)
     }
 }
 
@@ -987,6 +988,7 @@ enum InnerCodecError {
     DirectionMismatch,
     ProfileMismatch,
     SessionBindingMismatch,
+    CheckpointMismatch,
     UnknownNetwork,
     UnknownOutcome,
     InvalidFlags,
@@ -1043,6 +1045,9 @@ impl fmt::Display for InnerCodecError {
             Self::ProfileMismatch => f.write_str("private envelope profile does not match"),
             Self::SessionBindingMismatch => {
                 f.write_str("private envelope session binding does not match")
+            }
+            Self::CheckpointMismatch => {
+                f.write_str("private response checkpoint does not match the client session")
             }
             Self::UnknownNetwork => f.write_str("private envelope network tag is invalid"),
             Self::UnknownOutcome => f.write_str("private response outcome is invalid"),
@@ -1283,6 +1288,15 @@ mod tests {
     fn response() -> PrivateQueryResponse<RESPONSE_SLOTS> {
         PrivateQueryResponse::new(checkpoint(), complete_page(), false, None)
             .expect("complete test response is canonical")
+    }
+
+    #[test]
+    fn wallet_response_refuses_a_different_authenticated_checkpoint() {
+        let other = checkpoint_for(PrivateNetwork::Testnet);
+        assert_eq!(
+            response().into_wallet_parts_for_checkpoint(other),
+            Err(InnerCodecError::CheckpointMismatch)
+        );
     }
 
     fn digest<const N: usize>(envelope: &FixedEnvelope<N>) -> [u8; 32] {

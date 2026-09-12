@@ -13,8 +13,10 @@ networking, IAP-only TCP 22, no service account, the one-disk NVMe layout,
 Shielded VM settings, and the 21,600-second delete policy. The last recorded
 start was `2026-09-12T15:39:34.939Z`, making the no-restart runtime deadline
 approximately `2026-09-12T21:39:34.939Z`; Compute Engine did not return a
-separate `terminationTimestamp`. Manual teardown remains required after the
-bounded follow-up work.
+separate `terminationTimestamp`. The manifest-guarded manual teardown completed
+at `2026-09-12T16:12:33Z`, deleting the recorded instance, boot disk, firewall,
+subnet, and network. Its receipt is retained beside the manifest as
+`teardown-verified.txt`.
 
 The successful second collection round is retained at
 `/private/tmp/zaino-tdx-platform-20260912-run3/baseline-quote-round2`:
@@ -34,6 +36,14 @@ This parser check does not validate the signature or collateral. The quote
 begins with the little-endian QuoteV4 version field. The guest reported
 `tdx_guest=loaded`, Linux `7.0.0-1011-gcp`,
 15,374,100 KiB total memory, and no swap.
+
+Subsequent [client verifier work](https://github.com/sovright/zaino/pull/146)
+verified this same signed quote with authenticated Intel collateral and a
+diagnostic-derived test policy. The quote and signed collateral are retained
+as deterministic test fixtures. That test policy qualifies cryptographic
+plumbing only; it is not an approved image policy and supplies no private-query
+admission. This later result does not change the limited scope of the original
+acquisition diagnostic.
 
 Run 1 and run 2 stopped on strict API-representation assertions before guest
 access. Their guarded cleanup deleted each recorded instance, boot disk,

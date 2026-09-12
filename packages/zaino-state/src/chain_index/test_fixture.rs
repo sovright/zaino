@@ -7,13 +7,22 @@ use zaino_common::{network::ActivationHeights, DatabaseConfig, StorageConfig};
 
 use super::{
     finalized_height_floor,
-    shadow_vectors::{build_active_mockchain_source, load_test_vectors, try_indexed_block_chain},
+    shadow_vectors::{
+        build_active_mockchain_source, load_test_vectors, try_indexed_block_chain,
+        TestVectorBlockData,
+    },
     source::{mockchain_source::MockchainSource, BlockchainSource},
     NodeBackedChainIndex, NodeBackedChainIndexSubscriber,
 };
+use crate::shadow_parity::{
+    observed_standard_cases, OrdinaryUtxoShadowCase, OrdinaryUtxoShadowError,
+};
 use crate::{ChainIndexConfig, IndexedBlock};
 
-const INITIAL_ACTIVE_HEIGHT: u32 = 150;
+// Height 100 keeps the checked-in starting window within the production
+// 256-slot recent-snapshot budget. The next block also advances the finalized
+// boundary from genesis to height one.
+const INITIAL_ACTIVE_HEIGHT: u32 = 100;
 const READY_BUDGET: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -23,6 +32,7 @@ pub struct CanonicalProjectionTestFixture {
     subscriber: NodeBackedChainIndexSubscriber<MockchainSource>,
     source: MockchainSource,
     indexed_blocks: Vec<IndexedBlock>,
+    vector_blocks: Vec<TestVectorBlockData>,
     _database_dir: TempDir,
 }
 
@@ -41,6 +51,13 @@ impl std::error::Error for CanonicalProjectionTestFixtureError {}
 impl CanonicalProjectionTestFixture {
     /// Starts an actual persistent chain index over the checked-in regtest chain.
     pub async fn start() -> Result<Self, CanonicalProjectionTestFixtureError> {
+        Self::start_at_height(INITIAL_ACTIVE_HEIGHT).await
+    }
+
+    /// Starts the fixture at a chosen checked-in height for bounded capacity tests.
+    pub async fn start_at_height(
+        active_height: u32,
+    ) -> Result<Self, CanonicalProjectionTestFixtureError> {
         let vectors = load_test_vectors().map_err(|error| {
             CanonicalProjectionTestFixtureError(format!("test vectors could not load: {error}"))
         })?;
@@ -51,7 +68,12 @@ impl CanonicalProjectionTestFixture {
                     "test vectors could not be indexed: {error}"
                 ))
             })?;
-        let source = build_active_mockchain_source(INITIAL_ACTIVE_HEIGHT, vectors.blocks);
+        if active_height as usize >= vectors.blocks.len() {
+            return Err(CanonicalProjectionTestFixtureError(format!(
+                "fixture active height {active_height} exceeds checked-in chain"
+            )));
+        }
+        let source = build_active_mockchain_source(active_height, vectors.blocks.clone());
         let database_dir = tempfile::tempdir().map_err(|error| {
             CanonicalProjectionTestFixtureError(format!(
                 "fixture database directory could not be created: {error}"
@@ -82,6 +104,7 @@ impl CanonicalProjectionTestFixture {
             subscriber,
             source,
             indexed_blocks,
+            vector_blocks: vectors.blocks,
             _database_dir: database_dir,
         };
         if let Err(error) = fixture.await_active_tip().await {
@@ -100,6 +123,21 @@ impl CanonicalProjectionTestFixture {
     pub fn finalized_blocks(&self) -> &[IndexedBlock] {
         let finalized_len = finalized_height_floor(self.source.active_height()).0 as usize + 1;
         &self.indexed_blocks[..finalized_len]
+    }
+
+    /// Queries the ordinary source for standard-address UTXOs at the fixture's active tip.
+    pub async fn ordinary_utxo_cases(
+        &self,
+    ) -> Result<Vec<OrdinaryUtxoShadowCase>, OrdinaryUtxoShadowError> {
+        let active_len = self.source.active_height() as usize + 1;
+        let blocks = self.vector_blocks.get(..active_len).ok_or(
+            OrdinaryUtxoShadowError::MissingCheckpoint {
+                height: self.source.active_height(),
+            },
+        )?;
+        // Reuse the independent ordinary-source oracle used by shadow parity;
+        // it applies the source's own spent-output filtering.
+        observed_standard_cases(blocks, &self.source).await
     }
 
     /// Advances the public source and waits until the real subscriber publishes that tip.
@@ -185,6 +223,13 @@ mod tests {
                 .await?;
             assert!(!initial.recent().blocks().is_empty());
             let initial_tip = initial.recent().tip();
+            let initial_cases = fixture.ordinary_utxo_cases().await?;
+            let stable_case = initial_cases
+                .iter()
+                .filter(|case| !case.ordinary_utxos().is_empty())
+                .min_by_key(|case| case.ordinary_utxos().len())
+                .ok_or("fixture has no present-address UTXO case at height 100")?;
+            let stable_address = stable_case.address_script().clone();
 
             fixture.mine_blocks(1).await?;
             let advanced = fixture
@@ -193,6 +238,11 @@ mod tests {
                 .await?;
             assert!(!advanced.recent().blocks().is_empty());
             assert_ne!(advanced.recent().tip(), initial_tip);
+            let advanced_cases = fixture.ordinary_utxo_cases().await?;
+            advanced_cases
+                .iter()
+                .find(|case| case.address_script() == &stable_address)
+                .ok_or("height-100 ordinary UTXO address disappeared at height 101")?;
             Ok::<_, Box<dyn std::error::Error>>(())
         }
         .await;

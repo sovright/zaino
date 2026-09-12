@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -22,6 +24,22 @@ import (
 	"github.com/google/go-tdx-guest/validate"
 	"golang.org/x/sys/unix"
 )
+
+func TestWriteReceiptCorrelatesExactBytes(t *testing.T) {
+	var out bytes.Buffer
+	if err := writeReceipt(&out, []byte("quote"), []byte("policy"), []byte{0, 1, 255}); err != nil {
+		t.Fatal(err)
+	}
+	var got verificationReceipt
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SchemaVersion != 1 || got.Scope != "quote_signature_current_collateral_and_supplied_field_policy_only" ||
+		got.QuoteSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte("quote"))) ||
+		got.PolicySHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte("policy"))) || got.ReportData != "0001ff" {
+		t.Fatalf("unexpected receipt: %+v", got)
+	}
+}
 
 type recordedResponse struct {
 	Header map[string][]string `json:"header"`

@@ -270,7 +270,7 @@ mod tests {
         assert!(private_proto::BootstrapRequest {}
             .encode_to_vec()
             .is_empty());
-        let bootstrap = private_proto::BootstrapResponse {
+        let mut bootstrap = private_proto::BootstrapResponse {
             key_epoch: 1,
             request_key: vec![2],
             response_key: vec![3],
@@ -278,10 +278,28 @@ mod tests {
             envelope_bytes: 5,
             attestation: vec![6],
             profile_id: vec![7],
+            context_version: 0,
+            session_binding: Vec::new(),
+            network: private_proto::PrivateNetwork::Unspecified.into(),
+            serving_finalized_checkpoint_height: 0,
+            serving_finalized_checkpoint_block_hash_display: Vec::new(),
+            schema_version: 0,
+            projection_epoch: 0,
         };
         assert_eq!(
             bootstrap.encode_to_vec(),
             [8, 1, 18, 1, 2, 26, 1, 3, 34, 1, b'p', 40, 5, 50, 1, 6, 58, 1, 7]
+        );
+        bootstrap.context_version = 1;
+        bootstrap.session_binding = vec![9];
+        bootstrap.network = private_proto::PrivateNetwork::Regtest.into();
+        bootstrap.serving_finalized_checkpoint_height = 11;
+        bootstrap.serving_finalized_checkpoint_block_hash_display = vec![12];
+        bootstrap.schema_version = 13;
+        bootstrap.projection_epoch = 14;
+        assert_eq!(
+            &bootstrap.encode_to_vec()[19..],
+            [64, 1, 74, 1, 9, 80, 3, 88, 11, 98, 1, 12, 104, 13, 112, 14]
         );
         let request = private_proto::EvidenceRequest {
             challenge: vec![0xaa; 64],

@@ -1688,16 +1688,18 @@ async fn serve_private_surface(
         .refresh(&subscriber.indexer, projection)
         .await
         .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
-    let session_bootstrap = runtime.session_bootstrap();
+    let session_bootstrap = runtime
+        .client_session_bootstrap()
+        .map_err(|_| RunnerError::PrivateRuntimeUnavailable)?;
     // Refresh has accepted the exact finalized generation identified above.
     // This function performs no subsequent refresh while the listener serves.
     let evidence_binding = if tls.ephemeral_spki_sha256().is_ok() {
         Some(AttestationWorkloadBinding::new(
             running_executable_sha256()?,
-            private_evidence_config_sha256(source_backend, &session_bootstrap.profile_id),
-            session_bootstrap.profile_id,
+            private_evidence_config_sha256(source_backend, session_bootstrap.profile_id()),
+            *session_bootstrap.profile_id(),
             PRIVATE_SCHEMA_VERSION,
-            session_bootstrap.key_epoch,
+            session_bootstrap.key_epoch(),
             committed_height,
             checkpoint_block_hash,
         ))

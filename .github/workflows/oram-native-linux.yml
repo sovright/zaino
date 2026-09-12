@@ -12,6 +12,7 @@ on:
       - 'packages/zaino-common/**'
       - 'packages/zaino-fetch/**'
       - 'packages/zaino-oram/**'
+      - 'packages/zaino-private-client/**'
       - 'packages/zaino-proto/**'
       - 'packages/zaino-state/**'
       - 'packages/zainod-oram/**'
@@ -27,6 +28,7 @@ on:
       - 'packages/zaino-common/**'
       - 'packages/zaino-fetch/**'
       - 'packages/zaino-oram/**'
+      - 'packages/zaino-private-client/**'
       - 'packages/zaino-proto/**'
       - 'packages/zaino-state/**'
       - 'packages/zainod-oram/**'
@@ -40,6 +42,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  private-client:
+    name: Private client (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    # The production codec currently pulls in the chain-index native dependency
+    # closure; cold Clippy plus test builds need the same budget as the runner.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Verify pinned toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version --verbose
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: nextest@0.9.140
+          fallback: none
+      - name: Check client
+        run: >-
+          cargo clippy -p zaino-private-client --all-targets --no-deps --locked --
+          -D warnings -D clippy::unwrap_used
+      - name: Test client
+        run: >-
+          cargo nextest run -p zaino-private-client --locked
+          --no-tests fail --status-level fail
+
   zaino-oram:
     name: zaino-oram (Linux x86_64)
     runs-on: ubuntu-24.04

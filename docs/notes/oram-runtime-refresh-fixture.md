@@ -10,14 +10,22 @@ database is removed.
 The Linux `rostl-experimental` integration test uses that subscriber to refresh
 `MainnetPrivateQueryRuntime` from a nonempty recent snapshot, advances one
 block, rebuilds the typed finalized generation at the new seam, and refreshes
-again. Linux CI must execute this test before the path is described as tested;
+again. It also compares one present-address result against the ordinary
+subscriber's independently filtered UTXO result, including txid, output index,
+value, height, and script. Linux CI must execute this test before the path is described as tested;
 macOS only exercises the subscriber fixture because the typed backend fails
 closed there.
 
-This slice does not test a sealed wallet query across refresh. The production
-`SessionBootstrap` omits the serving checkpoint, network, and schema material
-that `PrivateQueryCodec` needs to form a request, and the only current wallet
-session constructor belongs to the isolated parity harness. Publishing and
-validating that client binding is a separate complete-path prerequisite. The
-fixture's source is a fixed linear chain with monotonic advancement, so it also
+The activated bootstrap context now lets this test seal and open a real
+first-page UTXO query before refresh, reject acceptance of a request sealed for
+the retired checkpoint, and seal a fresh successful query afterward. The
+query covers both that present address and the corpus's known-absent address.
+The
+client codec refuses a response that requires continuation, so this is not yet
+a pageable or complete wallet codec. It is currently compiled with
+`corpus-zaino`, which also brings the state/backend dependency graph into the
+client's trusted code; a later feature split is required before calling that
+dependency surface minimal.
+
+The fixture's source is a fixed linear chain with monotonic advancement, so it
 does not provide or claim deterministic reorg coverage.
