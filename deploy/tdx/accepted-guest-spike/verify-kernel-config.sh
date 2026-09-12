@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=kernel-config-common.sh
+source "$root/kernel-config-common.sh"
 policy="$root/kernel-config-policy.json"
 fail() { echo "kernel config refused: $*" >&2; exit 1; }
+allows_hidden_absence() {
+  case "$1" in
+    CONFIG_KEXEC_CORE|CONFIG_HIBERNATION|CONFIG_PM_SLEEP) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 [[ $# == 1 ]] || fail 'usage: verify-kernel-config.sh CONFIG_FILE'
 config=$1
 [[ -f "$config" && ! -L "$config" ]] || fail 'config is not a regular file'
 bytes=$(wc -c < "$config" | tr -d ' ')
 [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 && "$bytes" -le 2097152 ]] || fail 'config byte budget'
+refuse_duplicate_kernel_config_symbols "$config" || fail 'duplicate or conflicting config assignments'
 jq -e '
   .schema == "zaino-boot-spike-kernel-config-policy-v1" and
   (.required | type == "object" and length > 0 and all(keys[]; test("^CONFIG_[A-Z0-9_]+$"))) and
@@ -24,7 +33,11 @@ while IFS=$'\t' read -r name accepted; do
 done < <(jq -r '.required | to_entries[] | [.key, (.value | join(","))] | @tsv' "$policy")
 while IFS= read -r name; do
   count=$(awk -v name="$name" '$0 ~ ("^" name "=") || $0 == ("# " name " is not set") { n++ } END { print n+0 }' "$config")
-  [[ "$count" == 1 ]] || fail "missing or duplicate prohibition: $name"
-  grep -Fqx "# $name is not set" "$config" || fail "prohibited setting enabled: $name"
+  [[ "$count" -le 1 ]] || fail "duplicate prohibition: $name"
+  if [[ "$count" == 0 ]]; then
+    allows_hidden_absence "$name" || fail "missing prohibition: $name"
+  else
+    grep -Fqx "# $name is not set" "$config" || fail "prohibited setting enabled: $name"
+  fi
 done < <(jq -r '.prohibited[]' "$policy")
 echo 'Verified static kernel config policy. Halt fixes, runtime devices, and image admission remain unverified.'

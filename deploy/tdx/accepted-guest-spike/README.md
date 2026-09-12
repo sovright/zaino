@@ -96,3 +96,26 @@ The builder marks its private `file:` APT repository as trusted only because
 the outer gate has already authenticated every retained package against the
 signed snapshot indexes. That adapter is not a new package-signature claim and
 does not permit another source or network download.
+
+The effective-config verifier accepts an omitted disabled symbol only from a
+closed list reviewed against the selected 6.17 source. These symbols are hidden
+when their controlling dependency is disabled, so Kconfig represents `n` by
+absence. Unknown omissions, duplicate settings, and any enabled value remain
+refusals. `CONFIG_TSM_REPORTS` is checked by the static policy after the enabled
+TDX guest driver selects it; it is not asserted as an independent hidden input.
+`CONFIG_DEVKMEM` does not exist in the selected 6.17 Kconfig and is therefore
+not represented as a disabled or hidden setting. x86 selects
+`CONFIG_PERF_EVENTS=y` unconditionally. That enabled framework is accepted only
+with the separately tested guest boundary: the production process drops and
+verifies all five capability sets, refuses inherited descriptors, and its
+synchronized seccomp filter traps `perf_event_open`. Host PMU and side-channel
+closure and the real C3 guest remain qualification gates.
+
+`CONFIG_EXPERT=y` is required to disable standard kernel facilities and itself
+selects the `DEBUG_KERNEL` meta-symbol. The fragment therefore records that
+forced value while continuing to prohibit the concrete debugger, tracing,
+console, core-export, and alternate-execution facilities. Enabling EXPERT also
+exposes defaults that `allnoconfig` otherwise clears: the guest explicitly
+enables SHMEM for its required tmpfs mounts and PROC_SYSCTL for the production
+capability-bound lookup. PROC_SYSCTL selects the hidden SYSCTL symbol. No tmpfs
+ACL or extended-attribute option is enabled without a guest consumer.

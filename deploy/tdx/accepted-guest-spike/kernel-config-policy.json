@@ -8,16 +8,24 @@
     "CONFIG_GVE": ["y", "m"],
     "CONFIG_INTEL_TDX_GUEST": ["y"],
     "CONFIG_PCI_MSI": ["y"],
+    "CONFIG_PERF_EVENTS": ["y"],
+    "CONFIG_PROC_SYSCTL": ["y"],
+    "CONFIG_SHMEM": ["y"],
     "CONFIG_SWIOTLB": ["y"],
+    "CONFIG_SYSCTL": ["y"],
     "CONFIG_TDX_GUEST_DRIVER": ["y", "m"],
+    "CONFIG_TMPFS": ["y"],
     "CONFIG_TSM_REPORTS": ["y"]
   },
   "prohibited": [
-    "CONFIG_DEBUG_KERNEL",
+    "CONFIG_DEBUG_FS",
+    "CONFIG_FTRACE",
     "CONFIG_HIBERNATION",
+    "CONFIG_KGDB",
     "CONFIG_KEXEC",
     "CONFIG_KEXEC_CORE",
     "CONFIG_KEXEC_FILE",
+    "CONFIG_KPROBES",
     "CONFIG_PM_SLEEP"
   ],
   "scope": "static-config-policy-only;halt-fixes-runtime-device-and-image-admission-unverified"
