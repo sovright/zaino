@@ -648,8 +648,10 @@ Start from the [current Track B prerequisite audit](oram-track-b-mainnet-prerequ
 which checks the retained insertion/hybrid artifact lineage. Its original
 capture-availability limitation is superseded by the
 [recovery ledger](oram-mainnet-capture-recovery.md): the exact three-file capture
-is now retained in the dedicated project's private evidence bucket. Current
-typed-reader revalidation and hardware capacity/recovery gates remain separate.
+is now retained in the dedicated project's private evidence bucket. The
+[current-reader rerun](oram-mainnet-revalidation-2026-09-12.md) accepted the
+capture and exactly reproduced the historical logical qualification digest.
+Growth, calibrated hardware capacity, and full-service recovery remain open.
 The
 [recent-state width analysis](recent-snapshot-scan-width.md) records negative
 cost evidence and design alternatives at its named boundaries. Main `753f3fc5`
