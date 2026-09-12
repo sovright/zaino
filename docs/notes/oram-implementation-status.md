@@ -25,6 +25,15 @@ clear any Phase 0 gate.
 
 ## 2026-09-12 — finalized-record preparation at coherent publication
 
+At integration head `47bb6de2`, native Linux
+[run 34717151138](https://github.com/sovright/zaino/actions/runs/34717151138)
+passed the exact live-refresh regression (1/1) and the remaining selected
+all-feature ORAM tests (725/725, three skipped). Runner Clippy then failed
+because a Linux-only historical-geometry test named `ArtifactError` without
+an import. The test now uses the fully qualified error type; runner tests,
+codegen checks, release packaging, and real-capture execution still require
+their own successful native evidence.
+
 The native live-refresh regression at integration head `2cca5a82` reached the
 advanced present query, then refused response release with
 `projection_not_ready=true`, `store_failure=false`, and

@@ -3560,7 +3560,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(ArtifactError::InvalidArtifact {
+            Err(crate::corpus_artifact::ArtifactError::InvalidArtifact {
                 reason: "historical geometry input or checked native arithmetic was rejected"
             })
         ));
