@@ -659,6 +659,25 @@ struct MainnetSizingQualificationDto {
 }
 
 impl MainnetSizingQualification {
+    pub(crate) fn is_exact_historical_176_gib_model(&self) -> bool {
+        self.model.growth_horizon_years == 0
+            && self.model.annual_growth_bps == 0
+            && self.model.directory_capacity == 16_777_216
+            && self.model.directory_admission_limit == 9_193_009
+            && self.model.event_capacity == 536_870_912
+            && self.model.event_admission_limit == 351_872_272
+            && self.model.max_events_per_address == 3_360_022
+            && self.model.position_map_entry_bytes == 4
+            && self.model.backend_expansion_bps == 10_000
+            && self.model.tdx_memory_bytes == 188_978_561_024
+            && self.model.required_headroom_bps == 3_000
+            && self.compiled_record_bytes.directory_cell_bytes == 38
+            && self.compiled_record_bytes.event_cell_bytes == 82
+            && self.checkpoint.height == 3_425_046
+            && self.checkpoint.hash
+                == "0000000000a1014e9564513f1d5e5ddaba027c032857a236ca3178e9a8983ad4"
+    }
+
     fn new(
         checkpoint: MainnetCorpusCheckpoint,
         model: MainnetSizingModel,

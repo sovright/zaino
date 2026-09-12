@@ -145,3 +145,11 @@ members = [
     "GrowthDeltaWindow::empty (method) at packages/zaino-oram/src/hybrid_sizing.rs:1583-1601",
     "TraceRecorder::new (method) at packages/zaino-oram/src/trace.rs:285-304",
 ]
+
+[[ignore]]
+fingerprint = "c73d3c555d7c8b7b"
+reason = "PERMANENT. Structural coincidence. These match arms map unrelated closed enums to diagnostic labels (hardened artifact file roles versus sizing-overflow quantities); a shared function would erase their type separation without removing business logic."
+members = [
+    "FileRole::label (method) at packages/zainod-oram/src/execution_identity.rs:233-247",
+    "OverflowQuantity::description (method) at packages/zaino-oram/src/sizing.rs:443-458",
+]
