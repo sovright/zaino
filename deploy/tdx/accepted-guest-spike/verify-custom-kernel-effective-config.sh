@@ -7,7 +7,7 @@ source "$root/kernel-config-common.sh"
 fail() { echo "custom kernel effective config refused: $*" >&2; exit 1; }
 allows_hidden_absence() {
   case "$1" in
-    CONFIG_KEXEC_CORE|CONFIG_HIBERNATION|CONFIG_PM_SLEEP|CONFIG_PROC_VMCORE|CONFIG_NETCONSOLE|CONFIG_DEBUG_INFO|CONFIG_KGDB|CONFIG_RUST) return 0 ;;
+    CONFIG_KEXEC_CORE|CONFIG_HIBERNATION|CONFIG_PM_SLEEP|CONFIG_PROC_VMCORE|CONFIG_SERIAL_8250|CONFIG_NETCONSOLE|CONFIG_DEBUG_INFO|CONFIG_KGDB|CONFIG_RUST) return 0 ;;
     *) return 1 ;;
   esac
 }

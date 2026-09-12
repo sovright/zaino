@@ -5,6 +5,7 @@ temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT
 cp -- "$root/custom-kernel.config" "$temporary/effective.config"
 printf '%s\n' 'CONFIG_TSM_REPORTS=y' >> "$temporary/effective.config"
+printf '%s\n' 'CONFIG_SYSCTL=y' >> "$temporary/effective.config"
 bash "$root/verify-custom-kernel-effective-config.sh" "$temporary/effective.config" >/dev/null
 cp -- "$temporary/effective.config" "$temporary/mutated.config"
 awk '{ if ($0 == "CONFIG_NR_CPUS=4") print "CONFIG_NR_CPUS=8"; else print }' "$temporary/mutated.config" > "$temporary/changed"

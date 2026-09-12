@@ -100,3 +100,12 @@ with the separately tested guest boundary: the production process drops and
 verifies all five capability sets, refuses inherited descriptors, and its
 synchronized seccomp filter traps `perf_event_open`. Host PMU and side-channel
 closure and the real C3 guest remain qualification gates.
+
+`CONFIG_EXPERT=y` is required to disable standard kernel facilities and itself
+selects the `DEBUG_KERNEL` meta-symbol. The fragment therefore records that
+forced value while continuing to prohibit the concrete debugger, tracing,
+console, core-export, and alternate-execution facilities. Enabling EXPERT also
+exposes defaults that `allnoconfig` otherwise clears: the guest explicitly
+enables SHMEM for its required tmpfs mounts and PROC_SYSCTL for the production
+capability-bound lookup. PROC_SYSCTL selects the hidden SYSCTL symbol. No tmpfs
+ACL or extended-attribute option is enabled without a guest consumer.
