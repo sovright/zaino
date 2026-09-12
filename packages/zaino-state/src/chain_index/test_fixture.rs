@@ -20,8 +20,9 @@ use crate::shadow_parity::{
 use crate::{ChainIndexConfig, IndexedBlock};
 
 // Height 100 keeps the checked-in starting window within the production
-// 256-slot recent-snapshot budget. The next block also advances the finalized
-// boundary from genesis to height one.
+// 256-slot recent-snapshot budget. With `fast-test-seam` (or in-crate tests),
+// the next block also advances the finalized boundary from genesis to height
+// one. Cross-crate tests must enable that feature to exercise seam movement.
 const INITIAL_ACTIVE_HEIGHT: u32 = 100;
 const READY_BUDGET: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(25);

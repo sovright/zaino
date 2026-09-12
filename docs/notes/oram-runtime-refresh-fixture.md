@@ -36,5 +36,13 @@ to prove that the production-width controller refuses that larger capture while
 a deliberately 512-slot test controller accepts it. This changes test input
 only; the production profile and capacity bound are unchanged.
 
+The ORAM crate's development dependency explicitly enables the existing
+`zaino-state/fast-test-seam` feature. Without it, the cross-crate test uses the
+full production finalization depth and both heights 100 and 101 still finalize
+at genesis; a recent-tip advance alone cannot test retirement of a finalized
+checkpoint. The test checks that the finalized bootstrap height increases
+before submitting the old checkpoint's request. Ordinary production builds
+retain the full finalization depth.
+
 The fixture's source is a fixed linear chain with monotonic advancement, so it
 does not provide or claim deterministic reorg coverage.
