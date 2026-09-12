@@ -1,8 +1,17 @@
 # ORAM Track B mainnet evidence prerequisites — 2026-09-12
 
-Status: retained derivative artifact hashes and recorded lineage checked;
-original capture revalidation, physical calibration, and a current authorized
-execution host remain open.
+Status: historical prerequisite audit, superseded for capture availability and
+semantic revalidation; physical calibration and a current authorized execution
+host remain open.
+
+The later [capture recovery ledger](oram-mainnet-capture-recovery.md) records
+recovery and private retention of the exact three-file bundle, and the
+[current-reader revalidation](oram-mainnet-revalidation-2026-09-12.md) records
+successful semantic validation plus exact reproduction of the historical
+logical sizing digest. Statements below that the original capture was absent
+describe the earlier scoped cloud inventory and are retained as historical
+evidence. They are not the current Track B status and do not authorize a new
+capture or physical calibration run.
 
 Later implementation updates supersede this audit's proposed attestation
 implementation: the [raw evidence v1 contract](oram-raw-evidence-v1.md) and
