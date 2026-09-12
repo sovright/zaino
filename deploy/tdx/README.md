@@ -8,6 +8,23 @@ not provision the 176-GiB mainnet sizing target or define a production image.
 
 ## Pinned target
 
+All new ORAM cloud work uses project `sovright-oram-research` (project number
+`486673347298`), created on 2026-09-12. The scripts pass this project explicitly
+and do not depend on the caller's active gcloud configuration. It uses the
+existing research organization and billing account. Compute Engine, IAP, and
+OS Login APIs are enabled; experiments create their own restricted VPCs.
+
+Retain aggregate research evidence in `gs://sovright-oram-research-evidence`
+(`us-central1`), which enforces public-access prevention and uniform
+bucket-level access. The [recovered mainnet capture ledger](../../docs/notes/oram-mainnet-capture-recovery.md)
+records the first retained bundle and its integrity checks.
+
+Historical resources remain where their manifests and ledgers record them.
+The mainnet capture and builder are in `sovright-testnet`; the completed small
+TDX diagnostic was in `sovright-bedrock-mainnet`. Changing the project for new
+runs does not move those disks, restart the historical TDX VM, or qualify its
+image. Do not rewrite a historical manifest to target the new project.
+
 The experiment uses `c3-standard-4` in `us-central1-a`: the smallest C3 type
 currently exposed there, with 4 vCPUs and 16 GiB RAM. The separate mainnet
 capacity candidate remains `c3-standard-44` with 44 vCPUs and 176 GiB.

@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-readonly PROJECT_ID="sovright-bedrock-mainnet"
+readonly PROJECT_ID="sovright-oram-research"
 readonly REGION="us-central1"
 readonly ZONE="us-central1-a"
 readonly RESOURCE_PREFIX="zaino-tdx-exp"
