@@ -1277,15 +1277,14 @@ mod tests {
     ///
     /// The wallet material comes from `zaino_oram`'s `wallet-parity-harness`,
     /// enabled only through this crate's dev-dependencies. That harness hands
-    /// out the session binding and serving checkpoint the protocol does not
-    /// publish; without them no client-constructible request exists, which is
-    /// why the neighbouring `a_wallet_bootstraps_then_queries` had to fall back
-    /// on an XOR stand-in. This test uses no stand-in of any kind.
+    /// out the session binding and serving checkpoint directly from the
+    /// runtime. ADR0904 also publishes those fields in activated bootstrap,
+    /// but this test does not obtain its codec context through that boundary.
+    /// It uses the actual codec and protector throughout.
     ///
-    /// What it does *not* establish: that a deployable wallet exists. It does
-    /// not, and cannot until those two values are published or replaced. The
-    /// projection underneath is also the non-oblivious in-memory backend, so
-    /// nothing here bears on obliviousness.
+    /// This test does not establish attestation-gated client admission. The
+    /// projection underneath is the non-oblivious in-memory backend, so it
+    /// also makes no obliviousness claim.
     ///
     /// multi_thread required: the serve loop and the client run concurrently on
     /// separate tasks and the client blocks on a response the server must send.
