@@ -648,6 +648,125 @@ mod tests {
         ));
     }
 
+    /// multi_thread required: the persistent-v1 fixture transitively uses `block_in_place`.
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_width_accepts_the_live_fixture_capture(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use zaino_state::test_dependencies::{
+            chain_index::CanonicalProjectionTestFixture, TestChainSource,
+        };
+
+        type FixtureController = RecentSnapshotRefreshController<
+            { crate::profile::MAINNET_QUERY_SLOTS },
+            TestFinalizedStore,
+            CanonicalServingEpochCurrentness<TestChainSource>,
+        >;
+
+        let fixture = CanonicalProjectionTestFixture::start().await?;
+        let result = async {
+            let captured = fixture
+                .subscriber()
+                .capture_canonical_transparent_projection_input()
+                .await?;
+            let finalized = captured.finalized_checkpoint();
+            let committed = PublicChainCheckpoint::new(
+                CanonicalNetwork::Regtest,
+                u32::from(finalized.height),
+                finalized.hash,
+            );
+            let identity = serving_identity(
+                CanonicalNetwork::Regtest,
+                committed.height(),
+                committed.block_hash().bytes_in_display_order(),
+                1,
+                11,
+                7,
+            );
+            let mut controller = FixtureController::new(CanonicalNetwork::Regtest, 1, 11, 7)?;
+            controller
+                .refresh(
+                    fixture.subscriber(),
+                    committed,
+                    TestFinalizedStore { identity },
+                )
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        let shutdown = fixture.shutdown().await;
+        result?;
+        shutdown?;
+        Ok(())
+    }
+
+    /// multi_thread required: the persistent-v1 fixture transitively uses `block_in_place`.
+    #[cfg(feature = "corpus-zaino")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn later_fixture_rejection_is_the_production_slot_bound(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use zaino_state::test_dependencies::{
+            chain_index::CanonicalProjectionTestFixture, TestChainSource,
+        };
+
+        type ProductionController = RecentSnapshotRefreshController<
+            { crate::profile::MAINNET_QUERY_SLOTS },
+            TestFinalizedStore,
+            CanonicalServingEpochCurrentness<TestChainSource>,
+        >;
+        type WideController = RecentSnapshotRefreshController<
+            512,
+            TestFinalizedStore,
+            CanonicalServingEpochCurrentness<TestChainSource>,
+        >;
+
+        let fixture = CanonicalProjectionTestFixture::start_at_height(150).await?;
+        let result = async {
+            let captured = fixture
+                .subscriber()
+                .capture_canonical_transparent_projection_input()
+                .await?;
+            let finalized = captured.finalized_checkpoint();
+            let committed = PublicChainCheckpoint::new(
+                CanonicalNetwork::Regtest,
+                u32::from(finalized.height),
+                finalized.hash,
+            );
+            let identity = serving_identity(
+                CanonicalNetwork::Regtest,
+                committed.height(),
+                committed.block_hash().bytes_in_display_order(),
+                1,
+                11,
+                7,
+            );
+            let mut production = ProductionController::new(CanonicalNetwork::Regtest, 1, 11, 7)?;
+            assert_eq!(
+                production
+                    .refresh(
+                        fixture.subscriber(),
+                        committed,
+                        TestFinalizedStore { identity },
+                    )
+                    .await,
+                Err(RecentSnapshotRefreshError::BuildRejected)
+            );
+            let mut wide = WideController::new(CanonicalNetwork::Regtest, 1, 11, 7)?;
+            wide.refresh(
+                fixture.subscriber(),
+                committed,
+                TestFinalizedStore { identity },
+            )
+            .await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        let shutdown = fixture.shutdown().await;
+        result?;
+        shutdown?;
+        Ok(())
+    }
+
     #[test]
     fn live_entrypoint_typechecks() {
         let _refresh = LiveController::refresh;

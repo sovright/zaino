@@ -14,6 +14,15 @@ again. Linux CI must execute this test before the path is described as tested;
 macOS only exercises the subscriber fixture because the typed backend fails
 closed there.
 
+The native fixture previously started at active height 150. Its initial recent
+projection contains more than the production profile's 256 query slots, so the
+first refresh correctly failed capacity validation before it could test the
+refresh lifecycle. The default fixture now starts at height 100, which fits the
+unchanged production 256-slot profile. `start_at_height(150)` remains available
+to prove that the production-width controller refuses that larger capture while
+a deliberately 512-slot test controller accepts it. This changes test input
+only; the production profile and capacity bound are unchanged.
+
 This slice does not test a sealed wallet query across refresh. The production
 `SessionBootstrap` omits the serving checkpoint, network, and schema material
 that `PrivateQueryCodec` needs to form a request, and the only current wallet

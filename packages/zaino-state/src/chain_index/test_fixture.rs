@@ -13,7 +13,10 @@ use super::{
 };
 use crate::{ChainIndexConfig, IndexedBlock};
 
-const INITIAL_ACTIVE_HEIGHT: u32 = 150;
+// Height 100 keeps the checked-in starting window within the production
+// 256-slot recent-snapshot budget. The next block also advances the finalized
+// boundary from genesis to height one.
+const INITIAL_ACTIVE_HEIGHT: u32 = 100;
 const READY_BUDGET: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -41,6 +44,13 @@ impl std::error::Error for CanonicalProjectionTestFixtureError {}
 impl CanonicalProjectionTestFixture {
     /// Starts an actual persistent chain index over the checked-in regtest chain.
     pub async fn start() -> Result<Self, CanonicalProjectionTestFixtureError> {
+        Self::start_at_height(INITIAL_ACTIVE_HEIGHT).await
+    }
+
+    /// Starts the fixture at a chosen checked-in height for bounded capacity tests.
+    pub async fn start_at_height(
+        active_height: u32,
+    ) -> Result<Self, CanonicalProjectionTestFixtureError> {
         let vectors = load_test_vectors().map_err(|error| {
             CanonicalProjectionTestFixtureError(format!("test vectors could not load: {error}"))
         })?;
@@ -51,7 +61,12 @@ impl CanonicalProjectionTestFixture {
                     "test vectors could not be indexed: {error}"
                 ))
             })?;
-        let source = build_active_mockchain_source(INITIAL_ACTIVE_HEIGHT, vectors.blocks);
+        if active_height as usize >= vectors.blocks.len() {
+            return Err(CanonicalProjectionTestFixtureError(format!(
+                "fixture active height {active_height} exceeds checked-in chain"
+            )));
+        }
+        let source = build_active_mockchain_source(active_height, vectors.blocks);
         let database_dir = tempfile::tempdir().map_err(|error| {
             CanonicalProjectionTestFixtureError(format!(
                 "fixture database directory could not be created: {error}"
