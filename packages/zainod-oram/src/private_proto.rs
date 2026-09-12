@@ -42,9 +42,8 @@ pub struct BootstrapResponse {
     /// Exact envelope size class, so a wallet pads correctly without guessing.
     #[prost(uint32, tag = "5")]
     pub envelope_bytes: u32,
-    /// Reserved for a TDX quote binding the TLS identity to the measured binary.
-    /// Present and empty in this release; ADR 0010 defers verification, and
-    /// keeping the field means adding it later is not a breaking wire change.
+    /// Legacy reserved field, always empty. Fresh raw evidence is obtained from
+    /// GetEvidence before bootstrap; an empty field is never attestation success.
     #[prost(bytes = "vec", tag = "6")]
     pub attestation: ::prost::alloc::vec::Vec<u8>,
     /// Authoritative identifier of the compiled privacy profile: a digest over
@@ -60,6 +59,42 @@ pub struct BootstrapResponse {
     /// Unlike `profile_label`, this field IS authoritative. Pin on it.
     #[prost(bytes = "vec", tag = "7")]
     pub profile_id: ::prost::alloc::vec::Vec<u8>,
+}
+/// The verifier contributes only a fresh, exactly 64-byte challenge.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EvidenceRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub challenge: ::prost::alloc::vec::Vec<u8>,
+}
+/// Unverified raw evidence. The client must validate the quote and its policy,
+/// recompute REPORT_DATA, and match the actual TLS peer's SPKI before bootstrap.
+/// These public claims are not trusted merely because the server returned them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EvidenceResponse {
+    #[prost(uint32, tag = "1")]
+    pub transcript_version: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub challenge: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub tls_spki_sha256: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub binary_sha256: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub effective_config_sha256: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub profile_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "7")]
+    pub schema_version: u32,
+    #[prost(uint64, tag = "8")]
+    pub key_epoch: u64,
+    #[prost(uint32, tag = "9")]
+    pub checkpoint_height: u32,
+    /// Internal canonical block-hash bytes, not reversed display-order hex.
+    /// This identifies the public chain checkpoint, not an authenticated ORAM root.
+    #[prost(bytes = "vec", tag = "10")]
+    pub checkpoint_block_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "11")]
+    pub raw_quote: ::prost::alloc::vec::Vec<u8>,
 }
 /// Generated server implementations.
 pub mod private_compact_tx_streamer_server {
@@ -82,6 +117,10 @@ pub mod private_compact_tx_streamer_server {
             &self,
             request: tonic::Request<super::BootstrapRequest>,
         ) -> std::result::Result<tonic::Response<super::BootstrapResponse>, tonic::Status>;
+        async fn get_evidence(
+            &self,
+            request: tonic::Request<super::EvidenceRequest>,
+        ) -> std::result::Result<tonic::Response<super::EvidenceResponse>, tonic::Status>;
     }
     /// Independent private-query surface. This is not the legacy lightwallet API.
     #[derive(Debug)]
@@ -226,6 +265,47 @@ pub mod private_compact_tx_streamer_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = BootstrapSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/zaino.private.v1.PrivateCompactTxStreamer/GetEvidence" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetEvidenceSvc<T: PrivateCompactTxStreamer>(pub Arc<T>);
+                    impl<T: PrivateCompactTxStreamer>
+                        tonic::server::UnaryService<super::EvidenceRequest> for GetEvidenceSvc<T>
+                    {
+                        type Response = super::EvidenceResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::EvidenceRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as PrivateCompactTxStreamer>::get_evidence(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetEvidenceSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

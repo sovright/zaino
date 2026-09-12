@@ -558,6 +558,15 @@ derivation design. The controlled client must verify evidence and bind the TLS
 peer before bootstrap trust or query transmission. Empty attestation bytes and
 operator-supplied pin replacement are not substitutes.
 
+Implementation progress: the loopback research listener now has a bounded
+`GetEvidence` route tied to its actual ephemeral TLS key. The
+[raw evidence v1 contract](oram-raw-evidence-v1.md) freezes the transcript and
+public configuration encoding; local tests cover the certificate binding over
+real TLS. The [TDX diagnostic scripts](../../deploy/tdx/README.md) prepare a
+small, isolated, expiring platform test. Neither raw quote acquisition nor this
+administrator-accessible diagnostic image closes Track A. Client verification,
+accepted image policy, and the complete typed query path remain required.
+
 The experiment must compose actual attestation verification and quote-bound
 TLS, production-grade envelope cryptography with explicit nonce/key ownership,
 the real typed ORAM backend, bounded recent-state scan/merge, continuation and

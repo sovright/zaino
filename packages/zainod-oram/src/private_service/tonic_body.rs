@@ -21,6 +21,7 @@ use tonic_prost::{ProstDecoder, ProstEncoder};
 use zaino_oram::PrivateQueryUnavailable;
 use zaino_oram::{FixedEnvelopeRuntime, PendingFixedEnvelope, SessionBootstrap};
 
+use super::attestation::{AttestationChallenge, ConfigFsTsmQuoteProvider, RawEvidenceIssuer};
 use super::{
     release_schedule::ReleaseSchedule, PendingQueryPage, PrivateServiceAdapter,
     ValidatedFixedEnvelope,
@@ -321,6 +322,112 @@ impl PrivateSessionBootstrap {
 impl std::fmt::Debug for PrivateSessionBootstrap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PrivateSessionBootstrap { ..REDACTED.. }")
+    }
+}
+
+/// Public evidence acquisition has its own bounded worker, never the query lock.
+pub(super) struct PrivateEvidence {
+    issuer: RawEvidenceIssuer,
+    permits: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    test_quote: Option<TestQuote>,
+}
+
+#[cfg(test)]
+type TestQuote = Arc<dyn Fn([u8; 64]) -> Result<Vec<u8>, ()> + Send + Sync>;
+
+impl PrivateEvidence {
+    pub(super) fn new(issuer: RawEvidenceIssuer) -> Self {
+        Self {
+            issuer,
+            permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            test_quote: None,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(super) fn with_test_quote(issuer: RawEvidenceIssuer, test_quote: TestQuote) -> Self {
+        Self {
+            issuer,
+            permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            test_quote: Some(test_quote),
+        }
+    }
+
+    pub(super) async fn answer<B>(
+        self: &Arc<Self>,
+        request: http::Request<B>,
+    ) -> http::Response<TonicBody>
+    where
+        B: HttpBody + Send + 'static,
+        B::Error: Into<StdError> + Send,
+    {
+        // One bytes field: one tag, one length byte, exactly 64 challenge bytes.
+        let grpc = Grpc::new(tonic_prost::ProstCodec::<
+            private_proto::EvidenceResponse,
+            private_proto::EvidenceRequest,
+        >::default())
+        .max_decoding_message_size(66);
+        let (response, _) =
+            capped_unary_call(grpc, RespondEvidence(Arc::clone(self)), request).await;
+        response
+    }
+}
+
+struct RespondEvidence(Arc<PrivateEvidence>);
+
+impl UnaryService<private_proto::EvidenceRequest> for RespondEvidence {
+    type Response = private_proto::EvidenceResponse;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Response<Self::Response>, Status>> + Send>>;
+
+    fn call(&mut self, request: Request<private_proto::EvidenceRequest>) -> Self::Future {
+        let evidence = Arc::clone(&self.0);
+        Box::pin(async move {
+            let challenge = AttestationChallenge::try_from_wire(request.into_inner())
+                .map_err(|_| Status::unavailable("private query unavailable"))?;
+            let permit = Arc::clone(&evidence.permits)
+                .try_acquire_owned()
+                .map_err(|_| Status::unavailable("private query unavailable"))?;
+            let worker = tokio::task::spawn_blocking(move || {
+                // The permit lives in the worker: timeout/cancellation must not
+                // admit another kernel quote while this call still runs.
+                let _permit = permit;
+                #[cfg(test)]
+                if let Some(test_quote) = &evidence.test_quote {
+                    let mut provider = TestQuoteProvider(Arc::clone(test_quote));
+                    return evidence
+                        .issuer
+                        .issue(challenge, &mut provider)
+                        .map(|raw| raw.to_wire())
+                        .map_err(|_| Status::unavailable("private query unavailable"));
+                }
+                evidence
+                    .issuer
+                    .issue(challenge, &mut ConfigFsTsmQuoteProvider::new())
+                    .map(|raw| raw.to_wire())
+                    .map_err(|_| Status::unavailable("private query unavailable"))
+            });
+            let response = tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+                .await
+                .map_err(|_| Status::unavailable("private query unavailable"))?
+                .map_err(|_| Status::unavailable("private query unavailable"))??;
+            Ok(Response::new(response))
+        })
+    }
+}
+
+#[cfg(test)]
+struct TestQuoteProvider(TestQuote);
+
+#[cfg(test)]
+impl super::attestation::RawQuoteProvider for TestQuoteProvider {
+    type Error = ();
+
+    fn quote(&mut self, report_data: [u8; 64]) -> Result<Vec<u8>, Self::Error> {
+        (self.0)(report_data)
     }
 }
 
@@ -788,6 +895,27 @@ mod tests {
         PrivateSessionBootstrap::from_session(&session_bootstrap_fixture(), ENVELOPE_BYTES)
     }
 
+    fn evidence_fixture(test_quote: TestQuote) -> Arc<PrivateEvidence> {
+        let tls = super::super::tls::PrivateTlsIdentity::generate_ephemeral()
+            .expect("ephemeral TLS fixture identity is generated");
+        let binding = super::super::attestation::AttestationWorkloadBinding::new(
+            [1; 32],
+            [2; 32],
+            [3; PRIVATE_PROFILE_ID_BYTES],
+            4,
+            5,
+            6,
+            [7; 32],
+        );
+        let issuer = RawEvidenceIssuer::new(&tls, binding)
+            .expect("ephemeral fixture identity is evidence eligible");
+        Arc::new(PrivateEvidence::with_test_quote(issuer, test_quote))
+    }
+
+    fn evidence_request(challenge: Vec<u8>) -> http::Request<OneFrameBody> {
+        encoded_frame(private_proto::EvidenceRequest { challenge }.encode_to_vec())
+    }
+
     /// Every adapter test below runs on a paused clock, so a zero bucket and a
     /// production one cost the same wall time. A nonzero width is still the
     /// honest fixture: it is what makes `release()` an observable wait the
@@ -1134,6 +1262,71 @@ mod tests {
 
         assert_uniform_status(response.headers());
         assert!(response.into_body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn malformed_evidence_requests_never_reach_the_quote_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let evidence = evidence_fixture(Arc::new(move |_| {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![1])
+        }));
+
+        for request in [
+            evidence_request(vec![0; 63]),
+            evidence_request(vec![0; 65]),
+            encoded_frame(vec![0; 67]),
+        ] {
+            let response = evidence.answer(request).await;
+            assert_uniform_status(response.headers());
+            assert!(response.into_body().is_end_stream());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn quote_provider_failure_is_uniform() {
+        let evidence = evidence_fixture(Arc::new(|_| Err(())));
+        let response = evidence.answer(evidence_request(vec![0; 64])).await;
+        assert_uniform_status(response.headers());
+        assert!(response.into_body().is_end_stream());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_quote_worker_retains_the_only_permit_until_it_exits() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let callback_release = Arc::clone(&release_rx);
+        let evidence = evidence_fixture(Arc::new(move |_| {
+            entered_tx.send(()).map_err(|_| ())?;
+            callback_release
+                .lock()
+                .map_err(|_| ())?
+                .recv()
+                .map_err(|_| ())?;
+            Ok(vec![1])
+        }));
+
+        let first_evidence = Arc::clone(&evidence);
+        let first =
+            tokio::spawn(async move { first_evidence.answer(evidence_request(vec![0; 64])).await });
+        while entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+
+        let busy = evidence.answer(evidence_request(vec![1; 64])).await;
+        assert_uniform_status(busy.headers());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let timed_out = first.await.expect("evidence request task joins");
+        assert_uniform_status(timed_out.headers());
+
+        let still_busy = evidence.answer(evidence_request(vec![2; 64])).await;
+        assert_uniform_status(still_busy.headers());
+        release_tx
+            .send(())
+            .expect("blocked fixture provider is released");
     }
 
     /// Pure classification, independent of the wire: the epoch comparison is

@@ -7,6 +7,7 @@ use zaino_oram::{PendingFixedEnvelope, PrivateQueryUnavailable};
 
 use crate::private_proto;
 
+pub(crate) mod attestation;
 mod listener;
 mod release_schedule;
 mod tls;
@@ -258,77 +259,39 @@ mod tests {
 
     #[test]
     fn schema_and_generated_query_route_are_golden() {
+        let request = private_proto::EvidenceRequest {
+            challenge: vec![0xaa; 64],
+        };
+        let request_bytes = request.encode_to_vec();
+        assert_eq!(&request_bytes[..2], &[0x0a, 64]);
+        assert_eq!(request_bytes.len(), 66);
+
+        let response = private_proto::EvidenceResponse {
+            transcript_version: 1,
+            challenge: vec![1],
+            tls_spki_sha256: vec![2],
+            binary_sha256: vec![3],
+            effective_config_sha256: vec![4],
+            profile_id: vec![5],
+            schema_version: 6,
+            key_epoch: 7,
+            checkpoint_height: 8,
+            checkpoint_block_hash: vec![9],
+            raw_quote: vec![10],
+        };
         assert_eq!(
-            include_str!("../proto/private.proto"),
-            concat!(
-                "syntax = \"proto3\";\n",
-                "\n",
-                "package zaino.private.v1;\n",
-                "\n",
-                "// One fixed-size protected application envelope.\n",
-                "message FixedEnvelope {\n",
-                "  bytes envelope = 1;\n",
-                "  // The key epoch this envelope was sealed under. Cleartext on purpose: it is\n",
-                "  // per-generation and identical for every client, so it reveals nothing, and\n",
-                "  // sealing it inside would make a retired key indistinguishable from any\n",
-                "  // other refusal — leaving a wallet no way to learn it must re-bootstrap.\n",
-                "  uint64 key_epoch = 2;\n",
-                "}\n",
-                "\n",
-                "// Empty: bootstrap takes no client input. A field here would be an input to\n",
-                "// authenticate before the client holds any key material, which is exactly the\n",
-                "// surface this design avoids.\n",
-                "message BootstrapRequest {}\n",
-                "\n",
-                "// Everything a wallet needs to seal a query, and nothing else.\n",
-                "message BootstrapResponse {\n",
-                "  // Identifies the key generation these keys belong to. Sent back in cleartext\n",
-                "  // on every QueryPage so a retired key is actionable rather than opaque.\n",
-                "  uint64 key_epoch = 1;\n",
-                "  // Seals request envelopes.\n",
-                "  bytes request_key = 2;\n",
-                "  // Opens response envelopes.\n",
-                "  bytes response_key = 3;\n",
-                "  // Human-readable name of the compiled privacy profile, for logs and support.\n",
-                "  //\n",
-                "  // Diagnostic, NOT authoritative: do not pin on it. The authoritative profile\n",
-                "  // identifier is a digest over every logical budget dimension and is already\n",
-                "  // bound into protected request state, so a query sealed against the wrong\n",
-                "  // profile fails to open regardless of what this string says. It is named\n",
-                "  // `profile_label` rather than `profile_id` precisely so it cannot be mistaken\n",
-                "  // for that identifier.\n",
-                "  string profile_label = 4;\n",
-                "  // Exact envelope size class, so a wallet pads correctly without guessing.\n",
-                "  uint32 envelope_bytes = 5;\n",
-                "  // Reserved for a TDX quote binding the TLS identity to the measured binary.\n",
-                "  // Present and empty in this release; ADR 0010 defers verification, and\n",
-                "  // keeping the field means adding it later is not a breaking wire change.\n",
-                "  bytes attestation = 6;\n",
-                "  // Authoritative identifier of the compiled privacy profile: a digest over\n",
-                "  // every logical budget dimension the runtime compiles in.\n",
-                "  //\n",
-                "  // A wallet needs it to build the envelope protection context it seals a\n",
-                "  // request under. The same bytes are bound into protected request state on\n",
-                "  // the server side, so a request sealed under a different profile identifier\n",
-                "  // does not open — which is also why publishing it costs nothing: the digest\n",
-                "  // covers only compiled, deployment-wide parameters, carries no key material,\n",
-                "  // and is identical for every client this runtime serves.\n",
-                "  //\n",
-                "  // Unlike `profile_label`, this field IS authoritative. Pin on it.\n",
-                "  bytes profile_id = 7;\n",
-                "}\n",
-                "\n",
-                "// Independent private-query surface. This is not the legacy lightwallet API.\n",
-                "service PrivateCompactTxStreamer {\n",
-                "  rpc QueryPage(FixedEnvelope) returns (FixedEnvelope);\n",
-                "  rpc BootstrapSession(BootstrapRequest) returns (BootstrapResponse);\n",
-                "}\n",
-            )
+            response.encode_to_vec(),
+            [
+                8, 1, 18, 1, 1, 26, 1, 2, 34, 1, 3, 42, 1, 4, 50, 1, 5, 56, 6, 64, 7, 72, 8, 82, 1,
+                9, 90, 1, 10
+            ]
+        );
+        assert_eq!(
+            private_proto::private_compact_tx_streamer_server::SERVICE_NAME,
+            "zaino.private.v1.PrivateCompactTxStreamer"
         );
         assert!(include_str!("private_proto.rs")
-            .contains("\"/zaino.private.v1.PrivateCompactTxStreamer/QueryPage\""));
-        assert!(include_str!("private_proto.rs")
-            .contains("\"/zaino.private.v1.PrivateCompactTxStreamer/BootstrapSession\""));
+            .contains("\"/zaino.private.v1.PrivateCompactTxStreamer/GetEvidence\""));
     }
 
     #[test]
