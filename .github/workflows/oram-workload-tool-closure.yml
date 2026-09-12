@@ -1,0 +1,50 @@
+name: ORAM workload tool closure
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/oram-workload-tool-closure.yml'
+      - 'deploy/tdx/accepted-guest-spike/**'
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve workload compiler and linker tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Validate reviewed roots and Rust metadata
+        run: |
+          set -euo pipefail
+          spike=deploy/tdx/accepted-guest-spike
+          bash "$spike/verify-package-roots.sh" "$spike/workload-tool-roots.json"
+          bash "$spike/test-rust-toolchain-inputs.sh"
+      - name: Resolve twice and verify all downloaded bytes
+        run: |
+          set -euo pipefail
+          spike=deploy/tdx/accepted-guest-spike
+          roots="$spike/workload-tool-roots.json"
+          bash "$spike/resolve-package-closure.sh" "$RUNNER_TEMP/workload-a" "$roots"
+          bash "$spike/resolve-package-closure.sh" "$RUNNER_TEMP/workload-b" "$roots"
+          bash "$spike/verify-package-closure.sh" "$RUNNER_TEMP/workload-a" "$roots"
+          bash "$spike/verify-package-closure.sh" "$RUNNER_TEMP/workload-b" "$roots"
+          bash "$spike/test-package-closure.sh" "$RUNNER_TEMP/workload-a" "$roots"
+          jq -S . "$RUNNER_TEMP/workload-a/package-lock.json" > "$RUNNER_TEMP/workload-lock-a.json"
+          jq -S . "$RUNNER_TEMP/workload-b/package-lock.json" > "$RUNNER_TEMP/workload-lock-b.json"
+          cmp "$RUNNER_TEMP/workload-lock-a.json" "$RUNNER_TEMP/workload-lock-b.json"
+      - name: Retain verified package bytes and signed index proofs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workload-tool-closure
+          path: ${{ runner.temp }}/workload-a/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

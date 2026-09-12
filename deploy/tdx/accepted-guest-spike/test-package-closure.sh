@@ -3,8 +3,10 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 fail() { echo "package closure tests failed: $*" >&2; exit 1; }
-[[ $# == 1 ]] || fail 'usage: test-package-closure.sh CLOSURE_DIRECTORY'
+[[ $# -ge 1 && $# -le 2 ]] || fail 'usage: test-package-closure.sh CLOSURE_DIRECTORY [PACKAGE_ROOTS_JSON]'
 closure=$(cd -- "$1" && pwd -P) || fail 'missing closure'
+roots=${2:-$root/package-roots.json}
+verify() { bash "$root/verify-package-closure.sh" "$closure" "$roots"; }
 lock="$closure/package-lock.json"
 scratch=$(mktemp -d)
 backup="$scratch/package-lock.json"
@@ -21,15 +23,18 @@ cleanup() {
   rm -rf -- "$scratch"
 }
 trap cleanup EXIT
-bash "$root/verify-package-closure.sh" "$closure" >/dev/null
+verify >/dev/null
 refuse_lock() {
   local name=$1 filter=$2
   jq "$filter" "$backup" > "$lock"
-  if bash "$root/verify-package-closure.sh" "$closure" > "$scratch/$name.log" 2>&1; then fail "unexpected acceptance: $name"; fi
+  if verify > "$scratch/$name.log" 2>&1; then fail "unexpected acceptance: $name"; fi
   cp -- "$backup" "$lock"
 }
 refuse_lock changed-control '.packages[0].name = "altered-package"'
-refuse_lock missing-root 'del(.packages[] | select(.name == "linux-image-6.17.0-1012-gcp"))'
+missing_root=$(jq -r '(.guest_roots + .builder_tool_roots)[0] | split("=")[0]' "$roots")
+jq --arg name "$missing_root" 'del(.packages[] | select(.name == $name))' "$backup" > "$lock"
+if verify > "$scratch/missing-root.log" 2>&1; then fail 'unexpected acceptance: missing-root'; fi
+cp -- "$backup" "$lock"
 
 first_file=$(jq -r '.packages[0].filename | split("/")[-1]' "$lock")
 package="$closure/packages/$first_file"
@@ -41,26 +46,26 @@ digest=$(sha256sum -- "$package" | awk '{print $1}')
 jq --arg file "$first_file" --arg digest "$digest" --argjson bytes "$bytes" '
   (.packages[] | select((.filename | split("/")[-1]) == $file)) |= (.sha256 = $digest | .bytes = $bytes)
 ' "$backup" > "$lock"
-if bash "$root/verify-package-closure.sh" "$closure" > "$scratch/repaired-digest.log" 2>&1; then fail 'unexpected repaired-digest acceptance'; fi
+if verify > "$scratch/repaired-digest.log" 2>&1; then fail 'unexpected repaired-digest acceptance'; fi
 cp -- "$package_backup" "$package"
 cp -- "$backup" "$lock"
 rm -f -- "$package_backup"
 package_backup=''
 
 ln -s "$first_file" "$closure/packages/extra-link"
-if bash "$root/verify-package-closure.sh" "$closure" > "$scratch/extra-link.log" 2>&1; then fail 'unexpected extra-symlink acceptance'; fi
+if verify > "$scratch/extra-link.log" 2>&1; then fail 'unexpected extra-symlink acceptance'; fi
 rm -f -- "$closure/packages/extra-link"
 mkdir "$closure/packages/extra-dir"
-if bash "$root/verify-package-closure.sh" "$closure" > "$scratch/extra-dir.log" 2>&1; then fail 'unexpected extra-directory acceptance'; fi
+if verify > "$scratch/extra-dir.log" 2>&1; then fail 'unexpected extra-directory acceptance'; fi
 rmdir "$closure/packages/extra-dir"
 
 proof="$closure/indexes/noble-main-Packages.xz"
 proof_backup="$scratch/proof.xz"
 cp -- "$proof" "$proof_backup"
 printf 'tamper\n' >> "$proof"
-if bash "$root/verify-package-closure.sh" "$closure" > "$scratch/mutated-proof.log" 2>&1; then fail 'unexpected mutated-proof acceptance'; fi
+if verify > "$scratch/mutated-proof.log" 2>&1; then fail 'unexpected mutated-proof acceptance'; fi
 cp -- "$proof_backup" "$proof"
 rm -f -- "$proof_backup"
 proof_backup=''
-bash "$root/verify-package-closure.sh" "$closure" >/dev/null
+verify >/dev/null
 echo 'Package closure: positive controls and 6 tamper cases passed.'

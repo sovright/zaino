@@ -11,6 +11,10 @@ release manifest. Its verifier checks metadata consistency and, optionally,
 actual downloaded bytes. Compiler execution and the Cargo vendor closure
 remain required before an offline workload build.
 
+The [workload compiler and linker roots](workload-tools.md) select exact
+builder-only C, musl, and supporting tools. Their workflow resolves and
+verifies the complete package dependency set for later offline installation.
+
 The Ubuntu 24.04 amd64 root filesystem is the dated `release-20260826` artifact.
 Its 228,994,404 downloaded bytes matched the retained signed checksum manifest.
 The signature verified against fingerprint
