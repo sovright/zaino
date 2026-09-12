@@ -4,6 +4,7 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 bash "$root/verify-package-roots.sh" > "$scratch/positive.log"
+bash "$root/verify-package-roots.sh" "$root/custom-kernel-tool-roots.json" > "$scratch/custom-kernel-positive.log"
 refuse() {
   local name=$1 filter=$2
   jq "$filter" "$root/package-roots.json" > "$scratch/$name.json"

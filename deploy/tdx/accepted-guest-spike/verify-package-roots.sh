@@ -11,8 +11,9 @@ jq -e --arg image "$(jq -r '.builder_base.image' "$selection")" --arg snapshot "
   .schema == "zaino-boot-spike-package-roots-v1" and
   .selected_builder_base_image == $image and .snapshot == $snapshot and .architecture == "amd64" and
   .resolver_apt_version == "2.8.3" and
-  (.guest_roots | length > 0 and all(.[]; test("^[a-z0-9][a-z0-9+.-]*=[^[:space:]]+$"))) and
-  (.builder_tool_roots | length > 0 and all(.[]; test("^[a-z0-9][a-z0-9+.-]*=[^[:space:]]+$"))) and
+  (.guest_roots | type == "array" and all(.[]; test("^[a-z0-9][a-z0-9+.-]*=[^[:space:]]+$"))) and
+  (.builder_tool_roots | type == "array" and all(.[]; test("^[a-z0-9][a-z0-9+.-]*=[^[:space:]]+$"))) and
+  ((.guest_roots + .builder_tool_roots) | length > 0) and
   ((.guest_roots + .builder_tool_roots) | length == (unique | length)) and
   .scope == "resolver_roots_only;kernel_suitability_and_image_admission_unverified"
 ' "$roots" >/dev/null || fail 'invalid package roots'

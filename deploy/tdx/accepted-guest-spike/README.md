@@ -64,3 +64,21 @@ debug-kernel, kexec, hibernation, and sleep settings. The static
 separate from the TDX DEBUG guest attribute. An acceptable custom kernel,
 source/config/package digests, and review of the required TDX halt fixes remain
 prerequisites.
+
+`custom-kernel-tool-roots.json` is a separate builder-only request for the
+compiler, binutils, Kbuild utilities, source extractor, and development
+libraries. Its OpenSSL command and development packages are confined to the
+network-disabled disposable kernel builder; they are not Zaino Rust/runtime or
+guest-image dependencies. This scoped builder use does not relax the repository
+ban on OpenSSL crates or OpenSSL packages in shipped runtime images.
+
+`download-custom-kernel-source.sh` downloads only the three archives bound by
+the retained signed source index. `build-custom-kernel-once.sh` then accepts
+that directory, an offline closure resolved from `custom-kernel-tool-roots.json`,
+the reviewed `custom-kernel.config`, a `run-1` or `run-2` label, and a new
+output directory. It executes the selected OCI digest with networking disabled,
+checks the installed package and compiler versions, extracts the authenticated
+source, verifies the effective Kconfig, and builds `bzImage` and `vmlinux`.
+The CI workflow runs this front door on two separate clean runners and compares
+their artifact hashes. Matching builds establish this build-input experiment;
+they do not establish boot, TDX, image-admission, or runtime suitability.
