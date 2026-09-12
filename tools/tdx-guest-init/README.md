@@ -18,13 +18,15 @@ file descriptors 0/1/2, checks those release values, mounts `/dev/dm-0`
 read-only, and reads every logical byte through the verified mapping. Any
 geometry, identity, or read error stops boot. It waits for blocking OS
 randomness, mounts bounded noexec tmpfs at `/run` and `/tmp`, removes the old
-initramfs contents, performs the kernel-documented switch-root sequence, and
-executes only `/usr/lib/zaino/tdx-evidence-agent` on the discovered private
-IPv4 address.
+initramfs contents, performs the kernel-documented switch-root sequence, closes
+every descriptor outside 0/1/2, and executes only
+`/usr/lib/zaino/tdx-evidence-agent` on the discovered private IPv4 address.
 
 The evidence agent becomes PID 1 and permits no process creation after its
 seccomp policy is installed. `SIGCHLD` is ignored to reap any unexpected
 inherited child; the agent explicitly handles `SIGTERM` and `SIGINT` with a
 bounded graceful listener shutdown. Real boot must still prove C3 networking,
 mount behavior, and post-capability-drop ConfigFS plus CCEL access; local parser
-and sweep tests do not establish those properties.
+and sweep tests do not establish those properties. The seccomp policy traps
+`perf_event_open`, but host PMU exposure and side-channel qualification remain
+separate platform gates.

@@ -421,6 +421,13 @@ fn exec_agent(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
     // unexpected inherited child is auto-reaped while the agent is PID 1.
     // SAFETY: SIG_IGN is a valid SIGCHLD disposition.
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    // The initramfs is not an authority channel. Only the fixed stdio set may
+    // cross into the final evidence agent.
+    // SAFETY: close_range closes the inclusive descriptor range without
+    // touching descriptors 0, 1, or 2.
+    if unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) } < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
     let error = std::process::Command::new("/usr/lib/zaino/tdx-evidence-agent")
         .args(["--listen", listen, "--provider-timeout-seconds", "10"])
         .env_clear()
