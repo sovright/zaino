@@ -1,0 +1,49 @@
+{
+  "schema": "zaino-boot-spike-rust-inputs-v1",
+  "scope": "compiler_archive_selection_only",
+  "builder_execution_verified": false,
+  "version": "1.96.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "release_date": "2026-05-28",
+  "source_commit": "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96",
+  "manifest": {
+    "file": "rust-toolchain-inputs/channel-rust-1.96.0.toml",
+    "url": "https://static.rust-lang.org/dist/channel-rust-1.96.0.toml",
+    "bytes": 857570,
+    "sha256": "9af50610e1d82699f78a40b985c9277ae1a2c5a0bec86ae430cfe58832038285"
+  },
+  "components": [
+    {
+      "name": "cargo",
+      "file": "cargo-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-05-28/cargo-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+      "bytes": 11154668,
+      "sha256": "dee75c3c8f9f600ad75bc0c93249e767d3047845a4dd668327ce43ab039ba266",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "name": "rust-std",
+      "file": "rust-std-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-05-28/rust-std-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+      "bytes": 29740704,
+      "sha256": "c09c7c646248f14f473f5f7a029af15ee57c3a9f9bc93dfa72d9621938586b82",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "name": "rustc",
+      "file": "rustc-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-05-28/rustc-1.96.0-x86_64-unknown-linux-gnu.tar.xz",
+      "bytes": 80188348,
+      "sha256": "7d7fa1d0cfb0fab71a956bb78f41107202c17f30ab56c45288e869a37fd9633d",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "name": "rust-std",
+      "target": "x86_64-unknown-linux-musl",
+      "file": "rust-std-1.96.0-x86_64-unknown-linux-musl.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-05-28/rust-std-1.96.0-x86_64-unknown-linux-musl.tar.xz",
+      "bytes": 38833276,
+      "sha256": "4db24564076c243b377585bec0b938388638301ea5003d6245c4cbf9d86b11d0"
+    }
+  ]
+}

@@ -5,6 +5,12 @@
 It is deliberately a **partial upstream lock**, not the complete `inputs.json`
 required by that plan. It cannot authorize image assembly, import, or admission.
 
+The separate [Rust compiler input selection](rust-toolchain-inputs/README.md)
+pins the Linux amd64 GNU host and musl-target Rust 1.96.0 component archives and retains their
+release manifest. Its verifier checks metadata consistency and, optionally,
+actual downloaded bytes. Compiler execution and the Cargo vendor closure
+remain required before an offline workload build.
+
 The Ubuntu 24.04 amd64 root filesystem is the dated `release-20260826` artifact.
 Its 228,994,404 downloaded bytes matched the retained signed checksum manifest.
 The signature verified against fingerprint
