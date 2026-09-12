@@ -31,6 +31,8 @@ grep -F 'cargo 1.96.0' <<<"$cargov" >/dev/null || fail 'cargo version mismatch'
 mkdir -m 700 "$CARGO_HOME" /tmp/target
 cp "$source_input/config.toml" "$CARGO_HOME/config.toml"
 export CARGO_TARGET_DIR=/tmp/target CARGO_INCREMENTAL=0
+export CC=gcc-13 HOST_CC=gcc-13 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc-13
+export CC_x86_64_unknown_linux_gnu=gcc-13
 export RUSTFLAGS="-C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-Map=/tmp/evidence-agent.link-map --remap-path-prefix=$repo=/usr/src/zaino --remap-path-prefix=/tmp/target=/usr/src/zaino-target"
 cargo build --manifest-path "$repo/Cargo.toml" --locked --frozen --offline --release -p tdx-evidence-agent
 agent=/tmp/target/release/tdx-evidence-agent
