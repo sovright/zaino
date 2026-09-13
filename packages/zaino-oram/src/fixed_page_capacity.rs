@@ -17,7 +17,8 @@ use rostl_primitives::traits::Cmov;
 
 use crate::{
     hybrid_sizing::{
-        SourceBoundHybridSizingReport, SELECTED_GENERATION_INTERVAL_BLOCKS, SELECTED_PAGE_ENTRIES,
+        SourceBoundHybridSizingProfile, SourceBoundHybridSizingReport,
+        SELECTED_GENERATION_INTERVAL_BLOCKS, SELECTED_PAGE_ENTRIES,
     },
     records::{PersistentAddUtxoPage16, PersistentBaseUtxoPage16, PersistentSpendUtxoPage16},
 };
@@ -31,6 +32,15 @@ const POSITION_MAP_FAN_OUT_BYTES: usize = 64;
 const POSITION_BYTES: usize = size_of::<u32>();
 const POSITION_MAP_FAN_OUT: usize = POSITION_MAP_FAN_OUT_BYTES / POSITION_BYTES;
 const POSITION_MAP_LINEAR_ENTRIES: usize = POSITION_MAP_LEVEL_ZERO_BUCKETS * POSITION_MAP_FAN_OUT;
+const SELECTED_BASE_PAGES_V1: u64 = 2_388_477;
+const SELECTED_ADD_PAGES_V1: u64 = 69_233;
+const SELECTED_SPEND_PAGES_V1: u64 = 92_186;
+const SELECTED_FIXED_PAGE_READS_V1: u64 = 27_159;
+const SELECTED_MEASUREMENT_BLAKE2S256_V1: &str =
+    "aba46f64da0113d9b0e93209ab4a8a98626d6d5bc7973444c8bf766a1922b127";
+const SELECTED_CHECKPOINT_HEIGHT_V1: u32 = 3_425_046;
+const SELECTED_CHECKPOINT_HASH_V1: &str =
+    "0000000000a1014e9564513f1d5e5ddaba027c032857a236ca3178e9a8983ad4";
 
 // `RostlTable<T>` contains the main CircuitORAM, RecursivePositionMap, capacity,
 // public occupancy, terminal latch, and PhantomData. The nested Linux test in
@@ -111,6 +121,68 @@ impl FixedPageTableCapacityLowerBound {
     pub const fn retained_bytes(&self) -> u64 {
         self.retained_bytes
     }
+}
+
+/// Immutable v1 input for the real three-table allocation diagnostic.
+///
+/// Construction succeeds only for the exact selected source/checkpoint and
+/// demands in a semantically validated v1 report. The artifact loader remains
+/// responsible for authenticating that report's external bundle digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedPageAllocationProfile {
+    capacities: [usize; 3],
+    retained_floor_bytes: u64,
+}
+
+impl FixedPageAllocationProfile {
+    /// Derives the fixed diagnostic profile from the authenticated report.
+    pub fn try_from_report(
+        report: &SourceBoundHybridSizingReport,
+    ) -> Result<Self, FixedPageCapacityError> {
+        ensure_target_layout()?;
+        let demands = report
+            .selected_fixed_page_demands()
+            .map_err(|_| FixedPageCapacityError::InvalidSizingReport)?;
+        let (checkpoint_height, checkpoint_hash) = report.source_checkpoint();
+        if report.profile() != SourceBoundHybridSizingProfile::LiveUtxoBaseDeltaV1
+            || report.measurement_blake2s256() != SELECTED_MEASUREMENT_BLAKE2S256_V1
+            || checkpoint_height != SELECTED_CHECKPOINT_HEIGHT_V1
+            || checkpoint_hash != SELECTED_CHECKPOINT_HASH_V1
+        {
+            return Err(FixedPageCapacityError::UnsupportedProfile);
+        }
+        profile_from_demands(demands)
+    }
+
+    /// Returns the modeled retained floor, excluding whole-process overhead.
+    pub const fn retained_floor_bytes(&self) -> u64 {
+        self.retained_floor_bytes
+    }
+}
+
+fn profile_from_demands(
+    demands: SelectedFixedPageDemands,
+) -> Result<FixedPageAllocationProfile, FixedPageCapacityError> {
+    ensure_target_layout()?;
+    if demands
+        != (SelectedFixedPageDemands {
+            base_pages: SELECTED_BASE_PAGES_V1,
+            add_pages: SELECTED_ADD_PAGES_V1,
+            spend_pages: SELECTED_SPEND_PAGES_V1,
+            fixed_page_reads: SELECTED_FIXED_PAGE_READS_V1,
+        })
+    {
+        return Err(FixedPageCapacityError::UnsupportedProfile);
+    }
+    let lower_bound = derive_from_demands(demands)?;
+    Ok(FixedPageAllocationProfile {
+        capacities: [
+            capacity_as_usize(lower_bound.base.rounded_capacity)?,
+            capacity_as_usize(lower_bound.add.rounded_capacity)?,
+            capacity_as_usize(lower_bound.spend.rounded_capacity)?,
+        ],
+        retained_floor_bytes: lower_bound.retained_bytes,
+    })
 }
 
 /// Source-bound retained allocation floor for the selected page-table tuple.
@@ -216,6 +288,12 @@ pub enum FixedPageCapacityError {
     UnsupportedCapacity,
     /// The compiler target does not match the modeled 64-bit ABI.
     UnsupportedTargetLayout,
+    /// The report is valid but is not the reviewed fixed-page v1 tuple.
+    UnsupportedProfile,
+    /// A real table constructor failed or panicked.
+    AllocationFailed,
+    /// The observer refused or failed while all tables were retained.
+    ObserverFailed,
 }
 
 impl fmt::Display for FixedPageCapacityError {
@@ -232,7 +310,41 @@ impl fmt::Display for FixedPageCapacityError {
             }
             Self::UnsupportedTargetLayout => formatter
                 .write_str("fixed-page capacity model requires an x86_64-unknown-linux-gnu target"),
+            Self::UnsupportedProfile => {
+                formatter.write_str("hybrid sizing is not the reviewed fixed-page v1 profile")
+            }
+            Self::AllocationFailed => formatter.write_str("fixed-page table allocation failed"),
+            Self::ObserverFailed => formatter.write_str("fixed-page allocation observer failed"),
         }
+    }
+}
+
+/// Constructs and retains all three real tables while `observer` runs.
+///
+/// The callback receives only the reviewed capacities. No table or serving
+/// authority crosses this diagnostic boundary.
+pub fn with_fixed_page_allocation(
+    profile: &FixedPageAllocationProfile,
+    observer: impl FnOnce([usize; 3]) -> Result<(), ()>,
+) -> Result<(), FixedPageCapacityError> {
+    ensure_target_layout()?;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        crate::layout::with_fixed_page_allocation(profile.capacities, observer).map_err(|failure| {
+            match failure {
+                crate::layout::FixedPageAllocationFailure::Construction => {
+                    FixedPageCapacityError::AllocationFailed
+                }
+                crate::layout::FixedPageAllocationFailure::Observer => {
+                    FixedPageCapacityError::ObserverFailed
+                }
+            }
+        })
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = (profile, observer);
+        Err(FixedPageCapacityError::UnsupportedTargetLayout)
     }
 }
 
@@ -437,6 +549,10 @@ fn size_as_u64<T>() -> Result<u64, FixedPageCapacityError> {
     u64::try_from(size_of::<T>()).map_err(|_| FixedPageCapacityError::ArithmeticOverflow)
 }
 
+fn capacity_as_usize(value: u64) -> Result<usize, FixedPageCapacityError> {
+    usize::try_from(value).map_err(|_| FixedPageCapacityError::UnsupportedCapacity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +659,75 @@ mod tests {
         assert!(rendered.contains("nonclaims=allocator-overhead"));
         assert!(rendered.contains("target-headroom"));
         assert!(rendered.contains("gate1-go"));
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn allocation_profile_accepts_only_the_reviewed_v1_demands(
+    ) -> Result<(), FixedPageCapacityError> {
+        let selected = SelectedFixedPageDemands {
+            base_pages: SELECTED_BASE_PAGES_V1,
+            add_pages: SELECTED_ADD_PAGES_V1,
+            spend_pages: SELECTED_SPEND_PAGES_V1,
+            fixed_page_reads: SELECTED_FIXED_PAGE_READS_V1,
+        };
+        let profile = profile_from_demands(selected)?;
+        assert_eq!(profile.capacities, [4_194_304, 131_072, 131_072]);
+        assert_eq!(profile.retained_floor_bytes(), 22_020_227_816);
+
+        let mut changed = selected;
+        changed.add_pages += 1;
+        assert_eq!(
+            profile_from_demands(changed),
+            Err(FixedPageCapacityError::UnsupportedProfile)
+        );
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn checked_in_v1_report_is_the_only_public_allocation_profile(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const ARTIFACT: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/evidence/oram/gate1/",
+            "hybrid-mainnet-2316644-h3425046-v1/hybrid-sizing.json"
+        ));
+        let artifact: serde_json::Value = serde_json::from_str(ARTIFACT)?;
+        let report_value = artifact
+            .get("hybrid_sizing")
+            .ok_or("checked-in artifact contains hybrid_sizing")?;
+        let report: SourceBoundHybridSizingReport = serde_json::from_value(report_value.clone())?;
+        let profile = FixedPageAllocationProfile::try_from_report(&report)?;
+        assert_eq!(profile.capacities, [4_194_304, 131_072, 131_072]);
+
+        let mutations: &[(&str, fn(&mut serde_json::Value))] = &[
+            ("measurement", |value| {
+                value["source"]["measurement_blake2s256"] =
+                    serde_json::Value::String("11".repeat(32));
+            }),
+            ("checkpoint", |value| {
+                value["source"]["checkpoint_hash"] = serde_json::Value::String("22".repeat(32));
+            }),
+            ("profile", |value| {
+                value["profile"] =
+                    serde_json::Value::String("live-utxo-base-delta-growth-v2".into());
+            }),
+            ("demands", |value| {
+                value["base_page_candidates"][2]["base_pages"] =
+                    serde_json::Value::from(2_388_478_u64);
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed = report_value.clone();
+            mutate(&mut changed);
+            let changed: SourceBoundHybridSizingReport = serde_json::from_value(changed)?;
+            assert!(
+                FixedPageAllocationProfile::try_from_report(&changed).is_err(),
+                "{name} mutation must not mint an allocation profile"
+            );
+        }
         Ok(())
     }
 }

@@ -374,6 +374,11 @@ pub struct SourceBoundHybridSizingReport {
 }
 
 impl SourceBoundHybridSizingReport {
+    #[cfg(feature = "rostl-experimental")]
+    pub(super) const fn profile(&self) -> SourceBoundHybridSizingProfile {
+        self.profile
+    }
+
     /// Returns the source measurement digest retained by this report.
     pub fn measurement_blake2s256(&self) -> &str {
         &self.source.measurement_blake2s256

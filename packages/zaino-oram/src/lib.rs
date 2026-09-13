@@ -79,8 +79,8 @@ mod zaino_fixtures;
 pub use client_context::{PRIVATE_CLIENT_CONTEXT_VERSION, PRIVATE_MAINNET_ENVELOPE_BYTES};
 #[cfg(all(feature = "corpus-zaino", feature = "rostl-experimental"))]
 pub use fixed_page_capacity::{
-    derive_fixed_page_capacity_lower_bound, FixedPageCapacityError, FixedPageCapacityLowerBound,
-    FixedPageTableCapacityLowerBound,
+    derive_fixed_page_capacity_lower_bound, with_fixed_page_allocation, FixedPageAllocationProfile,
+    FixedPageCapacityError, FixedPageCapacityLowerBound, FixedPageTableCapacityLowerBound,
 };
 #[cfg(feature = "corpus-zaino")]
 pub use full_map_saturation::{

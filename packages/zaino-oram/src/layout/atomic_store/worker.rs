@@ -31,6 +31,13 @@ use crate::projection::ProjectionEventSink;
 mod rostl;
 #[cfg(feature = "rostl-experimental")]
 pub(crate) use rostl::{rostl_insert_timing_probe, validate_rostl_insert_timing_shape};
+#[cfg(all(
+    feature = "corpus-zaino",
+    feature = "rostl-experimental",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(crate) use rostl::{with_fixed_page_allocation, FixedPageAllocationFailure};
 
 const REPLY_CHANNEL_CAPACITY: usize = 1;
 // Allocation guard for the offline experiment, not an approved service profile.
