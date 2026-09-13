@@ -43,3 +43,32 @@ SHA-256 values are, respectively,
 `f9cfe3acb578538fe69521769ce7c0e636488c3cc7ee33cc2ec8fcdb81cb8f05`
 and `10be52b7273c9798e27f6412a5f272b8b893475b25ff69324f01b7b21d87d8d5`.
 The bucket enforces public-access prevention and uniform bucket-level access.
+
+## Second integration diagnostic
+
+Run `34724917398`, artifact `10308220938`, is also retained. The public GitHub
+artifact metadata's ZIP SHA-256 matches the downloaded bytes:
+`01985b4edf283aa1c827224739af349865bf4b547b8422f7431315d8391503ce`.
+All nine payload manifest entries verify. The embedded source merge is
+`a13646e816e3ffa240bfdef608894de83cdefef3`; its tree independently matches
+integration `3eb9d5a538d8740dc27972fee745e46f6201403c`. Static-check results and
+their limits are in the [repair review](oram-codegen-identity-and-mask-review-2026-09-12.md).
+The ELF remains unqualified and was not executed.
+
+Private retention prefix:
+
+```text
+gs://sovright-oram-research-evidence/builds/codegen-unqualified/56fab4e51e2e11f68d3df57a44795f94ec89dd33834d449271b71a62b4a89264/github-34724917398/
+```
+
+| Object | Bytes | Generation | SHA-256 |
+| --- | ---: | --- | --- |
+| `zaino-codegen-3eb9-diagnostic.zip` | 67451784 | `1789259569297119` | `01985b4edf283aa1c827224739af349865bf4b547b8422f7431315d8391503ce` |
+| `zaino-codegen-3eb9-github-artifact.json` | 728 | `1789259566978324` | `ed0f690f74e0020ad1954c30987ddc42604099e1ff58553dded8a972ef47d176` |
+| `zaino-codegen-3eb9-builder-commit.json` | 72199 | `1789259566978123` | `63a7bd6ad414cd7b0c280ae28e03e73d16775eaf887bb2ed67841043c011781f` |
+
+These uploads also required generation zero. The remote object set, all three
+sizes and MD5 checksums match the local files. Public-access prevention and
+uniform bucket-level access were rechecked before this upload. The larger
+commit record is the full public GitHub commit API response, not an ELF or a
+qualification receipt.
