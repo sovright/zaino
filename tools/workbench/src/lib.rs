@@ -5,6 +5,7 @@
 //! diagnostics and exit non-zero. [`run`] centralises that `main()` shape;
 //! [`repo_root`], [`git`], and [`toolchain_channel`] are the shared primitives.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
@@ -64,6 +65,314 @@ pub fn command(program: &str, args: &[&str]) -> Result<String, Vec<String>> {
     }
     String::from_utf8(output.stdout)
         .map_err(|error| vec![format!("{program} output is not valid UTF-8: {error}")])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElfSection {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+    pub contents: bool,
+    pub allocated: bool,
+    pub loaded: bool,
+    pub readonly: bool,
+    pub code: bool,
+}
+
+pub fn artifact_sections(artifact: &Path) -> Result<Vec<ElfSection>, Vec<String>> {
+    parse_elf_sections(&command(
+        "objdump",
+        &["-h", &artifact.display().to_string()],
+    )?)
+}
+
+pub fn parse_elf_sections(listing: &str) -> Result<Vec<ElfSection>, Vec<String>> {
+    if !listing
+        .lines()
+        .any(|line| line.trim_end().ends_with("file format elf64-x86-64"))
+    {
+        return Err(vec![
+            "artifact is not reported as exact elf64-x86-64".to_string()
+        ]);
+    }
+    let mut sections = Vec::new();
+    let mut indices = BTreeSet::new();
+    let mut lines = listing.lines();
+    while let Some(line) = lines.next() {
+        let mut fields = line.split_whitespace();
+        let Some(index) = fields.next().and_then(|field| field.parse::<usize>().ok()) else {
+            continue;
+        };
+        let (Some(name), Some(size), Some(address)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(vec![format!("malformed objdump section row: {line}")]);
+        };
+        if !indices.insert(index) {
+            return Err(vec![format!("duplicate objdump section index {index}")]);
+        }
+        let size = u64::from_str_radix(size, 16)
+            .map_err(|_| vec![format!("invalid objdump section size: {line}")])?;
+        let address = u64::from_str_radix(address, 16)
+            .map_err(|_| vec![format!("invalid objdump section address: {line}")])?;
+        address
+            .checked_add(size)
+            .ok_or_else(|| vec![format!("objdump section range overflows: {line}")])?;
+        let flags = lines
+            .next()
+            .ok_or_else(|| vec![format!("missing flags for objdump section `{name}`")])?
+            .split(',')
+            .map(str::trim)
+            .collect::<BTreeSet<_>>();
+        sections.push(ElfSection {
+            name: name.to_string(),
+            address,
+            size,
+            contents: flags.contains("CONTENTS"),
+            allocated: flags.contains("ALLOC"),
+            loaded: flags.contains("LOAD"),
+            readonly: flags.contains("READONLY"),
+            code: flags.contains("CODE"),
+        });
+    }
+    (!sections.is_empty())
+        .then_some(sections)
+        .ok_or_else(|| vec!["objdump did not provide any parseable section headers".to_string()])
+}
+
+pub fn rip_relative_target(
+    operand: &str,
+    next_address: u64,
+    indirect: bool,
+) -> Result<u64, &'static str> {
+    let operand = operand.trim();
+    let operand = if indirect {
+        operand
+            .strip_prefix('*')
+            .ok_or("expected an indirect RIP-relative operand")?
+    } else {
+        if operand.starts_with('*') {
+            return Err("unexpected indirect RIP-relative operand");
+        }
+        operand
+    };
+    let displacement = operand
+        .strip_suffix("(%rip)")
+        .ok_or("operand is not exact disp(%rip)")?;
+    let displacement = parse_signed_hex(displacement).ok_or("invalid RIP-relative displacement")?;
+    if displacement >= 0 {
+        next_address
+            .checked_add(displacement.unsigned_abs())
+            .ok_or("RIP-relative target overflows")
+    } else {
+        next_address
+            .checked_sub(displacement.unsigned_abs())
+            .ok_or("RIP-relative target underflows")
+    }
+}
+
+fn parse_signed_hex(value: &str) -> Option<i64> {
+    let (negative, digits) = if let Some(digits) = value.strip_prefix("-0x") {
+        (true, digits)
+    } else {
+        (false, value.strip_prefix("0x")?)
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let magnitude = i64::try_from(u64::from_str_radix(digits, 16).ok()?).ok()?;
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+pub fn comment_target(comment: &str) -> Option<(u64, &str)> {
+    let mut fields = comment.split_whitespace();
+    let address = fields.next()?;
+    let label = fields.next()?;
+    if fields.next().is_some()
+        || address.is_empty()
+        || !address.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((
+        u64::from_str_radix(address, 16).ok()?,
+        label.strip_prefix('<')?.strip_suffix('>')?,
+    ))
+}
+
+pub fn validate_readonly_constant_span(
+    sections: &[ElfSection],
+    relocation_addresses: impl IntoIterator<Item = u64>,
+    address: u64,
+    length: u64,
+) -> Result<(), Vec<String>> {
+    if length == 0 {
+        return Err(vec![
+            "RIP-relative constant length must be nonzero".to_string()
+        ]);
+    }
+    let end = address
+        .checked_add(length)
+        .ok_or_else(|| vec!["RIP-relative constant range overflows".to_string()])?;
+    let mut overlapping = Vec::new();
+    for section in sections {
+        let section_end = section
+            .address
+            .checked_add(section.size)
+            .ok_or_else(|| vec![format!("section `{}` range overflows", section.name)])?;
+        if section.size != 0 && section.address < end && address < section_end {
+            overlapping.push((section, section_end));
+        }
+    }
+    let [(section, section_end)] = overlapping.as_slice() else {
+        return Err(vec![format!(
+            "RIP-relative constant span 0x{address:x}..0x{end:x} intersects {} sections, expected exactly one",
+            overlapping.len()
+        )]);
+    };
+    if section.address > address || *section_end < end {
+        return Err(vec![format!(
+            "RIP-relative constant span is not fully contained by section `{}`",
+            section.name
+        )]);
+    }
+    if !(section.contents && section.allocated && section.loaded && section.readonly)
+        || section.code
+    {
+        return Err(vec![format!(
+            "RIP-relative constant span is in unapproved section `{}`; expected loaded, allocated, read-only data",
+            section.name
+        )]);
+    }
+    if let Some(slot) = relocation_addresses
+        .into_iter()
+        .find(|slot| section.address <= *slot && *slot < *section_end)
+    {
+        return Err(vec![format!(
+            "RIP-relative constant section `{}` contains dynamic relocation at 0x{slot:x}; relocation-free provenance is required",
+            section.name
+        )]);
+    }
+    Ok(())
+}
+
+/// Read an exact virtual-address byte range from an ELF through `objdump`.
+pub fn artifact_bytes(
+    artifact: &Path,
+    address: u64,
+    length: usize,
+) -> Result<Vec<u8>, Vec<String>> {
+    let length = u64::try_from(length)
+        .map_err(|_| vec!["requested artifact-byte length does not fit u64".to_string()])?;
+    let end = address
+        .checked_add(length)
+        .ok_or_else(|| vec!["requested artifact-byte range overflows".to_string()])?;
+    let listing = command(
+        "objdump",
+        &[
+            "-s",
+            &format!("--start-address=0x{address:x}"),
+            &format!("--stop-address=0x{end:x}"),
+            &artifact.display().to_string(),
+        ],
+    )?;
+    parse_artifact_bytes(&listing, address, end)
+}
+
+fn parse_artifact_bytes(listing: &str, start: u64, end: u64) -> Result<Vec<u8>, Vec<String>> {
+    let mut found = BTreeMap::new();
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(field) = fields.next() else {
+            continue;
+        };
+        let Ok(mut address) = u64::from_str_radix(field, 16) else {
+            continue;
+        };
+        for word in fields {
+            if word.is_empty()
+                || word.len() > 8
+                || word.len() % 2 != 0
+                || !word.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                break;
+            }
+            for index in (0..word.len()).step_by(2) {
+                let byte = u8::from_str_radix(&word[index..index + 2], 16)
+                    .map_err(|_| vec![format!("invalid objdump data byte: {word}")])?;
+                if address >= start && address < end && found.insert(address, byte).is_some() {
+                    return Err(vec![format!(
+                        "duplicate objdump data byte at address 0x{address:x}"
+                    )]);
+                }
+                address = address
+                    .checked_add(1)
+                    .ok_or_else(|| vec!["objdump data address overflows".to_string()])?;
+            }
+        }
+    }
+    (start..end)
+        .map(|address| {
+            found.get(&address).copied().ok_or_else(|| {
+                vec![format!(
+                    "objdump did not provide requested data byte at 0x{address:x}"
+                )]
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod elf_tests {
+    use super::*;
+
+    #[test]
+    fn artifact_data_parser_refuses_missing_and_duplicate_bytes() {
+        let complete = " 0200 ffffffff ffffffff ffffffff ffff0000  ................\n";
+        assert_eq!(
+            parse_artifact_bytes(complete, 0x200, 0x210).expect("fixture range is complete"),
+            [
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0, 0,
+            ]
+        );
+        assert!(parse_artifact_bytes(complete, 0x1ff, 0x210).is_err());
+        let duplicate = " 0200 ffffffff\n 0200 ffffffff\n";
+        assert!(parse_artifact_bytes(duplicate, 0x200, 0x204).is_err());
+    }
+
+    #[test]
+    fn rip_targets_accept_checked_positive_and_negative_displacements() {
+        assert_eq!(rip_relative_target("0xfa(%rip)", 0x106, false), Ok(0x200));
+        assert_eq!(rip_relative_target("-0x6(%rip)", 0x106, false), Ok(0x100));
+        assert!(rip_relative_target("0xffffffffffffffff(%rip)", 0x106, false).is_err());
+        assert!(rip_relative_target("-0xffffffffffffffff(%rip)", 0x106, false).is_err());
+    }
+
+    #[test]
+    fn readonly_span_refuses_zero_length_and_section_range_overflow() {
+        let section = ElfSection {
+            name: ".rodata".to_string(),
+            address: 0x200,
+            size: 0x100,
+            contents: true,
+            allocated: true,
+            loaded: true,
+            readonly: true,
+            code: false,
+        };
+        assert!(validate_readonly_constant_span(&[section], [], 0x200, 0).is_err());
+        let overflowing = ElfSection {
+            name: ".rodata".to_string(),
+            address: u64::MAX,
+            size: 2,
+            contents: true,
+            allocated: true,
+            loaded: true,
+            readonly: true,
+            code: false,
+        };
+        assert!(validate_readonly_constant_span(&[overflowing], [], u64::MAX, 1).is_err());
+    }
 }
 
 /// Repository root via `git rev-parse --show-toplevel`.

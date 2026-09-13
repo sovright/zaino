@@ -1,0 +1,25 @@
+{
+  "schema": "zaino-custom-kernel-patches-v1",
+  "source_driver_sha256": "06d50d736be3f708dd78654884b296b379736529f0a1cb73f7753e3f9e4fa078",
+  "patched_driver_sha256": "ac7a2fed535b553fbd112bca77d42f7d734fa23e72341ce7437b853d311f582a",
+  "upstream": [
+    {
+      "commit": "0f409eaea53e49932cf92a761de66345c9a4b4be",
+      "file": "0001-tdx-getquote-status.patch",
+      "bytes": 2597,
+      "sha256": "b9b94ea121334581b71f95bd723ea060222420ab09ee4773cf9ef35a57355035"
+    },
+    {
+      "commit": "c3fd16c3b98ed726294feab2f94f876290bf7b61",
+      "file": "0002-tdx-getquote-length.patch",
+      "bytes": 2960,
+      "sha256": "7bf1c49441cf2d168adedbf4a57df65b0e758e37ff713aa48f4e9b2d58e22ed1"
+    }
+  ],
+  "applied_backport": {
+    "file": "0003-tdx-getquote-linux-6.17-backport.patch",
+    "bytes": 1340,
+    "sha256": "ab420f4663f504a61f33d054a350a88dd9dae8e35431c5fcdd800f025ee88bf8"
+  },
+  "scope": "reviewed-status-and-host-controlled-length-fixes-only;boot-qualification-required"
+}

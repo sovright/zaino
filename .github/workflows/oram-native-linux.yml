@@ -76,6 +76,32 @@ jobs:
         run: >-
           cargo nextest run -p tdx-evidence-agent --locked
           --no-tests fail --status-level fail
+      - name: Verify privileged candidate reaches its filtered listener
+        shell: bash
+        run: |
+          cargo build -p tdx-evidence-agent --locked
+          agent_path="$PWD/target/debug/tdx-evidence-agent"
+          test -z "$(sudo -n /usr/bin/ss -H -ltnp 'sport = :39091')"
+          set +e
+          sudo -n /usr/bin/timeout --kill-after=1s 3s \
+            "$agent_path" --listen 127.0.0.1:39091 &
+          probe_pid=$!
+          listener_ready=0
+          for _ in $(seq 1 40); do
+            listener="$(sudo -n /usr/bin/ss -H -ltnp 'sport = :39091')"
+            if [[ "$listener" =~ pid=([0-9]+) ]] &&
+              test "$(sudo -n /usr/bin/readlink "/proc/${BASH_REMATCH[1]}/exe")" = "$agent_path"
+            then
+              listener_ready=1
+              break
+            fi
+            sleep 0.05
+          done
+          wait "$probe_pid"
+          probe_status=$?
+          set -e
+          test "$listener_ready" -eq 1
+          test "$probe_status" -eq 124
       - name: Check native init
         run: >-
           cargo clippy -p tdx-guest-init --features linux-init --all-targets
@@ -198,6 +224,43 @@ jobs:
         run: |
           nm --version | head -1
           objdump --version | head -1
+
+      # Preserve the exact binary for review even when a later profile rejects
+      # it. This is deliberately not the checked research-runner bundle.
+      - name: Prepare unqualified codegen diagnostic
+        run: |
+          set -euo pipefail
+          umask 077
+          diagnostic=target/oram-codegen-diagnostic
+          mkdir -m 0700 "$diagnostic"
+          install -m 0644 target/release/zainod-oram "$diagnostic/runner.UNQUALIFIED"
+          cp Cargo.lock "$diagnostic/Cargo.lock"
+          rustc --version --verbose > "$diagnostic/rustc-version.txt"
+          nm --defined-only target/release/zainod-oram > "$diagnostic/defined-symbols.txt"
+          nm --demangle --defined-only target/release/zainod-oram > "$diagnostic/demangled-symbols.txt"
+          objdump --version > "$diagnostic/binutils-version.txt"
+          objdump --disassemble --wide target/release/zainod-oram > "$diagnostic/disassembly.txt"
+          readelf --relocs --wide target/release/zainod-oram > "$diagnostic/relocations.txt"
+          jq -n --arg source_commit "$(git rev-parse HEAD)" \
+            --arg source_tree "$(git rev-parse 'HEAD^{tree}')" \
+            --arg workflow_commit "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{schema:"zaino-oram-codegen-diagnostic-v1",qualified:false,
+              source_commit:$source_commit,source_tree:$source_tree,
+              workflow_commit:$workflow_commit,run_id:$run_id,run_attempt:$run_attempt,
+              build_command:"cargo build -p zainod-oram --all-features --locked --release",
+              scope:"unqualified-binary-for-static-inspection-only"}' > "$diagnostic/diagnostic.json"
+          (cd "$diagnostic" && sha256sum runner.UNQUALIFIED Cargo.lock \
+            rustc-version.txt defined-symbols.txt demangled-symbols.txt \
+            binutils-version.txt disassembly.txt relocations.txt diagnostic.json > SHA256SUMS)
+
+      - name: Retain unqualified codegen diagnostic
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oram-codegen-UNQUALIFIED-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/oram-codegen-diagnostic/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Check the ORAM access-path codegen profile
         run: >-

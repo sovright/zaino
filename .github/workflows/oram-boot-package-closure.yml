@@ -53,7 +53,8 @@ jobs:
             echo 'stock kernel unexpectedly passed the no-admin policy' >&2
             exit 1
           fi
-          grep -Fq 'prohibited setting enabled: CONFIG_DEBUG_KERNEL' "$RUNNER_TEMP/kernel-policy.log"
+          cat "$RUNNER_TEMP/kernel-policy.log"
+          grep -Fq 'prohibited setting enabled: CONFIG_DEBUG_FS' "$RUNNER_TEMP/kernel-policy.log"
       - name: Retain canonical negative-decision inputs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

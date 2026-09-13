@@ -53,10 +53,13 @@
 //! - `check-oram-codegen --profile fixed-exact-upsert <path-to-x86_64-elf>`
 //!   guards `fixed_exact_upsert`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::Path;
-use workbench::{command as tool, encoded_byte_len, is_gnu_prefix, run};
+use workbench::{
+    artifact_bytes, artifact_sections, command as tool, comment_target, encoded_byte_len,
+    is_gnu_prefix, rip_relative_target, run, validate_readonly_constant_span, ElfSection,
+};
 
 /// The original access-path function whose body must match the approved
 /// profile. These constants remain the default so the historical one-argument
@@ -68,41 +71,36 @@ const FIXED_EXACT_UPSERT: &str = "fixed_exact_upsert";
 const FIXED_EXACT_UPSERT_SYMBOL: &str =
     "zaino_oram::layout::atomic_store::worker::rostl::fixed_exact_upsert";
 
-// Re-pinned from the qualifying Linux x86_64 release build after the upstream
-// sync. Every `17h<hash>` disambiguator moved at once, which is what a
-// dependency-graph change does: cargo derives `-C metadata` from it.
-//
-// `read` and `write_or_insert` each had two instantiations before and have two
-// now, so for them this is churn. `random_range` is different: only one
-// identity was ever pinned while two are present, so the guard counted
-// addresses for the pinned symbol alone. Whether the second appeared with this
-// sync or was always there and unpinned is not decidable from what the guard
-// reports, so both are pinned here and the question is left open rather than
-// answered by assumption.
-//
-// The DIRECTORY/EVENT split in these names records the original qualification's
-// attribution. This re-pin cannot re-confirm it: the guard reports which
-// instantiations exist for a path, not which record type each serves, and both
-// map to the same target either way. Treat the suffix as historical.
+// These identities deliberately stop before rustc's `17h<hash>` legacy
+// disambiguator. The statically reviewed diagnostic artifact retained under
+// digest f5cc1c3f contains the complete asserted set of two instantiations for
+// each path. Every resolved address maps to the same
+// semantic call target; record attribution is neither encoded nor inferred.
+const RANDOM_RANGE_SYMBOL_PATH: &str = "_ZN4rand3rng3Rng12random_range";
+const CIRCUIT_READ_SYMBOL_PATH: &str = "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read";
+const CIRCUIT_WRITE_OR_INSERT_SYMBOL_PATH: &str =
+    "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert";
+const EXPECTED_DIRECT_CALL_INSTANTIATIONS: usize = 2;
+
+// Measured identities remain test fixtures. Production matching ignores their
+// disambiguator values and asserts the complete path set instead.
+#[cfg(test)]
 const RANDOM_RANGE_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17h43bc1d42da279629E";
+#[cfg(test)]
 const RANDOM_RANGE_SECOND_RAW_SYMBOL: &str = "_ZN4rand3rng3Rng12random_range17hb9510b448ebef3c3E";
+#[cfg(test)]
 const CIRCUIT_READ_RAW_SYMBOL: &str =
     "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h18365c90d6304c81E";
+#[cfg(test)]
 const CIRCUIT_EVENT_READ_RAW_SYMBOL: &str =
     "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$4read17h79d3bb87fa7ca204E";
+#[cfg(test)]
 const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
     "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17h1408426bfb5e61feE";
+#[cfg(test)]
 const CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL: &str =
     "_ZN10rostl_oram12circuit_oram20CircuitORAM$LT$V$GT$15write_or_insert17ha119a6051f7d95a7E";
 const UNWIND_DYNAMIC_SYMBOL: &str = "_Unwind_Resume@GCC_3.0";
-
-const RANDOM_RANGE_RAW_SYMBOLS: &[&str] =
-    &[RANDOM_RANGE_RAW_SYMBOL, RANDOM_RANGE_SECOND_RAW_SYMBOL];
-const CIRCUIT_READ_RAW_SYMBOLS: &[&str] = &[CIRCUIT_READ_RAW_SYMBOL, CIRCUIT_EVENT_READ_RAW_SYMBOL];
-const CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOLS: &[&str] = &[
-    CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL,
-    CIRCUIT_EVENT_WRITE_OR_INSERT_RAW_SYMBOL,
-];
 
 /// Both record monomorphizations must be present: the 38-byte directory record
 /// and the 82-byte event record. Finding fewer means the build did not select
@@ -286,12 +284,12 @@ impl ExactDirectCallTarget {
         }
     }
 
-    const fn raw_symbols(self) -> &'static [&'static str] {
+    const fn symbol_path(self) -> Option<&'static str> {
         match self {
-            Self::RandomRange => RANDOM_RANGE_RAW_SYMBOLS,
-            Self::CircuitRead => CIRCUIT_READ_RAW_SYMBOLS,
-            Self::CircuitWriteOrInsert => CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOLS,
-            Self::UnwindResume => &[],
+            Self::RandomRange => Some(RANDOM_RANGE_SYMBOL_PATH),
+            Self::CircuitRead => Some(CIRCUIT_READ_SYMBOL_PATH),
+            Self::CircuitWriteOrInsert => Some(CIRCUIT_WRITE_OR_INSERT_SYMBOL_PATH),
+            Self::UnwindResume => None,
         }
     }
 
@@ -611,10 +609,17 @@ fn parse_defined_text_symbols(listing: &str) -> Result<TextSymbols, Vec<String>>
         let expected_in_line = FixedCallTarget::ALL
             .into_iter()
             .find(|target| line.contains(target.identity()));
+        let direct_family_in_line = [
+            RANDOM_RANGE_SYMBOL_PATH,
+            CIRCUIT_READ_SYMBOL_PATH,
+            CIRCUIT_WRITE_OR_INSERT_SYMBOL_PATH,
+        ]
+        .into_iter()
+        .any(|path| line.contains(path));
         let mut fields = line.split_whitespace();
         let (Some(address), Some(size), Some(kind)) = (fields.next(), fields.next(), fields.next())
         else {
-            if expected_in_line.is_some() {
+            if expected_in_line.is_some() || direct_family_in_line {
                 return Err(vec![format!("malformed expected text symbol: {line}")]);
             }
             continue;
@@ -623,14 +628,21 @@ fn parse_defined_text_symbols(listing: &str) -> Result<TextSymbols, Vec<String>>
         let expected = FixedCallTarget::ALL
             .into_iter()
             .find(|target| name == target.identity());
+        let direct_family = [
+            RANDOM_RANGE_SYMBOL_PATH,
+            CIRCUIT_READ_SYMBOL_PATH,
+            CIRCUIT_WRITE_OR_INSERT_SYMBOL_PATH,
+        ]
+        .into_iter()
+        .any(|path| name.starts_with(path));
         if !matches!(kind, "T" | "t") {
-            if expected.is_some() {
+            if expected.is_some() || direct_family {
                 return Err(vec![format!("expected symbol is not text: {line}")]);
             }
             continue;
         }
         let Ok(address) = u64::from_str_radix(address, 16) else {
-            if expected.is_some() {
+            if expected.is_some() || direct_family {
                 return Err(vec![format!(
                     "invalid expected text-symbol address: {line}"
                 )]);
@@ -638,15 +650,15 @@ fn parse_defined_text_symbols(listing: &str) -> Result<TextSymbols, Vec<String>>
             continue;
         };
         let Ok(size) = u64::from_str_radix(size, 16) else {
-            if expected.is_some() {
+            if expected.is_some() || direct_family {
                 return Err(vec![format!("invalid expected text-symbol size: {line}")]);
             }
             continue;
         };
+        if (expected.is_some() || direct_family) && size == 0 {
+            return Err(vec![format!("zero-sized expected text symbol: {line}")]);
+        }
         if let Some(target) = expected {
-            if size == 0 {
-                return Err(vec![format!("zero-sized expected text symbol: {line}")]);
-            }
             if expected_addresses
                 .insert(target.identity(), address)
                 .is_some()
@@ -751,25 +763,28 @@ fn exact_direct_call_symbols(
     parse_exact_direct_call_symbols(text_symbols, relocations, &unwind_listing)
 }
 
-/// Symbols sharing `pinned`'s demangled path but not its disambiguator hash.
+/// Removes only a syntactically complete rustc disambiguator.
 ///
-/// Diagnostic only: it reports what a stale pin should be updated to. Matching
-/// itself stays exact, because one path can have several legitimate
-/// instantiations that only the hash tells apart.
-fn same_path_instantiations(text_symbols: &TextSymbols, pinned: &str) -> Vec<String> {
-    let Some(prefix_end) = pinned.rfind("17h") else {
-        return Vec::new();
-    };
-    let prefix = &pinned[..prefix_end];
-    let mut found = text_symbols
-        .values()
-        .flatten()
-        .filter(|name| name.starts_with(prefix) && name.as_str() != pinned)
-        .cloned()
-        .collect::<Vec<_>>();
-    found.sort();
-    found.dedup();
-    found
+/// Legacy symbols end in `17h` plus sixteen lowercase hexadecimal digits and
+/// `E`. Anything malformed is refused. The current direct targets are all
+/// legacy-mangled; the separately pinned v0 panic target remains unchanged.
+fn disambiguator_free_symbol_path(symbol: &str) -> Option<String> {
+    if let Some(path_end) = symbol
+        .strip_suffix('E')
+        .and_then(|value| value.rfind("17h"))
+    {
+        let hash = &symbol[path_end + 3..symbol.len() - 1];
+        if symbol.starts_with("_ZN")
+            && hash.len() == 16
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Some(symbol[..path_end].to_string());
+        }
+        return None;
+    }
+    None
 }
 
 fn parse_exact_direct_call_symbols(
@@ -787,37 +802,46 @@ fn parse_exact_direct_call_symbols(
         ExactDirectCallTarget::CircuitRead,
         ExactDirectCallTarget::CircuitWriteOrInsert,
     ] {
-        for raw_symbol in target.raw_symbols() {
-            let addresses = text_symbols
+        let path = target
+            .symbol_path()
+            .ok_or_else(|| vec!["unwind has no defined-text path".to_string()])?;
+        let mut instantiations = Vec::new();
+        for (address, names) in text_symbols {
+            for name in names {
+                match disambiguator_free_symbol_path(name) {
+                    Some(found) if found == path => instantiations.push((*address, name)),
+                    None if name.starts_with(path) => mismatches.push(format!(
+                        "malformed disambiguator for direct-call path `{path}`: {name}"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        let unique_addresses = instantiations
+            .iter()
+            .map(|(address, _)| *address)
+            .collect::<std::collections::BTreeSet<_>>();
+        let unique_names = instantiations
+            .iter()
+            .map(|(_, name)| *name)
+            .collect::<BTreeSet<_>>();
+        if instantiations.len() != EXPECTED_DIRECT_CALL_INSTANTIATIONS
+            || unique_addresses.len() != EXPECTED_DIRECT_CALL_INSTANTIATIONS
+            || unique_names.len() != EXPECTED_DIRECT_CALL_INSTANTIATIONS
+        {
+            let found = instantiations
                 .iter()
-                .filter_map(|(address, names)| {
-                    names
-                        .iter()
-                        .any(|name| name == raw_symbol)
-                        .then_some(*address)
-                })
-                .collect::<Vec<_>>();
-            let [address] = addresses.as_slice() else {
-                // Name the instantiations that DO exist for this path. The
-                // trailing `17h<hash>` is a compiler disambiguator, so it moves
-                // when the toolchain or dependency graph does. Without this
-                // list, re-qualifying means guessing the new value. The hash is
-                // still matched exactly: distinct instantiations of one path are
-                // distinguished by it and nothing else.
-                let present = same_path_instantiations(text_symbols, raw_symbol);
-                let found = if present.is_empty() {
-                    "none".to_string()
-                } else {
-                    present.join(", ")
-                };
-                mismatches.push(format!(
-                    "expected exactly one defined raw text identity `{raw_symbol}`; \
-                     found {}. Instantiations present for this path: {found}",
-                    addresses.len()
-                ));
-                continue;
-            };
-            insert_exact_direct_target(&mut resolved, *address, target)?;
+                .map(|(address, name)| format!("{address:x}:{name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            mismatches.push(format!(
+                "expected exactly {EXPECTED_DIRECT_CALL_INSTANTIATIONS} distinct defined text identities of `{path}` at distinct addresses; found {} ({found})",
+                instantiations.len()
+            ));
+            continue;
+        }
+        for address in unique_addresses {
+            insert_exact_direct_target(&mut resolved, address, target)?;
         }
     }
     if !mismatches.is_empty() {
@@ -956,12 +980,110 @@ fn inspect(
         return Err(scanned.failures);
     }
     let record_loop = validate_allowances_for_profile(&scanned, &symbol.name, profile)?;
+    if profile == GuardedProfile::FixedExactUpsert {
+        validate_upsert_mask(artifact, &disassembly, relocations, record_loop)?;
+    }
     Ok(Inspected {
         name: symbol.name.clone(),
         instructions: scanned.instructions,
         allowed: scanned.allowed,
         record_loop,
     })
+}
+
+fn validate_upsert_mask(
+    artifact: &Path,
+    disassembly: &str,
+    relocations: &DynamicRelocations,
+    record_loop: RecordLoop,
+) -> Result<(), Vec<String>> {
+    let sections = artifact_sections(artifact)?;
+    validate_upsert_mask_with(
+        disassembly,
+        &sections,
+        relocations,
+        record_loop,
+        |address, width| artifact_bytes(artifact, address, width),
+    )
+}
+
+fn validate_upsert_mask_with(
+    disassembly: &str,
+    sections: &[ElfSection],
+    relocations: &DynamicRelocations,
+    record_loop: RecordLoop,
+    mut read_bytes: impl FnMut(u64, usize) -> Result<Vec<u8>, Vec<String>>,
+) -> Result<(), Vec<String>> {
+    let mut masks = Vec::new();
+    for line in disassembly.lines() {
+        let Some(parsed) = parse_instruction(line).map_err(|reason| vec![reason.to_string()])?
+        else {
+            continue;
+        };
+        let instruction = &parsed.instruction;
+        if matches!(instruction.bare_mnemonic(), "call" | "callq")
+            || !instruction.operands.contains("%rip")
+        {
+            continue;
+        }
+        // `lea` computes an address without reading the referenced bytes, so
+        // it is outside this mask-provenance proof. No broader dataflow claim
+        // is inferred from excluding it here.
+        if instruction.bare_mnemonic() == "lea" {
+            continue;
+        }
+        if instruction.has_prefix() || instruction.bare_mnemonic() != "pand" {
+            return Err(vec![format!(
+                "unapproved non-call RIP-relative data instruction at 0x{:x}: {} {}",
+                instruction.address, instruction.mnemonic, instruction.operands
+            )]);
+        }
+        let length = parsed
+            .encoded_len
+            .ok_or_else(|| vec!["RIP mask has no encoded length".to_string()])?;
+        let next = instruction
+            .address
+            .checked_add(length)
+            .ok_or_else(|| vec!["RIP mask instruction range overflows".to_string()])?;
+        let (operands, comment) = instruction
+            .operands
+            .split_once('#')
+            .ok_or_else(|| vec!["RIP mask is missing resolved target comment".to_string()])?;
+        let (source, destination) = operands
+            .trim()
+            .rsplit_once(',')
+            .ok_or_else(|| vec!["RIP mask operands are malformed".to_string()])?;
+        if destination != "%xmm7" {
+            return Err(vec![format!(
+                "RIP mask has unapproved destination `{destination}`"
+            )]);
+        }
+        let target = rip_relative_target(source.trim(), next, false)
+            .map_err(|reason| vec![format!("RIP mask: {reason}")])?;
+        let (comment_address, _) = comment_target(comment)
+            .ok_or_else(|| vec!["RIP mask comment is malformed".to_string()])?;
+        if target != comment_address {
+            return Err(vec![
+                "RIP mask comment conflicts with encoded target".to_string()
+            ]);
+        }
+        masks.push(target);
+    }
+    match record_loop {
+        RecordLoop::Directory if masks.is_empty() => Ok(()),
+        RecordLoop::Event if masks.len() == 1 => {
+            validate_readonly_constant_span(sections, relocations.keys().copied(), masks[0], 16)?;
+            let bytes = read_bytes(masks[0], 16)?;
+            let expected = [0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            (bytes == expected)
+                .then_some(())
+                .ok_or_else(|| vec![format!("event equality mask bytes changed: {bytes:02x?}")])
+        }
+        _ => Err(vec![format!(
+            "unexpected RIP equality-mask count {} for {record_loop:?}",
+            masks.len()
+        )]),
+    }
 }
 
 struct Scan {
@@ -3091,7 +3213,6 @@ mod tests {
         let duplicated = TextSymbols::from([
             (0x600, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
             (0x601, vec![RANDOM_RANGE_RAW_SYMBOL.to_string()]),
-            (0x602, vec![RANDOM_RANGE_SECOND_RAW_SYMBOL.to_string()]),
             (0x610, vec![CIRCUIT_READ_RAW_SYMBOL.to_string()]),
             (0x611, vec![CIRCUIT_EVENT_READ_RAW_SYMBOL.to_string()]),
             (0x620, vec![CIRCUIT_WRITE_OR_INSERT_RAW_SYMBOL.to_string()]),
@@ -3104,6 +3225,239 @@ mod tests {
             parse_exact_direct_call_symbols(&duplicated, &relocations, UNWIND_PLT).is_err(),
             "one raw identity at two addresses must be ambiguous"
         );
+    }
+
+    #[test]
+    fn exact_direct_call_paths_accept_hash_churn_but_require_complete_sets() {
+        let symbols = TextSymbols::from([
+            (
+                0x600,
+                vec![format!("{RANDOM_RANGE_SYMBOL_PATH}17h0000000000000000E")],
+            ),
+            (
+                0x601,
+                vec![format!("{RANDOM_RANGE_SYMBOL_PATH}17h1111111111111111E")],
+            ),
+            (
+                0x610,
+                vec![format!("{CIRCUIT_READ_SYMBOL_PATH}17h2222222222222222E")],
+            ),
+            (
+                0x611,
+                vec![format!("{CIRCUIT_READ_SYMBOL_PATH}17h3333333333333333E")],
+            ),
+            (
+                0x620,
+                vec![format!(
+                    "{CIRCUIT_WRITE_OR_INSERT_SYMBOL_PATH}17h4444444444444444E"
+                )],
+            ),
+            (
+                0x621,
+                vec![format!(
+                    "{CIRCUIT_WRITE_OR_INSERT_SYMBOL_PATH}17h5555555555555555E"
+                )],
+            ),
+        ]);
+        let resolved = parse_exact_direct_call_symbols(
+            &symbols,
+            &unwind_jump_slot(UNWIND_DYNAMIC_SYMBOL),
+            UNWIND_PLT,
+        )
+        .expect("complete path sets survive disambiguator churn");
+        assert_eq!(resolved.len(), 7);
+
+        let mut extra = symbols.clone();
+        extra.insert(
+            0x602,
+            vec![format!("{RANDOM_RANGE_SYMBOL_PATH}17h6666666666666666E")],
+        );
+        let errors = parse_exact_direct_call_symbols(
+            &extra,
+            &unwind_jump_slot(UNWIND_DYNAMIC_SYMBOL),
+            UNWIND_PLT,
+        )
+        .expect_err("an extra instantiation must fail closed");
+        assert!(errors.iter().any(|error| error.contains("found 3")));
+    }
+
+    #[test]
+    fn symbol_path_normalization_accepts_only_complete_legacy_suffixes() {
+        assert_eq!(
+            disambiguator_free_symbol_path("_ZN4test4path17h0123456789abcdefE").as_deref(),
+            Some("_ZN4test4path")
+        );
+        for malformed in [
+            "_ZN4test4path17h0123456789abcdeE",
+            "_ZN4test4path17h0123456789ABCDEFE",
+            "_ZN4test4path17h0123456789abcdef",
+            "_RNvNtCs27Vx93FoQ6z_4core9panicking16panic_in_cleanup",
+        ] {
+            assert_eq!(
+                disambiguator_free_symbol_path(malformed),
+                None,
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_family_nm_rows_require_sized_text_and_valid_numeric_fields() {
+        let identity = format!("{RANDOM_RANGE_SYMBOL_PATH}17h0123456789abcdefE");
+        let valid = format!("0000000000000100 0000000000000010 T {identity}\n");
+        let symbols = parse_defined_text_symbols(&valid).expect("actual legacy row shape is valid");
+        assert_eq!(symbols.get(&0x100), Some(&vec![identity.clone()]));
+
+        for malformed in [
+            format!("0000000000000100 0000000000000010 D {identity}\n"),
+            format!("0000000000000100 0000000000000000 T {identity}\n"),
+            format!("malformed 0000000000000010 T {identity}\n"),
+            format!("0000000000000100 malformed T {identity}\n"),
+            format!("0000000000000100 {identity}\n"),
+        ] {
+            assert!(
+                parse_defined_text_symbols(&malformed).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    fn mask_section(readonly: bool) -> ElfSection {
+        ElfSection {
+            name: ".rodata".to_string(),
+            address: 0x200,
+            size: 0x100,
+            contents: true,
+            allocated: true,
+            loaded: true,
+            readonly,
+            code: false,
+        }
+    }
+
+    fn event_mask_listing() -> &'static str {
+        "  100:\t66 0f db 3d f8 00 00 00\tpand 0xf8(%rip),%xmm7 # 200 <anonymous>\n"
+    }
+
+    #[test]
+    fn event_mask_binds_count_destination_target_and_exact_bytes() {
+        let expected = [0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(validate_upsert_mask_with(
+            event_mask_listing(),
+            &[mask_section(true)],
+            &DynamicRelocations::new(),
+            RecordLoop::Event,
+            |address, width| {
+                assert_eq!((address, width), (0x200, 16));
+                Ok(expected.to_vec())
+            },
+        )
+        .is_ok());
+
+        for changed in [
+            event_mask_listing().replace("%xmm7", "%xmm6"),
+            event_mask_listing().replace("# 200", "# 201"),
+            format!("{}{}", event_mask_listing(), event_mask_listing()),
+            String::new(),
+        ] {
+            assert!(
+                validate_upsert_mask_with(
+                    &changed,
+                    &[mask_section(true)],
+                    &DynamicRelocations::new(),
+                    RecordLoop::Event,
+                    |_, _| Ok(expected.to_vec()),
+                )
+                .is_err(),
+                "{changed}"
+            );
+        }
+        let mut wrong = expected;
+        wrong[0] = 0;
+        assert!(validate_upsert_mask_with(
+            event_mask_listing(),
+            &[mask_section(true)],
+            &DynamicRelocations::new(),
+            RecordLoop::Event,
+            |_, _| Ok(wrong.to_vec()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn upsert_refuses_every_other_non_call_rip_data_operand() {
+        let expected = [0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let other = event_mask_listing().replace("pand", "movdqu");
+        assert!(validate_upsert_mask_with(
+            &other,
+            &[mask_section(true)],
+            &DynamicRelocations::new(),
+            RecordLoop::Event,
+            |_, _| Ok(expected.to_vec()),
+        )
+        .is_err());
+        assert!(validate_upsert_mask_with(
+            event_mask_listing(),
+            &[mask_section(true)],
+            &DynamicRelocations::new(),
+            RecordLoop::Directory,
+            |_, _| Ok(expected.to_vec()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn event_mask_requires_readonly_bounded_relocation_free_storage() {
+        let expected = [0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let relocation = DynamicRelocations::from([(
+            0x280,
+            DynamicRelocation {
+                kind: "R_X86_64_RELATIVE".to_string(),
+                relative_target: None,
+                dynamic_symbol: None,
+            },
+        )]);
+        for (sections, relocations) in [
+            (vec![mask_section(false)], DynamicRelocations::new()),
+            (vec![mask_section(true)], relocation),
+            (
+                vec![ElfSection {
+                    size: 8,
+                    ..mask_section(true)
+                }],
+                DynamicRelocations::new(),
+            ),
+        ] {
+            assert!(validate_upsert_mask_with(
+                event_mask_listing(),
+                &sections,
+                &relocations,
+                RecordLoop::Event,
+                |_, _| Ok(expected.to_vec()),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn event_mask_refuses_truncated_reads_and_instruction_address_overflow() {
+        assert!(validate_upsert_mask_with(
+            event_mask_listing(),
+            &[mask_section(true)],
+            &DynamicRelocations::new(),
+            RecordLoop::Event,
+            |_, _| Ok(vec![0xff]),
+        )
+        .is_err());
+        let overflow = "  fffffffffffffffc:\t66 0f db 3d f8 00 00 00\tpand 0xf8(%rip),%xmm7 # 200 <anonymous>\n";
+        assert!(validate_upsert_mask_with(
+            overflow,
+            &[mask_section(true)],
+            &DynamicRelocations::new(),
+            RecordLoop::Event,
+            |_, _| Ok(Vec::new()),
+        )
+        .is_err());
     }
 
     #[test]

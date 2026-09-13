@@ -411,6 +411,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, std::io::Error> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    refuse_inherited_descriptors()?;
     let args = Args::parse();
     if !private_listener(args.listen.ip()) || args.provider_timeout_seconds == 0 {
         return Err("listener and provider deadline must be closed and explicit".into());
@@ -423,6 +424,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Drop privilege before thread construction so every worker inherits the
     // same empty capability state.
     confinement::drop_capabilities()?;
+    verify_zero_capabilities(true)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(1)
@@ -449,6 +451,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown,
         },
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_zero_capabilities(require_empty_bounding: bool) -> std::io::Result<()> {
+    let status = fs::read_to_string("/proc/self/status")?;
+    for name in ["CapInh", "CapPrm", "CapEff", "CapAmb"]
+        .into_iter()
+        .chain(require_empty_bounding.then_some("CapBnd"))
+    {
+        let value = status
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:\t")))
+            .ok_or_else(|| std::io::Error::other("capability status field absent"))?;
+        if u64::from_str_radix(value.trim(), 16)
+            .map_err(|_| std::io::Error::other("invalid capability status"))?
+            != 0
+        {
+            return Err(std::io::Error::other("capability drop incomplete"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_zero_capabilities(_require_empty_bounding: bool) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "capability verification requires Linux",
+    ))
+}
+
+fn refuse_inherited_descriptors() -> std::io::Result<()> {
+    let descriptors = fs::read_dir("/proc/self/fd")?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .to_string_lossy()
+                .parse::<i32>()
+                .map_err(|_| std::io::Error::other("invalid proc descriptor entry"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // read_dir's own descriptor is closed by collection. Recheck the numeric
+    // entries so that transient iterator state is not mistaken for inheritance.
+    for descriptor in descriptors.into_iter().filter(|descriptor| *descriptor > 2) {
+        // SAFETY: F_GETFD only inspects the numeric descriptor.
+        let result = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        if result >= 0 {
+            return Err(std::io::Error::other(
+                "unexpected inherited descriptor refused",
+            ));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EBADF) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 fn tls_identity() -> Result<GuestTlsIdentity, Box<dyn std::error::Error>> {
@@ -506,6 +564,7 @@ async fn serve_listener(
         let mut accepted = 0_usize;
         loop {
             if connection_limit.is_some_and(|limit| accepted >= limit) {
+                std::future::pending::<()>().await;
                 break;
             }
             let item = match listener.accept().await {
@@ -571,6 +630,55 @@ fn private_listener(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::ExitStatusExt as _;
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    static SIGSYS_DIAGNOSTIC_FD: AtomicI32 = AtomicI32::new(-1);
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    extern "C" fn record_sigsys(
+        _signal: libc::c_int,
+        _info: *mut libc::siginfo_t,
+        context: *mut libc::c_void,
+    ) {
+        // SAFETY: SA_SIGINFO supplies a live ucontext for this synchronous
+        // x86_64 seccomp trap. write and _exit are async-signal-safe.
+        unsafe {
+            let syscall =
+                (*(context.cast::<libc::ucontext_t>())).uc_mcontext.gregs[libc::REG_RAX as usize];
+            let fd = SIGSYS_DIAGNOSTIC_FD.load(Ordering::Relaxed);
+            libc::write(
+                fd,
+                std::ptr::from_ref(&syscall).cast(),
+                std::mem::size_of_val(&syscall),
+            );
+            libc::_exit(159);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn install_sigsys_diagnostic(path: &Path) {
+        let file = fs::File::create(path).expect("SIGSYS diagnostic opens");
+        SIGSYS_DIAGNOSTIC_FD.store(file.as_raw_fd(), Ordering::Relaxed);
+        std::mem::forget(file);
+        // SAFETY: action is fully initialized before registering a test-only
+        // SA_SIGINFO handler, and the signal mask is initialized empty.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_sigsys as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+    }
 
     #[cfg(target_os = "linux")]
     struct ChildGuard(Option<std::process::Child>);
@@ -608,9 +716,167 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn inherited_descriptor_check_accepts_closed_process() {
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::inherited_descriptor_check_child",
+                "--nocapture",
+            ])
+            .env("ZAINO_FD_PROBE", "1")
+            .status()
+            .expect("descriptor probe starts");
+        assert!(child.success(), "closed descriptor probe refused");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_descriptor_check_refuses_open_descriptor() {
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::inherited_descriptor_refusal_child",
+                "--nocapture",
+            ])
+            .env("ZAINO_FD_REFUSAL_PROBE", "1")
+            .status()
+            .expect("descriptor refusal probe starts");
+        assert!(child.success(), "open descriptor was not refused");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_descriptor_check_child() {
+        if std::env::var_os("ZAINO_FD_PROBE").is_none() {
+            return;
+        }
+        // SAFETY: isolated child closes only descriptors outside stdio.
+        assert!(unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) } >= 0);
+        refuse_inherited_descriptors().expect("no descriptor crosses the init boundary");
+        // SAFETY: the isolated child completed every assertion.
+        unsafe { libc::_exit(0) }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_descriptor_refusal_child() {
+        if std::env::var_os("ZAINO_FD_REFUSAL_PROBE").is_none() {
+            return;
+        }
+        let _open = fs::File::open("/dev/null").expect("probe descriptor opens");
+        refuse_inherited_descriptors().expect_err("live inherited descriptor is refused");
+        // SAFETY: the isolated child completed every assertion.
+        unsafe { libc::_exit(0) }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn confinement_filter_traps_perf_event_open() {
+        let directory = tempfile::tempdir().expect("diagnostic directory");
+        let diagnostic = directory.path().join("perf-sigsys");
+        for mode in ["control", "filtered-control", "filtered", "diagnostic"] {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "tests::confinement_perf_event_probe_child",
+                        "--nocapture",
+                    ])
+                    .env("ZAINO_PERF_PROBE", mode)
+                    .env("ZAINO_SIGSYS_DIAGNOSTIC", &diagnostic)
+                    .status()
+                    .expect("perf probe starts");
+            if mode == "diagnostic" {
+                assert_eq!(status.code(), Some(159), "diagnostic handler exits 159");
+                let bytes = read_bounded(&diagnostic, std::mem::size_of::<libc::greg_t>())
+                    .expect("fixed SIGSYS diagnostic record");
+                let value: [u8; std::mem::size_of::<libc::greg_t>()] = bytes
+                    .try_into()
+                    .expect("SIGSYS diagnostic record has exact width");
+                assert_eq!(
+                    libc::greg_t::from_ne_bytes(value),
+                    libc::SYS_perf_event_open,
+                    "x86_64 REG_RAX identifies the trapped syscall"
+                );
+            } else if mode != "filtered" {
+                assert!(status.success(), "non-target syscall control must survive");
+            } else {
+                assert_eq!(
+                    status.signal(),
+                    Some(libc::SIGSYS),
+                    "shipped TSYNC filter must trap perf_event_open"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn confinement_perf_event_probe_child() {
+        let Some(mode) = std::env::var_os("ZAINO_PERF_PROBE") else {
+            return;
+        };
+        let confinement = if mode != "control" {
+            // CI runs unprivileged and cannot drop its inherited bounding set;
+            // the current authority-bearing sets must already be empty. The
+            // shipped UID0 path additionally drops and verifies CapBnd.
+            verify_zero_capabilities(false).expect("current probe capability sets are empty");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("probe runtime");
+            let _provider = start_provider_with(Arc::new(|_| {
+                Err(std::io::Error::other("unused probe collector"))
+            }))
+            .expect("permanent provider starts");
+            let _signals = {
+                let _runtime = runtime.enter();
+                shutdown_signals().expect("signal streams initialize")
+            };
+            if mode == "diagnostic" {
+                install_sigsys_diagnostic(Path::new(
+                    &std::env::var_os("ZAINO_SIGSYS_DIAGNOSTIC")
+                        .expect("diagnostic path is present"),
+                ));
+            }
+            confinement::install_seccomp().expect("install synchronized filter");
+            Some((runtime, _provider, _signals))
+        } else {
+            None
+        };
+        std::hint::black_box(&confinement);
+        if mode == "filtered-control" {
+            // SAFETY: getpid is explicitly allowed by the shipped filter.
+            unsafe {
+                libc::syscall(libc::SYS_getpid);
+                libc::_exit(0);
+            }
+        }
+        // A null attribute is intentional: the control may return EFAULT or
+        // host policy EPERM, but it must survive. Seccomp evaluates the syscall
+        // number first and must terminate the filtered process with SIGSYS.
+        // SAFETY: the kernel validates this deliberately invalid pointer.
+        unsafe {
+            libc::syscall(
+                libc::SYS_perf_event_open,
+                std::ptr::null::<libc::c_void>(),
+                0,
+                -1,
+                -1,
+                0,
+            );
+            libc::_exit(0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn confinement_filter_supports_precreated_runtime_and_fixed_worker() {
         let directory = tempfile::tempdir().expect("probe directory");
         let marker = directory.path().join("listener");
+        let sigsys = directory.path().join("sigsys");
         let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -618,6 +884,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("ZAINO_SECCOMP_PROBE", directory.path())
+            .env("ZAINO_SIGSYS_DIAGNOSTIC", &sigsys)
             .spawn()
             .expect("start isolated confinement probe");
         let mut child = ChildGuard(Some(child));
@@ -632,32 +899,45 @@ mod tests {
             .enable_time()
             .build()
             .expect("probe client runtime");
-        runtime.block_on(async {
+        let rpc_result = runtime.block_on(async {
             let mut connection = zaino_private_client::UnverifiedRetainedTlsConnection::connect(
                 address,
                 tokio::time::Instant::from_std(deadline),
             )
-            .await
-            .expect("real TLS 1.3 handshake through filtered server");
+            .await?;
             let response: EvidenceResponse = connection
                 .unary(
                     EvidenceRequest {
                         challenge: vec![7; CHALLENGE_BYTES],
                     },
                     tonic::codegen::http::uri::PathAndQuery::from_static(
-                        "/zaino.boot.v1.BootSpikeEvidence/GetEvidence",
+                        "/zaino.boot_spike.v1.BootSpikeEvidence/GetEvidence",
                     ),
                     CHALLENGE_BYTES + 16,
                     MAX_RESPONSE_BYTES,
                     tokio::time::Instant::from_std(deadline),
                 )
-                .await
-                .expect("quote job crosses the filtered permanent worker");
-            assert_eq!(response.quote_v4, [1]);
-            assert_eq!(response.ccel_table, [2]);
-            assert_eq!(response.ccel_log, [3]);
+                .await?;
             drop(connection);
+            Ok::<_, zaino_private_client::RetainedClientError>(response)
         });
+        let response = rpc_result.unwrap_or_else(|error| {
+            let syscall = read_bounded(&sigsys, std::mem::size_of::<libc::greg_t>())
+                .ok()
+                .filter(|bytes| bytes.len() == std::mem::size_of::<libc::greg_t>())
+                .map(|bytes| {
+                    let mut value = [0_u8; std::mem::size_of::<libc::greg_t>()];
+                    value.copy_from_slice(&bytes);
+                    libc::greg_t::from_ne_bytes(value)
+                });
+            panic!("filtered evidence RPC failed: {error:?}; trapped syscall: {syscall:?}")
+        });
+        assert_eq!(response.quote_v4, [1]);
+        assert_eq!(response.ccel_table, [2]);
+        assert_eq!(response.ccel_log, [3]);
+        let child_id = child.0.as_ref().expect("child guard retains process").id();
+        // SAFETY: child_id belongs to the guarded probe process.
+        assert_eq!(unsafe { libc::kill(child_id as i32, libc::SIGTERM) }, 0);
         let status = loop {
             let owned = child.0.as_mut().expect("child guard retains process");
             if let Some(status) = owned.try_wait().expect("probe child state") {
@@ -684,6 +964,7 @@ mod tests {
             .enable_time()
             .build()
             .expect("probe runtime");
+        verify_zero_capabilities(false).expect("current probe capability sets are empty");
         let report = std::path::PathBuf::from(&directory).join("report");
         let collector = Arc::new(move |_report_data: [u8; 64]| {
             fs::create_dir(&report)?;
@@ -700,6 +981,10 @@ mod tests {
             let _runtime = runtime.enter();
             shutdown_signals().expect("signal streams initialize before filter")
         };
+        #[cfg(target_arch = "x86_64")]
+        install_sigsys_diagnostic(Path::new(
+            &std::env::var_os("ZAINO_SIGSYS_DIAGNOSTIC").expect("diagnostic path"),
+        ));
         confinement::install_seccomp().expect("install synchronized filter");
         runtime.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0")

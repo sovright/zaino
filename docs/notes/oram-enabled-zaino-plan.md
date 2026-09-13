@@ -578,14 +578,60 @@ the same live TLS peer, independently approved launch policy, provenance, and
 state-freshness policy remain separate gates.
 
 The [Rust client foundation](../../packages/zaino-private-client/README.md)
-reconstructs the canonical transcript and correlates the pinned verifier's
-bounded result. [ADR-0904](../adr/0904-activated-private-client-bootstrap-context.md)
+reconstructs the canonical transcript, correlates the pinned verifier's
+bounded result, and retains one TLS stream through attestation, bootstrap, and
+private queries without a reconnect fallback. Its fixed client-owned admission
+age and per-query helper invocation recheck collateral before each
+authorization on that stream. [ADR-0904](../adr/0904-activated-private-client-bootstrap-context.md)
 defines the activated owner bootstrap and strict production-codec context.
-These components do not yet own a retained TLS stream or grant query admission.
+This is a closed client transport and authorization foundation; it does not
+create an approved measurement policy, accepted guest image, rollback witness,
+or complete wallet interface.
 The [accepted guest design](oram-accepted-guest-design.md) specifies the next
 measured-boot, administration-removal, reproducibility, and negative-test gates;
 the successful administrator-accessible diagnostic quote is not an accepted
 workload image.
+
+Two independent offline workload builds at source `ef4d81b9` produced the same
+canonical evidence agent/runtime output, including agent SHA-256
+`95671d547e6226e34d0e26705795560c4e2ae9f2df06846afcf06a064cb41d0e`.
+The exact source is intentionally distinct from this integration head. The
+[workload retention ledger](oram-workload-build-retention-2026-09-12.md)
+authenticates the complete file set, manifests, modes, builder/source identity,
+and durable private copies. This clears the reproducible-workload-input part of
+the boot spike. It does not provide a rootfs, bound native init, UKI, booted
+guest, accepted measurement, or private-query qualification.
+
+Two independent custom-kernel builds, repeated at the integration head,
+produced byte-identical `bzImage`, `vmlinux`, `System.map`, and effective
+configuration. Independent extraction confirmed that the embedded IKCONFIG is
+the effective configuration and includes the required TDX/TSM, ConfigFS,
+seccomp, `MULTIUSER`, SHMEM/tmpfs, and `/proc/sys` capabilities. The
+[kernel build verification ledger](oram-kernel-build-verification-2026-09-12.md)
+records the exact hashes, provenance, and private retention. This clears the
+reproducible kernel-build and static-config inputs only. It does not establish
+that the kernel boots the assembled image, that the quote measures the intended
+UKI/rootfs/configuration, that ConfigFS remains usable after privilege drop, or
+that the C3 host closes PMU and other side channels.
+
+The native Linux probe at workload source `ef4d81b9` exercised the shipped
+agent as UID 0 through its main-thread check that all five capability sets are
+empty and confirmed that the same process reaches its filtered listener.
+Separately, the confinement suite passed 10/10, covering inherited-descriptor
+refusal and synchronized seccomp behavior including `perf_event_open` refusal;
+the native-init suite passed 3/3. This clears the native source/runtime
+confinement test gate on the CI kernel. It does not exercise the custom kernel,
+switch-root assembly, TDX, or post-drop ConfigFS/CCEL access in a real guest.
+
+The current retained ORAM runner is deliberately an unqualified diagnostic.
+Its native tests and access-path check passed, but its exact-upsert codegen
+identity did not. The
+[codegen diagnostic ledger](oram-codegen-diagnostic-retention-2026-09-12.md)
+preserves the actual ELF, disassembly, relocations, source tree, and failure.
+The [reviewed checker repair](oram-codegen-identity-and-mask-review-2026-09-12.md)
+now accepts the original artifact and rejects a demonstrated equality-mask
+mutation, with the existing page profiles unchanged. Fresh native integration
+remains required, so Gate 2 and release-codegen qualification remain open.
 
 The experiment must compose actual attestation verification and quote-bound
 TLS, production-grade envelope cryptography with explicit nonce/key ownership,
@@ -697,6 +743,20 @@ proceed independently once their inputs are frozen:
 6. Review both tracks, update the gate scorecard, and decide whether to retain
    the backend, revise the design, or open production integration. Missing
    hardware measurements cannot be replaced by additional unit-test totals.
+
+Current status against that order:
+
+| Input or gate | Status on 2026-09-12 | Consequence |
+| --- | --- | --- |
+| Reproducible evidence workload | Input passed at pinned source `ef4d81b9`; retained | May enter image assembly; does not admit the workload |
+| Reproducible custom kernel and effective config | Patched `390880cb` passed two-builder run `34728001247` and [independent artifact verification](oram-patched-kernel-build-verification.md) | Only the patched input may enter candidate assembly; pre-fix artifacts remain historical, and boot/measurement remain open |
+| Native capability/seccomp/init confinement | Source/runtime test gate passed at `ef4d81b9` | Real custom-kernel C3 execution and post-drop evidence access remain mandatory |
+| Complete rootfs, dm-verity, initramfs/UKI and deterministic image | Open | No accepted image measurement exists |
+| Real C3 TDX boot, CCEL/RTMR replay, wrong-image/admin negatives | Open | No workload or query admission claim |
+| Release ORAM codegen | Open; repaired checker `5770994e` passes two retained diagnostics statically; fresh native run `34726972640` is pending | Historical failed receipts remain unqualified; no Gate 2 promotion or runner qualification |
+| Physical ORAM access/timing classification | Open | No host-oblivious access-pattern claim |
+| Mainnet physical capacity, growth, RSS/no-swap and recovery RTO | Open | Logical corpus/sizing evidence cannot establish deployment fit |
+| Complete private-wallet workflow and whole-session capture | Open | The protected UTXO method is not a private-wallet product claim |
 
 ### Phase 0 — fork baseline, threat model, and feasibility gate
 

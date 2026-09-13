@@ -11,6 +11,11 @@ blocking worker retains the permit until it exits. TLS uses AWS-LC, TLS 1.3,
 HTTP/2 ALPN, no resumption, bounded handshakes, headers, streams, messages, and
 requests.
 
+Startup refuses inherited descriptors outside stdio and verifies the
+inheritable, permitted, effective, bounding, and ambient capability sets are
+empty before binding. The synchronized filter traps `perf_event_open`; this is
+a guest syscall boundary and does not establish host PMU isolation.
+
 This is diagnostic plumbing. It does not establish an accepted guest image,
 semantic measured-boot coverage, rollback protection, or Zaino query admission.
 Access to ConfigFS and CCEL after the intended guest capability drop remains a
