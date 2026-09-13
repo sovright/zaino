@@ -107,6 +107,13 @@ pub use inner_codec::private_service::{
     PrivateProjectionShape, PrivateRuntimeDeployment, PrivateRuntimeKeys, ReleasableSessionKeys,
     SessionBootstrap, PRIVATE_PROFILE_ID_BYTES, PRIVATE_RUNTIME_KEY_BYTES,
 };
+#[cfg(all(
+    feature = "wallet-parity-harness",
+    feature = "rostl-experimental",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub use inner_codec::wallet_parity_harness::typed_wallet_parity_harness;
 #[cfg(feature = "wallet-parity-harness")]
 pub use inner_codec::wallet_parity_harness::{
     parity_mismatch, wallet_parity_harness, ParityHarnessError, ParityPendingResponse,

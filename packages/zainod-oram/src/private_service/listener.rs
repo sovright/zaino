@@ -1619,9 +1619,7 @@ mod tests {
     async fn retained_client_accepts_synthetic_quote_then_executes_one_real_private_query(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use std::{fs, time::Duration};
-        use zaino_oram::{
-            wallet_parity_harness, MainnetClientOutcome, WalletParityRuntime, PARITY_ENVELOPE_BYTES,
-        };
+        use zaino_oram::{MainnetClientOutcome, WalletParityRuntime, PARITY_ENVELOPE_BYTES};
         use zaino_private_client::{
             BootstrapNetwork, RetainedClientConfig, RetainedClientError, RetainedPrivateClient,
             VerifierOwnedEvidencePolicy,
@@ -1629,7 +1627,24 @@ mod tests {
 
         let fixture = zaino_state::test_dependencies::load_ordinary_utxo_shadow_fixture().await?;
         let journal = tempfile::TempDir::new()?;
-        let harness = wallet_parity_harness(
+        #[cfg(all(
+            feature = "typed-qualification",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        let harness = zaino_oram::typed_wallet_parity_harness(
+            &parity_shape()?,
+            fixture.indexed_blocks(),
+            journal.path().join("replay"),
+            [0x6a; 16],
+            1,
+        )?;
+        #[cfg(not(all(
+            feature = "typed-qualification",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )))]
+        let harness = zaino_oram::wallet_parity_harness(
             &parity_shape()?,
             fixture.indexed_blocks(),
             journal.path().join("replay"),
