@@ -55,6 +55,11 @@ This verifies reproducible kernel bytes and embedded/effective configuration.
 It does not establish boot, measured image admission, post-drop ConfigFS access,
 host PMU closure, or actual C3 runtime suitability.
 
+These retained kernels predate the reviewed TDX GetQuote status and
+host-controlled output-length fixes. They remain reproducibility evidence but
+are not boot-qualified inputs. A newly patched two-builder result and the
+existing boot and admission checks are required before use.
+
 ## Durable retention
 
 The two original PR166 ZIPs, `zaino-kernel-artifact-verification.md`, and

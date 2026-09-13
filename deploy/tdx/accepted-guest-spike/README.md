@@ -75,6 +75,14 @@ separate from the TDX DEBUG guest attribute. An acceptable custom kernel,
 source/config/package digests, and review of the required TDX halt fixes remain
 prerequisites.
 
+The authenticated Linux 6.17 source also predates the reviewed TDX GetQuote
+status and output-length fixes. The custom-kernel builder therefore admits only
+the pinned combined backport in `kernel-patches.json`, verifies the exact
+driver before and after applying it, and records that lock with the output.
+Previously retained kernel bytes remain historical reproducibility evidence.
+Guest admission requires a new patch-bound two-builder result followed by the
+separate boot and admission checks.
+
 `custom-kernel-tool-roots.json` is a separate builder-only request for the
 compiler, binutils, Kbuild utilities, source extractor, and development
 libraries. Its OpenSSL command and development packages are confined to the

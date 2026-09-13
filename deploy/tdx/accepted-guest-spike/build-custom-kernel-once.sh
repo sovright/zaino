@@ -17,6 +17,7 @@ closure=$(cd -- "$2" && pwd -P) || fail 'missing tool closure'
 fragment=$(cd -- "$(dirname -- "$3")" && pwd -P)/$(basename -- "$3")
 [[ -f "$fragment" && ! -L "$fragment" ]] || fail 'invalid config fragment'
 bash "$root/verify-custom-kernel-source.sh" "$sources" >/dev/null
+bash "$root/verify-kernel-patches.sh" >/dev/null
 bash "$root/verify-package-closure.sh" "$closure" "$root/custom-kernel-tool-roots.json" >/dev/null
 requested=$5; [[ ! -e "$requested" ]] || fail 'output already exists'
 parent=$(cd -- "$(dirname -- "$requested")" && pwd -P); name=$(basename -- "$requested")
@@ -82,11 +83,14 @@ container_id=$(docker create --cidfile "$cidfile" --network none --pull never --
   --mount "type=bind,src=$partial/local-repo,dst=/inputs/repo,readonly" \
   --mount "type=bind,src=$partial/expected-packages.tsv,dst=/inputs/expected-packages.tsv,readonly" \
   --mount "type=bind,src=$fragment,dst=/inputs/custom-kernel.config,readonly" \
+  --mount "type=bind,src=$root/kernel-source,dst=/inputs/patches,readonly" \
   --mount "type=bind,src=$root/build-custom-kernel-inner.sh,dst=/builder/build.sh,readonly" \
+  --mount "type=bind,src=$root/kernel-patches.json,dst=/builder/kernel-patches.json,readonly" \
+  --mount "type=bind,src=$root/verify-tdx-quote-hardening.sh,dst=/builder/verify-tdx-quote-hardening.sh,readonly" \
   --mount "type=bind,src=$root/verify-custom-kernel-effective-config.sh,dst=/builder/verify-effective-config.sh,readonly" \
   --mount "type=bind,src=$root/kernel-config-common.sh,dst=/builder/kernel-config-common.sh,readonly" \
   --mount "type=bind,src=$partial/output,dst=/output" \
-  "$image" bash /builder/build.sh /inputs/sources /inputs/closure /inputs/repo /inputs/expected-packages.tsv /inputs/custom-kernel.config /output/result "$run_label")
+  "$image" bash /builder/build.sh /inputs/sources /inputs/closure /inputs/repo /inputs/expected-packages.tsv /inputs/custom-kernel.config /inputs/patches /output/result "$run_label")
 [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || fail 'builder container creation failed'
 docker start --attach "$container_id"
 docker rm "$container_id" >/dev/null
@@ -96,17 +100,18 @@ bash "$root/verify-custom-kernel-effective-config.sh" "$partial/output/result/ar
 source_lock_sha=$(openssl dgst -sha256 -r "$root/custom-kernel-source.json"); source_lock_sha=${source_lock_sha%% *}
 tool_lock_sha=$(openssl dgst -sha256 -r "$closure/package-lock.json"); tool_lock_sha=${tool_lock_sha%% *}
 config_sha=$(openssl dgst -sha256 -r "$fragment"); config_sha=${config_sha%% *}
-scripts_sha=$(for file in build-custom-kernel-inner.sh build-custom-kernel-once.sh kernel-config-common.sh verify-custom-kernel-effective-config.sh verify-kernel-config.sh kernel-config-policy.json; do openssl dgst -sha256 -r "$root/$file" | awk '{print $1}'; done | LC_ALL=C sort | openssl dgst -sha256 -r); scripts_sha=${scripts_sha%% *}
+scripts_sha=$(for file in build-custom-kernel-inner.sh build-custom-kernel-once.sh kernel-config-common.sh verify-custom-kernel-effective-config.sh verify-kernel-config.sh kernel-config-policy.json verify-kernel-patches.sh verify-tdx-quote-hardening.sh; do openssl dgst -sha256 -r "$root/$file" | awk '{print $1}'; done | LC_ALL=C sort | openssl dgst -sha256 -r); scripts_sha=${scripts_sha%% *}
+patches_sha=$(openssl dgst -sha256 -r "$root/kernel-patches.json"); patches_sha=${patches_sha%% *}
 revision=$(git -C "$root" rev-parse HEAD)
 artifact_manifest_sha=$(openssl dgst -sha256 -r "$partial/output/result/artifacts/SHA256SUMS"); artifact_manifest_sha=${artifact_manifest_sha%% *}
 tool_versions_sha=$(openssl dgst -sha256 -r "$partial/output/result/tool-versions.txt"); tool_versions_sha=${tool_versions_sha%% *}
 jq -n --arg run "$run_label" --arg image "$image" --arg image_id "$image_id" --arg source "$source_lock_sha" --arg tools "$tool_lock_sha" --arg config "$config_sha" \
   --arg repository_generator "$repository_generator_version" \
-  --arg scripts "$scripts_sha" --arg revision "$revision" --arg artifacts "$artifact_manifest_sha" --arg tool_versions "$tool_versions_sha" \
+  --arg scripts "$scripts_sha" --arg patches "$patches_sha" --arg revision "$revision" --arg artifacts "$artifact_manifest_sha" --arg tool_versions "$tool_versions_sha" \
   '{schema:"zaino-custom-kernel-build-run-v1",run_label:$run,selected_builder_base_image:$image,executed_builder_image_id:$image_id,
     network_during_build:"disabled",source_lock_sha256:$source,tool_closure_lock_sha256:$tools,requested_config_sha256:$config,
     local_repository_generator_dpkg_dev_version:$repository_generator,
-    builder_scripts_sha256:$scripts,repository_revision:$revision,artifact_manifest_sha256:$artifacts,tool_versions_sha256:$tool_versions,
+    builder_scripts_sha256:$scripts,kernel_patch_lock_sha256:$patches,repository_revision:$revision,artifact_manifest_sha256:$artifacts,tool_versions_sha256:$tool_versions,
     scope:"single-clean-builder-output;cross-runner-reproducibility-unverified;boot-and-TEE-admission-unverified"}' > "$partial/output/result/build-run.json"
 mv --no-clobber --no-target-directory -- "$partial/output/result" "$final"
 [[ -d "$final" && ! -e "$partial/output/result" ]] || fail 'atomic publication failure'
