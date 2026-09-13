@@ -14,13 +14,31 @@ not provide a host-visible TDX page sensor and cannot replace one.
 `packages/zaino-oram/Cargo.toml` pins `rostl-oram` and `rostl-primitives` to the
 revision above; `Cargo.lock` resolves both to that exact commit. The upstream
 workspace declares `MIT OR Apache-2.0` in its root `Cargo.toml`, inherited by
-`crates/oram/Cargo.toml`. The checked-out commit contains no `LICENSE*`,
-`COPYING*`, or `NOTICE*` file. The manifest declaration is useful provenance,
-but is not the canonical license-text closure needed to redistribute a fork.
-Before publishing or distributing patched source or binaries, obtain the
-canonical MIT and Apache-2.0 texts and any required notices from upstream and
-record their hashes. Until then, a local implementation branch is research-only
-and must not be treated as clearing the existing license gate.
+`crates/oram/Cargo.toml`; its README expressly offers either license at the
+recipient's option. The checked-out commit and publisher's `0.1.0-alpha9`
+crate archive contain no `LICENSE*`, `COPYING*`, or `NOTICE*` file.
+
+For this research fork, select the offered Apache-2.0 option. Include the
+[canonical Apache-2.0 text](https://www.apache.org/licenses/LICENSE-2.0.txt)
+as `LICENSE-APACHE`, with SHA-256
+`cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`.
+Preserve existing source attribution, mark modified files, and retain any
+applicable notices found in the exact source being redistributed. Apache-2.0
+section 4(d) requires retaining a NOTICE file when the original distribution
+includes one; the inspected upstream source and archive have none. Do not
+invent an upstream NOTICE or fill an MIT template with inferred authorship.
+This supersedes the earlier requirement to reconstruct both alternative
+license-file sets before local fork publication.
+
+Retain the exact upstream README/manifest declaration and source identities as
+provenance. The publisher's `rostl-oram 0.1.0-alpha9` archive has SHA-256
+`cefc16f819cfa43d40e7654abb8db5c91030b26ac6c10b59ad56b708c76409fe`,
+matching the crates.io index; its `.cargo_vcs_info.json` identifies
+`8c3a12d2...` and `crates/oram`. Carry `LICENSE-APACHE` with any distributed
+research source or binary even if Cargo's package/vendor step omits a
+workspace-root file. This records the selected upstream license route; it
+does not clear the separate complete dependency/notice or production-release
+gates.
 
 The implementation pins a Sovright fork commit derived directly from
 `8c3a12d2...`; it never tracks a branch or tag. The fork commit and its tree,
