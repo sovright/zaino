@@ -628,8 +628,10 @@ Its native tests and access-path check passed, but its exact-upsert codegen
 identity did not. The
 [codegen diagnostic ledger](oram-codegen-diagnostic-retention-2026-09-12.md)
 preserves the actual ELF, disassembly, relocations, source tree, and failure.
-The matcher correction is still under review and native integration remains in
-progress, so Gate 2 and release-codegen qualification remain open.
+The [reviewed checker repair](oram-codegen-identity-and-mask-review-2026-09-12.md)
+now accepts the original artifact and rejects a demonstrated equality-mask
+mutation, with the existing page profiles unchanged. Fresh native integration
+remains required, so Gate 2 and release-codegen qualification remain open.
 
 The experiment must compose actual attestation verification and quote-bound
 TLS, production-grade envelope cryptography with explicit nonce/key ownership,
