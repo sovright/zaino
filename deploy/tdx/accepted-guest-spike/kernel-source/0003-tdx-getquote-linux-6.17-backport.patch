@@ -1,0 +1,48 @@
+Zaino deterministic Linux 6.17 backport of:
+  0f409eaea53e49932cf92a761de66345c9a4b4be
+  c3fd16c3b98ed726294feab2f94f876290bf7b61
+
+--- a/drivers/virt/coco/tdx-guest/tdx-guest.c
++++ b/drivers/virt/coco/tdx-guest/tdx-guest.c
+@@ -168,6 +168,8 @@
+ /* TDX GetQuote status codes */
+ #define GET_QUOTE_SUCCESS		0
+ #define GET_QUOTE_IN_FLIGHT		0xffffffffffffffff
++
++#define TDX_QUOTE_MAX_LEN		(GET_QUOTE_BUF_SIZE - sizeof(struct tdx_quote_buf))
+ 
+ /* struct tdx_quote_buf: Format of Quote request buffer.
+  * @version: Quote format version, filled by TD.
+@@ -267,6 +269,7 @@
+ 	u8 *buf;
+ 	struct tdx_quote_buf *quote_buf = quote_data;
+ 	struct tsm_report_desc *desc = &report->desc;
++	u32 out_len;
+ 	int ret;
+ 	u64 err;
+ 
+@@ -304,12 +307,22 @@
+ 		return ret;
+ 	}
+ 
+-	buf = kvmemdup(quote_buf->data, quote_buf->out_len, GFP_KERNEL);
++	if (quote_buf->status != GET_QUOTE_SUCCESS) {
++		pr_debug("GetQuote request failed, status:%llx\n", quote_buf->status);
++		return -EIO;
++	}
++
++	out_len = READ_ONCE(quote_buf->out_len);
++
++	if (out_len > TDX_QUOTE_MAX_LEN)
++		return -EFBIG;
++
++	buf = kvmemdup(quote_buf->data, out_len, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+ 	report->outblob = buf;
+-	report->outblob_len = quote_buf->out_len;
++	report->outblob_len = out_len;
+ 
+ 	/*
+ 	 * TODO: parse the PEM-formatted cert chain out of the quote buffer when

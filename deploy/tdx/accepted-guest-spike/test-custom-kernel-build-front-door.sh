@@ -3,6 +3,41 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT
+bash "$root/verify-kernel-patches.sh" >/dev/null
+cp -R -- "$root/kernel-source" "$temporary/kernel-source"
+cp -- "$root/kernel-patches.json" "$temporary/kernel-patches.json"
+cp -- "$root/verify-kernel-patches.sh" "$temporary/verify-kernel-patches.sh"
+printf '\n' >> "$temporary/kernel-source/0003-tdx-getquote-linux-6.17-backport.patch"
+if bash "$temporary/verify-kernel-patches.sh" >/dev/null 2>&1; then
+  echo 'tampered kernel patch was accepted' >&2; exit 1
+fi
+changed="$temporary/kernel-source/0003-tdx-getquote-linux-6.17-backport.patch"
+changed_bytes=$(wc -c < "$changed"); changed_bytes=${changed_bytes//[[:space:]]/}
+changed_sha=$(sha256sum -- "$changed"); changed_sha=${changed_sha%% *}
+jq --argjson bytes "$changed_bytes" --arg sha "$changed_sha" \
+  '.applied_backport.bytes = $bytes | .applied_backport.sha256 = $sha' \
+  "$root/kernel-patches.json" > "$temporary/kernel-patches.json"
+if bash "$temporary/verify-kernel-patches.sh" >/dev/null 2>&1; then
+  echo 'changed patch with self-consistent mutable lock was accepted' >&2; exit 1
+fi
+cp -R -- "$root/kernel-source" "$temporary/closed-set"
+mv -- "$temporary/kernel-source" "$temporary/tampered-set"
+mv -- "$temporary/closed-set" "$temporary/kernel-source"
+cp -- "$root/kernel-patches.json" "$temporary/kernel-patches.json"
+printf 'unexpected\n' > "$temporary/kernel-source/9999-unknown.patch"
+if bash "$temporary/verify-kernel-patches.sh" >/dev/null 2>&1; then
+  echo 'unknown patch was accepted' >&2; exit 1
+fi
+rm -- "$temporary/kernel-source/9999-unknown.patch"
+ln -s -- 0001-tdx-getquote-status.patch "$temporary/kernel-source/9999-symlink.patch"
+if bash "$temporary/verify-kernel-patches.sh" >/dev/null 2>&1; then
+  echo 'patch symlink was accepted' >&2; exit 1
+fi
+rm -- "$temporary/kernel-source/9999-symlink.patch"
+mkdir -- "$temporary/kernel-source/9999-directory.patch"
+if bash "$temporary/verify-kernel-patches.sh" >/dev/null 2>&1; then
+  echo 'patch directory was accepted' >&2; exit 1
+fi
 cp -- "$root/custom-kernel.config" "$temporary/effective.config"
 printf '%s\n' 'CONFIG_TSM_REPORTS=y' >> "$temporary/effective.config"
 printf '%s\n' 'CONFIG_SYSCTL=y' >> "$temporary/effective.config"
