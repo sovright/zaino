@@ -126,6 +126,11 @@ listener. The RPC accepts one 64-byte public challenge and returns
 only bounded QuoteV4 bytes plus the fixed CCEL table/log. It exposes no path,
 command, upload, metadata, log, shell, key-export, or general file-read method.
 
+The [ConfigFS source audit](oram-configfs-post-drop-source-audit.md) supports
+using ordinary filesystem-UID-0 owner permissions with empty capability sets.
+It does not replace post-filter quote generation, cleanup, and CCEL access in
+the exact rebuilt guest; those remain required live gates.
+
 This diagnostic RPC uses a separate transcript domain and receipt scope from
 Zaino's evidence v1. For an exact 64-byte client challenge, the agent requests:
 
