@@ -749,7 +749,7 @@ Current status against that order:
 | Input or gate | Status on 2026-09-12 | Consequence |
 | --- | --- | --- |
 | Reproducible evidence workload | Input passed at pinned source `ef4d81b9`; retained | May enter image assembly; does not admit the workload |
-| Reproducible custom kernel and effective config | Historical pre-fix builds reproduced and are retained; reviewed quote-buffer backport `390880cb` is awaiting fresh two-builder run `34728001247` | Pre-fix kernel is not admitted to candidate image assembly; patched reproducibility, boot and measurement remain open |
+| Reproducible custom kernel and effective config | Patched `390880cb` passed two-builder run `34728001247` and [independent artifact verification](oram-patched-kernel-build-verification.md) | Only the patched input may enter candidate assembly; pre-fix artifacts remain historical, and boot/measurement remain open |
 | Native capability/seccomp/init confinement | Source/runtime test gate passed at `ef4d81b9` | Real custom-kernel C3 execution and post-drop evidence access remain mandatory |
 | Complete rootfs, dm-verity, initramfs/UKI and deterministic image | Open | No accepted image measurement exists |
 | Real C3 TDX boot, CCEL/RTMR replay, wrong-image/admin negatives | Open | No workload or query admission claim |
