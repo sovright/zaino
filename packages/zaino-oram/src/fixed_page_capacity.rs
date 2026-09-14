@@ -702,7 +702,8 @@ mod tests {
         let profile = FixedPageAllocationProfile::try_from_report(&report)?;
         assert_eq!(profile.capacities, [4_194_304, 131_072, 131_072]);
 
-        let mutations: &[(&str, fn(&mut serde_json::Value))] = &[
+        type ReportMutation = (&'static str, fn(&mut serde_json::Value));
+        let mutations: &[ReportMutation] = &[
             ("measurement", |value| {
                 value["source"]["measurement_blake2s256"] =
                     serde_json::Value::String("11".repeat(32));
