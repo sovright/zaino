@@ -100,6 +100,8 @@ mod corpus_artifact;
 #[cfg(feature = "typed-qualification")]
 mod execution_identity;
 #[cfg(feature = "typed-qualification")]
+mod fixed_page_allocation_measurement;
+#[cfg(feature = "typed-qualification")]
 mod full_map_saturation_artifact;
 #[cfg(feature = "typed-qualification")]
 mod gate2;
@@ -308,6 +310,13 @@ enum QualificationSubcommand {
     /// Derive a pinned-Rostl retained-memory floor from an admitted hybrid bundle.
     #[cfg(feature = "typed-qualification")]
     FixedPageCapacity(QualificationFixedPageCapacityArgs),
+    /// Measure the exact reviewed three-table allocation under a guarded child process.
+    #[cfg(feature = "typed-qualification")]
+    FixedPageAllocation(QualificationFixedPageAllocationArgs),
+    /// Internal child for the fixed allocation measurement; never accepts capacities.
+    #[cfg(feature = "typed-qualification")]
+    #[command(hide = true)]
+    FixedPageAllocationChild(QualificationFixedPageAllocationChildArgs),
     /// Publish a preallocation NO-GO for the recovered historical two-table model.
     #[cfg(feature = "typed-qualification")]
     HistoricalGeometry(QualificationHistoricalGeometryArgs),
@@ -601,6 +610,29 @@ struct QualificationFixedPageCapacityArgs {
 
 #[cfg(feature = "typed-qualification")]
 #[derive(Debug, Args)]
+struct QualificationFixedPageAllocationArgs {
+    /// Exact retained three-file hybrid-sizing directory to consume.
+    #[arg(long, value_name = "DIR")]
+    hybrid_sizing_dir: PathBuf,
+    /// Packaged unsigned native build.json for this exact running executable.
+    #[arg(long, value_name = "FILE")]
+    native_build_manifest: PathBuf,
+    /// New directory receiving preregistration and terminal evidence.
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
+struct QualificationFixedPageAllocationChildArgs {
+    #[arg(long, value_name = "DIR", hide = true)]
+    hybrid_sizing_dir: PathBuf,
+    #[arg(long, value_name = "FILE", hide = true)]
+    native_build_manifest: PathBuf,
+}
+
+#[cfg(feature = "typed-qualification")]
+#[derive(Debug, Args)]
 struct QualificationHistoricalGeometryArgs {
     /// Packaged unsigned native build.json for this exact running executable.
     #[arg(long, value_name = "FILE")]
@@ -860,6 +892,21 @@ async fn run(cli: Cli) -> RunnerResult<()> {
             QualificationSubcommand::ColdRebuild(args) => run_cold_rebuild(args).await,
             #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::FixedPageCapacity(args) => run_fixed_page_capacity(args),
+            #[cfg(feature = "typed-qualification")]
+            QualificationSubcommand::FixedPageAllocation(args) => {
+                fixed_page_allocation_measurement::run_parent(
+                    &args.hybrid_sizing_dir,
+                    &args.native_build_manifest,
+                    &args.output_dir,
+                )
+            }
+            #[cfg(feature = "typed-qualification")]
+            QualificationSubcommand::FixedPageAllocationChild(args) => {
+                fixed_page_allocation_measurement::run_child(
+                    &args.hybrid_sizing_dir,
+                    &args.native_build_manifest,
+                )
+            }
             #[cfg(feature = "typed-qualification")]
             QualificationSubcommand::HistoricalGeometry(args) => run_historical_geometry(args),
             #[cfg(feature = "typed-qualification")]
@@ -3009,6 +3056,8 @@ mod tests {
                 | QualificationSubcommand::TargetLoad(_)
                 | QualificationSubcommand::ColdRebuild(_)
                 | QualificationSubcommand::FixedPageCapacity(_)
+                | QualificationSubcommand::FixedPageAllocation(_)
+                | QualificationSubcommand::FixedPageAllocationChild(_)
                 | QualificationSubcommand::HistoricalGeometry(_)
                 | QualificationSubcommand::Timing(_) => {
                     panic!("insertion-bound arguments parsed as another qualification command")
@@ -3035,6 +3084,8 @@ mod tests {
                 | QualificationSubcommand::TargetLoad(_)
                 | QualificationSubcommand::ColdRebuild(_)
                 | QualificationSubcommand::FixedPageCapacity(_)
+                | QualificationSubcommand::FixedPageAllocation(_)
+                | QualificationSubcommand::FixedPageAllocationChild(_)
                 | QualificationSubcommand::HistoricalGeometry(_)
                 | QualificationSubcommand::Timing(_)
                 | QualificationSubcommand::InsertionBound(_) => {
@@ -3051,6 +3102,48 @@ mod tests {
             #[cfg(feature = "private-service")]
             Command::Private(_) => panic!("hybrid-sizing arguments parsed as private"),
         }
+    }
+
+    #[cfg(feature = "typed-qualification")]
+    #[test]
+    fn fixed_page_allocation_cli_has_no_capacity_or_fallback_controls() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "zainod-oram",
+            "qualification",
+            "fixed-page-allocation",
+            "--hybrid-sizing-dir",
+            "/retained/hybrid",
+            "--native-build-manifest",
+            "/retained/build.json",
+            "--output-dir",
+            "/new/evidence",
+        ])?;
+        let args = match cli.command {
+            Command::Qualification(command) => match command.command {
+                QualificationSubcommand::FixedPageAllocation(args) => args,
+                _ => panic!("fixed-page allocation arguments parsed as another command"),
+            },
+            _ => panic!("fixed-page allocation arguments parsed outside qualification"),
+        };
+        assert_eq!(args.output_dir, PathBuf::from("/new/evidence"));
+
+        for rejected in ["--base-capacity", "--deadline-seconds", "--allow-swap"] {
+            let mut arguments = vec![
+                "zainod-oram",
+                "qualification",
+                "fixed-page-allocation",
+                "--hybrid-sizing-dir",
+                "/retained/hybrid",
+                "--native-build-manifest",
+                "/retained/build.json",
+                "--output-dir",
+                "/new/evidence",
+            ];
+            arguments.push(rejected);
+            arguments.push("1");
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+        Ok(())
     }
 
     #[cfg(feature = "typed-qualification")]
@@ -3078,6 +3171,10 @@ mod tests {
                 }
                 QualificationSubcommand::FixedPageCapacity(_) => {
                     panic!("fixed-page-capacity arguments parsed as stress")
+                }
+                QualificationSubcommand::FixedPageAllocation(_)
+                | QualificationSubcommand::FixedPageAllocationChild(_) => {
+                    panic!("fixed-page-allocation arguments parsed as stress")
                 }
                 QualificationSubcommand::HistoricalGeometry(_) => {
                     panic!("historical-geometry arguments parsed as stress")
@@ -3117,6 +3214,10 @@ mod tests {
                 }
                 QualificationSubcommand::FixedPageCapacity(_) => {
                     panic!("fixed-page-capacity arguments parsed as fixed qualification")
+                }
+                QualificationSubcommand::FixedPageAllocation(_)
+                | QualificationSubcommand::FixedPageAllocationChild(_) => {
+                    panic!("fixed-page-allocation arguments parsed as fixed qualification")
                 }
                 QualificationSubcommand::HistoricalGeometry(_) => {
                     panic!("historical-geometry arguments parsed as fixed qualification")
@@ -3472,6 +3573,8 @@ mod tests {
                 | QualificationSubcommand::InsertionBound(_)
                 | QualificationSubcommand::HybridSizing(_)
                 | QualificationSubcommand::FixedPageCapacity(_)
+                | QualificationSubcommand::FixedPageAllocation(_)
+                | QualificationSubcommand::FixedPageAllocationChild(_)
                 | QualificationSubcommand::HistoricalGeometry(_) => {
                     panic!("target-load arguments parsed as another qualification command")
                 }
@@ -3583,6 +3686,8 @@ mod tests {
                 | QualificationSubcommand::InsertionBound(_)
                 | QualificationSubcommand::HybridSizing(_)
                 | QualificationSubcommand::FixedPageCapacity(_)
+                | QualificationSubcommand::FixedPageAllocation(_)
+                | QualificationSubcommand::FixedPageAllocationChild(_)
                 | QualificationSubcommand::HistoricalGeometry(_) => {
                     panic!("cold-rebuild arguments parsed as another qualification command")
                 }

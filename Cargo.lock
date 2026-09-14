@@ -5726,6 +5726,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wait4"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1adcfa718941fd2e500214045e8317f42c40a34948262c5de82e8bce4c568ea"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6564,6 +6575,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "wait4",
  "zaino-common",
  "zaino-oram",
  "zaino-private-client",
