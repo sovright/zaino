@@ -477,7 +477,7 @@ struct Harness<E, T, R, N> {
 enum HarnessBackend {
     QualificationMemory,
     #[cfg(all(
-        test,
+        feature = "wallet-parity-harness",
         feature = "rostl-experimental",
         target_os = "linux",
         target_arch = "x86_64"
@@ -522,7 +522,7 @@ fn memory_backed_serving_store(
 }
 
 #[cfg(all(
-    test,
+    feature = "wallet-parity-harness",
     feature = "rostl-experimental",
     target_os = "linux",
     target_arch = "x86_64"
@@ -577,7 +577,7 @@ fn serving_store(
     match backend {
         HarnessBackend::QualificationMemory => memory_backed_serving_store(shape, blocks),
         #[cfg(all(
-            test,
+            feature = "wallet-parity-harness",
             feature = "rostl-experimental",
             target_os = "linux",
             target_arch = "x86_64"
@@ -678,12 +678,12 @@ pub fn wallet_parity_harness(
 /// This is available only on the backend's supported build target. It makes no
 /// persistence, mainnet-capacity, trace-qualification, or live-freshness claim.
 #[cfg(all(
-    test,
+    feature = "wallet-parity-harness",
     feature = "rostl-experimental",
     target_os = "linux",
     target_arch = "x86_64"
 ))]
-fn typed_wallet_parity_harness(
+pub fn typed_wallet_parity_harness(
     shape: &PrivateProjectionShape,
     blocks: &[IndexedBlock],
     replay_journal_root: PathBuf,

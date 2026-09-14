@@ -56,9 +56,9 @@ zaino-tdx-evidence = { version = "0.1.0", path = "../zaino-tdx-evidence" }
 zainod = { version = "0.4.3-ironwood.1", path = "../zainod" }
 
 [dev-dependencies]
-# Test-support only. `wallet-parity-harness` hands out the session binding and
-# serving checkpoint the protocol does not publish, so it must never reach a
-# shipped binary; declaring it here and nowhere else is what guarantees that.
+# Test-support only. `wallet-parity-harness` exposes fixture constructors and
+# owner controls that must never reach a shipped binary; declaring it here and
+# nowhere else is what guarantees that.
 # `cargo tree -e features -p zaino-oram` on a non-test build shows the feature
 # absent, and `cargo build` never resolves dev-dependencies at all.
 zaino-oram = { version = "0.1.0", path = "../zaino-oram", features = [
