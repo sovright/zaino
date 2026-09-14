@@ -1,0 +1,51 @@
+name: ORAM rootfs verity build
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/oram-rootfs-verity.yml'
+      - 'deploy/tdx/accepted-guest-spike/**'
+      - 'tools/tdx-evidence-agent/**'
+      - 'tools/tdx-boot-spike-protocol/**'
+      - 'packages/zaino-tdx-evidence/**'
+      - 'Cargo.lock'
+permissions:
+  contents: read
+jobs:
+  build-compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with: {persist-credentials: false, fetch-depth: 0}
+      - name: Build two isolated workload inputs
+        run: |
+          set -euo pipefail
+          s=deploy/tdx/accepted-guest-spike
+          mkdir "$RUNNER_TEMP/rust"
+          jq -r '.components[] | [.url,.file] | @tsv' "$s/rust-toolchain-inputs.json" | while IFS=$'\t' read -r url file; do curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 20 --max-time 600 --max-filesize 268435456 --output "$RUNNER_TEMP/rust/$file" "$url"; done
+          bash "$s/verify-rust-toolchain-inputs.sh" "$RUNNER_TEMP/rust"
+          for run in run-1 run-2; do
+            bash "$s/resolve-package-closure.sh" "$RUNNER_TEMP/workload-tools-$run" "$s/workload-tool-roots.json"
+            bash "$s/prepare-workload-source.sh" "$RUNNER_TEMP/source-$run"
+            bash "$s/build-workload-once.sh" "$RUNNER_TEMP/source-$run" "$RUNNER_TEMP/workload-tools-$run" "$RUNNER_TEMP/rust" "$run" "$RUNNER_TEMP/workload-$run"
+          done
+          bash "$s/compare-workload-outputs.sh" "$RUNNER_TEMP/workload-run-1" "$RUNNER_TEMP/workload-run-2"
+          jq -n --slurpfile producer "$RUNNER_TEMP/workload-run-1/build-run.json" \
+            --arg one "$(sha256sum "$RUNNER_TEMP/workload-run-1/OUTPUT-SHA256SUMS" | awk '{print $1}')" \
+            --arg two "$(sha256sum "$RUNNER_TEMP/workload-run-2/OUTPUT-SHA256SUMS" | awk '{print $1}')" \
+            '{schema:"zaino-rootfs-trusted-workload-v1",producer:($producer[0]|del(.run_label)),accepted_runs:[{run_label:"run-1",output_sha256s_sha256:$one},{run_label:"run-2",output_sha256s_sha256:$two}]}' >"$RUNNER_TEMP/expectations.json"
+          bash "$s/verify-workload-output.sh" "$RUNNER_TEMP/workload-run-1" "$RUNNER_TEMP/expectations.json"
+          bash "$s/verify-workload-output.sh" "$RUNNER_TEMP/workload-run-2" "$RUNNER_TEMP/expectations.json"
+          bash "$s/test-workload-restore.sh" "$RUNNER_TEMP/workload-run-1" "$RUNNER_TEMP/expectations.json"
+      - name: Build, inspect, and compare two rootfs images
+        run: |
+          set -euo pipefail
+          s=deploy/tdx/accepted-guest-spike
+          for run in run-1 run-2; do
+            bash "$s/resolve-package-closure.sh" "$RUNNER_TEMP/rootfs-tools-$run" "$s/rootfs-tool-roots.json"
+            bash "$s/build-rootfs-once.sh" "$RUNNER_TEMP/workload-$run" "$RUNNER_TEMP/expectations.json" "$RUNNER_TEMP/rootfs-tools-$run" "$run" "$RUNNER_TEMP/rootfs-$run"
+            bash "$s/verify-rootfs-in-container.sh" "$RUNNER_TEMP/rootfs-$run" "$RUNNER_TEMP/workload-$run" "$RUNNER_TEMP/expectations.json" "$RUNNER_TEMP/rootfs-tools-$run" verify
+          done
+          bash "$s/verify-rootfs-in-container.sh" "$RUNNER_TEMP/rootfs-run-1" "$RUNNER_TEMP/workload-run-1" "$RUNNER_TEMP/expectations.json" "$RUNNER_TEMP/rootfs-tools-run-1" test
+          bash "$s/verify-rootfs-in-container.sh" "$RUNNER_TEMP/rootfs-run-1" "$RUNNER_TEMP/workload-run-1" "$RUNNER_TEMP/expectations.json" "$RUNNER_TEMP/rootfs-tools-run-1" compare "$RUNNER_TEMP/rootfs-run-2" "$RUNNER_TEMP/workload-run-2" "$RUNNER_TEMP/rootfs-tools-run-2"
