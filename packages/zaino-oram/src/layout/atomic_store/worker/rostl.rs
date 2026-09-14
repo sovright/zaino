@@ -1342,20 +1342,38 @@ mod tests {
 
     #[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn synthetic_fixed_page_owner_constructs_all_real_table_types() -> Result<(), RostlStoreError> {
-        let mut owner = FixedPageAllocationOwner::new([2, 4, 4])?;
+    fn synthetic_fixed_page_owner_constructs_all_real_table_types() {
+        let mut owner =
+            FixedPageAllocationOwner::new([2, 4, 4]).expect("valid fixed-page owner shape");
         assert_eq!(owner.capacities(), [2, 4, 4]);
 
         let base = PersistentBaseUtxoPage16::default();
-        owner.base.insert_unique(0, base)?;
-        assert_eq!(owner.base.read(0)?, Some(base));
+        owner
+            .base
+            .insert_unique(0, base)
+            .expect("base table insert succeeds");
+        assert_eq!(
+            owner.base.read(0).expect("base table read succeeds"),
+            Some(base)
+        );
         let add = PersistentAddUtxoPage16::default();
-        owner.add.insert_unique(0, add)?;
-        assert_eq!(owner.add.read(0)?, Some(add));
+        owner
+            .add
+            .insert_unique(0, add)
+            .expect("add table insert succeeds");
+        assert_eq!(
+            owner.add.read(0).expect("add table read succeeds"),
+            Some(add)
+        );
         let spend = PersistentSpendUtxoPage16::default();
-        owner.spend.insert_unique(0, spend)?;
-        assert_eq!(owner.spend.read(0)?, Some(spend));
-        Ok(())
+        owner
+            .spend
+            .insert_unique(0, spend)
+            .expect("spend table insert succeeds");
+        assert_eq!(
+            owner.spend.read(0).expect("spend table read succeeds"),
+            Some(spend)
+        );
     }
 
     #[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
