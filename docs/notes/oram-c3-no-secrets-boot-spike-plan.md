@@ -1,7 +1,9 @@
 # Minimal C3 TDX no-secrets boot spike
 
-Status: executable implementation plan only. No image has been built, imported,
-booted, measured, or approved. No cloud action is authorized by this document.
+Status: implementation in progress; native init, evidence agent, and diagnostic
+client sources exist, but the assembled guest remains unqualified. No image has
+been built, imported, booted, measured, or approved. No cloud action is
+authorized by this document.
 The spike carries public test data only and cannot establish private Zaino or
 ORAM access-pattern privacy.
 
@@ -29,7 +31,7 @@ instance pins:
 | base rootfs | Ubuntu 24.04 amd64 cloud/rootfs artifact by immutable URL, byte length, SHA-256, and signed release-manifest identity |
 | packages | one dated Ubuntu snapshot URL plus exact package name/version/architecture and `.deb` SHA-256 list; network disabled during assembly |
 | kernel | one Linux `>=6.6` package and exact config/source/package digest containing GVE, PCI MSI, SWIOTLB, NVMe, dm-verity, TDX guest/configfs-tsm, and required TDX halt fixes |
-| boot | exact `systemd-boot`/`systemd-stub`, `ukify`, initramfs builder, EFI tools, verity tools, and signing-tool package digests |
+| boot | exact `systemd-stub`, `ukify`, deterministic initramfs builder, EFI, verity, and signing-tool inputs, plus `systemd-boot` if included; native static `tdx-guest-init` is the only initramfs entry point |
 | Secure Boot | offline spike PK/KEK/db/dbx certificate fingerprints; private signing key path supplied out of band and never copied into build output |
 | workload | fixed public evidence-only binary digest; no Zaino keys, wallet data, credentials, operator shell, updater, or workload downloader |
 | machine | `c3-standard-4` for feasibility only, one 20-GiB balanced NVMe boot disk, exact supported zone selected at execution review |
@@ -68,16 +70,15 @@ deploy/tdx/accepted-guest-spike/
   negative-tests.sh
   rootfs-files.txt
   kernel.config.required
-  evidence-agent.service
   evidence-agent.policy
 ```
 
-`tools/tdx-evidence-agent` is a required new Rust package and explicit build
-target for this spike; it does not exist at this planning head. Its source,
-dependency closure, Cargo feature set, binary digest, and tests must be reviewed
-before `inputs.json` can become complete. A digest field cannot stand in for
-that missing implementation.
-`tools/tdx-boot-spike-client` is the corresponding required diagnostic consumer.
+`tools/tdx-evidence-agent`, `tools/tdx-guest-init`, and
+`tools/tdx-boot-spike-client` now have source implementations. Their reviewed
+source, dependency closure, Cargo feature sets, actual binary digests, and
+passing platform tests are still required before `inputs.json` can become
+complete. Source availability does not establish a working assembled guest.
+`tools/tdx-boot-spike-client` is the corresponding diagnostic consumer.
 It owns the TLS stream and challenge, validates the dedicated transcript, runs
 the strict quote-plus-CCEL verifier, and emits only the dedicated diagnostic
 receipt. The existing retained Zaino client rejects this scope by design.
@@ -98,13 +99,37 @@ and microcode fragments. `assemble-image.sh` creates one GPT image with one ESP
 and one read-only verity root. Writable runtime paths are tmpfs. There is no
 swap or hibernation image.
 
+The initramfs contains a static musl ELF `tdx-guest-init`, with no shell or
+general-purpose init system. UKI assembly may use systemd tooling on the
+builder; the guest does not depend on systemd services or its verity generator.
+The native init verifies the exact exposed command-line bytes, dm-verity UUID,
+and logical mapping size against mandatory release-build constants. It mounts
+the verified root read-only and executes the evidence agent as PID 1 after
+switch-root and descriptor cleanup.
+
+Build ordering is part of the input contract: first build the evidence agent
+and retain its actual GNU runtime closure; then assemble the deterministic root
+filesystem and verity tree and derive the exact authenticated command line.
+Only then compile the static init with `ZAINO_EXPECTED_CMDLINE_SHA256`,
+`ZAINO_EXPECTED_DM_UUID`, and `ZAINO_EXPECTED_ROOT_BYTES` bound to those outputs.
+Finally assemble the initramfs, UKI, and disk image. Missing or placeholder
+constants cannot produce a candidate image. The init ELF must have no program
+interpreter or dynamic dependencies; static PIE is permitted. Each independent
+builder must reproduce this complete sequence, including the bound init.
+
 The evidence-only PID 1 path performs a bounded full read of the verity-protected
-root, waits for blocking OS randomness, generates a fresh TLS key and lease ID,
-starts the fixed ConfigFS quote worker/evidence RPC, applies its final mount,
-device, syscall, capability, and no-new-privileges policy, and only then opens
-the private listener. The RPC accepts one 64-byte public challenge and returns
+root and waits for blocking OS randomness. The evidence agent drops its
+capabilities before constructing Tokio threads or the fixed ConfigFS quote
+worker. It generates a fresh TLS key and lease ID and applies the final mount,
+device, no-new-privileges, and TSYNC syscall policy before opening the private
+listener. The RPC accepts one 64-byte public challenge and returns
 only bounded QuoteV4 bytes plus the fixed CCEL table/log. It exposes no path,
 command, upload, metadata, log, shell, key-export, or general file-read method.
+
+The [ConfigFS source audit](oram-configfs-post-drop-source-audit.md) supports
+using ordinary filesystem-UID-0 owner permissions with empty capability sets.
+It does not replace post-filter quote generation, cleanup, and CCEL access in
+the exact rebuilt guest; those remain required live gates.
 
 This diagnostic RPC uses a separate transcript domain and receipt scope from
 Zaino's evidence v1. For an exact 64-byte client challenge, the agent requests:
@@ -145,9 +170,9 @@ Run twice on independent clean builders:
 ```
 
 The second builder writes `out-b`. Approval to import is blocked unless
-`verify-artifacts.sh` proves byte-identical workload binary, root filesystem,
-verity tree/root, UKI, ESP, disk image, SBOM, file/capability manifest, and
-release manifest. It must also prove:
+`verify-artifacts.sh` proves byte-identical workload binary, bound static init,
+initramfs, root filesystem, verity tree/root, UKI, ESP, disk image, SBOM,
+file/capability manifest, and release manifest. It must also prove:
 
 - one UKI profile and no companion/addon/alternate boot inputs;
 - kernel config contains every required setting and no debug/kexec/hibernation

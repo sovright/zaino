@@ -1,0 +1,20 @@
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/obliviouslabs/rostl?rev=8c3a12d2febf17b024f2e949428b3bc526d74172"]
+git = "https://github.com/obliviouslabs/rostl"
+rev = "8c3a12d2febf17b024f2e949428b3bc526d74172"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/sovright/zebra.git?rev=68ba61488a3c4386e6a3bd0370583f4ead153770"]
+git = "https://github.com/sovright/zebra.git"
+rev = "68ba61488a3c4386e6a3bd0370583f4ead153770"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/zingolabs/infrastructure.git?rev=85502cd0b5faf9308e590865dae51bf31fdd342e"]
+git = "https://github.com/zingolabs/infrastructure.git"
+rev = "85502cd0b5faf9308e590865dae51bf31fdd342e"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "/inputs/vendor"

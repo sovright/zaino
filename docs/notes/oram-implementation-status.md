@@ -23,6 +23,27 @@ This file is the implementation chronology. Entries here describe completed
 research slices and their limits; they do not override the normative plan or
 clear any Phase 0 gate.
 
+## 2026-09-12 — rejected exact-upsert identities and diagnostic retention
+
+Native [run 34719266410](https://github.com/sovright/zaino/actions/runs/34719266410)
+at integration head `b648a3b0` passed the live-refresh regression (1/1),
+remaining selected ORAM tests (725/725, three skipped), and runner tests
+(246/246, one skipped). The release binary built and passed the access-path
+profile. The exact-upsert profile then rejected missing raw identities for
+`random_range`, `CircuitORAM::read`, and `CircuitORAM::write_or_insert`;
+different instantiations were present. This proves identity drift, not
+equivalent machine code. Fixed-page checking and checked-runner packaging
+were skipped, and that failed binary was not retained.
+
+The workflow now retains a separately named unqualified diagnostic before
+profile checks: the exact non-executable ELF copy, raw and demangled symbols,
+full disassembly, relocations, compiler/binutils identities, source/tree/run
+identities, Cargo.lock, and file hashes. Its distinct manifest sets
+`qualified:false` and supplies no native build receipt. Profile checks and
+checked-runner packaging remain unchanged. A fresh retained ELF must undergo
+the complete call/instantiation and instruction audit before any reviewed pin
+update; diagnostic retention itself establishes no codegen qualification.
+
 ## 2026-09-12 — finalized-record preparation at coherent publication
 
 At integration head `47bb6de2`, native Linux

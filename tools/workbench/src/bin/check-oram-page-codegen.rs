@@ -29,7 +29,12 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use workbench::{command as tool, encoded_byte_len, is_gnu_prefix, run};
+#[cfg(test)]
+use workbench::parse_elf_sections;
+use workbench::{
+    artifact_bytes, artifact_sections, command as tool, comment_target, encoded_byte_len,
+    is_gnu_prefix, rip_relative_target, run, validate_readonly_constant_span, ElfSection,
+};
 
 const EXPECTED_SYMBOL_SIZE: u64 = 0xca9;
 const EXPECTED_BRANCHES: usize = 26;
@@ -289,17 +294,7 @@ struct DynamicRelocation {
 
 type DynamicRelocations = BTreeMap<u64, DynamicRelocation>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Section {
-    name: String,
-    address: u64,
-    size: u64,
-    contents: bool,
-    allocated: bool,
-    loaded: bool,
-    readonly: bool,
-    code: bool,
-}
+type Section = ElfSection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibcCall {
@@ -502,68 +497,6 @@ fn parse_guarded_symbols(
 fn dynamic_relocations(artifact: &Path) -> Result<DynamicRelocations, Vec<String>> {
     let listing = tool("objdump", &["-R", &artifact.display().to_string()])?;
     parse_dynamic_relocations(&listing)
-}
-
-fn artifact_sections(artifact: &Path) -> Result<Vec<Section>, Vec<String>> {
-    let listing = tool("objdump", &["-h", &artifact.display().to_string()])?;
-    parse_sections(&listing)
-}
-
-fn parse_sections(listing: &str) -> Result<Vec<Section>, Vec<String>> {
-    if !listing
-        .lines()
-        .any(|line| line.trim_end().ends_with("file format elf64-x86-64"))
-    {
-        return Err(vec![
-            "artifact is not reported as exact elf64-x86-64".to_string()
-        ]);
-    }
-    let mut sections = Vec::new();
-    let mut indices = BTreeSet::new();
-    let mut lines = listing.lines();
-    while let Some(line) = lines.next() {
-        let mut fields = line.split_whitespace();
-        let Some(index) = fields.next().and_then(|field| field.parse::<usize>().ok()) else {
-            continue;
-        };
-        let (Some(name), Some(size), Some(address)) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(vec![format!("malformed objdump section row: {line}")]);
-        };
-        if !indices.insert(index) {
-            return Err(vec![format!("duplicate objdump section index {index}")]);
-        }
-        let size = u64::from_str_radix(size, 16)
-            .map_err(|_| vec![format!("invalid objdump section size: {line}")])?;
-        let address = u64::from_str_radix(address, 16)
-            .map_err(|_| vec![format!("invalid objdump section address: {line}")])?;
-        address
-            .checked_add(size)
-            .ok_or_else(|| vec![format!("objdump section range overflows: {line}")])?;
-        let flags_line = lines
-            .next()
-            .ok_or_else(|| vec![format!("missing flags for objdump section `{name}`")])?;
-        let flags = flags_line
-            .split(',')
-            .map(str::trim)
-            .collect::<BTreeSet<_>>();
-        sections.push(Section {
-            name: name.to_string(),
-            address,
-            size,
-            contents: flags.contains("CONTENTS"),
-            allocated: flags.contains("ALLOC"),
-            loaded: flags.contains("LOAD"),
-            readonly: flags.contains("READONLY"),
-            code: flags.contains("CODE"),
-        });
-    }
-    if sections.is_empty() {
-        return Err(vec![
-            "objdump did not provide any parseable section headers".to_string(),
-        ]);
-    }
-    Ok(sections)
 }
 
 fn parse_dynamic_relocations(listing: &str) -> Result<DynamicRelocations, Vec<String>> {
@@ -1002,7 +935,7 @@ fn normalize_rip_constant(
     let width = expected.bytes.len();
     let length = u64::try_from(width)
         .map_err(|_| vec!["reviewed constant width does not fit u64".to_string()])?;
-    validate_readonly_constant_span(sections, relocations, target, length)?;
+    validate_readonly_constant_span(sections, relocations.keys().copied(), target, length)?;
     let bytes = read_bytes(target, width)?;
     if bytes.len() != width {
         return Err(vec![format!(
@@ -1020,113 +953,6 @@ fn normalize_rip_constant(
     Ok(format!("<const:{}>,{destination}", encode_hex(&bytes)))
 }
 
-fn validate_readonly_constant_span(
-    sections: &[Section],
-    relocations: &DynamicRelocations,
-    address: u64,
-    length: u64,
-) -> Result<(), Vec<String>> {
-    let end = address
-        .checked_add(length)
-        .ok_or_else(|| vec!["RIP-relative constant range overflows".to_string()])?;
-    let mut overlapping = Vec::new();
-    for section in sections {
-        let section_end = section
-            .address
-            .checked_add(section.size)
-            .ok_or_else(|| vec![format!("section `{}` range overflows", section.name)])?;
-        if section.size != 0 && section.address < end && address < section_end {
-            overlapping.push((section, section_end));
-        }
-    }
-    let [(section, section_end)] = overlapping.as_slice() else {
-        return Err(vec![format!(
-            "RIP-relative constant span 0x{address:x}..0x{end:x} intersects {} sections, expected exactly one",
-            overlapping.len()
-        )]);
-    };
-    if section.address > address || *section_end < end {
-        return Err(vec![format!(
-            "RIP-relative constant span is not fully contained by section `{}`",
-            section.name
-        )]);
-    }
-    if !(section.contents && section.allocated && section.loaded && section.readonly)
-        || section.code
-    {
-        return Err(vec![format!(
-            "RIP-relative constant span is in unapproved section `{}`; expected loaded, allocated, read-only data",
-            section.name
-        )]);
-    }
-    if let Some((slot, relocation)) = relocations.range(section.address..*section_end).next() {
-        return Err(vec![format!(
-            "RIP-relative constant section `{}` contains dynamic relocation at 0x{slot:x}: {} {}; relocation-free provenance is required",
-            section.name, relocation.kind, relocation.symbol
-        )]);
-    }
-    Ok(())
-}
-
-fn rip_relative_target(
-    operand: &str,
-    next_address: u64,
-    indirect: bool,
-) -> Result<u64, &'static str> {
-    let operand = operand.trim();
-    let operand = if indirect {
-        operand
-            .strip_prefix('*')
-            .ok_or("expected an indirect RIP-relative operand")?
-    } else {
-        if operand.starts_with('*') {
-            return Err("unexpected indirect RIP-relative operand");
-        }
-        operand
-    };
-    let displacement = operand
-        .strip_suffix("(%rip)")
-        .ok_or("operand is not exact disp(%rip)")?;
-    let displacement = parse_signed_hex(displacement).ok_or("invalid RIP-relative displacement")?;
-    if displacement >= 0 {
-        next_address
-            .checked_add(displacement.unsigned_abs())
-            .ok_or("RIP-relative target overflows")
-    } else {
-        next_address
-            .checked_sub(displacement.unsigned_abs())
-            .ok_or("RIP-relative target underflows")
-    }
-}
-
-fn parse_signed_hex(value: &str) -> Option<i64> {
-    let (negative, digits) = if let Some(digits) = value.strip_prefix("-0x") {
-        (true, digits)
-    } else {
-        (false, value.strip_prefix("0x")?)
-    };
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let magnitude = u64::from_str_radix(digits, 16).ok()?;
-    let magnitude = i64::try_from(magnitude).ok()?;
-    Some(if negative { -magnitude } else { magnitude })
-}
-
-fn comment_target(comment: &str) -> Option<(u64, &str)> {
-    let mut fields = comment.split_whitespace();
-    let address = fields.next()?;
-    let label = fields.next()?;
-    if fields.next().is_some()
-        || address.is_empty()
-        || !address.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    let label = label.strip_prefix('<')?.strip_suffix('>')?;
-    Some((u64::from_str_radix(address, 16).ok()?, label))
-}
-
 fn direct_target(operands: &str) -> Option<u64> {
     let mut fields = operands.split_whitespace();
     let target = fields.next()?;
@@ -1134,67 +960,6 @@ fn direct_target(operands: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(target, 16).ok()
-}
-
-fn artifact_bytes(artifact: &Path, address: u64, length: usize) -> Result<Vec<u8>, Vec<String>> {
-    let length = u64::try_from(length)
-        .map_err(|_| vec!["requested artifact-byte length does not fit u64".to_string()])?;
-    let end = address
-        .checked_add(length)
-        .ok_or_else(|| vec!["requested artifact-byte range overflows".to_string()])?;
-    let listing = tool(
-        "objdump",
-        &[
-            "-s",
-            &format!("--start-address=0x{address:x}"),
-            &format!("--stop-address=0x{end:x}"),
-            &artifact.display().to_string(),
-        ],
-    )?;
-    parse_artifact_bytes(&listing, address, end)
-}
-
-fn parse_artifact_bytes(listing: &str, start: u64, end: u64) -> Result<Vec<u8>, Vec<String>> {
-    let mut found = BTreeMap::new();
-    for line in listing.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(address) = fields.next() else {
-            continue;
-        };
-        let Ok(mut address) = u64::from_str_radix(address, 16) else {
-            continue;
-        };
-        for word in fields {
-            if word.is_empty()
-                || word.len() > 8
-                || word.len() % 2 != 0
-                || !word.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                break;
-            }
-            for index in (0..word.len()).step_by(2) {
-                let byte = u8::from_str_radix(&word[index..index + 2], 16)
-                    .map_err(|_| vec![format!("invalid objdump data byte: {word}")])?;
-                if address >= start && address < end && found.insert(address, byte).is_some() {
-                    return Err(vec![format!(
-                        "duplicate objdump data byte at address 0x{address:x}"
-                    )]);
-                }
-                address = address
-                    .checked_add(1)
-                    .ok_or_else(|| vec!["objdump data address overflows".to_string()])?;
-            }
-        }
-    }
-    let mut bytes = Vec::new();
-    for address in start..end {
-        bytes.push(*found.get(&address).ok_or_else(|| {
-            vec![format!(
-                "objdump did not provide requested data byte at 0x{address:x}"
-            )]
-        })?);
-    }
-    Ok(bytes)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -1442,12 +1207,14 @@ Idx Name          Size      VMA               LMA               File off  Algn
  11 .data         00000100  0000000000000300  0000000000000300  00000300  2**4
                   CONTENTS, ALLOC, LOAD, DATA
 ";
-        let sections = parse_sections(listing).expect("section table is valid");
+        let sections = parse_elf_sections(listing).expect("section table is valid");
         assert_eq!(sections.len(), 2);
         assert!(sections[0].readonly);
         assert!(!sections[0].code);
         assert!(!sections[1].readonly);
-        assert!(parse_sections(&listing.replace("elf64-x86-64", "elf64-littleaarch64")).is_err());
+        assert!(
+            parse_elf_sections(&listing.replace("elf64-x86-64", "elf64-littleaarch64")).is_err()
+        );
     }
 
     #[test]
@@ -1552,13 +1319,9 @@ Idx Name          Size      VMA               LMA               File off  Algn
         let address = 0x200;
         let mut writable = readonly_data_section(address, 0x100);
         writable.readonly = false;
-        assert!(validate_readonly_constant_span(
-            &[writable],
-            &DynamicRelocations::new(),
-            address,
-            16
-        )
-        .is_err());
+        assert!(
+            validate_readonly_constant_span(&[writable], std::iter::empty(), address, 16).is_err()
+        );
 
         let relocation = DynamicRelocations::from([(
             address + 0x80,
@@ -1569,7 +1332,7 @@ Idx Name          Size      VMA               LMA               File off  Algn
         )]);
         assert!(validate_readonly_constant_span(
             &[readonly_data_section(address, 0x100)],
-            &relocation,
+            relocation.keys().copied(),
             address,
             16,
         )
@@ -1579,26 +1342,10 @@ Idx Name          Size      VMA               LMA               File off  Algn
             readonly_data_section(address, 0x100),
             readonly_data_section(address + 8, 0x100),
         ];
-        assert!(validate_readonly_constant_span(
-            &overlapping,
-            &DynamicRelocations::new(),
-            address,
-            16,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn artifact_data_parser_requires_complete_exact_bytes() {
-        let listing = "\
-Contents of section .rodata:
- 0200 ffffffff ffffffff ffffffff ffff0000  ................
-";
-        assert_eq!(
-            parse_artifact_bytes(listing, 0x200, 0x210).expect("data bytes are complete"),
-            FIRST_MASK
+        assert!(
+            validate_readonly_constant_span(&overlapping, std::iter::empty(), address, 16,)
+                .is_err()
         );
-        assert!(parse_artifact_bytes(listing, 0x1ff, 0x210).is_err());
     }
 
     #[test]
@@ -1623,6 +1370,22 @@ Contents of section .rodata:
         assert_eq!(rip_relative_target("-0x6(%rip)", 0x106, false), Ok(0x100));
         assert!(rip_relative_target("*0xfa(%rip)", 0x106, false).is_err());
         assert!(rip_relative_target("0xfa(%rip)", 0x106, true).is_err());
+    }
+
+    #[test]
+    fn resolved_constant_comments_require_one_exact_address_and_label() {
+        assert_eq!(
+            comment_target(" 200 <anonymous>"),
+            Some((0x200, "anonymous"))
+        );
+        for malformed in [
+            "200",
+            "200 anonymous",
+            "200 <anonymous> trailing",
+            "xyz <anonymous>",
+        ] {
+            assert_eq!(comment_target(malformed), None, "{malformed}");
+        }
     }
 
     #[test]

@@ -3,10 +3,10 @@
 set -euo pipefail
 export LC_ALL=C.UTF-8 TZ=UTC
 fail() { echo "custom kernel build refused: $*" >&2; exit 1; }
-[[ $# == 7 ]] || fail 'internal usage: SOURCES CLOSURE LOCAL_REPO EXPECTED_PACKAGES FRAGMENT OUTPUT RUN_LABEL'
-sources=$1 closure=$2 local_repo=$3 expected_packages=$4 fragment=$5 output=$6 run_label=$7
+[[ $# == 8 ]] || fail 'internal usage: SOURCES CLOSURE LOCAL_REPO EXPECTED_PACKAGES FRAGMENT PATCHES OUTPUT RUN_LABEL'
+sources=$1 closure=$2 local_repo=$3 expected_packages=$4 fragment=$5 patches=$6 output=$7 run_label=$8
 [[ "$run_label" =~ ^run-[12]$ ]] || fail 'invalid run label'
-for path in "$sources" "$closure" "$local_repo" "$expected_packages" "$fragment"; do [[ -e "$path" && ! -L "$path" ]] || fail 'missing regular build input'; done
+for path in "$sources" "$closure" "$local_repo" "$expected_packages" "$fragment" "$patches"; do [[ -e "$path" && ! -L "$path" ]] || fail 'missing regular build input'; done
 [[ ! -e "$output" ]] || fail 'output already exists'
 output_owner=$(stat -c '%u:%g' "$(dirname -- "$output")")
 [[ "$output_owner" =~ ^[0-9]+:[0-9]+$ ]] || fail 'invalid output owner'
@@ -76,6 +76,13 @@ dsc=$(find "$sources" -mindepth 1 -maxdepth 1 -type f -name '*.dsc' -print)
 [[ $(printf '%s\n' "$dsc" | awk 'NF {n++} END {print n+0}') == 1 ]] || fail 'expected exactly one dsc'
 src="$output/source"
 dpkg-source --no-check -x "$dsc" "$src"
+lock_sha=$(sha256sum -- /builder/kernel-patches.json); [[ ${lock_sha%% *} == fa4aa401443c303077fc1a434bb82c5fe558f44b5a62f4ca3d6534f649c2289a ]] || fail 'mounted patch lock digest changed'
+backport_sha=$(sha256sum -- "$patches/0003-tdx-getquote-linux-6.17-backport.patch"); [[ ${backport_sha%% *} == ab420f4663f504a61f33d054a350a88dd9dae8e35431c5fcdd800f025ee88bf8 ]] || fail 'mounted backport digest changed'
+driver="$src/drivers/virt/coco/tdx-guest/tdx-guest.c"
+driver_sha=$(sha256sum -- "$driver"); [[ ${driver_sha%% *} == 06d50d736be3f708dd78654884b296b379736529f0a1cb73f7753e3f9e4fa078 ]] || fail 'unexpected pre-patch TDX quote driver'
+patch --batch --fuzz=0 -p1 -d "$src" < "$patches/0003-tdx-getquote-linux-6.17-backport.patch"
+driver_sha=$(sha256sum -- "$driver"); [[ ${driver_sha%% *} == ac7a2fed535b553fbd112bca77d42f7d734fa23e72341ce7437b853d311f582a ]] || fail 'unexpected post-patch TDX quote driver'
+bash /builder/verify-tdx-quote-hardening.sh "$driver" >/dev/null
 build="$output/build"
 mkdir -m 700 -- "$build"
 export SOURCE_DATE_EPOCH=1789084800
@@ -99,7 +106,8 @@ cp -- "$output/embedded.config" "$output/artifacts/embedded.config"
 cp -- "$build/arch/x86/boot/bzImage" "$output/artifacts/bzImage"
 cp -- "$build/vmlinux" "$output/artifacts/vmlinux"
 cp -- "$build/System.map" "$output/artifacts/System.map"
-for name in System.map bzImage config embedded.config vmlinux; do
+cp -- /builder/kernel-patches.json "$output/artifacts/kernel-patches.json"
+for name in System.map bzImage config embedded.config kernel-patches.json vmlinux; do
   artifact="$output/artifacts/$name"
   digest=$(sha256sum -- "$artifact"); printf '%s  %s\n' "${digest%% *}" "${artifact##*/}"
 done | LC_ALL=C sort > "$output/artifacts/SHA256SUMS"
