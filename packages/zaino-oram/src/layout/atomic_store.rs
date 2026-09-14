@@ -32,6 +32,13 @@ pub(crate) use worker::{
     AtomicQualificationAppendResult, AtomicQualificationCommandError, AtomicQualificationSnapshot,
     AtomicQueueCapacity, AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError,
 };
+#[cfg(all(
+    feature = "corpus-zaino",
+    feature = "rostl-experimental",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(crate) use worker::{with_fixed_page_allocation, FixedPageAllocationFailure};
 
 /// A sparse fixed-capacity table whose insert never overwrites an existing key.
 ///

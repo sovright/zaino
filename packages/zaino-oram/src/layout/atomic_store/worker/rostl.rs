@@ -27,6 +27,10 @@ use crate::layout::FixedProbeLayout;
 use crate::records::{
     AddressDirectory, AddressEventPage, AddressKey, UtxoEvent, UtxoScriptClass, TXID_BYTES,
 };
+#[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+use crate::records::{
+    PersistentAddUtxoPage16, PersistentBaseUtxoPage16, PersistentSpendUtxoPage16,
+};
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use crate::records::{PersistentAddressDirectory, PersistentAddressEventPage};
 use crate::timing_equivalence::ArmMeasurement;
@@ -317,6 +321,62 @@ where
     occupied_records: u64,
     failed_closed: bool,
     record: PhantomData<T>,
+}
+
+/// Owns the three real fixed-page tables for one bounded allocation diagnostic.
+///
+/// It deliberately exposes no table operation or serving handle. Field order is
+/// the published construction order, and construction retains each completed
+/// table while the next independent table and recursive position map allocate.
+#[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+struct FixedPageAllocationOwner {
+    base: RostlTable<PersistentBaseUtxoPage16>,
+    add: RostlTable<PersistentAddUtxoPage16>,
+    spend: RostlTable<PersistentSpendUtxoPage16>,
+}
+
+#[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+impl FixedPageAllocationOwner {
+    fn new(capacities: [usize; 3]) -> Result<Self, RostlStoreError> {
+        let [base, add, spend] = capacities;
+        validate_capacity(base)?;
+        validate_capacity(add)?;
+        validate_capacity(spend)?;
+        let base = RostlTable::new(base)?;
+        let add = RostlTable::new(add)?;
+        let spend = RostlTable::new(spend)?;
+        Ok(Self { base, add, spend })
+    }
+
+    const fn capacities(&self) -> [usize; 3] {
+        [
+            self.base.capacity_value(),
+            self.add.capacity_value(),
+            self.spend.capacity_value(),
+        ]
+    }
+}
+
+#[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn with_fixed_page_allocation(
+    capacities: [usize; 3],
+    observe_while_retained: impl FnOnce([usize; 3]) -> Result<(), ()>,
+) -> Result<(), FixedPageAllocationFailure> {
+    let owner = FixedPageAllocationOwner::new(capacities)
+        .map_err(|_| FixedPageAllocationFailure::Construction)?;
+    // This only prevents the diagnostic owner from becoming optimizer-dead;
+    // the parent process's child-specific peak observation remains the evidence.
+    std::hint::black_box(&owner);
+    let observation = observe_while_retained(owner.capacities());
+    std::hint::black_box(&owner);
+    drop(owner);
+    observation.map_err(|()| FixedPageAllocationFailure::Observer)
+}
+
+#[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) enum FixedPageAllocationFailure {
+    Construction,
+    Observer,
 }
 
 impl<T> RostlTable<T>
@@ -1278,6 +1338,58 @@ mod tests {
             u64::try_from(std::mem::size_of::<RostlTable<PersistentBaseUtxoPage16>>()),
             Ok(TARGET_ROSTL_TABLE_OBJECT_BYTES)
         );
+    }
+
+    #[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn synthetic_fixed_page_owner_constructs_all_real_table_types() {
+        let mut owner =
+            FixedPageAllocationOwner::new([2, 4, 4]).expect("valid fixed-page owner shape");
+        assert_eq!(owner.capacities(), [2, 4, 4]);
+
+        let base = PersistentBaseUtxoPage16::default();
+        owner
+            .base
+            .insert_unique(0, base)
+            .expect("base table insert succeeds");
+        assert_eq!(
+            owner.base.read(0).expect("base table read succeeds"),
+            Some(base)
+        );
+        let add = PersistentAddUtxoPage16::default();
+        owner
+            .add
+            .insert_unique(0, add)
+            .expect("add table insert succeeds");
+        assert_eq!(
+            owner.add.read(0).expect("add table read succeeds"),
+            Some(add)
+        );
+        let spend = PersistentSpendUtxoPage16::default();
+        owner
+            .spend
+            .insert_unique(0, spend)
+            .expect("spend table insert succeeds");
+        assert_eq!(
+            owner.spend.read(0).expect("spend table read succeeds"),
+            Some(spend)
+        );
+    }
+
+    #[cfg(all(feature = "corpus-zaino", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn synthetic_fixed_page_owner_refuses_invalid_shape_and_observer_failure() {
+        assert!(matches!(
+            FixedPageAllocationOwner::new([2, 4, 3]),
+            Err(RostlStoreError::InvalidCapacity)
+        ));
+        for _ in 0..2 {
+            assert!(with_fixed_page_allocation([2, 4, 4], |_| Ok(())).is_ok());
+        }
+        assert!(matches!(
+            with_fixed_page_allocation([2, 4, 4], |_| Err(())),
+            Err(FixedPageAllocationFailure::Observer)
+        ));
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -50,6 +50,13 @@ pub(super) use atomic_store::{
     AtomicQualificationCommandError, AtomicQualificationSnapshot, AtomicQueueCapacity,
     AtomicQueueCapacityError, AtomicWorker, AtomicWorkerBuildError, QualificationMemoryTable,
 };
+#[cfg(all(
+    feature = "corpus-zaino",
+    feature = "rostl-experimental",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub(crate) use atomic_store::{with_fixed_page_allocation, FixedPageAllocationFailure};
 #[cfg(all(test, feature = "corpus-zaino"))]
 pub(super) use atomic_store::{BackendFailure, UniqueTable};
 
